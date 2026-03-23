@@ -1,0 +1,97 @@
+# Default ML training task for radar.
+# Usage: RADAR_TASK=tasks/ml_training/ml_training.yaml python researcher.py
+# Or just: python researcher.py  (uses the built-in ml_training task)
+
+name: ml_training
+description: >
+  Optimize a neural network training script to minimize validation
+  bits-per-byte (val_bpb) under a fixed wall-clock time budget.
+
+target_file: submission.py
+seed_file: submission.py
+frozen_files:
+  - prepare.py
+
+run_command: "python {target}"
+time_budget: 300
+kill_timeout: 600
+
+objectives:
+  - name: val_bpb
+    pattern: "val_bpb:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 1.0
+    primary: true
+    default: .inf
+
+  - name: code_lines
+    pattern: "$^"              # computed, not extracted from output
+    lower_is_better: true
+    weight: 0.1
+    default: .inf
+
+  - name: exec_time
+    pattern: "training_seconds:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.2
+    default: .inf
+
+  - name: memory_mb
+    pattern: "peak_vram_mb:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.1
+    default: .inf
+
+strategies:
+  - id: architecture
+    name: Architecture Modification
+    description: Modify attention, layers, activations, residuals, normalization, or topology.
+
+  - id: optimizer
+    name: Optimizer & Schedule
+    description: Change optimizer, learning rate, schedule, weight decay, clipping, warmup.
+
+  - id: regularization
+    name: Regularization
+    description: Add/remove dropout, weight tying, label smoothing, stochastic depth.
+
+  - id: efficiency
+    name: Training Efficiency
+    description: Improve throughput via batch size, gradient accumulation, mixed precision, compile.
+
+  - id: simplify
+    name: Simplification
+    description: Remove unnecessary complexity. Fewer params = more steps in time budget.
+
+  - id: scale
+    name: Scale Rebalancing
+    description: Rebalance depth vs width vs sequence length vs batch size.
+
+  - id: novel
+    name: Novel Idea
+    description: Try something unconventional from a different domain. High risk, high reward.
+
+domain_system_prompt: >
+  You are an expert autonomous ML researcher conducting neural architecture
+  and training optimization. You analyze loss curves, memory stats, and timing
+  data to propose targeted improvements. Every change needs a clear hypothesis
+  and theoretical grounding. The code runs on a single GPU under a fixed time
+  budget — throughput matters as much as per-step quality.
+
+constraints:
+  - Every experiment runs for a fixed time budget (wall clock)
+  - Code must be runnable on a single GPU
+  - Only modify the target file — everything else is frozen
+  - Preserve metric output format (runner needs to extract val_bpb)
+  - Code must be syntactically valid and crash-free
+
+anti_patterns:
+  - Tweaking a single hyperparameter by a tiny amount
+  - Increasing model size without compensating for time budget
+  - Breaking the evaluation protocol or metric reporting
+  - Adding external dependencies not already available
+
+example_hypotheses:
+  - Replacing LayerNorm with RMSNorm will reduce overhead and allow more steps
+  - Adding a gated MLP with SwiGLU will improve expressiveness at minimal cost
+  - Reducing depth from 8 to 6 but increasing width will be more time-efficient

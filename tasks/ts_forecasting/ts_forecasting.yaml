@@ -1,0 +1,73 @@
+name: ts_forecasting
+description: >
+  Train a time series foundation model to minimize CRPS on
+  held-out forecasting tasks across diverse domains and frequencies.
+
+target_file: submission.py
+seed_file: submission.py
+frozen_files:
+  - harness.py
+  - prepare.py
+  - evaluate.py
+  - auth.py
+
+run_command: "python /workspace/frozen/harness.py {target}"
+eval_command: "python /workspace/frozen/evaluate.py"
+time_budget: 300
+kill_timeout: 600
+
+runner_dir: runner/timeseries_forecast
+docker_memory: "8g"
+docker_cpus: "2"
+
+objectives:
+  - name: crps
+    pattern: "crps:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 1.0
+    primary: true
+    default: .inf
+
+  - name: mase
+    pattern: "mase:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.5
+    default: .inf
+
+  - name: exec_time
+    pattern: "training_seconds:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.2
+    default: .inf
+
+  - name: memory_mb
+    pattern: "peak_vram_mb:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.1
+    default: .inf
+
+domain_system_prompt: >
+  You are an expert autonomous ML researcher building time-series foundation
+  models. The model receives multivariate context windows and must output
+  probabilistic forecasts (quantile predictions). The code runs on a single
+  GPU under a fixed time budget — throughput matters as much as per-step quality.
+
+constraints:
+  - Every experiment runs for a fixed time budget (wall clock)
+  - Code must be runnable on a single GPU
+  - "Implement build_model() and build_optimizer() — the harness runs training"
+  - "Model input: (batch, context_len, num_variates) float tensor"
+  - "Model output: (batch, prediction_len, num_variates, num_quantiles) float tensor"
+  - Preserve metric output format (runner needs to extract crps and mase)
+  - Code must be syntactically valid and crash-free
+
+anti_patterns:
+  - Tweaking a single hyperparameter by a tiny amount
+  - Increasing model size without compensating for time budget
+  - Breaking the evaluation protocol or metric reporting
+  - Adding external dependencies not already available
+
+example_hypotheses:
+  - Using patching (PatchTST-style) will improve efficiency and allow more steps
+  - Channel-independent processing reduces parameters while maintaining quality
+  - A reversible instance normalization layer will improve cross-domain generalization

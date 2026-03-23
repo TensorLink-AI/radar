@@ -1,0 +1,132 @@
+# nanoGPT-style language model training task.
+# Usage: RADAR_TASK=nanogpt python researcher.py
+#    or: RADAR_TASK=tasks/nanogpt/nanogpt.yaml python researcher.py
+#
+# Agnostic to the specific nanoGPT variant — patterns match common output
+# formats like "val_loss: 1.23", "val loss 1.23", "val_loss=1.23", etc.
+
+name: nanogpt
+description: >
+  Optimize a nanoGPT-style language model training script.
+  Minimize validation loss under a fixed wall-clock time budget
+  while balancing throughput and memory efficiency.
+
+target_file: submission.py
+seed_file: submission.py
+frozen_files:
+  - prepare.py
+  - data/
+
+run_command: "python {target}"
+time_budget: 300
+kill_timeout: 600
+
+objectives:
+  - name: val_loss
+    pattern: "val[_ ]loss[=:\\s]+(\\d+(?:\\.\\d+)?)"
+    lower_is_better: true
+    weight: 1.0
+    primary: true
+    default: .inf
+
+  - name: train_loss
+    pattern: "train[_ ]loss[=:\\s]+(\\d+(?:\\.\\d+)?)"
+    lower_is_better: true
+    weight: 0.3
+    default: .inf
+
+  - name: iter_per_sec
+    pattern: "(?:iter(?:ation)?s?[/_]s(?:ec)?|throughput)[=:\\s]+(\\d+(?:\\.\\d+)?)"
+    lower_is_better: false
+    weight: 0.4
+    default: 0.0
+
+  - name: exec_time
+    pattern: "(?:training|total|wall)[_ ](?:seconds|time|clock)[=:\\s]+(\\d+(?:\\.\\d+)?)"
+    lower_is_better: true
+    weight: 0.2
+    default: .inf
+
+  - name: memory_mb
+    pattern: "(?:peak[_ ])?(?:vram|memory|gpu[_ ]mem)[_ ]?(?:mb|MB)[=:\\s]+(\\d+(?:\\.\\d+)?)"
+    lower_is_better: true
+    weight: 0.1
+    default: .inf
+
+strategies:
+  - id: architecture
+    name: Architecture Modification
+    description: >
+      Modify attention mechanism, layer structure, activations, residual
+      connections, normalization, positional encoding, or model topology.
+
+  - id: optimizer
+    name: Optimizer & Schedule
+    description: >
+      Change optimizer, learning rate, schedule, weight decay, gradient
+      clipping, warmup, cooldown.
+
+  - id: regularization
+    name: Regularization
+    description: >
+      Add/remove dropout, weight tying, label smoothing, stochastic depth,
+      embedding scaling.
+
+  - id: efficiency
+    name: Training Efficiency
+    description: >
+      Improve throughput via batch size, gradient accumulation, mixed
+      precision, torch.compile, fused kernels.
+
+  - id: simplify
+    name: Simplification
+    description: >
+      Remove unnecessary complexity. Fewer parameters means more training
+      steps within the time budget.
+
+  - id: scale
+    name: Scale Rebalancing
+    description: >
+      Rebalance depth vs width vs context length vs batch size to find
+      a better compute-optimal configuration.
+
+  - id: novel
+    name: Novel Idea
+    description: >
+      Try something unconventional: alternative attention patterns, new
+      activations, weight sharing schemes, or ideas from recent papers.
+
+domain_system_prompt: >
+  You are an expert autonomous ML researcher optimizing a nanoGPT-style
+  language model. You analyze loss curves, throughput, and memory usage to
+  propose targeted improvements. Every change needs a clear hypothesis.
+  The code runs on a single GPU under a fixed wall-clock time budget —
+  throughput (iterations/sec) matters as much as per-step loss improvement.
+  A smaller model that trains for more steps often beats a larger model
+  that barely finishes one epoch.
+
+constraints:
+  - Every experiment runs for a fixed wall-clock time budget
+  - Code must run on a single GPU
+  - Only modify the target file — data prep and tokenization are frozen
+  - Preserve metric output format so the runner can extract val_loss
+  - Code must be syntactically valid and crash-free
+  - Do not change the dataset, vocabulary, or evaluation protocol
+  - "torch.nn.RMSNorm is NOT available (added in PyTorch 2.4). If you want RMSNorm, implement it manually as a simple nn.Module."
+  - "torch.compile may fail on some ops or older PyTorch. Always guard with try/except and fall back to eager mode."
+  - "Only use APIs available in PyTorch 2.1+. Do NOT use torch.nn.RMSNorm, torch.nn.functional.scaled_dot_product_attention is fine."
+
+anti_patterns:
+  - Tweaking a single hyperparameter by a tiny amount
+  - Increasing model size without compensating for time budget
+  - Breaking the evaluation protocol or metric reporting
+  - Adding external dependencies not already available
+  - Skipping validation to save time (metrics become meaningless)
+
+example_hypotheses:
+  - Implementing RMSNorm manually (simple nn.Module) to replace LayerNorm will reduce per-step overhead
+  - SwiGLU activation in MLP will improve expressiveness at minimal throughput cost
+  - Reducing n_layer from 12 to 8 but increasing n_embd will be more compute-efficient
+  - Using torch.compile with try/except fallback will improve iter/s when supported
+  - Cosine schedule with warmup=200 will stabilize early training and lower final val_loss
+  - Weight tying between embedding and output projection saves parameters for a free win

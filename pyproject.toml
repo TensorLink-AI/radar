@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "radar-subnet"
+version = "0.1.0"
+description = "Bittensor subnet for autonomous ML research via evolutionary code optimization"
+requires-python = ">=3.10"
+dependencies = [
+    "affinetes @ git+https://github.com/AffineFoundation/affinetes.git",
+    "bittensor>=8.0",
+    "fastapi>=0.104",
+    "uvicorn>=0.24",
+    "pydantic>=2.0",
+    "httpx>=0.25",
+    "docker>=7.0",
+    "pyyaml>=6.0",
+    "cryptography>=41.0",
+    "boto3>=1.28",
+    "python-dotenv>=1.0",
+    "safetensors>=0.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+lightning = [
+    "btlightning>=0.2.4",
+]
+
+[tool.setuptools.packages.find]
+include = ["shared*", "validator*", "miner*", "learners*"]
+
+[tool.setuptools]
+py-modules = ["config"]
