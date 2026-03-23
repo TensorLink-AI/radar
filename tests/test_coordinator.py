@@ -111,8 +111,10 @@ async def test_no_attestation_id_passes():
     endpoints = {1: "http://trainer:8080"}
     commitments = {1: _FakeCommitment(pod_attestation_id="")}  # no attestation
 
-    # Mock the HTTP call to avoid actual network
-    with patch("httpx.AsyncClient") as mock_client:
+    # Mock the HTTP call and helpers to avoid actual network / serialization issues
+    with patch("httpx.AsyncClient") as mock_client, \
+         patch("shared.artifacts.generate_upload_urls", return_value={"checkpoint": "http://fake/ckpt"}), \
+         patch("shared.auth.sign_request", return_value={"X-Epistula-Signed-By": "hk0"}):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"status": "success", "flops_equivalent_size": 500000}
         mock_client.return_value.__aenter__ = AsyncMock(return_value=MagicMock(
@@ -143,7 +145,9 @@ async def test_url_without_commitment_passes():
     # No commitment for trainer UID 1
     commitments = {}
 
-    with patch("httpx.AsyncClient") as mock_client:
+    with patch("httpx.AsyncClient") as mock_client, \
+         patch("shared.artifacts.generate_upload_urls", return_value={"checkpoint": "http://fake/ckpt"}), \
+         patch("shared.auth.sign_request", return_value={"X-Epistula-Signed-By": "hk0"}):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"status": "success", "flops_equivalent_size": 500000}
         mock_client.return_value.__aenter__ = AsyncMock(return_value=MagicMock(
