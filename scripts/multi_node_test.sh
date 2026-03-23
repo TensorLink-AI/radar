@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# EvoLoop Subnet — Multi-Node Integration Test
+# Radar Subnet — Multi-Node Integration Test
 #
 # Orchestrates a realistic testbed on a single server:
 #   - 1 local subtensor (Docker)
@@ -187,7 +187,7 @@ if [ "$CPU_ONLY" = true ]; then TRAINING_MODE="cpu-only (training skipped)"; fi
 
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
-echo "║         EvoLoop Multi-Node Integration Test                  ║"
+echo "║         Radar Multi-Node Integration Test                  ║"
 echo "║                                                              ║"
 printf "║  Network:    %-48s ║\n" "$NETWORK (netuid $NETUID)"
 printf "║  Miners:     %-48s ║\n" "$NUM_MINERS"

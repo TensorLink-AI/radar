@@ -1,4 +1,4 @@
-"""EvoLoop Validator Neuron — 3-phase validation pipeline.
+"""Radar Validator Neuron — 3-phase validation pipeline.
 
 Phase A: Collect architecture submissions from miner agents
 Phase B: Dispatch training to miner trainers (cross-eval)
@@ -74,7 +74,7 @@ def get_my_assignments(
 
 
 class Validator:
-    """EvoLoop subnet validator — 3-phase pipeline."""
+    """Radar subnet validator — 3-phase pipeline."""
 
     def __init__(self, config: bt.Config):
         self.config = config
@@ -591,7 +591,7 @@ class Validator:
 
 
 def get_config() -> bt.Config:
-    parser = argparse.ArgumentParser(description="EvoLoop Validator")
+    parser = argparse.ArgumentParser(description="Radar Validator")
     parser.add_argument("--netuid", type=int, default=1)
     parser.add_argument("--task", type=str, default="ml_training")
     parser.add_argument("--db_dir", type=str, default="./experiments")

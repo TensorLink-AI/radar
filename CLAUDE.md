@@ -1,4 +1,4 @@
-# EvoLoop Subnet — CLAUDE.md
+# Radar Subnet — CLAUDE.md
 
 ## What This Is
 

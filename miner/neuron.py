@@ -1,4 +1,4 @@
-"""EvoLoop Miner — commits Docker agent image to chain, hosts trainer on Basilica.
+"""Radar Miner — commits Docker agent image to chain, hosts trainer on Basilica.
 
 The miner has two components:
   1. Agent: a Docker image committed to chain. Validators pull and run it.
@@ -36,7 +36,7 @@ def _get_image_digest(image_url: str) -> str:
 
 
 class Miner:
-    """EvoLoop subnet miner — Docker agent + Basilica trainer."""
+    """Radar subnet miner — Docker agent + Basilica trainer."""
 
     def __init__(self, config: bt.Config):
         self.config = config
@@ -96,7 +96,7 @@ class Miner:
 
 
 def get_config() -> bt.Config:
-    parser = argparse.ArgumentParser(description="EvoLoop Miner")
+    parser = argparse.ArgumentParser(description="Radar Miner")
     parser.add_argument("--netuid", type=int, default=1)
     parser.add_argument("--docker_image", type=str, default="systematic:latest",
                         help="Docker agent image (validators pull and run this)")

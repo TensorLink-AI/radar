@@ -1,6 +1,6 @@
-# EvoLoop Subnet — Setup & Testing Guide
+# Radar Subnet — Setup & Testing Guide
 
-Hands-on guide for running the EvoLoop subnet on a local chain or Bittensor testnet with multiple miners and validators, and verifying that every component works.
+Hands-on guide for running the Radar subnet on a local chain or Bittensor testnet with multiple miners and validators, and verifying that every component works.
 
 ---
 
@@ -33,7 +33,7 @@ Hands-on guide for running the EvoLoop subnet on a local chain or Bittensor test
 
 ### Deployment Modes: Local GPU vs Basilica
 
-EvoLoop supports two training backends. This affects what hardware **you** need:
+Radar supports two training backends. This affects what hardware **you** need:
 
 | | Local (`RADAR_RUNNER_BACKEND=local`) | Basilica (`RADAR_RUNNER_BACKEND=basilica`) |
 |---|---|---|

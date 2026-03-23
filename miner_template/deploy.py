@@ -35,7 +35,7 @@ def deploy_trainer(image: str) -> str:
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    parser = argparse.ArgumentParser(description="Deploy EvoLoop miner")
+    parser = argparse.ArgumentParser(description="Deploy Radar miner")
     parser.add_argument("--docker_image", type=str, required=True,
                         help="Agent Docker image (e.g. myregistry/my-agent:v1)")
     parser.add_argument("--trainer_image", type=str,

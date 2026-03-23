@@ -22,7 +22,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
-app = FastAPI(title="EvoLoop Trainer")
+app = FastAPI(title="Radar Trainer")
 
 # R2 client (initialized on first use, only for localnet fallback)
 _r2 = None

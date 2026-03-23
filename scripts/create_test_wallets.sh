@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# EvoLoop — Create Test Wallets
+# Radar — Create Test Wallets
 #
 # Creates miner + validator wallets for testing. On localnet, funds them from
 # the Alice dev account and registers them on the subnet. On testnet, creates
@@ -102,7 +102,7 @@ fi
 
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
-echo "║         EvoLoop — Create Test Wallets                        ║"
+echo "║         Radar — Create Test Wallets                        ║"
 echo "║                                                              ║"
 printf "║  Network:    %-48s ║\n" "$NETWORK"
 printf "║  Netuid:     %-48s ║\n" "$NETUID_DISPLAY"

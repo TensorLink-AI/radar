@@ -1,4 +1,4 @@
-# EvoLoop
+# Radar
 
 **A Bittensor subnet for autonomous ML research using phase-split validation.**
 
