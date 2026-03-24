@@ -43,6 +43,26 @@ def stdout_key(round_id: int, miner_hotkey: str) -> str:
     return f"round_{round_id}/miner_{miner_hotkey}/stdout.log"
 
 
+def scratchpad_key(miner_hotkey: str) -> str:
+    """R2 key for a miner's persistent scratchpad archive."""
+    return f"scratchpad/{miner_hotkey}/state.tar.gz"
+
+
+def generate_scratchpad_urls(
+    r2: "R2AuditLog",
+    miner_hotkey: str,
+    ttl: int = 900,
+) -> tuple[str, str]:
+    """Generate presigned GET and PUT URLs for a miner's scratchpad.
+
+    Returns (get_url, put_url). GET URL returns 404 if no scratchpad exists yet.
+    """
+    key = scratchpad_key(miner_hotkey)
+    get_url = r2.generate_presigned_get_url(key, ttl=ttl)
+    put_url = r2.generate_presigned_put_url(key, ttl=ttl)
+    return get_url, put_url
+
+
 # ── TrainingMeta ─────────────────────────────────────────────────
 
 @dataclass

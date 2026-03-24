@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 from typing import Optional
 
 from config import Config
+from shared.artifacts import generate_scratchpad_urls
 from shared.commitment import ImageCommitment, pull_and_verify_image
 from shared.protocol import Proposal
 from validator.pod_manager import get_mode, launch_agent_pod, run_agent_on_pod
@@ -69,13 +71,27 @@ async def run_and_collect_agents(
                 logger.warning("UID %d: image verification failed", uid)
                 continue
 
+            # Generate per-miner scratchpad URLs
+            miner_challenge_json = challenge_json
+            if Config.SCRATCHPAD_ENABLED:
+                try:
+                    sp_get, sp_put = generate_scratchpad_urls(
+                        r2, commitment.hotkey, ttl=Config.SCRATCHPAD_TTL,
+                    )
+                    challenge_data = json.loads(challenge_json)
+                    challenge_data["scratchpad_get_url"] = sp_get
+                    challenge_data["scratchpad_put_url"] = sp_put
+                    miner_challenge_json = json.dumps(challenge_data)
+                except Exception as e:
+                    logger.warning("UID %d: scratchpad URL generation failed: %s", uid, e)
+
             agent_env = await launch_agent_pod(
                 image_url=commitment.image_url,
                 mem_limit="8192Mi",
             )
             try:
                 result = await run_agent_on_pod(
-                    agent_env, challenge_json,
+                    agent_env, miner_challenge_json,
                     timeout=Config.AGENT_TIMEOUT,
                 )
                 if result and isinstance(result, dict) and "code" in result:
@@ -150,13 +166,27 @@ async def run_and_collect_agents(
                     logger.warning("UID %d: image verification failed (fallback)", uid)
                     continue
 
+                # Generate per-miner scratchpad URLs (fallback)
+                fallback_challenge_json = challenge_json
+                if Config.SCRATCHPAD_ENABLED:
+                    try:
+                        sp_get, sp_put = generate_scratchpad_urls(
+                            r2, commitment.hotkey, ttl=Config.SCRATCHPAD_TTL,
+                        )
+                        challenge_data = json.loads(challenge_json)
+                        challenge_data["scratchpad_get_url"] = sp_get
+                        challenge_data["scratchpad_put_url"] = sp_put
+                        fallback_challenge_json = json.dumps(challenge_data)
+                    except Exception as e:
+                        logger.warning("UID %d: scratchpad URL generation failed (fallback): %s", uid, e)
+
                 agent_env = await launch_agent_pod(
                     image_url=commitment.image_url,
                     mem_limit="8192Mi",
                 )
                 try:
                     result = await run_agent_on_pod(
-                        agent_env, challenge_json,
+                        agent_env, fallback_challenge_json,
                         timeout=Config.AGENT_TIMEOUT,
                     )
                     if result and isinstance(result, dict) and "code" in result:

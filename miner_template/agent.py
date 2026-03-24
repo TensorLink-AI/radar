@@ -17,12 +17,74 @@ It must print a Proposal JSON to stdout with:
 """
 
 import json
+import os
 import sys
+import tarfile
+import tempfile
+import urllib.request
 
 
 def log(msg: str):
     """Write reasoning trace to stderr (captured by validator)."""
     print(msg, file=sys.stderr)
+
+
+def load_scratchpad(challenge: dict, local_dir: str = "/tmp/scratchpad") -> str:
+    """Download and extract the agent's persistent scratchpad from R2.
+
+    Returns the local directory path. Creates it empty if no scratchpad exists
+    (first round for this miner).
+    """
+    os.makedirs(local_dir, exist_ok=True)
+    url = challenge.get("scratchpad_get_url", "")
+    if not url:
+        return local_dir
+
+    try:
+        archive_path = os.path.join(local_dir, "state.tar.gz")
+        urllib.request.urlretrieve(url, archive_path)
+        with tarfile.open(archive_path, "r:gz") as tar:
+            tar.extractall(local_dir, filter="data")
+        os.remove(archive_path)
+        log(f"Loaded scratchpad ({len(os.listdir(local_dir))} files)")
+    except Exception as e:
+        log(f"Scratchpad load: {e} (starting fresh)")
+    return local_dir
+
+
+def save_scratchpad(challenge: dict, local_dir: str = "/tmp/scratchpad") -> bool:
+    """Upload the agent's scratchpad to R2 for next round.
+
+    Tars everything in local_dir and uploads via presigned PUT URL.
+    Call this before exiting.
+    """
+    url = challenge.get("scratchpad_put_url", "")
+    if not url:
+        return False
+
+    try:
+        archive_path = os.path.join(tempfile.gettempdir(), "scratchpad_upload.tar.gz")
+        with tarfile.open(archive_path, "w:gz") as tar:
+            for f in os.listdir(local_dir):
+                tar.add(os.path.join(local_dir, f), arcname=f)
+
+        size_mb = os.path.getsize(archive_path) / (1024 * 1024)
+        if size_mb > 10:
+            log(f"Scratchpad too large ({size_mb:.1f}MB > 10MB limit). Not saving.")
+            os.remove(archive_path)
+            return False
+
+        with open(archive_path, "rb") as f:
+            data = f.read()
+        req = urllib.request.Request(url, data=data, method="PUT")
+        req.add_header("Content-Type", "application/gzip")
+        urllib.request.urlopen(req)
+        os.remove(archive_path)
+        log(f"Saved scratchpad ({size_mb:.1f}MB)")
+        return True
+    except Exception as e:
+        log(f"Scratchpad save failed: {e}")
+        return False
 
 
 def _pick_hyperparams(min_flops: int, max_flops: int) -> dict:
@@ -74,6 +136,11 @@ def design_architecture(challenge: dict) -> dict:
 
     Returns dict with: code, name, motivation
     """
+    # Load persistent state from previous rounds (optional)
+    scratch_dir = load_scratchpad(challenge)
+    # Your agent's state lives here — probe DB, notes, whatever
+    # e.g. if os.path.exists(f"{scratch_dir}/probe.db"): ...
+
     frontier = challenge.get("feasible_frontier", [])
     min_flops = challenge.get("min_flops_equivalent", 0)
     max_flops = challenge.get("max_flops_equivalent", 0)
@@ -132,6 +199,9 @@ def build_model(context_len, prediction_len, num_variates, quantiles):
 def build_optimizer(model):
     return torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
 '''
+    # Save state for next round
+    save_scratchpad(challenge, scratch_dir)
+
     return {
         "code": code,
         "name": f"transformer_d{d_model}_l{num_layers}_ff{dim_feedforward}",

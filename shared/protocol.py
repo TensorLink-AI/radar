@@ -29,6 +29,10 @@ class Challenge:
     # Each entry: {code, metric, objectives} for frontier points in range
     feasible_frontier: list = field(default_factory=list)
 
+    # Agent scratchpad — presigned R2 URLs for persistent private storage
+    scratchpad_get_url: str = ""  # presigned GET URL for scratchpad.tar.gz
+    scratchpad_put_url: str = ""  # presigned PUT URL for scratchpad.tar.gz
+
     def to_json(self) -> str:
         return json.dumps({
             "challenge_id": self.challenge_id,
@@ -41,6 +45,8 @@ class Challenge:
             "db_url": self.db_url,
             "desearch_url": self.desearch_url,
             "feasible_frontier": self.feasible_frontier,
+            "scratchpad_get_url": self.scratchpad_get_url,
+            "scratchpad_put_url": self.scratchpad_put_url,
         })
 
     @classmethod
