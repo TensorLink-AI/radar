@@ -16,10 +16,10 @@ if TYPE_CHECKING:
 
 
 def passes_size_gate(metrics: dict, challenge) -> bool:
-    """Hard gate with configurable tolerance for wallclock calibration noise.
+    """Hard gate with configurable tolerance for FLOPs measurement variance.
 
-    Default 50% — wallclock calibration varies significantly across CPU
-    hardware, especially for small models where overhead dominates compute.
+    Default 10% — analytical FLOPs counting (torch.utils.flop_counter) is
+    exact for standard ops; wallclock calibration fallback for custom ops.
     """
     from config import Config
     tolerance = Config.SIZE_GATE_TOLERANCE

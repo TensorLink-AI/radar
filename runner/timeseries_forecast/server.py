@@ -180,10 +180,9 @@ async def _execute_training(
         logger.warning("FLOPs measurement failed: %s", e)
         flops_equiv = 0
 
-    # 5. Size gate — configurable tolerance for wallclock calibration noise.
-    #    Default 50%: wallclock ratios vary 2-4x across CPU hardware for small
-    #    models where Python/BLAS overhead dominates actual compute.
-    SIZE_GATE_TOLERANCE = float(os.environ.get("RADAR_SIZE_GATE_TOLERANCE", "0.50"))
+    # 5. Size gate — configurable tolerance for FLOPs measurement variance.
+    #    Default 10%: analytical FLOPs counting is exact for standard ops.
+    SIZE_GATE_TOLERANCE = float(os.environ.get("RADAR_SIZE_GATE_TOLERANCE", "0.10"))
     if min_flops > 0 and max_flops > 0:
         effective_min = int(min_flops * (1 - SIZE_GATE_TOLERANCE))
         effective_max = int(max_flops * (1 + SIZE_GATE_TOLERANCE))
@@ -198,12 +197,31 @@ async def _execute_training(
     # 6. Train (simplified harness logic)
     start = time.time()
     num_params = sum(p.numel() for p in model.parameters())
+
+    # init_weights hook
+    if hasattr(sub, "init_weights") and callable(sub.init_weights):
+        try:
+            sub.init_weights(model)
+            params_after = sum(p.numel() for p in model.parameters())
+            if params_after != num_params:
+                return JSONResponse(content=_result(
+                    round_id, miner_hotkey, "build_failed",
+                    error=f"init_weights() changed param count from {num_params} to {params_after}",
+                ))
+        except Exception as e:
+            logger.warning("init_weights() failed: %s", e)
+
     try:
         from prepare import get_dataloader, validate
-        from harness import _read_config, default_loss
+        from harness import _read_config, _read_amp_config, _validate_batch, default_loss, _AMP_DTYPE_WHITELIST
 
         cfg = _read_config(sub)
         optimizer = sub.build_optimizer(model)
+
+        # AMP config
+        amp_cfg = _read_amp_config(sub)
+        amp_enabled = amp_cfg["enabled"] and (device == "cuda")
+        amp_dtype = _AMP_DTYPE_WHITELIST[amp_cfg["dtype"]]
 
         total_steps_est = (time_budget * cfg["batch_size"]) // 2
         scheduler = None
@@ -217,15 +235,48 @@ async def _execute_training(
         if hasattr(sub, "compute_loss") and callable(sub.compute_loss):
             loss_fn = sub.compute_loss
 
+        # Detect hooks
+        has_transform_batch = hasattr(sub, "transform_batch") and callable(sub.transform_batch)
+        has_on_step_end = hasattr(sub, "on_step_end") and callable(sub.on_step_end)
+        transform_batch_disabled = False
+        transform_batch_slow_count = 0
+        transform_batch_fail_count = 0
+
         model.train()
         step = 0
+        optim_step = 0
         for batch in get_dataloader(batch_size=cfg["batch_size"]):
             if time.time() - start > time_budget:
                 break
             context = batch["context"].to(device)
             targets = batch["target"].to(device)
 
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device == "cuda")):
+            # transform_batch hook
+            if has_transform_batch and not transform_batch_disabled:
+                try:
+                    t0_tb = time.perf_counter()
+                    tb_result = sub.transform_batch({"context": context, "target": targets}, step, total_steps_est)
+                    elapsed_tb = time.perf_counter() - t0_tb
+                    if elapsed_tb > 0.05:
+                        transform_batch_slow_count += 1
+                    if transform_batch_slow_count >= 3:
+                        transform_batch_disabled = True
+                    elif _validate_batch(tb_result, cfg["batch_size"], "transform_batch"):
+                        context = tb_result["context"]
+                        targets = tb_result["target"]
+                        transform_batch_fail_count = 0
+                        if elapsed_tb <= 0.05:
+                            transform_batch_slow_count = 0
+                    else:
+                        transform_batch_fail_count += 1
+                        if transform_batch_fail_count >= 5:
+                            transform_batch_disabled = True
+                except Exception:
+                    transform_batch_fail_count += 1
+                    if transform_batch_fail_count >= 5:
+                        transform_batch_disabled = True
+
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
                 predictions = model(context)
                 loss = loss_fn(predictions, targets, QUANTILES) / cfg["grad_accum_steps"]
 
@@ -237,6 +288,18 @@ async def _execute_training(
                 optimizer.zero_grad(set_to_none=True)
                 if scheduler:
                     scheduler.step()
+                optim_step += 1
+
+                # on_step_end hook
+                if has_on_step_end:
+                    try:
+                        sub.on_step_end(
+                            model=model, optimizer=optimizer,
+                            step=optim_step, total_steps=total_steps_est,
+                            loss_value=loss.item() * cfg["grad_accum_steps"],
+                        )
+                    except Exception as e:
+                        logger.warning("on_step_end() failed: %s", e)
             step += 1
 
     except Exception as e:

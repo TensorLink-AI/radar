@@ -51,28 +51,29 @@ def test_size_gate_at_boundary():
 
 
 def test_size_gate_tolerance():
-    """Models within 50% of bucket boundary should pass (default tolerance)."""
-    # Over max (500K * 1.50 = 750K) — should pass
-    metrics = {"flops_equivalent_size": 700_000}
+    """Models within 10% of bucket boundary should pass (default tolerance)."""
+    # Over max (500K * 1.10 = 550K) — should pass
+    metrics = {"flops_equivalent_size": 540_000}
     assert passes_size_gate(metrics, _MockChallenge())
-    # Under min (100K * 0.50 = 50K) — should pass
-    metrics = {"flops_equivalent_size": 55_000}
+    # Under min (100K * 0.90 = 90K) — should pass
+    metrics = {"flops_equivalent_size": 92_000}
     assert passes_size_gate(metrics, _MockChallenge())
-    # Way over — should fail
-    metrics = {"flops_equivalent_size": 900_000}
+    # Over 10% tolerance — should fail
+    metrics = {"flops_equivalent_size": 600_000}
     assert not passes_size_gate(metrics, _MockChallenge())
 
 
 def test_size_gate_tolerance_large_bucket():
-    """150M FLOPs should pass the large bucket (max 125M) with 50% tolerance."""
+    """137M FLOPs should pass the large bucket (max 125M) with 10% tolerance."""
     class _LargeBucket:
         min_flops_equivalent = 100_000
         max_flops_equivalent = 125_000_000
 
-    metrics = {"flops_equivalent_size": 150_000_000}
+    # 125M * 1.10 = 137.5M — should pass
+    metrics = {"flops_equivalent_size": 135_000_000}
     assert passes_size_gate(metrics, _LargeBucket())
-    # Way over should still fail
-    metrics = {"flops_equivalent_size": 250_000_000}
+    # Over 10% tolerance — should fail
+    metrics = {"flops_equivalent_size": 150_000_000}
     assert not passes_size_gate(metrics, _LargeBucket())
 
 

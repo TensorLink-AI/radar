@@ -28,7 +28,6 @@ from shared.challenge import (
 from shared.commitment import read_miner_commitments
 from shared.database import DataElement
 from shared.sqlite_store import SQLiteExperimentStore
-from shared.dedup import is_unchanged_from_parent
 from shared.pareto import ParetoFront
 from shared.protocol import Challenge, Proposal
 from shared.provenance import detect_components
@@ -293,16 +292,11 @@ class Validator:
             get_my_assignments_fn=get_my_assignments,
         )
 
-        # Pre-filter: syntax check + reject copies of existing frontier members
-        frontier_codes = [
-            entry["code"] for entry in challenge.feasible_frontier if entry.get("code")
-        ]
+        # Pre-filter: syntax check
         filtered: dict[int, Proposal] = {}
         for uid, proposal in submissions.items():
             ok, reason = pre_validate_code(proposal.code)
             if not ok:
-                continue
-            if any(is_unchanged_from_parent(proposal.code, fc) for fc in frontier_codes):
                 continue
             filtered[uid] = proposal
 

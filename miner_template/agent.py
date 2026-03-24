@@ -42,7 +42,9 @@ def load_scratchpad(challenge: dict, local_dir: str = "/tmp/scratchpad") -> str:
 
     try:
         archive_path = os.path.join(local_dir, "state.tar.gz")
-        urllib.request.urlretrieve(url, archive_path)
+        # Use explicit timeout to avoid hanging indefinitely on slow/unresponsive URLs
+        with urllib.request.urlopen(url, timeout=10) as resp, open(archive_path, "wb") as f:
+            f.write(resp.read())
         with tarfile.open(archive_path, "r:gz") as tar:
             tar.extractall(local_dir, filter="data")
         os.remove(archive_path)
@@ -63,7 +65,8 @@ def save_scratchpad(challenge: dict, local_dir: str = "/tmp/scratchpad") -> bool
         return False
 
     try:
-        archive_path = os.path.join(tempfile.gettempdir(), "scratchpad_upload.tar.gz")
+        fd, archive_path = tempfile.mkstemp(suffix=".tar.gz", prefix="scratchpad_")
+        os.close(fd)
         with tarfile.open(archive_path, "w:gz") as tar:
             for root, dirs, files in os.walk(local_dir):
                 for f in files:

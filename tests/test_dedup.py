@@ -1,6 +1,6 @@
-"""Tests for shared.dedup — code similarity and parent identity checking."""
+"""Tests for shared.dedup — code similarity for provenance queries."""
 
-from shared.dedup import code_similarity, is_unchanged_from_parent
+from shared.dedup import code_similarity
 
 
 def test_identical_code():
@@ -15,31 +15,6 @@ def test_different_code():
     assert sim < 0.5
 
 
-def test_empty_code():
+def test_empty_code_similarity():
     assert code_similarity("", "") == 0.0
     assert code_similarity("import torch", "") == 0.0
-
-
-def test_unchanged_from_parent_identical():
-    code = "import torch\nmodel = nn.Linear(10, 10)"
-    assert is_unchanged_from_parent(code, code) is True
-
-
-def test_unchanged_from_parent_trivial_change():
-    """Whitespace-only or comment-only changes should still be caught."""
-    parent = "import torch\nmodel = nn.Linear(10, 10)"
-    child = "import torch\nmodel = nn.Linear(10, 10)  # added comment"
-    assert is_unchanged_from_parent(child, parent) is True
-
-
-def test_changed_from_parent():
-    """Real code changes should pass."""
-    parent = "import torch\nmodel = nn.Linear(10, 10)"
-    child = "import torch\nmodel = nn.Linear(10, 20)\noptimizer = torch.optim.Adam(model.parameters())"
-    assert is_unchanged_from_parent(child, parent) is False
-
-
-def test_unchanged_empty():
-    """Empty inputs should not be flagged."""
-    assert is_unchanged_from_parent("", "") is False
-    assert is_unchanged_from_parent("import torch", "") is False
