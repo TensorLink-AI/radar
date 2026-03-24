@@ -52,14 +52,18 @@ def generate_scratchpad_urls(
     r2: "R2AuditLog",
     miner_hotkey: str,
     ttl: int = 900,
+    max_size_bytes: int = 10 * 1024 * 1024,
 ) -> tuple[str, str]:
     """Generate presigned GET and PUT URLs for a miner's scratchpad.
 
     Returns (get_url, put_url). GET URL returns 404 if no scratchpad exists yet.
+    PUT URL includes a Content-Length condition to enforce max_size_bytes.
     """
     key = scratchpad_key(miner_hotkey)
     get_url = r2.generate_presigned_get_url(key, ttl=ttl)
-    put_url = r2.generate_presigned_put_url(key, ttl=ttl)
+    put_url = r2.generate_presigned_put_url(
+        key, ttl=ttl, max_content_length=max_size_bytes,
+    )
     return get_url, put_url
 
 
@@ -173,6 +177,9 @@ def generate_upload_urls(
 ) -> dict[str, str]:
     """Generate pre-signed PUT URLs for all training artifacts.
 
+    TTL defaults to 5400s (~90 min). URLs are path-locked to the specific
+    round/miner key.
+
     Returns dict mapping artifact name to presigned URL.
     """
     keys = {
@@ -189,6 +196,46 @@ def generate_upload_urls(
         else:
             logger.error("Failed to generate presigned URL for %s", key)
     return urls
+
+
+def verify_uploaded_artifacts(
+    r2: "R2AuditLog",
+    round_id: int,
+    miner_hotkey: str,
+) -> tuple[bool, str]:
+    """Verify that expected artifacts exist in R2 after training upload.
+
+    Checks that checkpoint and meta files exist at the expected keys.
+    This catches cases where a presigned URL was used to write to an
+    unexpected path (which S3 presigned URLs prevent, but defense-in-depth).
+
+    Returns (ok, error_message).
+    """
+    ck = checkpoint_key(round_id, miner_hotkey)
+    mk = meta_key(round_id, miner_hotkey)
+
+    if not r2.key_exists(mk):
+        return False, f"training_meta.json missing at {mk}"
+    if not r2.key_exists(ck):
+        return False, f"checkpoint missing at {ck}"
+
+    # Verify meta contains correct round_id and miner_hotkey
+    meta_dict = r2.download_json(mk)
+    if not meta_dict:
+        return False, "Failed to download training_meta.json for verification"
+
+    if meta_dict.get("round_id") != round_id:
+        return False, (
+            f"Meta round_id mismatch: expected {round_id}, "
+            f"got {meta_dict.get('round_id')}"
+        )
+    if meta_dict.get("miner_hotkey") != miner_hotkey:
+        return False, (
+            f"Meta miner_hotkey mismatch: expected {miner_hotkey}, "
+            f"got {meta_dict.get('miner_hotkey')}"
+        )
+
+    return True, ""
 
 
 def upload_training_artifacts_presigned(

@@ -32,11 +32,14 @@ class R2AuditLog:
         secret_access_key = secret_access_key or os.getenv("R2_SECRET_ACCESS_KEY", "")
 
         import boto3
+        from botocore.config import Config as BotoConfig
+
         self._s3 = boto3.client(
             "s3",
             endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com" if account_id else None,
             aws_access_key_id=access_key_id,
             aws_secret_access_key=secret_access_key,
+            config=BotoConfig(signature_version="s3v4"),
         )
 
     def upload_json(self, key: str, data: dict) -> bool:
@@ -128,20 +131,30 @@ class R2AuditLog:
             logger.error("Failed to download text %s: %s", key, e)
             return None
 
-    def generate_presigned_put_url(self, key: str, ttl: int = 5400) -> str:
+    def generate_presigned_put_url(
+        self,
+        key: str,
+        ttl: int = 3600,
+        max_content_length: int = 0,
+    ) -> str:
         """Generate a pre-signed PUT URL for uploading to a specific key.
 
         Args:
             key: The S3 key to generate the URL for.
             ttl: Time-to-live in seconds (default 1 hour).
+            max_content_length: If > 0, add Content-Length condition to limit
+                upload size. S3-compatible stores enforce this server-side.
 
         Returns:
             Pre-signed URL string, or empty string on failure.
         """
         try:
+            params: dict = {"Bucket": self.bucket, "Key": key}
+            if max_content_length > 0:
+                params["ContentLength"] = max_content_length
             url = self._s3.generate_presigned_url(
                 "put_object",
-                Params={"Bucket": self.bucket, "Key": key},
+                Params=params,
                 ExpiresIn=ttl,
             )
             return url

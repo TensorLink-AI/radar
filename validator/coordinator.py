@@ -234,7 +234,7 @@ class TrainingCoordinator:
                 else f"uid_{job.arch_owner}"
             )
 
-            # Generate presigned PUT URLs so trainer can upload without R2 creds
+            # Generate presigned PUT URLs so trainer can upload without R2 creds.
             from shared.artifacts import generate_upload_urls
             presigned_ttl = int(os.getenv("RADAR_PRESIGNED_TTL", "5400"))
             upload_urls = generate_upload_urls(
@@ -333,8 +333,12 @@ class TrainingCoordinator:
         expected_miners: list[int],
         timeout: int = 300,
     ) -> dict[int, dict]:
-        """Poll R2 for training_meta.json from each miner."""
-        from shared.artifacts import list_round_artifacts, meta_key as mk_fn
+        """Poll R2 for training_meta.json from each miner.
+
+        Performs post-upload verification: checks that the meta's round_id
+        and miner_hotkey match expectations, rejecting tampered artifacts.
+        """
+        from shared.artifacts import list_round_artifacts, meta_key as mk_fn, verify_uploaded_artifacts
 
         results: dict[int, dict] = {}
         deadline = asyncio.get_event_loop().time() + timeout
@@ -356,6 +360,15 @@ class TrainingCoordinator:
                 if uid is None or uid in results:
                     continue
                 try:
+                    # Verify artifact integrity before accepting
+                    ok, err = verify_uploaded_artifacts(self.r2, round_id, hk)
+                    if not ok:
+                        logger.warning(
+                            "Artifact verification failed for miner %s round %d: %s",
+                            hk, round_id, err,
+                        )
+                        continue
+
                     meta = self.r2.download_json(mk_fn(round_id, hk))
                     if meta:
                         meta["miner_uid"] = uid
