@@ -149,6 +149,18 @@ class R2AuditLog:
             logger.error("Failed to generate presigned PUT URL for %s: %s", key, e)
             return ""
 
+    def generate_presigned_get_url(self, key: str, ttl: int = 900) -> str:
+        """Generate a presigned GET URL for downloading from R2."""
+        try:
+            return self._s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": self.bucket, "Key": key},
+                ExpiresIn=ttl,
+            )
+        except Exception as e:
+            logger.error("Failed to generate presigned GET URL for %s: %s", key, e)
+            return ""
+
     def key_exists(self, key: str) -> bool:
         """Check if a key exists in the bucket."""
         try:

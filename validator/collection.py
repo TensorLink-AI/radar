@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 from typing import Optional
 
 from config import Config
+from shared.artifacts import generate_scratchpad_urls
 from shared.commitment import ImageCommitment, pull_and_verify_image
 from shared.protocol import Proposal
 from validator.pod_manager import get_mode, launch_agent_pod, run_agent_on_pod
@@ -23,6 +25,24 @@ logger = logging.getLogger(__name__)
 
 # Seconds to wait for other validators to upload proposals
 _PROPOSAL_SYNC_DELAY = 60
+
+
+def _attach_scratchpad_urls(challenge_json: str, r2, hotkey: str) -> str:
+    """Inject per-miner scratchpad presigned URLs into a challenge JSON string."""
+    if not Config.SCRATCHPAD_ENABLED:
+        return challenge_json
+    try:
+        sp_get, sp_put = generate_scratchpad_urls(
+            r2, hotkey, ttl=Config.SCRATCHPAD_TTL,
+        )
+        data = json.loads(challenge_json)
+        data["scratchpad_get_url"] = sp_get
+        data["scratchpad_put_url"] = sp_put
+        data["scratchpad_max_mb"] = Config.SCRATCHPAD_MAX_MB
+        return json.dumps(data)
+    except Exception as e:
+        logger.warning("Scratchpad URL generation failed for %s: %s", hotkey, e)
+        return challenge_json
 
 
 async def run_and_collect_agents(
@@ -69,13 +89,17 @@ async def run_and_collect_agents(
                 logger.warning("UID %d: image verification failed", uid)
                 continue
 
+            miner_challenge_json = _attach_scratchpad_urls(
+                challenge_json, r2, commitment.hotkey,
+            )
+
             agent_env = await launch_agent_pod(
                 image_url=commitment.image_url,
                 mem_limit="8192Mi",
             )
             try:
                 result = await run_agent_on_pod(
-                    agent_env, challenge_json,
+                    agent_env, miner_challenge_json,
                     timeout=Config.AGENT_TIMEOUT,
                 )
                 if result and isinstance(result, dict) and "code" in result:
@@ -150,13 +174,17 @@ async def run_and_collect_agents(
                     logger.warning("UID %d: image verification failed (fallback)", uid)
                     continue
 
+                fallback_challenge_json = _attach_scratchpad_urls(
+                    challenge_json, r2, commitment.hotkey,
+                )
+
                 agent_env = await launch_agent_pod(
                     image_url=commitment.image_url,
                     mem_limit="8192Mi",
                 )
                 try:
                     result = await run_agent_on_pod(
-                        agent_env, challenge_json,
+                        agent_env, fallback_challenge_json,
                         timeout=Config.AGENT_TIMEOUT,
                     )
                     if result and isinstance(result, dict) and "code" in result:
