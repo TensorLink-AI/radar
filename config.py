@@ -39,7 +39,7 @@ class Config:
     R2_ACCESS_KEY_ID: str = os.getenv("R2_ACCESS_KEY_ID", "")
     R2_SECRET_ACCESS_KEY: str = os.getenv("R2_SECRET_ACCESS_KEY", "")
     R2_BUCKET: str = os.getenv("R2_BUCKET", "")
-    R2_PRESIGNED_TTL: int = int(os.getenv("RADAR_PRESIGNED_TTL", "5400"))
+    R2_PRESIGNED_TTL: int = int(os.getenv("RADAR_PRESIGNED_TTL", "2400"))
 
     # ── Round Timing (blocks, ~12s/block) ────────────────────────
     ROUND_INTERVAL_BLOCKS: int = int(os.getenv("RADAR_ROUND_INTERVAL", "275"))

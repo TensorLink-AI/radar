@@ -14,6 +14,7 @@ from shared.artifacts import (
     upload_training_artifacts,
     download_training_artifacts,
     list_round_artifacts,
+    verify_uploaded_artifacts,
 )
 
 
@@ -165,3 +166,84 @@ def test_list_round_artifacts(mock_r2):
 
 def test_list_round_artifacts_empty(mock_r2):
     assert list_round_artifacts(mock_r2, 1) == []
+
+
+# ── verify_uploaded_artifacts tests ──────────────────────────────
+
+
+def test_verify_uploaded_artifacts_success(mock_r2):
+    """Valid upload passes verification."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".safetensors") as f:
+        f.write(b"checkpoint data")
+        ckpt_path = f.name
+
+    try:
+        meta = TrainingMeta(round_id=5, miner_hotkey="5Valid", status="success")
+        upload_training_artifacts(
+            mock_r2, 5, "5Valid", ckpt_path, "code", "stdout", meta,
+        )
+
+        ok, err = verify_uploaded_artifacts(mock_r2, 5, "5Valid")
+        assert ok
+        assert err == ""
+    finally:
+        os.unlink(ckpt_path)
+
+
+def test_verify_uploaded_artifacts_missing_meta(mock_r2):
+    """Missing meta file fails verification."""
+    ok, err = verify_uploaded_artifacts(mock_r2, 99, "5Missing")
+    assert not ok
+    assert "training_meta.json missing" in err
+
+
+def test_verify_uploaded_artifacts_missing_checkpoint(mock_r2):
+    """Meta exists but checkpoint missing fails verification."""
+    meta = TrainingMeta(round_id=7, miner_hotkey="5NoCkpt", status="success")
+    mock_r2.upload_json(meta_key(7, "5NoCkpt"), meta.to_dict())
+
+    ok, err = verify_uploaded_artifacts(mock_r2, 7, "5NoCkpt")
+    assert not ok
+    assert "checkpoint missing" in err
+
+
+def test_verify_uploaded_artifacts_round_id_mismatch(mock_r2):
+    """Meta with wrong round_id fails verification."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".safetensors") as f:
+        f.write(b"data")
+        ckpt_path = f.name
+
+    try:
+        # Upload with round_id=3 but meta claims round_id=999
+        meta = TrainingMeta(round_id=999, miner_hotkey="5Wrong", status="success")
+        upload_training_artifacts(
+            mock_r2, 3, "5Wrong", ckpt_path, "code", "stdout", meta,
+        )
+        # Meta was uploaded with round_id=999 inside the JSON
+
+        ok, err = verify_uploaded_artifacts(mock_r2, 3, "5Wrong")
+        assert not ok
+        assert "round_id mismatch" in err
+    finally:
+        os.unlink(ckpt_path)
+
+
+def test_verify_uploaded_artifacts_hotkey_mismatch(mock_r2):
+    """Meta with wrong miner_hotkey fails verification."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".safetensors") as f:
+        f.write(b"data")
+        ckpt_path = f.name
+
+    try:
+        meta = TrainingMeta(round_id=4, miner_hotkey="5Impostor", status="success")
+        # Upload to 5Real's path but meta says 5Impostor
+        ck = checkpoint_key(4, "5Real")
+        mk = meta_key(4, "5Real")
+        mock_r2.upload_file_from_disk(ckpt_path, ck)
+        mock_r2.upload_json(mk, meta.to_dict())
+
+        ok, err = verify_uploaded_artifacts(mock_r2, 4, "5Real")
+        assert not ok
+        assert "miner_hotkey mismatch" in err
+    finally:
+        os.unlink(ckpt_path)

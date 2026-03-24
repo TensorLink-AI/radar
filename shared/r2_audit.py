@@ -128,20 +128,30 @@ class R2AuditLog:
             logger.error("Failed to download text %s: %s", key, e)
             return None
 
-    def generate_presigned_put_url(self, key: str, ttl: int = 5400) -> str:
+    def generate_presigned_put_url(
+        self,
+        key: str,
+        ttl: int = 3600,
+        max_content_length: int = 0,
+    ) -> str:
         """Generate a pre-signed PUT URL for uploading to a specific key.
 
         Args:
             key: The S3 key to generate the URL for.
             ttl: Time-to-live in seconds (default 1 hour).
+            max_content_length: If > 0, add Content-Length condition to limit
+                upload size. S3-compatible stores enforce this server-side.
 
         Returns:
             Pre-signed URL string, or empty string on failure.
         """
         try:
+            params: dict = {"Bucket": self.bucket, "Key": key}
+            if max_content_length > 0:
+                params["ContentLength"] = max_content_length
             url = self._s3.generate_presigned_url(
                 "put_object",
-                Params={"Bucket": self.bucket, "Key": key},
+                Params=params,
                 ExpiresIn=ttl,
             )
             return url
