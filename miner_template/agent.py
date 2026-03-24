@@ -65,7 +65,8 @@ def save_scratchpad(challenge: dict, local_dir: str = "/tmp/scratchpad") -> bool
         return False
 
     try:
-        archive_path = os.path.join(tempfile.gettempdir(), "scratchpad_upload.tar.gz")
+        fd, archive_path = tempfile.mkstemp(suffix=".tar.gz", prefix="scratchpad_")
+        os.close(fd)
         with tarfile.open(archive_path, "w:gz") as tar:
             for root, dirs, files in os.walk(local_dir):
                 for f in files:

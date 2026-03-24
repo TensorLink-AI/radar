@@ -22,8 +22,6 @@ val = os.environ.get("SECRET_TEST_VAR", "NOT_FOUND")
 print(json.dumps({"crps": 999.0, "mase": 999.0, "leaked_secret": val}))
 sys.exit(0)
 '''
-    # We need a dummy checkpoint — the code above exits before loading it,
-    # but evaluate_checkpoint still needs the path to exist for the template
     with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as f:
         dummy_ckpt = f.name
 
@@ -52,13 +50,10 @@ time.sleep(200)
         dummy_ckpt = f.name
 
     try:
-        # Use a short timeout for testing by monkeypatching isn't needed —
-        # evaluate_checkpoint has a 120s timeout. We can't wait that long in tests.
-        # Instead, test with a code that exits immediately but incorrectly.
-        # For the actual timeout test, we verify the error handling path.
-        result = evaluate_checkpoint(arch_code, dummy_ckpt)
+        # Use a 3s timeout so this test doesn't block CI for 120s
+        result = evaluate_checkpoint(arch_code, dummy_ckpt, timeout=3)
         assert result["crps"] == float("inf")
-        assert "error" in result
+        assert "timed out" in result.get("error", "")
     finally:
         try:
             os.remove(dummy_ckpt)
@@ -112,6 +107,33 @@ sys.exit(0)
     finally:
         os.environ.pop("R2_SECRET_ACCESS_KEY", None)
         os.environ.pop("BASILICA_TOKEN", None)
+        try:
+            os.remove(dummy_ckpt)
+        except OSError:
+            pass
+
+
+def test_stdout_noise_does_not_break_parsing():
+    """Miner code that prints extra output should not break JSON parsing."""
+    arch_code = '''
+# This print will execute during import in the runner template
+print("WARNING: some noisy miner log output")
+print("DEBUG: initializing model...")
+
+import torch.nn as nn
+
+def build_model(context_len, prediction_len, num_variates, quantiles):
+    return nn.Linear(context_len * num_variates, prediction_len * num_variates * len(quantiles))
+'''
+    with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as f:
+        dummy_ckpt = f.name
+
+    try:
+        result = evaluate_checkpoint(arch_code, dummy_ckpt)
+        # Should get a result dict (either success or error), not a JSON parse failure
+        assert isinstance(result, dict)
+        assert "crps" in result
+    finally:
         try:
             os.remove(dummy_ckpt)
         except OSError:

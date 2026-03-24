@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 from typing import Optional, TYPE_CHECKING
 
@@ -89,6 +90,7 @@ def evaluate_checkpoint(
     checkpoint_path: str,
     eval_split_seed: int = 42,
     device: str = "cpu",
+    timeout: int = 120,
 ) -> dict:
     """Evaluate a single checkpoint in an isolated subprocess.
 
@@ -125,10 +127,10 @@ def evaluate_checkpoint(
 
         try:
             result = subprocess.run(
-                ["python3", runner_path],
+                [sys.executable, runner_path],
                 capture_output=True,
                 text=True,
-                timeout=120,  # Phase C should take seconds, not minutes
+                timeout=timeout,
                 env=clean_env,
                 cwd=tmpdir,
             )
@@ -137,17 +139,43 @@ def evaluate_checkpoint(
                     "crps": float("inf"), "mase": float("inf"),
                     "error": f"Eval subprocess failed: {result.stderr[:500]}",
                 }
-            return json.loads(result.stdout)
+            # Parse only the last non-empty line of stdout to avoid
+            # spurious output from miner code (print statements, warnings).
+            return _parse_last_json_line(result.stdout)
         except subprocess.TimeoutExpired:
             return {
                 "crps": float("inf"), "mase": float("inf"),
-                "error": "Eval subprocess timed out (120s)",
+                "error": f"Eval subprocess timed out ({timeout}s)",
             }
         except json.JSONDecodeError:
             return {
                 "crps": float("inf"), "mase": float("inf"),
-                "error": f"Eval subprocess returned invalid JSON: {result.stdout[:200]}",
+                "error": f"Eval subprocess returned invalid JSON: {result.stdout[-200:]}",
             }
+
+
+def _parse_last_json_line(stdout: str) -> dict:
+    """Parse JSON from the last non-empty line of subprocess stdout.
+
+    Miner code loaded via importlib may produce print output during import.
+    The eval runner template always prints its JSON result as the final line.
+    """
+    lines = [line.strip() for line in stdout.strip().splitlines() if line.strip()]
+    if not lines:
+        return {
+            "crps": float("inf"), "mase": float("inf"),
+            "error": "Eval subprocess produced no output",
+        }
+    # Try last line first (expected), then scan backwards
+    for line in reversed(lines):
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
+    return {
+        "crps": float("inf"), "mase": float("inf"),
+        "error": f"Eval subprocess returned no valid JSON line: {lines[-1][:200]}",
+    }
 
 
 async def evaluate_all_checkpoints(
