@@ -32,11 +32,14 @@ class R2AuditLog:
         secret_access_key = secret_access_key or os.getenv("R2_SECRET_ACCESS_KEY", "")
 
         import boto3
+        from botocore.config import Config as BotoConfig
+
         self._s3 = boto3.client(
             "s3",
             endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com" if account_id else None,
             aws_access_key_id=access_key_id,
             aws_secret_access_key=secret_access_key,
+            config=BotoConfig(signature_version="s3v4"),
         )
 
     def upload_json(self, key: str, data: dict) -> bool:
