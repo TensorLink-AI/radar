@@ -235,9 +235,8 @@ class TrainingCoordinator:
             )
 
             # Generate presigned PUT URLs so trainer can upload without R2 creds.
-            # TTL scoped to training window + buffer (default 2400s = 40 min).
             from shared.artifacts import generate_upload_urls
-            presigned_ttl = int(os.getenv("RADAR_PRESIGNED_TTL", "2400"))
+            presigned_ttl = int(os.getenv("RADAR_PRESIGNED_TTL", "5400"))
             upload_urls = generate_upload_urls(
                 self.r2, challenge.round_id, miner_hotkey, ttl=presigned_ttl,
             )

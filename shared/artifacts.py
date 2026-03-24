@@ -173,13 +173,12 @@ def generate_upload_urls(
     r2: "R2AuditLog",
     round_id: int,
     miner_hotkey: str,
-    ttl: int = 2400,
+    ttl: int = 5400,
 ) -> dict[str, str]:
     """Generate pre-signed PUT URLs for all training artifacts.
 
-    TTL defaults to 2400s (40 min) — covers the 30-min training window
-    plus a 10-min buffer for upload. URLs are path-locked to the specific
-    round/miner key and expire well before the next round starts.
+    TTL defaults to 5400s (~90 min). URLs are path-locked to the specific
+    round/miner key.
 
     Returns dict mapping artifact name to presigned URL.
     """
