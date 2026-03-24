@@ -177,13 +177,13 @@ class TrainingCoordinator:
             if not url or not commitment:
                 verified_trainers[tid] = bool(url)  # has URL but no commitment = pass (localnet compat)
                 continue
-            attest_id = getattr(commitment, "pod_attestation_id", "") or ""
-            if not attest_id:
+            instance_name = getattr(commitment, "pod_attestation_id", "") or ""
+            if not instance_name:
                 # No attestation committed — allow (localnet compatibility)
                 verified_trainers[tid] = True
                 continue
             ok, reason = await verify_miner_pod(
-                pod_url=url, attestation_id=attest_id,
+                instance_name=instance_name,
             )
             verified_trainers[tid] = ok
             if not ok:

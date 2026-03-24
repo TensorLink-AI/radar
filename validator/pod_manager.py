@@ -131,31 +131,60 @@ async def run_agent_on_pod(env, challenge_json: str, timeout: int = 300) -> Opti
         return None
 
 
-# ── Pod Verification (Basilica attestation) ──────────────────────
+# ── Pod Verification (Basilica public metadata) ──────────────────
+
+
+def _parse_image_ref(image_ref: str) -> tuple[str, str]:
+    """Split 'registry/repo:tag' into (image, tag). Empty tag if none."""
+    if ":" in image_ref and not image_ref.endswith(":"):
+        parts = image_ref.rsplit(":", 1)
+        return parts[0], parts[1]
+    return image_ref.rstrip(":"), ""
+
 
 async def verify_miner_pod(
-    pod_url: str,
-    attestation_id: str,
-    expected_digest: str = "",
+    instance_name: str,
+    expected_image: str = "",
 ) -> tuple[bool, str]:
-    """Ask Basilica if this pod is running the official image."""
+    """Check Basilica public metadata to verify a trainer pod.
+
+    Args:
+        instance_name: Basilica deployment instance name.
+        expected_image: Expected image reference (e.g. 'ghcr.io/org/repo:tag').
+            Defaults to Config.OFFICIAL_TRAINING_IMAGE.
+
+    Returns:
+        (ok, reason) tuple.
+    """
     try:
         from config import Config
-        if not expected_digest:
-            expected_digest = Config.OFFICIAL_TRAINING_IMAGE_DIGEST
-        if not expected_digest:
-            return True, "ok (no digest configured)"
+        if not expected_image:
+            expected_image = Config.OFFICIAL_TRAINING_IMAGE
+        if not expected_image:
+            return True, "ok (no expected image configured)"
 
         # Lazy import basilica SDK
-        import basilica
-        attestation = basilica.verify_attestation(
-            pod_url=pod_url,
-            attestation_id=attestation_id,
+        from basilica import BasilicaClient
+
+        meta = BasilicaClient().get_public_deployment_metadata(
+            instance_name=instance_name,
         )
-        if attestation.image_digest != expected_digest:
-            return False, f"Wrong image: {attestation.image_digest[:16]}..."
-        if not attestation.running:
-            return False, "Pod not running"
+
+        # Compare image
+        exp_image, exp_tag = _parse_image_ref(expected_image)
+        if meta.image != exp_image:
+            return False, f"Wrong image: expected {exp_image}, got {meta.image}"
+        if exp_tag and meta.image_tag != exp_tag:
+            return False, f"Wrong tag: expected {exp_tag}, got {meta.image_tag}"
+
+        # Check pod is running
+        if meta.state not in ("running", "active"):
+            return False, f"Pod not running: state={meta.state}"
+
+        # Check replicas
+        if meta.replicas < 1:
+            return False, f"No replicas: replicas={meta.replicas}"
+
         return True, "ok"
     except ImportError:
         logger.warning("basilica SDK not installed, skipping attestation check")
