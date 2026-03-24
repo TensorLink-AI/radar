@@ -27,6 +27,24 @@ logger = logging.getLogger(__name__)
 _PROPOSAL_SYNC_DELAY = 60
 
 
+def _attach_scratchpad_urls(challenge_json: str, r2, hotkey: str) -> str:
+    """Inject per-miner scratchpad presigned URLs into a challenge JSON string."""
+    if not Config.SCRATCHPAD_ENABLED:
+        return challenge_json
+    try:
+        sp_get, sp_put = generate_scratchpad_urls(
+            r2, hotkey, ttl=Config.SCRATCHPAD_TTL,
+        )
+        data = json.loads(challenge_json)
+        data["scratchpad_get_url"] = sp_get
+        data["scratchpad_put_url"] = sp_put
+        data["scratchpad_max_mb"] = Config.SCRATCHPAD_MAX_MB
+        return json.dumps(data)
+    except Exception as e:
+        logger.warning("Scratchpad URL generation failed for %s: %s", hotkey, e)
+        return challenge_json
+
+
 async def run_and_collect_agents(
     wallet,
     metagraph,
@@ -71,19 +89,9 @@ async def run_and_collect_agents(
                 logger.warning("UID %d: image verification failed", uid)
                 continue
 
-            # Generate per-miner scratchpad URLs
-            miner_challenge_json = challenge_json
-            if Config.SCRATCHPAD_ENABLED:
-                try:
-                    sp_get, sp_put = generate_scratchpad_urls(
-                        r2, commitment.hotkey, ttl=Config.SCRATCHPAD_TTL,
-                    )
-                    challenge_data = json.loads(challenge_json)
-                    challenge_data["scratchpad_get_url"] = sp_get
-                    challenge_data["scratchpad_put_url"] = sp_put
-                    miner_challenge_json = json.dumps(challenge_data)
-                except Exception as e:
-                    logger.warning("UID %d: scratchpad URL generation failed: %s", uid, e)
+            miner_challenge_json = _attach_scratchpad_urls(
+                challenge_json, r2, commitment.hotkey,
+            )
 
             agent_env = await launch_agent_pod(
                 image_url=commitment.image_url,
@@ -166,19 +174,9 @@ async def run_and_collect_agents(
                     logger.warning("UID %d: image verification failed (fallback)", uid)
                     continue
 
-                # Generate per-miner scratchpad URLs (fallback)
-                fallback_challenge_json = challenge_json
-                if Config.SCRATCHPAD_ENABLED:
-                    try:
-                        sp_get, sp_put = generate_scratchpad_urls(
-                            r2, commitment.hotkey, ttl=Config.SCRATCHPAD_TTL,
-                        )
-                        challenge_data = json.loads(challenge_json)
-                        challenge_data["scratchpad_get_url"] = sp_get
-                        challenge_data["scratchpad_put_url"] = sp_put
-                        fallback_challenge_json = json.dumps(challenge_data)
-                    except Exception as e:
-                        logger.warning("UID %d: scratchpad URL generation failed (fallback): %s", uid, e)
+                fallback_challenge_json = _attach_scratchpad_urls(
+                    challenge_json, r2, commitment.hotkey,
+                )
 
                 agent_env = await launch_agent_pod(
                     image_url=commitment.image_url,

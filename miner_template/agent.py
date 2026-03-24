@@ -65,12 +65,16 @@ def save_scratchpad(challenge: dict, local_dir: str = "/tmp/scratchpad") -> bool
     try:
         archive_path = os.path.join(tempfile.gettempdir(), "scratchpad_upload.tar.gz")
         with tarfile.open(archive_path, "w:gz") as tar:
-            for f in os.listdir(local_dir):
-                tar.add(os.path.join(local_dir, f), arcname=f)
+            for root, dirs, files in os.walk(local_dir):
+                for f in files:
+                    full = os.path.join(root, f)
+                    arcname = os.path.relpath(full, local_dir)
+                    tar.add(full, arcname=arcname)
 
+        max_mb = challenge.get("scratchpad_max_mb", 10)
         size_mb = os.path.getsize(archive_path) / (1024 * 1024)
-        if size_mb > 10:
-            log(f"Scratchpad too large ({size_mb:.1f}MB > 10MB limit). Not saving.")
+        if size_mb > max_mb:
+            log(f"Scratchpad too large ({size_mb:.1f}MB > {max_mb}MB limit). Not saving.")
             os.remove(archive_path)
             return False
 

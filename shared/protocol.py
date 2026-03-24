@@ -30,8 +30,9 @@ class Challenge:
     feasible_frontier: list = field(default_factory=list)
 
     # Agent scratchpad — presigned R2 URLs for persistent private storage
-    scratchpad_get_url: str = ""  # presigned GET URL for scratchpad.tar.gz
-    scratchpad_put_url: str = ""  # presigned PUT URL for scratchpad.tar.gz
+    scratchpad_get_url: str = ""   # presigned GET URL for scratchpad.tar.gz
+    scratchpad_put_url: str = ""   # presigned PUT URL for scratchpad.tar.gz
+    scratchpad_max_mb: int = 10    # size limit enforced by agent
 
     def to_json(self) -> str:
         return json.dumps({
@@ -47,6 +48,7 @@ class Challenge:
             "feasible_frontier": self.feasible_frontier,
             "scratchpad_get_url": self.scratchpad_get_url,
             "scratchpad_put_url": self.scratchpad_put_url,
+            "scratchpad_max_mb": self.scratchpad_max_mb,
         })
 
     @classmethod
