@@ -33,7 +33,7 @@ scripts/         Localnet test script
 | `shared/task.py` | TaskSpec, Objective, YAML loader |
 | `shared/database.py` | ExperimentDB — append-only store with flops range + snapshot |
 | `shared/pareto.py` | ParetoFront — non-dominated sorting, UCT sampling, get_feasible() |
-| `shared/dedup.py` | Code similarity / deduplication |
+| `shared/dedup.py` | Code similarity (provenance queries) |
 | `shared/scoring.py` | Size-gated Pareto frontier scoring (Phase C) |
 | `shared/commitment.py` | On-chain Docker image + endpoint commitment |
 | `shared/r2_audit.py` | R2 storage for checkpoints, snapshots, dispatch records |
@@ -46,7 +46,7 @@ scripts/         Localnet test script
 | `validator/pod_manager.py` | Affinetes pod lifecycle + code pre-validation |
 | `miner/neuron.py` | Miner neuron (deploy agent + trainer on Basilica) |
 | `miner_template/agent.py` | Starter miner agent (FastAPI GET /submission/{round_id}) |
-| `runner/timeseries_forecast/harness.py` | Frozen training loop (no eval — Phase C does that) |
+| `runner/timeseries_forecast/harness.py` | Frozen training loop with recipe hooks (init_weights, transform_batch, on_step_end, configure_amp) |
 | `runner/timeseries_forecast/server.py` | Trainer HTTP endpoint (POST /train) |
 | `runner/timeseries_forecast/flops.py` | FLOPs-equivalent wallclock calibration |
 | `runner/timeseries_forecast/prepare.py` | Data pipeline + validate() |
@@ -97,7 +97,7 @@ docker build -t ts-runner:latest runner/timeseries_forecast/
 | Medium | 10M | 50M |
 | Large | 50M | 125M |
 
-Each round targets one bucket deterministically from the block hash. A 5% tolerance is applied to both the trainer size gate and validator scoring to account for wallclock measurement variance.
+Each round targets one bucket deterministically from the block hash. FLOPs measured via analytical counting (torch.utils.flop_counter) with wallclock calibration fallback. 10% tolerance.
 
 ## Round Timing
 

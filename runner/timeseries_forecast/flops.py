@@ -108,19 +108,51 @@ def calibrate(device: str = "cpu", seq_len: int = 512, num_variates: int = 7) ->
     return flops_per_sec
 
 
+def compute_flops_analytical(
+    model: nn.Module,
+    context_len: int,
+    num_variates: int,
+) -> int | None:
+    """Analytical FLOPs counting via torch.utils.flop_counter.
+
+    Returns integer FLOPs count for one forward pass, or None if
+    the model uses ops that can't be counted analytically.
+    """
+    try:
+        from torch.utils.flop_counter import FlopCounterMode
+        model.eval()
+        dummy = torch.randn(1, context_len, num_variates)
+        flop_counter = FlopCounterMode(display=False)
+        with flop_counter:
+            model(dummy)
+        total = flop_counter.get_total_flops()
+        if total > 0:
+            return int(total)
+        return None
+    except Exception:
+        return None
+
+
 def compute_flops_equivalent(
     model: nn.Module,
     context_len: int,
     num_variates: int,
     device: str = "cpu",
 ) -> int:
-    """Measure FLOPs-equivalent via wallclock calibration.
+    """Measure FLOPs — analytical counting preferred, wallclock fallback.
 
-    Uses batch_size=_MEASURE_BATCH to amortize per-op overhead, then divides
-    by batch size to get per-sample FLOPs-equivalent.
-
-    Returns an integer FLOPs-equivalent count for one forward pass.
+    Analytical counting is exact for standard nn.Module ops.
+    Wallclock calibration is used only when analytical counting fails
+    (custom CUDA kernels, dynamic control flow, etc.)
     """
+    # Try analytical first (device-independent, exact)
+    analytical = compute_flops_analytical(model, context_len, num_variates)
+    if analytical is not None:
+        logger.info("FLOPs (analytical): %d", analytical)
+        return analytical
+
+    # Fallback to wallclock calibration
+    logger.info("Analytical FLOPs failed, falling back to wallclock calibration")
     flops_per_sec = calibrate(device)
     dummy = torch.randn(_MEASURE_BATCH, context_len, num_variates, device=device)
 

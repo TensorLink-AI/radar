@@ -2,16 +2,18 @@
 
 Every validator independently downloads checkpoints and computes metrics.
 Cheap (seconds per model on CPU), fully deterministic, provides consensus.
+
+Miner-submitted architecture code runs in an isolated subprocess to prevent
+access to the validator's environment variables, filesystem, or memory.
 """
 
 from __future__ import annotations
 
-import importlib.util
+import json
 import logging
 import os
-import random
+import subprocess
 import tempfile
-import types
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -21,6 +23,66 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_EVAL_RUNNER_TEMPLATE = '''
+import json
+import os
+import random
+import sys
+
+import torch
+from safetensors.torch import load_file
+
+# Frozen eval imports
+from prepare import validate, CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES
+from flops import compute_flops_equivalent
+
+random.seed({eval_split_seed})
+torch.manual_seed({eval_split_seed})
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+arch_path = "{arch_path}"
+checkpoint_path = "{checkpoint_path}"
+device = "{device}"
+
+try:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("submission", arch_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    if not hasattr(mod, "build_model") or not callable(mod.build_model):
+        print(json.dumps({{"crps": float("inf"), "mase": float("inf"), "error": "Missing build_model()"}}))
+        sys.exit(0)
+
+    model = mod.build_model(CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES).to(device)
+    state_dict = load_file(checkpoint_path, device=device)
+    model.load_state_dict(state_dict)
+
+    flops_equiv = 0
+    try:
+        flops_equiv = compute_flops_equivalent(model, CONTEXT_LEN, NUM_VARIATES, device)
+    except Exception:
+        pass
+
+    param_count = sum(p.numel() for p in model.parameters())
+    if hasattr(model, "reset"):
+        model.reset()
+    model.eval()
+
+    metrics = validate(model)
+
+    print(json.dumps({{
+        "crps": metrics["crps"],
+        "ncrps": metrics.get("ncrps", float("inf")),
+        "mase": metrics["mase"],
+        "flops_equivalent_size": flops_equiv,
+        "param_count": param_count,
+    }}))
+except Exception as e:
+    print(json.dumps({{"crps": float("inf"), "mase": float("inf"), "error": str(e)}}))
+'''
+
 
 def evaluate_checkpoint(
     architecture_code: str,
@@ -28,86 +90,64 @@ def evaluate_checkpoint(
     eval_split_seed: int = 42,
     device: str = "cpu",
 ) -> dict:
-    """Evaluate a single checkpoint. This is the Phase C core function.
+    """Evaluate a single checkpoint in an isolated subprocess.
 
-    1. exec architecture_code -> get build_model()
-    2. model = build_model(CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES)
-    3. model.load_state_dict(torch.load(checkpoint_path))
-    4. flops_equiv = compute_flops_equivalent(model, ...)
-    5. metrics = validate(model)
-    6. return {crps, mase, flops_equivalent_size, param_count}
+    Runs miner code in a separate process so it cannot access the
+    validator's memory, environment variables, or filesystem beyond
+    the temp directory.
     """
-    # Import frozen eval dependencies
-    import sys
-    runner_dir = os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast")
-    runner_dir = os.path.abspath(runner_dir)
-    if runner_dir not in sys.path:
-        sys.path.insert(0, runner_dir)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Write architecture code
+        arch_path = os.path.join(tmpdir, "submission.py")
+        with open(arch_path, "w") as f:
+            f.write(architecture_code)
 
-    import torch
-    from prepare import validate, CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES
-    from flops import compute_flops_equivalent
-    from safetensors.torch import load_file
+        # Write eval runner script
+        runner_path = os.path.join(tmpdir, "run_eval.py")
+        runner_code = _EVAL_RUNNER_TEMPLATE.format(
+            arch_path=arch_path,
+            checkpoint_path=checkpoint_path,
+            eval_split_seed=eval_split_seed,
+            device=device,
+        )
+        with open(runner_path, "w") as f:
+            f.write(runner_code)
 
-    random.seed(eval_split_seed)
-    torch.manual_seed(eval_split_seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-    # 1. Load architecture code
-    mod = types.ModuleType("submission")
-    try:
-        exec(compile(architecture_code, "<submission>", "exec"), mod.__dict__)
-    except Exception as e:
-        logger.error("Architecture code failed to compile: %s", e)
-        return {"crps": float("inf"), "mase": float("inf"), "error": str(e)}
-
-    if not hasattr(mod, "build_model") or not callable(mod.build_model):
-        return {"crps": float("inf"), "mase": float("inf"), "error": "Missing build_model()"}
-
-    # 2. Build model
-    try:
-        model = mod.build_model(CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES).to(device)
-    except Exception as e:
-        return {"crps": float("inf"), "mase": float("inf"), "error": f"build_model failed: {e}"}
-
-    # 3. Load checkpoint (safetensors — safe, no pickle)
-    try:
-        state_dict = load_file(checkpoint_path, device=device)
-        model.load_state_dict(state_dict)
-    except Exception as e:
-        return {"crps": float("inf"), "mase": float("inf"), "error": f"load_state_dict failed: {e}"}
-
-    # 4. Measure FLOPs
-    try:
-        flops_equiv = compute_flops_equivalent(model, CONTEXT_LEN, NUM_VARIATES, device)
-    except Exception as e:
-        logger.warning("FLOPs measurement failed: %s", e)
-        flops_equiv = 0
-
-    # 5. Validate
-    param_count = sum(p.numel() for p in model.parameters())
-    if hasattr(model, "reset"):
-        model.reset()
-    model.eval()
-
-    try:
-        metrics = validate(model)
-    except Exception as e:
-        return {
-            "crps": float("inf"), "mase": float("inf"),
-            "flops_equivalent_size": flops_equiv,
-            "param_count": param_count,
-            "error": f"validate failed: {e}",
+        # Run in subprocess with restricted environment
+        clean_env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/usr/local/bin"),
+            "HOME": tmpdir,
+            "PYTHONPATH": os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast")
+            ),
         }
+        # Do NOT forward R2 credentials, wallet keys, or BASILICA tokens
 
-    return {
-        "crps": metrics["crps"],
-        "ncrps": metrics.get("ncrps", float("inf")),
-        "mase": metrics["mase"],
-        "flops_equivalent_size": flops_equiv,
-        "param_count": param_count,
-    }
+        try:
+            result = subprocess.run(
+                ["python3", runner_path],
+                capture_output=True,
+                text=True,
+                timeout=120,  # Phase C should take seconds, not minutes
+                env=clean_env,
+                cwd=tmpdir,
+            )
+            if result.returncode != 0:
+                return {
+                    "crps": float("inf"), "mase": float("inf"),
+                    "error": f"Eval subprocess failed: {result.stderr[:500]}",
+                }
+            return json.loads(result.stdout)
+        except subprocess.TimeoutExpired:
+            return {
+                "crps": float("inf"), "mase": float("inf"),
+                "error": "Eval subprocess timed out (120s)",
+            }
+        except json.JSONDecodeError:
+            return {
+                "crps": float("inf"), "mase": float("inf"),
+                "error": f"Eval subprocess returned invalid JSON: {result.stdout[:200]}",
+            }
 
 
 async def evaluate_all_checkpoints(
