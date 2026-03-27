@@ -37,6 +37,7 @@ class DataElement:
     manifest_sha256: str = ""
     generated_samples: list = field(default_factory=list)
     task: str = ""
+    round_id: int = -1
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -66,6 +67,7 @@ class DataElement:
             },
             "analysis": self.analysis,
             "score": self.score,
+            "round_id": self.round_id,
         }
 
     def summary(self) -> str:

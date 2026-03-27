@@ -103,6 +103,9 @@ class Validator:
         # EMA scores per UID
         self.ema_scores: dict[int, float] = {}
 
+        # Trainer reliability tracking (keyed by trainer UID)
+        self.trainer_reliability: dict[int, float] = {}
+
         # DB server config
         self.db_port = int(getattr(config, "db_port", 8080))
 
@@ -442,6 +445,31 @@ class Validator:
                 )
                 training_metas.update(fb_metas)
 
+        # ── Pre-cache GIFT-Eval data for Phase C ────────────────
+        if self.r2:
+            try:
+                from shared.gift_eval import GiftEvalBenchmark
+                gift = GiftEvalBenchmark(
+                    r2=self.r2,
+                    cache_dir=Config.GIFT_EVAL_CACHE_DIR,
+                    r2_prefix=Config.GIFT_EVAL_R2_PREFIX,
+                )
+                selected = gift.select_datasets(
+                    eval_split_seed=challenge.eval_split_seed,
+                    n=Config.GIFT_EVAL_DATASETS_PER_ROUND,
+                )
+                for ds_name in selected:
+                    try:
+                        gift.download_dataset(ds_name)
+                    except Exception as e:
+                        logger.warning("GIFT-Eval download failed for %s: %s", ds_name, e)
+                logger.info(
+                    "GIFT-Eval: cached %d datasets for seed=%d: %s",
+                    len(selected), challenge.eval_split_seed, selected,
+                )
+            except Exception as e:
+                logger.warning("GIFT-Eval pre-cache failed: %s", e)
+
         # ── PHASE C: EVALUATION (TRUST ANCHOR) ────────────────
         eval_results = await evaluate_all_checkpoints(
             r2=self.r2,
@@ -465,6 +493,15 @@ class Validator:
         # ── SCORING ───────────────────────────────────────────
         penalties = compute_penalties(training_metas, eval_results)
 
+        # Track trainer reliability for future job assignment
+        for uid, meta in training_metas.items():
+            trainer_uid = meta.get("trainer_uid", uid)
+            status = meta.get("status", "")
+            score = 1.0 if status == "success" else 0.0
+            alpha = Config.EMA_ALPHA
+            prev = self.trainer_reliability.get(trainer_uid, 1.0)
+            self.trainer_reliability[trainer_uid] = alpha * score + (1 - alpha) * prev
+
         # Record which frontier experiments were shown this round
         for entry in challenge.feasible_frontier:
             entry_code = entry.get("code", "")
@@ -484,6 +521,7 @@ class Validator:
             if metrics.get("passed_size_gate"):
                 proposal = filtered.get(uid, Proposal())
 
+                miner_hk = self.metagraph.hotkeys[uid] if uid < len(self.metagraph.hotkeys) else ""
                 element = DataElement(
                     name=f"round_{challenge.round_id}_miner_{uid}",
                     code=proposal.code,
@@ -491,9 +529,11 @@ class Validator:
                     success=True,
                     objectives=metrics,
                     miner_uid=uid,
+                    miner_hotkey=miner_hk,
                     motivation=proposal.motivation,
                     trace=agent_logs.get(uid, ""),
                     task=task_name,
+                    round_id=challenge.round_id,
                 )
                 self.db.add(element)
                 pareto.update(element)
@@ -505,6 +545,7 @@ class Validator:
 
         round_scores = score_round(
             eval_results, challenge, pareto, self.task.objectives, penalties,
+            training_metas=training_metas,
         )
 
         if round_scores:
@@ -517,11 +558,9 @@ class Validator:
         else:
             logger.warning("Round scores empty — no eval results passed size gate")
 
-        # EMA + weights
-        uids, weights = scores_to_weights(round_scores, Config.SOFTMAX_TEMPERATURE)
-        normalized = dict(zip(uids, weights))
+        # EMA on raw scores, softmax applied once in _set_weights()
         all_uids = list(range(self.metagraph.n))
-        self.ema_scores = ema_update(self.ema_scores, normalized, all_uids, Config.EMA_ALPHA)
+        self.ema_scores = ema_update(self.ema_scores, round_scores, all_uids, Config.EMA_ALPHA)
         self._set_weights()
 
         # Write frontier to R2
@@ -539,17 +578,12 @@ class Validator:
         )
 
     def _set_weights(self):
-        """Set weights on chain proportional to EMA scores."""
+        """Set weights on chain — softmax on EMA scores (single normalization)."""
         if not self.ema_scores:
             logger.warning("No EMA scores — skipping weight setting")
             return
         try:
-            n = self.metagraph.n
-            uids = list(range(n))
-            weights = [self.ema_scores.get(uid, 0.0) for uid in uids]
-            total = sum(weights)
-            if total > 0:
-                weights = [w / total for w in weights]
+            uids, weights = scores_to_weights(self.ema_scores, Config.SOFTMAX_TEMPERATURE)
             nonzero_weights = {
                 uid: f"{w:.4f}" for uid, w in zip(uids, weights) if w > 0
             }

@@ -132,7 +132,8 @@ def test_penalties_failed_trainer():
     training_metas = {0: {"status": "failed", "trainer_uid": 1}}
     eval_results = {}
     penalties = compute_penalties(training_metas, eval_results)
-    assert penalties.get(1, 0) > 0
+    # Penalty is on arch_owner (uid=0), not trainer_uid
+    assert penalties.get(0, 0) > 0
 
 
 def test_penalties_flops_mismatch():

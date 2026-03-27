@@ -65,13 +65,12 @@ def current_phase(
     submission_window: int = 50,
     training_window: int = 150,
     eval_window: int = 25,
-    fallback_window: int = 0,
+    scoring_window: int = 50,
 ) -> str:
     """Determine the current phase within a round.
 
     Returns 'submission' | 'training' | 'evaluation' | 'scoring' | 'idle'.
-    When fallback_window=0 (default), there is no scoring phase —
-    rounds are 3 phases only (submission, training, evaluation).
+    The scoring window covers fallback/scoring after evaluation ends.
     """
     offset = current_block - round_start
     if offset < 0:
@@ -82,6 +81,6 @@ def current_phase(
         return "training"
     if offset < submission_window + training_window + eval_window:
         return "evaluation"
-    if fallback_window > 0 and offset < submission_window + training_window + eval_window + fallback_window:
+    if offset < submission_window + training_window + eval_window + scoring_window:
         return "scoring"
     return "idle"

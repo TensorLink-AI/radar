@@ -71,15 +71,20 @@ try:
         model.reset()
     model.eval()
 
-    metrics = validate(model)
+    data_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "")
+    metrics = validate(model, seed={eval_split_seed},
+                       data_dir=data_dir if data_dir else None)
 
-    print(json.dumps({{
+    result = {{
         "crps": metrics["crps"],
         "ncrps": metrics.get("ncrps", float("inf")),
         "mase": metrics["mase"],
         "flops_equivalent_size": flops_equiv,
         "param_count": param_count,
-    }}))
+    }}
+    if "n_datasets" in metrics:
+        result["n_datasets"] = metrics["n_datasets"]
+    print(json.dumps(result))
 except Exception as e:
     print(json.dumps({{"crps": float("inf"), "mase": float("inf"), "error": str(e)}}))
 '''
@@ -116,12 +121,18 @@ def evaluate_checkpoint(
             f.write(runner_code)
 
         # Run in subprocess with restricted environment
+        runner_path_abs = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast")
+        )
+        shared_path_abs = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..")
+        )
         clean_env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/usr/local/bin"),
             "HOME": tmpdir,
-            "PYTHONPATH": os.path.abspath(
-                os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast")
-            ),
+            "PYTHONPATH": f"{runner_path_abs}:{shared_path_abs}",
+            "RADAR_GIFT_EVAL_CACHE": os.environ.get("RADAR_GIFT_EVAL_CACHE", ""),
+            "RADAR_EVAL_DATA": os.environ.get("RADAR_EVAL_DATA", "gift_eval"),
         }
         # Do NOT forward R2 credentials, wallet keys, or BASILICA tokens
 
