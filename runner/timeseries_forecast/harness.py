@@ -76,8 +76,12 @@ def _read_config(sub) -> dict:
             if isinstance(user_cfg, dict):
                 for k, v in user_cfg.items():
                     if k in _CLAMPS:
+                        try:
+                            numeric_v = float(v)
+                        except (TypeError, ValueError):
+                            continue
                         lo, hi = _CLAMPS[k]
-                        cfg[k] = type(_DEFAULTS[k])(max(lo, min(hi, v)))
+                        cfg[k] = type(_DEFAULTS[k])(max(lo, min(hi, numeric_v)))
         except Exception as e:
             print(f"WARNING: training_config() failed: {e}", file=sys.stderr)
     return cfg
@@ -147,15 +151,20 @@ def _validate_batch(batch: dict, batch_size: int, label: str = "batch") -> bool:
 # ── Stdout capture ────────────────────────────────────────────────
 
 class TeeWriter:
-    """Write to both original stdout and a StringIO buffer."""
+    """Write to both original stdout and a capped StringIO buffer."""
+
+    _MAX_BUFFER = 10 * 1024 * 1024  # 10 MB cap
 
     def __init__(self, original):
         self.original = original
         self.buffer = io.StringIO()
+        self._size = 0
 
     def write(self, text):
         self.original.write(text)
-        self.buffer.write(text)
+        if self._size < self._MAX_BUFFER:
+            self.buffer.write(text)
+            self._size += len(text)
 
     def flush(self):
         self.original.flush()

@@ -100,12 +100,13 @@ def row_to_element(row: sqlite3.Row) -> DataElement:
         objectives=json.loads(row["objectives"]),
         timestamp=row["timestamp"],
         task=row["task"],
+        round_id=row["round_id"] if row["round_id"] is not None else -1,
     )
 
 
 def element_to_params(element: DataElement, next_id: int) -> dict:
     """Convert a DataElement to a dict of column values for INSERT."""
-    round_id = element.objectives.get("round_id") if element.objectives else None
+    round_id = element.round_id if element.round_id >= 0 else None
     return {
         "id": next_id,
         "name": element.name,

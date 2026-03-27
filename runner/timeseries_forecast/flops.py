@@ -28,13 +28,13 @@ class _ReferenceDenseTransformer(nn.Module):
     def __init__(self, d_model: int = 256, nhead: int = 4, num_layers: int = 2):
         super().__init__()
         self.d_model = d_model
-        self.proj_in = nn.Linear(7, d_model)  # num_variates -> d_model
+        self.proj_in = nn.Linear(1, d_model)  # num_variates -> d_model
         layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=d_model * 4,
             batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
-        self.proj_out = nn.Linear(d_model, 7)
+        self.proj_out = nn.Linear(d_model, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj_out(self.encoder(self.proj_in(x)))
@@ -44,8 +44,9 @@ class _ReferenceDenseTransformer(nn.Module):
         """Approximate FLOPs for one forward pass with seq_len=512, batch=1."""
         seq_len = 512
         d = self.d_model
-        # Linear projections: 2 * seq * d * 7
-        proj_flops = 2 * seq_len * d * 7 * 2
+        num_variates = 1
+        # Linear projections: 2 * seq * d * num_variates
+        proj_flops = 2 * seq_len * d * num_variates * 2
         # Self-attention per layer: 4 * seq * d^2 + 2 * seq^2 * d
         attn_flops = (4 * seq_len * d * d + 2 * seq_len * seq_len * d)
         # FFN per layer: 2 * seq * d * 4d * 2
@@ -68,7 +69,7 @@ def _trimmed_mean(values: list[float], trim_fraction: float = 0.2) -> float:
     return sum(trimmed) / len(trimmed)
 
 
-def calibrate(device: str = "cpu", seq_len: int = 512, num_variates: int = 7) -> float:
+def calibrate(device: str = "cpu", seq_len: int = 512, num_variates: int = 1) -> float:
     """Run reference model with known FLOPs, return FLOPS_PER_SEC for this device.
 
     Uses batch_size=_MEASURE_BATCH to amortize per-op overhead (CUDA kernel
@@ -82,7 +83,7 @@ def calibrate(device: str = "cpu", seq_len: int = 512, num_variates: int = 7) ->
 
     ref = _ReferenceDenseTransformer().to(device).eval()
     dummy = torch.randn(_MEASURE_BATCH, seq_len, num_variates, device=device)
-    known_flops_batch = ref.known_flops * _MEASURE_BATCH
+    known_flops_batch = _get_reference_flops() * _MEASURE_BATCH
 
     # Warmup
     with torch.no_grad():
@@ -133,6 +134,40 @@ def compute_flops_analytical(
         return None
 
 
+def _try_jit_analytical(
+    model: nn.Module, context_len: int, num_variates: int,
+) -> int | None:
+    """Try FLOPs counting on a jit.trace'd version of the model."""
+    try:
+        dummy = torch.randn(1, context_len, num_variates)
+        traced = torch.jit.trace(model.cpu().eval(), dummy)
+        from torch.utils.flop_counter import FlopCounterMode
+        flop_counter = FlopCounterMode(display=False)
+        with flop_counter:
+            traced(dummy)
+        total = flop_counter.get_total_flops()
+        if total > 0:
+            return int(total)
+        return None
+    except Exception:
+        return None
+
+
+# Hard-coded reference FLOPs constant (device-independent).
+# Computed analytically for _ReferenceDenseTransformer with d=256, nhead=4,
+# num_layers=2, seq_len=512, num_variates=1.
+_REFERENCE_FLOPS_CONSTANT = None  # lazily computed once
+
+
+def _get_reference_flops() -> int:
+    """Get the reference model's known FLOPs (computed once, cached)."""
+    global _REFERENCE_FLOPS_CONSTANT
+    if _REFERENCE_FLOPS_CONSTANT is None:
+        ref = _ReferenceDenseTransformer()
+        _REFERENCE_FLOPS_CONSTANT = ref.known_flops
+    return _REFERENCE_FLOPS_CONSTANT
+
+
 def compute_flops_equivalent(
     model: nn.Module,
     context_len: int,
@@ -142,8 +177,7 @@ def compute_flops_equivalent(
     """Measure FLOPs — analytical counting preferred, wallclock fallback.
 
     Analytical counting is exact for standard nn.Module ops.
-    Wallclock calibration is used only when analytical counting fails
-    (custom CUDA kernels, dynamic control flow, etc.)
+    Falls back to jit.trace + analytical, then wallclock calibration.
     """
     # Try analytical first (device-independent, exact)
     analytical = compute_flops_analytical(model, context_len, num_variates)
@@ -151,9 +185,15 @@ def compute_flops_equivalent(
         logger.info("FLOPs (analytical): %d", analytical)
         return analytical
 
-    # Fallback to wallclock calibration
+    # Second attempt: jit.trace the model then count analytically
+    jit_analytical = _try_jit_analytical(model, context_len, num_variates)
+    if jit_analytical is not None:
+        logger.info("FLOPs (jit.trace + analytical): %d", jit_analytical)
+        return jit_analytical
+
+    # Last resort: wallclock calibration (use hard-coded reference FLOPs)
     logger.info("Analytical FLOPs failed, falling back to wallclock calibration")
-    flops_per_sec = calibrate(device)
+    flops_per_sec = calibrate(device, num_variates=num_variates)
     dummy = torch.randn(_MEASURE_BATCH, context_len, num_variates, device=device)
 
     model.eval()

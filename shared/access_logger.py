@@ -123,7 +123,10 @@ class AccessLogger:
         ).fetchall()
         ids: set[int] = set()
         for row in rows:
-            ids.update(json.loads(row[0]))
+            try:
+                ids.update(json.loads(row[0]))
+            except (json.JSONDecodeError, TypeError):
+                continue
         return ids
 
     def get_round_access(self, round_id: int) -> dict[str, set[int]]:
@@ -135,5 +138,8 @@ class AccessLogger:
         ).fetchall()
         result: dict[str, set[int]] = {}
         for row in rows:
-            result.setdefault(row[0], set()).update(json.loads(row[1]))
+            try:
+                result.setdefault(row[0], set()).update(json.loads(row[1]))
+            except (json.JSONDecodeError, TypeError):
+                continue
         return result

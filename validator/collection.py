@@ -23,8 +23,9 @@ from validator.pod_manager import get_mode, launch_agent_pod, run_agent_on_pod
 
 logger = logging.getLogger(__name__)
 
-# Seconds to wait for other validators to upload proposals
-_PROPOSAL_SYNC_DELAY = 60
+# Polling parameters for R2 proposal sync
+_PROPOSAL_SYNC_MAX_WAIT = 120  # max seconds to wait for other validators
+_PROPOSAL_SYNC_POLL_INTERVAL = 15  # seconds between polls
 
 
 def _attach_scratchpad_urls(challenge_json: str, r2, hotkey: str) -> str:
@@ -132,31 +133,62 @@ async def run_and_collect_agents(
         "Ran %d agents, got %d proposals", len(my_agent_uids), len(proposals),
     )
 
-    # Wait for other validators to upload their proposals
-    if len(validator_uids) > 1:
-        await asyncio.sleep(_PROPOSAL_SYNC_DELAY)
+    # Poll R2 for other validators' proposals (replaces fixed sleep)
+    expected_from_others = {
+        uid for uid in all_uids
+        if uid not in proposals and uid in commitments and commitments[uid].image_url
+    }
 
-    # Read ALL proposals from R2 (including other validators' runs)
-    for uid in all_uids:
-        if uid in proposals:
-            continue
-        try:
-            data = r2.download_json(
-                f"round_{round_id}/proposals/{uid}.json",
+    if expected_from_others and len(validator_uids) > 1:
+        import time as _time
+        deadline = _time.monotonic() + _PROPOSAL_SYNC_MAX_WAIT
+        while expected_from_others and _time.monotonic() < deadline:
+            await asyncio.sleep(_PROPOSAL_SYNC_POLL_INTERVAL)
+            still_missing = set()
+            for uid in expected_from_others:
+                try:
+                    data = r2.download_json(
+                        f"round_{round_id}/proposals/{uid}.json",
+                    )
+                    if data and "code" in data:
+                        proposals[uid] = Proposal(
+                            code=data["code"],
+                            name=data.get("name", ""),
+                            motivation=data.get("motivation", ""),
+                        )
+                        agent_logs[uid] = data.get("agent_log", "")
+                    else:
+                        still_missing.add(uid)
+                except Exception:
+                    still_missing.add(uid)
+            expected_from_others = still_missing
+            if not expected_from_others:
+                break
+            logger.info(
+                "R2 sync: still waiting for %d proposals (%ds remaining)",
+                len(expected_from_others),
+                int(deadline - _time.monotonic()),
             )
-            if data and "code" in data:
-                proposals[uid] = Proposal(
-                    code=data["code"],
-                    name=data.get("name", ""),
-                    motivation=data.get("motivation", ""),
+    else:
+        # Single validator or no expected proposals — just try once
+        for uid in all_uids:
+            if uid in proposals:
+                continue
+            try:
+                data = r2.download_json(
+                    f"round_{round_id}/proposals/{uid}.json",
                 )
-                agent_logs[uid] = data.get("agent_log", "")
-        except Exception:
-            pass
+                if data and "code" in data:
+                    proposals[uid] = Proposal(
+                        code=data["code"],
+                        name=data.get("name", ""),
+                        motivation=data.get("motivation", ""),
+                    )
+                    agent_logs[uid] = data.get("agent_log", "")
+            except Exception:
+                pass
 
-    # Fallback: if R2 sync missed proposals, run remaining agents locally.
-    # This handles the case where the other validator(s) haven't uploaded
-    # yet or R2 is unavailable.
+    # Fallback: only run agents locally for UIDs still missing after full polling
     missing_uids = [
         uid for uid in all_uids
         if uid not in proposals and uid not in my_agent_uids

@@ -188,14 +188,16 @@ class ProvenanceQuery:
         results: list[dict] = []
 
         # Which later experiments' agents accessed this one?
+        # Use json_each() for exact ID matching (avoids partial matches)
         try:
             rows = self.conn.execute(
                 "SELECT DISTINCT a.hotkey, a.round_id, e.id as exp_id "
                 "FROM miner_access_log a "
+                "JOIN json_each(a.experiment_ids) j ON j.value = ? "
                 "JOIN experiments e ON e.miner_hotkey = a.hotkey "
                 "  AND e.round_id = a.round_id "
-                "WHERE a.experiment_ids LIKE ? AND e.id > ?",
-                (f'%{experiment_id}%', experiment_id),
+                "WHERE e.id > ?",
+                (experiment_id, experiment_id),
             ).fetchall()
             for row in rows:
                 results.append({

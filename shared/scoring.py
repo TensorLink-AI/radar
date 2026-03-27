@@ -35,6 +35,7 @@ def score_round(
     frontier: "ParetoFront",
     objectives: list["Objective"],
     penalties: dict[int, float],
+    training_metas: dict[int, dict] | None = None,
 ) -> dict[int, float]:
     """Score all miners in a round using Phase C eval results.
 
@@ -83,16 +84,21 @@ def score_round(
         )
         for uid, metrics in ranked:
             crps = metrics.get("crps", float("inf"))
-            if best_front_crps > 0:
+            if best_front_crps > 1e-9:
                 improvement = (best_front_crps - crps) / max(abs(best_front_crps), 1e-8)
             else:
                 improvement = 0.0
             scores[uid] = _sigmoid(improvement, steepness=20.0)
 
-            # Pareto dominance bonus
+            # Pareto dominance bonus — merge training meta for full objective vector
+            merged_objectives = dict(metrics)
+            if training_metas and uid in training_metas:
+                tm = training_metas[uid]
+                merged_objectives.setdefault("exec_time", tm.get("training_time_seconds", float("inf")))
+                merged_objectives.setdefault("memory_mb", tm.get("peak_vram_mb", float("inf")))
             temp = DataElement(
                 metric=crps, success=True,
-                objectives=metrics,
+                objectives=merged_objectives,
             )
             if frontier.count_dominated_by(temp) > 0:
                 scores[uid] *= 1.5
@@ -109,27 +115,24 @@ def compute_penalties(
     training_metas: dict[int, dict],
     eval_results: dict[int, dict],
 ) -> dict[int, float]:
-    """Compute per-miner penalties.
+    """Compute per-miner penalties keyed by arch_owner UID.
 
-    - Trainer claimed FLOPs doesn't match validator-measured FLOPs -> penalty on trainer
-    - Trainer returned failure/timeout -> reliability penalty on trainer
+    Penalties apply to the architecture owner (the miner being scored),
+    not the trainer (who may be a different miner in cross-eval).
     """
     penalties: dict[int, float] = {}
 
     for uid, meta in training_metas.items():
         status = meta.get("status", "")
         if status == "attestation_failed":
-            trainer_uid = meta.get("trainer_uid", uid)
-            penalties[trainer_uid] = penalties.get(trainer_uid, 0.0) + 1.0
+            penalties[uid] = min(1.0, penalties.get(uid, 0.0) + 1.0)
         elif status in ("failed", "timeout", "build_failed"):
-            trainer_uid = meta.get("trainer_uid", uid)
-            penalties[trainer_uid] = penalties.get(trainer_uid, 0.0) + 0.5
+            penalties[uid] = min(1.0, penalties.get(uid, 0.0) + 0.5)
 
         if uid in eval_results:
             ev = eval_results[uid]
             if not ev.get("flops_verified", True):
-                trainer_uid = meta.get("trainer_uid", uid)
-                penalties[trainer_uid] = penalties.get(trainer_uid, 0.0) + 0.3
+                penalties[uid] = min(1.0, penalties.get(uid, 0.0) + 0.3)
 
     return penalties
 

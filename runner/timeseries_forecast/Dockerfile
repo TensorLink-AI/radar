@@ -11,7 +11,7 @@ RUN pip3 install --no-cache-dir \
 
 RUN pip3 install --no-cache-dir \
     bittensor cryptography sentencepiece \
-    fastapi uvicorn httpx boto3 safetensors
+    fastapi uvicorn httpx boto3 safetensors pyarrow
 
 # Frozen code (harness, auth, prepare, evaluate, flops, server)
 COPY harness.py /workspace/frozen/harness.py

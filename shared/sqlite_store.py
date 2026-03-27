@@ -78,14 +78,15 @@ class SQLiteExperimentStore:
         with self._lock:
             indices = []
             now = time.time()
+            next_id = self.conn.execute(
+                "SELECT COUNT(*) FROM experiments"
+            ).fetchone()[0]
             for elem in elements:
-                next_id = self.conn.execute(
-                    "SELECT COUNT(*) FROM experiments"
-                ).fetchone()[0]
                 elem.index = next_id
                 elem.timestamp = now
                 self.conn.execute(INSERT_SQL, element_to_params(elem, next_id))
                 indices.append(next_id)
+                next_id += 1
             if indices:
                 self.conn.commit()
             return indices
