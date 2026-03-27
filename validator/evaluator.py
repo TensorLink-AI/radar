@@ -158,10 +158,10 @@ def evaluate_checkpoint(
                 "crps": float("inf"), "mase": float("inf"),
                 "error": f"Eval subprocess timed out ({timeout}s)",
             }
-        except json.JSONDecodeError:
+        except (OSError, json.JSONDecodeError) as e:
             return {
                 "crps": float("inf"), "mase": float("inf"),
-                "error": f"Eval subprocess returned invalid JSON: {result.stdout[-200:]}",
+                "error": f"Eval subprocess error: {e}",
             }
 
 
@@ -234,6 +234,18 @@ async def evaluate_all_checkpoints(
 
         if not artifacts.architecture_code:
             continue
+
+        # Re-verify checkpoint hash immediately before eval (TOCTOU defense)
+        if artifacts.meta.checkpoint_sha256:
+            from shared.artifacts import sha256_file
+            actual_hash = sha256_file(artifacts.checkpoint_path)
+            if actual_hash != artifacts.meta.checkpoint_sha256:
+                logger.warning("UID %d: checkpoint hash changed after download (TOCTOU)", uid)
+                results[uid] = {
+                    "crps": float("inf"), "mase": float("inf"),
+                    "error": "checkpoint hash mismatch at eval time",
+                }
+                continue
 
         # Evaluate
         metrics = evaluate_checkpoint(

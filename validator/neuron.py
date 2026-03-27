@@ -506,11 +506,12 @@ class Validator:
         for entry in challenge.feasible_frontier:
             entry_code = entry.get("code", "")
             if entry_code:
-                # Find matching experiment by code
-                match = self.db.conn.execute(
-                    "SELECT id FROM experiments WHERE code = ? LIMIT 1",
-                    (entry_code,),
-                ).fetchone()
+                # Find matching experiment by code (use DB lock)
+                with self.db._lock:
+                    match = self.db.conn.execute(
+                        "SELECT id FROM experiments WHERE code = ? LIMIT 1",
+                        (entry_code,),
+                    ).fetchone()
                 if match:
                     self.db.provenance.record_round_context(
                         challenge.round_id, match[0], "frontier",

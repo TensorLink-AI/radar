@@ -27,7 +27,20 @@ logger = logging.getLogger(__name__)
 
 # ── R2 path helpers ──────────────────────────────────────────────
 
+import re as _re
+
+_SAFE_HOTKEY = _re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_hotkey(miner_hotkey: str) -> str:
+    """Validate hotkey contains no path-traversal characters."""
+    if not _SAFE_HOTKEY.match(miner_hotkey):
+        raise ValueError(f"Invalid miner_hotkey (unsafe characters): {miner_hotkey!r}")
+    return miner_hotkey
+
+
 def checkpoint_key(round_id: int, miner_hotkey: str) -> str:
+    _validate_hotkey(miner_hotkey)
     return f"round_{round_id}/miner_{miner_hotkey}/checkpoint.safetensors"
 
 

@@ -62,6 +62,8 @@ class GiftEvalBenchmark:
 
     def download_dataset(self, dataset_name: str) -> Path:
         """Download Arrow file from R2 to local cache. Skip if cached."""
+        if dataset_name not in GIFT_EVAL_DATASETS:
+            raise ValueError(f"Unknown dataset: {dataset_name}")
         local_dir = self.cache_dir / dataset_name
         local_dir.mkdir(parents=True, exist_ok=True)
         local_path = local_dir / "data-00000-of-00001.arrow"
@@ -93,6 +95,9 @@ def load_dataset(
     """
     import pyarrow.ipc as ipc
 
+    # Validate dataset_name to prevent path traversal
+    if "/" in dataset_name or "\\" in dataset_name or ".." in dataset_name:
+        raise ValueError(f"Invalid dataset name: {dataset_name}")
     arrow_path = Path(cache_dir) / dataset_name / "data-00000-of-00001.arrow"
     if not arrow_path.exists():
         raise FileNotFoundError(f"Arrow file not found: {arrow_path}")

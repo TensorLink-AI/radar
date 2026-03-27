@@ -1,4 +1,4 @@
-"""Tests for shared.pareto — dominance, sampling, would_add."""
+"""Tests for shared.pareto — dominance, would_add, feasible."""
 
 from shared.database import DataElement
 from shared.pareto import ParetoFront
@@ -59,13 +59,17 @@ def test_would_add_failed():
     assert not pf.would_add(failed)
 
 
-def test_sample_via_uct():
-    pf = ParetoFront(max_size=10)
-    pf.update(_elem(0.8, 100, 1000, name="a"))
+def test_max_size_evicts_worst_primary():
+    """When front exceeds max_size, evict worst primary objective."""
+    pf = ParetoFront(max_size=2)
+    pf.update(_elem(0.8, 200, 2000, name="a"))
     pf.update(_elem(0.9, 50, 500, name="b"))
-    result = pf.sample_via_uct()
-    assert result is not None
-    assert result.name in ("a", "b")
+    assert pf.size == 2
+    # Adding a third — should evict worst primary (0.9)
+    pf.update(_elem(0.85, 100, 1000, name="c"))
+    assert pf.size == 2
+    names = {c.element.name for c in pf.candidates}
+    assert "b" not in names, "Worst primary objective should be evicted"
 
 
 def test_count_dominated_by():

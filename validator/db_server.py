@@ -7,6 +7,7 @@ Includes Epistula auth middleware, rate limiting, and access logging.
 from __future__ import annotations
 
 import re
+import threading
 import time
 from collections import defaultdict
 from typing import Optional
@@ -28,6 +29,7 @@ _metagraph = None
 
 # Rate limiter: hotkey -> list of timestamps
 _rate_window: dict[str, list[float]] = defaultdict(list)
+_rate_lock = threading.Lock()
 _rate_limit: int = 10  # requests per minute per miner
 
 # Current challenge and frontier (set by validator each round)
@@ -90,15 +92,15 @@ def _require_provenance():
 
 
 def _check_rate_limit(hotkey: str) -> bool:
-    """Sliding-window rate limiter. Returns True if allowed."""
-    now = time.time()
-    window = _rate_window[hotkey]
-    # Remove entries older than 60 seconds
-    _rate_window[hotkey] = [t for t in window if now - t < 60]
-    if len(_rate_window[hotkey]) >= _rate_limit:
-        return False
-    _rate_window[hotkey].append(now)
-    return True
+    """Thread-safe sliding-window rate limiter. Returns True if allowed."""
+    with _rate_lock:
+        now = time.time()
+        window = _rate_window[hotkey]
+        _rate_window[hotkey] = [t for t in window if now - t < 60]
+        if len(_rate_window[hotkey]) >= _rate_limit:
+            return False
+        _rate_window[hotkey].append(now)
+        return True
 
 
 def _extract_experiment_ids_from_path(path: str) -> list[int]:

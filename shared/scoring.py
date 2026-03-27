@@ -84,7 +84,7 @@ def score_round(
         )
         for uid, metrics in ranked:
             crps = metrics.get("crps", float("inf"))
-            if best_front_crps > 0:
+            if best_front_crps > 1e-9:
                 improvement = (best_front_crps - crps) / max(abs(best_front_crps), 1e-8)
             else:
                 improvement = 0.0
