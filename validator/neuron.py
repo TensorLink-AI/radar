@@ -276,7 +276,19 @@ class Validator:
         # Run agents DURING Phase A (not after), then wait for the window
         # to close so all validators finish before Phase B starts.
         validator_uids = self._get_validator_uids()
-        commitments = read_miner_commitments(self.subtensor, self.netuid, self.metagraph)
+        all_commitments = read_miner_commitments(self.subtensor, self.netuid, self.metagraph)
+
+        # Filter out validator neurons — only miners should be in the pipeline
+        commitments = {
+            uid: c for uid, c in all_commitments.items()
+            if uid not in validator_uids
+        }
+        if len(commitments) < len(all_commitments):
+            logger.info(
+                "Filtered %d validator neurons from %d commitments → %d miners",
+                len(all_commitments) - len(commitments),
+                len(all_commitments), len(commitments),
+            )
 
         if not self.r2:
             logger.warning("No R2 configured — skipping Phase A/B/C")
@@ -329,9 +341,24 @@ class Validator:
             )
             dispatch_validators.append(my_uid)
 
+        # Filter commitments: exclude validators and neurons without
+        # trainer endpoints so they are never assigned as trainers.
+        trainer_endpoints = {uid: c.pod_url for uid, c in commitments.items() if c.pod_url}
+        miner_uids = [
+            uid for uid in commitments
+            if uid not in validator_uids and uid in trainer_endpoints
+        ]
+        excluded = [uid for uid in commitments if uid not in miner_uids]
+        if excluded:
+            logger.info(
+                "Phase B: excluded %d neurons from trainer pool "
+                "(validators or missing trainer endpoint): %s",
+                len(excluded), excluded,
+            )
+
         all_jobs = compute_assignments(
             block_hash, filtered,
-            miner_uids=list(commitments.keys()),
+            miner_uids=miner_uids,
             validator_uids=dispatch_validators,
             round_id=challenge.round_id,
         )
@@ -349,7 +376,6 @@ class Validator:
             )
             my_jobs = list(all_jobs)
 
-        trainer_endpoints = {uid: c.pod_url for uid, c in commitments.items() if c.pod_url}
         logger.info(
             "Phase B: %d total jobs, %d mine (my_uid=%d, validators=%s), %d trainer endpoints",
             len(all_jobs), len(my_jobs), my_uid, dispatch_validators, len(trainer_endpoints),

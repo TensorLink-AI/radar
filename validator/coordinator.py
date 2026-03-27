@@ -374,8 +374,11 @@ class TrainingCoordinator:
                         meta["miner_uid"] = uid
                         meta["miner_hotkey"] = hk
                         results[uid] = meta
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        "Failed to read checkpoint for miner %s round %d: %s",
+                        hk, round_id, e,
+                    )
 
             if len(results) >= len(expected_miners):
                 break
