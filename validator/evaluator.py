@@ -212,11 +212,22 @@ async def evaluate_all_checkpoints(
     results: dict[int, dict] = {}
     device = os.getenv("RADAR_EVAL_DEVICE", "cpu")
 
+    success_count = sum(1 for m in training_metas.values() if m.get("status") == "success")
+    skipped = {uid: m.get("status", "?") for uid, m in training_metas.items() if m.get("status") != "success"}
+    logger.info(
+        "Phase C evaluation starting: %d total metas, %d successful, %d skipped (round %d)",
+        len(training_metas), success_count, len(skipped), round_id,
+    )
+    if skipped:
+        for uid, status in skipped.items():
+            logger.info("  UID %d skipped (status=%s)", uid, status)
+
     for uid, meta in training_metas.items():
         if meta.get("status") != "success":
             continue
 
         miner_hotkey = meta.get("miner_hotkey", f"uid_{uid}")
+        logger.info("Evaluating UID %d (miner %s...) round %d", uid, miner_hotkey[:16], round_id)
 
         # Download and verify all artifacts
         artifacts = download_training_artifacts(r2, round_id, miner_hotkey, tmp_dir)

@@ -339,22 +339,35 @@ def download_training_artifacts(
     Returns None if meta can't be downloaded.
     Sets verified=False with verification_error if hash mismatch.
     """
+    hk_short = miner_hotkey[:16]
+    logger.info("Downloading artifacts for miner %s... round %d", hk_short, round_id)
+
     # Download meta
     mk = meta_key(round_id, miner_hotkey)
     meta_dict = r2.download_json(mk)
     if not meta_dict:
+        logger.warning("No training_meta.json found for miner %s... round %d", hk_short, round_id)
         return None
 
     meta = TrainingMeta.from_dict(meta_dict)
+    logger.info(
+        "Training meta for %s...: status=%s steps=%d time=%.1fs params=%.2fM",
+        hk_short, meta.status, meta.num_steps,
+        meta.training_time_seconds, meta.num_params_M,
+    )
 
     # Download checkpoint
     ck = checkpoint_key(round_id, miner_hotkey)
     os.makedirs(download_dir, exist_ok=True)
     local_checkpoint = os.path.join(download_dir, f"checkpoint_{miner_hotkey}.safetensors")
     if not r2.download_file_to_disk(ck, local_checkpoint):
+        logger.warning("Failed to download checkpoint for miner %s... round %d", hk_short, round_id)
         return DownloadedArtifacts(
             meta=meta, verification_error="Failed to download checkpoint",
         )
+
+    ckpt_size_mb = os.path.getsize(local_checkpoint) / (1024 * 1024)
+    logger.info("Checkpoint downloaded: %s... (%.2f MB)", hk_short, ckpt_size_mb)
 
     # Download architecture
     ak = architecture_key(round_id, miner_hotkey)
@@ -363,6 +376,10 @@ def download_training_artifacts(
     # Download stdout
     sk = stdout_key(round_id, miner_hotkey)
     stdout_log = r2.download_text(sk) or ""
+    logger.info(
+        "Artifacts downloaded for %s...: checkpoint=%.2fMB arch=%d bytes stdout=%d bytes",
+        hk_short, ckpt_size_mb, len(architecture_code), len(stdout_log),
+    )
 
     # Verify hashes
     result = DownloadedArtifacts(
@@ -390,8 +407,10 @@ def download_training_artifacts(
 
     if errors:
         result.verification_error = "; ".join(errors)
+        logger.warning("Hash verification failed for %s...: %s", hk_short, result.verification_error)
     else:
         result.verified = True
+        logger.info("All hashes verified for miner %s...", hk_short)
 
     return result
 
