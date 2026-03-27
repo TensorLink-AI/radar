@@ -352,7 +352,14 @@ class TrainingCoordinator:
             uid_to_hotkey[uid] = hk
             hotkey_to_uid[hk] = uid
 
+        poll_count = 0
         while asyncio.get_event_loop().time() < deadline:
+            poll_count += 1
+            remaining = deadline - asyncio.get_event_loop().time()
+            logger.info(
+                "Checkpoint poll #%d: %d/%d collected, %.0fs remaining (round %d)",
+                poll_count, len(results), len(expected_miners), remaining, round_id,
+            )
             # Use list_round_artifacts to find which miners have uploaded
             available = list_round_artifacts(self.r2, round_id)
             for hk in available:
@@ -364,8 +371,8 @@ class TrainingCoordinator:
                     ok, err = verify_uploaded_artifacts(self.r2, round_id, hk)
                     if not ok:
                         logger.warning(
-                            "Artifact verification failed for miner %s round %d: %s",
-                            hk, round_id, err,
+                            "Artifact verification failed for miner %s (UID %s) round %d: %s",
+                            hk[:16], uid, round_id, err,
                         )
                         continue
 
@@ -374,12 +381,23 @@ class TrainingCoordinator:
                         meta["miner_uid"] = uid
                         meta["miner_hotkey"] = hk
                         results[uid] = meta
-                except Exception:
-                    pass
+                        logger.info(
+                            "Checkpoint received: UID %d status=%s flops=%d (round %d)",
+                            uid, meta.get("status", "?"),
+                            meta.get("flops_equivalent_size", 0), round_id,
+                        )
+                except Exception as exc:
+                    logger.warning("Error reading checkpoint for UID %s round %d: %s", uid, round_id, exc)
 
             if len(results) >= len(expected_miners):
+                logger.info("All %d checkpoints collected (round %d)", len(expected_miners), round_id)
                 break
             await asyncio.sleep(30)
+        else:
+            logger.warning(
+                "Checkpoint collection timed out: %d/%d collected after %ds (round %d)",
+                len(results), len(expected_miners), timeout, round_id,
+            )
 
         return results
 
