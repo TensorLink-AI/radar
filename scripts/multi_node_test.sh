@@ -946,7 +946,7 @@ if [ "$NUM_VALIDATORS" -ge 2 ]; then
     TOTAL_V0=$(curl -sf "http://localhost:${DB_PORT_BASE}/experiments/stats" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
     TOTAL_V1=$(curl -sf "http://localhost:$((DB_PORT_BASE+1))/experiments/stats" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
     DIFF=$(( TOTAL_V0 > TOTAL_V1 ? TOTAL_V0 - TOTAL_V1 : TOTAL_V1 - TOTAL_V0 ))
-    check "Validators consistent (v0=$TOTAL_V0, v1=$TOTAL_V1, diff=$DIFF)" "$([ "$DIFF" -le 2 ] && echo true || echo false)"
+    check "Validators consistent (v0=$TOTAL_V0, v1=$TOTAL_V1, diff=$DIFF)" "$([ "$TOTAL_V0" -gt 0 ] && [ "$TOTAL_V1" -gt 0 ] && [ "$DIFF" -le 2 ] && echo true || echo false)"
 fi
 
 # =============================================================================
