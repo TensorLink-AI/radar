@@ -319,15 +319,16 @@ class Validator:
 
         my_uid = self._my_uid()
 
-        # Ensure this validator is in the dispatch rotation even if
-        # validator_permit hasn't propagated yet (common on localnet).
+        # Use only UIDs with validator_permit so ALL validators compute
+        # the same job assignments deterministically.  If my_uid has no
+        # permit yet (common on localnet/testnet), it will get 0 jobs from
+        # round-robin and the safety net below dispatches everything.
         dispatch_validators = list(validator_uids)
         if my_uid >= 0 and my_uid not in dispatch_validators:
-            logger.warning(
-                "My UID %d not in validator_uids %s — adding self for dispatch",
+            logger.info(
+                "My UID %d not in validator_uids %s — will use safety-net dispatch",
                 my_uid, dispatch_validators,
             )
-            dispatch_validators.append(my_uid)
 
         all_jobs = compute_assignments(
             block_hash, filtered,
