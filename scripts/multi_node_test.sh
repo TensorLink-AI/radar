@@ -827,19 +827,25 @@ while [ "$ELAPSED" -lt "$TOTAL_TIMEOUT" ] && [ "$ROUNDS_COMPLETED" -lt "$WAIT_RO
         fi
     fi
 
-    # Check for round completion in any validator log
+    # Check for round completion — require ALL validators to complete
+    MIN_COMPLETED=$((999999))
     for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
         COMPLETED=$(grep -c "Round.*complete\|Weights set\|forward.*complete" "$LOG_DIR/validator${i}.log" 2>/dev/null || true)
         COMPLETED="${COMPLETED:-0}"
-        if [ "$COMPLETED" -gt "$ROUNDS_COMPLETED" ]; then
-            ROUNDS_COMPLETED=$COMPLETED
-            ok "Round $ROUNDS_COMPLETED completed (detected in validator $i)"
+        if [ "$COMPLETED" -lt "$MIN_COMPLETED" ]; then
+            MIN_COMPLETED=$COMPLETED
         fi
     done
+    if [ "$MIN_COMPLETED" -gt "$ROUNDS_COMPLETED" ]; then
+        ROUNDS_COMPLETED=$MIN_COMPLETED
+        ok "Round $ROUNDS_COMPLETED completed by ALL validators"
+    fi
 
-    # Also check DB for experiments
-    DB_PORT=$((DB_PORT_BASE))
-    EXP_COUNT=$(curl -sf "http://localhost:${DB_PORT}/experiments/stats" 2>/dev/null | python3 -c "
+    # Also check DB for experiments across ALL validators
+    ALL_HAVE_EXPERIMENTS=true
+    for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
+        V_PORT=$((DB_PORT_BASE + i))
+        V_EXP=$(curl -sf "http://localhost:${V_PORT}/experiments/stats" 2>/dev/null | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -847,12 +853,16 @@ try:
 except:
     print(0)
 " 2>/dev/null | tail -1 || echo 0)
-    EXP_COUNT="${EXP_COUNT//[^0-9]/}"
-    EXP_COUNT="${EXP_COUNT:-0}"
+        V_EXP="${V_EXP//[^0-9]/}"
+        V_EXP="${V_EXP:-0}"
+        if [ "$V_EXP" -eq 0 ]; then
+            ALL_HAVE_EXPERIMENTS=false
+        fi
+    done
 
-    if [ "$EXP_COUNT" -gt 0 ] && [ "$ROUNDS_COMPLETED" -eq 0 ]; then
+    if [ "$ALL_HAVE_EXPERIMENTS" = true ] && [ "$ROUNDS_COMPLETED" -eq 0 ]; then
         ROUNDS_COMPLETED=1
-        ok "Experiments found in DB ($EXP_COUNT total)"
+        ok "Experiments found in ALL validator DBs"
     fi
 
     if [ "$ROUNDS_COMPLETED" -ge "$WAIT_ROUNDS" ]; then
