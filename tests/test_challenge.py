@@ -63,17 +63,17 @@ def test_current_phase_evaluation():
     assert current_phase(324, 100) == "evaluation"
 
 
-def test_current_phase_scoring_with_fallback():
-    """Scoring phase only appears when fallback_window > 0."""
-    assert current_phase(325, 100, fallback_window=50) == "scoring"
-    assert current_phase(374, 100, fallback_window=50) == "scoring"
+def test_current_phase_scoring():
+    """Scoring phase covers fallback/scoring window after evaluation."""
+    assert current_phase(325, 100) == "scoring"
+    assert current_phase(374, 100) == "scoring"
 
 
-def test_current_phase_no_scoring_by_default():
-    """Without fallback window, evaluation goes straight to idle."""
-    assert current_phase(325, 100) == "idle"
+def test_current_phase_no_scoring_zero_window():
+    """Without scoring window, evaluation goes straight to idle."""
+    assert current_phase(325, 100, scoring_window=0) == "idle"
 
 
 def test_current_phase_idle():
-    assert current_phase(375, 100, fallback_window=50) == "idle"
+    assert current_phase(375, 100) == "idle"
     assert current_phase(99, 100) == "idle"

@@ -60,6 +60,10 @@ constraints:
   - "Model output: (batch, prediction_len, num_variates, num_quantiles) float tensor"
   - Preserve metric output format (runner needs to extract crps and mase)
   - Code must be syntactically valid and crash-free
+  - "Optional: init_weights(model) for custom initialization (param count must not change)"
+  - "Optional: transform_batch(batch, step, total_steps) for data augmentation (shape must match, no NaN/Inf)"
+  - "Optional: on_step_end(model, optimizer, step, total_steps, loss_value) for EMA, progressive freezing"
+  - "Optional: configure_amp() returning {enabled: bool, dtype: 'bfloat16'|'float16'|'float32'}"
 
 anti_patterns:
   - Tweaking a single hyperparameter by a tiny amount

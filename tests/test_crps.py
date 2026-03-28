@@ -106,8 +106,8 @@ def test_ncrps_uses_geometric_mean():
     Correct: geomean(crps[b] / naive[b]) = exp(mean(log(crps[b] / naive[b])))
     Wrong:   mean(crps) / mean(naive)  (ratio of batch means)
     """
-    fn_src = _get_function_source("validate")
-    assert fn_src, "validate not found"
+    fn_src = _get_function_source("_random_validate")
+    assert fn_src, "_random_validate not found"
     # Must use log + exp for geometric mean
     assert "log" in fn_src, "nCRPS must use log for geometric mean"
     assert "exp" in fn_src, "nCRPS must use exp for geometric mean"
@@ -115,8 +115,8 @@ def test_ncrps_uses_geometric_mean():
 
 def test_ncrps_divides_per_sample():
     """nCRPS ratio must be per-sample, not batch-scalar / per-sample."""
-    fn_src = _get_function_source("validate")
-    assert fn_src, "validate not found"
+    fn_src = _get_function_source("_random_validate")
+    assert fn_src, "_random_validate not found"
     # Should have sample_crps / sample_naive (per-sample division)
     assert "sample_crps" in fn_src or "crps" in fn_src.lower()
     # Should NOT just call .mean().item() then divide

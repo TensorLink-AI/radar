@@ -177,13 +177,13 @@ class TrainingCoordinator:
             if not url or not commitment:
                 verified_trainers[tid] = bool(url)  # has URL but no commitment = pass (localnet compat)
                 continue
-            attest_id = getattr(commitment, "pod_attestation_id", "") or ""
-            if not attest_id:
+            instance_name = getattr(commitment, "pod_attestation_id", "") or ""
+            if not instance_name:
                 # No attestation committed — allow (localnet compatibility)
                 verified_trainers[tid] = True
                 continue
             ok, reason = await verify_miner_pod(
-                pod_url=url, attestation_id=attest_id,
+                instance_name=instance_name,
             )
             verified_trainers[tid] = ok
             if not ok:
@@ -234,7 +234,7 @@ class TrainingCoordinator:
                 else f"uid_{job.arch_owner}"
             )
 
-            # Generate presigned PUT URLs so trainer can upload without R2 creds
+            # Generate presigned PUT URLs so trainer can upload without R2 creds.
             from shared.artifacts import generate_upload_urls
             presigned_ttl = int(os.getenv("RADAR_PRESIGNED_TTL", "5400"))
             upload_urls = generate_upload_urls(
@@ -333,8 +333,12 @@ class TrainingCoordinator:
         expected_miners: list[int],
         timeout: int = 300,
     ) -> dict[int, dict]:
-        """Poll R2 for training_meta.json from each miner."""
-        from shared.artifacts import list_round_artifacts, meta_key as mk_fn
+        """Poll R2 for training_meta.json from each miner.
+
+        Performs post-upload verification: checks that the meta's round_id
+        and miner_hotkey match expectations, rejecting tampered artifacts.
+        """
+        from shared.artifacts import list_round_artifacts, meta_key as mk_fn, verify_uploaded_artifacts
 
         results: dict[int, dict] = {}
         deadline = asyncio.get_event_loop().time() + timeout
@@ -348,7 +352,14 @@ class TrainingCoordinator:
             uid_to_hotkey[uid] = hk
             hotkey_to_uid[hk] = uid
 
+        poll_count = 0
         while asyncio.get_event_loop().time() < deadline:
+            poll_count += 1
+            remaining = deadline - asyncio.get_event_loop().time()
+            logger.info(
+                "Checkpoint poll #%d: %d/%d collected, %.0fs remaining (round %d)",
+                poll_count, len(results), len(expected_miners), remaining, round_id,
+            )
             # Use list_round_artifacts to find which miners have uploaded
             available = list_round_artifacts(self.r2, round_id)
             for hk in available:
@@ -356,17 +367,37 @@ class TrainingCoordinator:
                 if uid is None or uid in results:
                     continue
                 try:
+                    # Verify artifact integrity before accepting
+                    ok, err = verify_uploaded_artifacts(self.r2, round_id, hk)
+                    if not ok:
+                        logger.warning(
+                            "Artifact verification failed for miner %s (UID %s) round %d: %s",
+                            hk[:16], uid, round_id, err,
+                        )
+                        continue
+
                     meta = self.r2.download_json(mk_fn(round_id, hk))
                     if meta:
                         meta["miner_uid"] = uid
                         meta["miner_hotkey"] = hk
                         results[uid] = meta
-                except Exception:
-                    pass
+                        logger.info(
+                            "Checkpoint received: UID %d status=%s flops=%d (round %d)",
+                            uid, meta.get("status", "?"),
+                            meta.get("flops_equivalent_size", 0), round_id,
+                        )
+                except Exception as exc:
+                    logger.warning("Error reading checkpoint for UID %s round %d: %s", uid, round_id, exc)
 
             if len(results) >= len(expected_miners):
+                logger.info("All %d checkpoints collected (round %d)", len(expected_miners), round_id)
                 break
             await asyncio.sleep(30)
+        else:
+            logger.warning(
+                "Checkpoint collection timed out: %d/%d collected after %ds (round %d)",
+                len(results), len(expected_miners), timeout, round_id,
+            )
 
         return results
 

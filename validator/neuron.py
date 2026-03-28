@@ -28,7 +28,6 @@ from shared.challenge import (
 from shared.commitment import read_miner_commitments
 from shared.database import DataElement
 from shared.sqlite_store import SQLiteExperimentStore
-from shared.dedup import is_unchanged_from_parent
 from shared.pareto import ParetoFront
 from shared.protocol import Challenge, Proposal
 from shared.provenance import detect_components
@@ -103,6 +102,9 @@ class Validator:
 
         # EMA scores per UID
         self.ema_scores: dict[int, float] = {}
+
+        # Trainer reliability tracking (keyed by trainer UID)
+        self.trainer_reliability: dict[int, float] = {}
 
         # DB server config
         self.db_port = int(getattr(config, "db_port", 8080))
@@ -293,16 +295,11 @@ class Validator:
             get_my_assignments_fn=get_my_assignments,
         )
 
-        # Pre-filter: syntax check + reject copies of existing frontier members
-        frontier_codes = [
-            entry["code"] for entry in challenge.feasible_frontier if entry.get("code")
-        ]
+        # Pre-filter: syntax check
         filtered: dict[int, Proposal] = {}
         for uid, proposal in submissions.items():
             ok, reason = pre_validate_code(proposal.code)
             if not ok:
-                continue
-            if any(is_unchanged_from_parent(proposal.code, fc) for fc in frontier_codes):
                 continue
             filtered[uid] = proposal
 
@@ -322,15 +319,16 @@ class Validator:
 
         my_uid = self._my_uid()
 
-        # Ensure this validator is in the dispatch rotation even if
-        # validator_permit hasn't propagated yet (common on localnet).
+        # Use only UIDs with validator_permit so ALL validators compute
+        # the same job assignments deterministically.  If my_uid has no
+        # permit yet (common on localnet/testnet), it will get 0 jobs from
+        # round-robin and the safety net below dispatches everything.
         dispatch_validators = list(validator_uids)
         if my_uid >= 0 and my_uid not in dispatch_validators:
-            logger.warning(
-                "My UID %d not in validator_uids %s — adding self for dispatch",
+            logger.info(
+                "My UID %d not in validator_uids %s — will use safety-net dispatch",
                 my_uid, dispatch_validators,
             )
-            dispatch_validators.append(my_uid)
 
         all_jobs = compute_assignments(
             block_hash, filtered,
@@ -448,6 +446,31 @@ class Validator:
                 )
                 training_metas.update(fb_metas)
 
+        # ── Pre-cache GIFT-Eval data for Phase C ────────────────
+        if self.r2:
+            try:
+                from shared.gift_eval import GiftEvalBenchmark
+                gift = GiftEvalBenchmark(
+                    r2=self.r2,
+                    cache_dir=Config.GIFT_EVAL_CACHE_DIR,
+                    r2_prefix=Config.GIFT_EVAL_R2_PREFIX,
+                )
+                selected = gift.select_datasets(
+                    eval_split_seed=challenge.eval_split_seed,
+                    n=Config.GIFT_EVAL_DATASETS_PER_ROUND,
+                )
+                for ds_name in selected:
+                    try:
+                        gift.download_dataset(ds_name)
+                    except Exception as e:
+                        logger.warning("GIFT-Eval download failed for %s: %s", ds_name, e)
+                logger.info(
+                    "GIFT-Eval: cached %d datasets for seed=%d: %s",
+                    len(selected), challenge.eval_split_seed, selected,
+                )
+            except Exception as e:
+                logger.warning("GIFT-Eval pre-cache failed: %s", e)
+
         # ── PHASE C: EVALUATION (TRUST ANCHOR) ────────────────
         eval_results = await evaluate_all_checkpoints(
             r2=self.r2,
@@ -471,15 +494,25 @@ class Validator:
         # ── SCORING ───────────────────────────────────────────
         penalties = compute_penalties(training_metas, eval_results)
 
+        # Track trainer reliability for future job assignment
+        for uid, meta in training_metas.items():
+            trainer_uid = meta.get("trainer_uid", uid)
+            status = meta.get("status", "")
+            score = 1.0 if status == "success" else 0.0
+            alpha = Config.EMA_ALPHA
+            prev = self.trainer_reliability.get(trainer_uid, 1.0)
+            self.trainer_reliability[trainer_uid] = alpha * score + (1 - alpha) * prev
+
         # Record which frontier experiments were shown this round
         for entry in challenge.feasible_frontier:
             entry_code = entry.get("code", "")
             if entry_code:
-                # Find matching experiment by code
-                match = self.db.conn.execute(
-                    "SELECT id FROM experiments WHERE code = ? LIMIT 1",
-                    (entry_code,),
-                ).fetchone()
+                # Find matching experiment by code (use DB lock)
+                with self.db._lock:
+                    match = self.db.conn.execute(
+                        "SELECT id FROM experiments WHERE code = ? LIMIT 1",
+                        (entry_code,),
+                    ).fetchone()
                 if match:
                     self.db.provenance.record_round_context(
                         challenge.round_id, match[0], "frontier",
@@ -490,6 +523,7 @@ class Validator:
             if metrics.get("passed_size_gate"):
                 proposal = filtered.get(uid, Proposal())
 
+                miner_hk = self.metagraph.hotkeys[uid] if uid < len(self.metagraph.hotkeys) else ""
                 element = DataElement(
                     name=f"round_{challenge.round_id}_miner_{uid}",
                     code=proposal.code,
@@ -497,9 +531,11 @@ class Validator:
                     success=True,
                     objectives=metrics,
                     miner_uid=uid,
+                    miner_hotkey=miner_hk,
                     motivation=proposal.motivation,
                     trace=agent_logs.get(uid, ""),
                     task=task_name,
+                    round_id=challenge.round_id,
                 )
                 self.db.add(element)
                 pareto.update(element)
@@ -511,6 +547,7 @@ class Validator:
 
         round_scores = score_round(
             eval_results, challenge, pareto, self.task.objectives, penalties,
+            training_metas=training_metas,
         )
 
         if round_scores:
@@ -523,11 +560,9 @@ class Validator:
         else:
             logger.warning("Round scores empty — no eval results passed size gate")
 
-        # EMA + weights
-        uids, weights = scores_to_weights(round_scores, Config.SOFTMAX_TEMPERATURE)
-        normalized = dict(zip(uids, weights))
+        # EMA on raw scores, softmax applied once in _set_weights()
         all_uids = list(range(self.metagraph.n))
-        self.ema_scores = ema_update(self.ema_scores, normalized, all_uids, Config.EMA_ALPHA)
+        self.ema_scores = ema_update(self.ema_scores, round_scores, all_uids, Config.EMA_ALPHA)
         self._set_weights()
 
         # Write frontier to R2
@@ -545,17 +580,12 @@ class Validator:
         )
 
     def _set_weights(self):
-        """Set weights on chain proportional to EMA scores."""
+        """Set weights on chain — softmax on EMA scores (single normalization)."""
         if not self.ema_scores:
             logger.warning("No EMA scores — skipping weight setting")
             return
         try:
-            n = self.metagraph.n
-            uids = list(range(n))
-            weights = [self.ema_scores.get(uid, 0.0) for uid in uids]
-            total = sum(weights)
-            if total > 0:
-                weights = [w / total for w in weights]
+            uids, weights = scores_to_weights(self.ema_scores, Config.SOFTMAX_TEMPERATURE)
             nonzero_weights = {
                 uid: f"{w:.4f}" for uid, w in zip(uids, weights) if w > 0
             }
