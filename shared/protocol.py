@@ -76,3 +76,84 @@ class Proposal:
     def from_json(cls, s: str) -> Proposal:
         d = json.loads(s)
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class TrainerRequest:
+    """Validator → Miner: prepare your trainer pod for this round.
+
+    Includes the GPU spec the miner must deploy on Basilica.
+    The validator controls hardware requirements to ensure consistent
+    training conditions across the round.
+    """
+    round_id: int = 0
+    challenge_id: str = ""
+    seed: int = 0
+    min_flops_equivalent: int = 0
+    max_flops_equivalent: int = 0
+    time_budget: int = 300
+    validator_db_url: str = ""
+
+    # GPU spec — miner must deploy a pod matching these requirements
+    gpu_count: int = 1
+    gpu_model: str = "NVIDIA-RTX-A4000"
+    memory: str = "16Gi"
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "round_id": self.round_id,
+            "challenge_id": self.challenge_id,
+            "seed": self.seed,
+            "min_flops_equivalent": self.min_flops_equivalent,
+            "max_flops_equivalent": self.max_flops_equivalent,
+            "time_budget": self.time_budget,
+            "validator_db_url": self.validator_db_url,
+            "gpu_count": self.gpu_count,
+            "gpu_model": self.gpu_model,
+            "memory": self.memory,
+        })
+
+    @classmethod
+    def from_json(cls, s: str) -> TrainerRequest:
+        d = json.loads(s)
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class TrainerReady:
+    """Miner → Validator: my trainer pod is live at this URL."""
+    round_id: int = 0
+    trainer_url: str = ""
+    instance_name: str = ""
+    miner_hotkey: str = ""
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "round_id": self.round_id,
+            "trainer_url": self.trainer_url,
+            "instance_name": self.instance_name,
+            "miner_hotkey": self.miner_hotkey,
+        })
+
+    @classmethod
+    def from_json(cls, s: str) -> TrainerReady:
+        d = json.loads(s)
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class TrainerRelease:
+    """Validator → Miner: training done, tear down your pod."""
+    round_id: int = 0
+    miner_hotkey: str = ""
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "round_id": self.round_id,
+            "miner_hotkey": self.miner_hotkey,
+        })
+
+    @classmethod
+    def from_json(cls, s: str) -> TrainerRelease:
+        d = json.loads(s)
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})

@@ -17,7 +17,7 @@ from typing import Optional, TYPE_CHECKING
 import httpx
 
 from shared.auth import sign_request
-from shared.protocol import Proposal
+from shared.protocol import Proposal, TrainerRequest, TrainerReady, TrainerRelease
 
 if TYPE_CHECKING:
     from shared.commitment import ImageCommitment
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 class Job:
     """A training job assignment."""
     arch_owner: int      # miner whose architecture is being trained
-    trainer_uid: int     # DIFFERENT miner whose trainer runs the job
+    trainer_uid: int     # miner whose trainer runs the job (self-training allowed)
     dispatcher: int      # validator UID responsible for dispatching
     round_id: int = 0
 
@@ -58,11 +58,10 @@ def compute_assignments(
     validator_uids: list[int],
     round_id: int,
 ) -> list[Job]:
-    """Deterministic job assignment from block hash.
+    """Deterministic job assignment — fully randomised each round.
 
-    Cross-eval: arch_owner != trainer_uid.
-    Dispatch split across validators.
-    Everyone with the same inputs gets identical output.
+    Any miner can train any architecture, including their own.
+    Trainer pool is shuffled fresh from the block hash each round.
     """
     if not submissions or not miner_uids or not validator_uids:
         return []
@@ -74,15 +73,13 @@ def compute_assignments(
     trainer_pool = sorted(miner_uids)
     sorted_validators = sorted(validator_uids)
 
+    # Shuffle trainer pool — completely random pairing each round
+    rng.shuffle(trainer_pool)
+
     jobs: list[Job] = []
     for i, arch_uid in enumerate(arch_uids):
-        # Cross-eval: pick a different miner as trainer
-        candidates = [u for u in trainer_pool if u != arch_uid]
-        if not candidates:
-            candidates = trainer_pool  # self-train if only one miner
-
-        rng_copy = random.Random(seed + arch_uid)
-        trainer_uid = rng_copy.choice(candidates)
+        # Round-robin through shuffled trainer pool (self-training allowed)
+        trainer_uid = trainer_pool[i % len(trainer_pool)]
 
         # Round-robin dispatch across validators
         dispatcher = sorted_validators[i % len(sorted_validators)]
@@ -133,6 +130,7 @@ class TrainingCoordinator:
         self.metagraph = metagraph
         self.r2 = r2
         self.my_uid = my_uid
+        self._fallback_uids: dict[int, set[int]] = {}  # round_id → UIDs using proxy
 
     def compute_my_jobs(
         self,
@@ -158,36 +156,12 @@ class TrainingCoordinator:
     ) -> list[TrainingResult]:
         """POST to trainer endpoints with Epistula-signed payload.
 
-        Dispatches concurrently and verifies Basilica attestation before
-        dispatching to any trainer.
+        Dispatches concurrently. Attestation is already verified in
+        prepare_trainers() when TrainerReady arrives; fallback proxy
+        is trusted subnet-owner infrastructure.
         """
-        from validator.pod_manager import verify_miner_pod
-
         commitments = commitments or {}
         logger.info("Dispatching %d jobs to %d trainer endpoints", len(jobs), len(trainer_endpoints))
-
-        # Verify each trainer pod ONCE before dispatching any jobs to it
-        verified_trainers: dict[int, bool] = {}
-        for job in jobs:
-            tid = job.trainer_uid
-            if tid in verified_trainers:
-                continue
-            url = trainer_endpoints.get(tid, "")
-            commitment = commitments.get(tid)
-            if not url or not commitment:
-                verified_trainers[tid] = bool(url)  # has URL but no commitment = pass (localnet compat)
-                continue
-            instance_name = getattr(commitment, "pod_attestation_id", "") or ""
-            if not instance_name:
-                # No attestation committed — allow (localnet compatibility)
-                verified_trainers[tid] = True
-                continue
-            ok, reason = await verify_miner_pod(
-                instance_name=instance_name,
-            )
-            verified_trainers[tid] = ok
-            if not ok:
-                logger.warning("Trainer UID %d failed attestation: %s", tid, reason)
 
         # Per-job timeout: time_budget + 120s buffer for startup/upload overhead
         time_budget = challenge.task.get("time_budget", 300)
@@ -198,16 +172,6 @@ class TrainingCoordinator:
         dispatch_tasks: list[tuple[Job, str, bytes, dict]] = []
 
         for job in jobs:
-            if not verified_trainers.get(job.trainer_uid, False):
-                immediate_results.append(TrainingResult(
-                    round_id=job.round_id,
-                    arch_owner=job.arch_owner,
-                    trainer_uid=job.trainer_uid,
-                    dispatcher=self.my_uid,
-                    status="attestation_failed",
-                    error="Trainer pod failed Basilica attestation check",
-                ))
-                continue
             proposal = submissions.get(job.arch_owner)
             if not proposal:
                 continue
@@ -426,3 +390,148 @@ class TrainingCoordinator:
         else:
             key = "frontier/latest.json"
         self.r2.upload_json(key, {"frontier": frontier_data})
+
+    async def prepare_trainers(
+        self,
+        challenge,
+        commitments: dict[int, "ImageCommitment"],
+        db_url: str,
+    ) -> dict[int, str]:
+        """Send TrainerRequest to all miners' listener_urls, wait for TrainerReady.
+
+        Called at Phase A start. Sends to all miners because trainer
+        assignments depend on proposals which aren't collected yet.
+        Non-responsive miners get routed to the fallback proxy if configured.
+
+        Returns {uid: trainer_url} for all miners that responded or fell back.
+        """
+        from config import Config
+        from validator.db_server import get_ready_trainers
+        from validator.pod_manager import verify_miner_pod
+
+        round_id = challenge.round_id
+        time_budget = challenge.task.get("time_budget", 300)
+
+        req = TrainerRequest(
+            round_id=round_id,
+            challenge_id=challenge.challenge_id,
+            seed=challenge.seed,
+            min_flops_equivalent=challenge.min_flops_equivalent,
+            max_flops_equivalent=challenge.max_flops_equivalent,
+            time_budget=time_budget,
+            validator_db_url=db_url,
+            gpu_count=Config.TRAINER_GPU_COUNT,
+            gpu_model=Config.TRAINER_GPU_MODEL,
+            memory=Config.TRAINER_MEMORY,
+        )
+        body = req.to_json().encode()
+        headers = sign_request(self.wallet, body)
+        headers["Content-Type"] = "application/json"
+
+        # Fire TrainerRequest to all miners with listener_urls
+        sent_uids: set[int] = set()
+        async with httpx.AsyncClient(timeout=30) as client:
+            for uid, commitment in commitments.items():
+                if not commitment.listener_url:
+                    continue
+                try:
+                    url = f"{commitment.listener_url.rstrip('/')}/prepare"
+                    await client.post(url, content=body, headers=headers)
+                    sent_uids.add(uid)
+                except Exception as e:
+                    logger.warning("Failed to send TrainerRequest to UID %d: %s", uid, e)
+
+        logger.info(
+            "Sent TrainerRequest to %d miners (round %d), waiting for readiness",
+            len(sent_uids), round_id,
+        )
+
+        # Poll for TrainerReady responses
+        deadline = asyncio.get_event_loop().time() + Config.TRAINER_PREPARE_TIMEOUT
+        result: dict[int, str] = {}
+
+        while asyncio.get_event_loop().time() < deadline:
+            ready = get_ready_trainers(round_id)
+            for uid, ready_msg in ready.items():
+                if uid in result:
+                    continue
+                # Verify the pod via Basilica public metadata
+                if ready_msg.instance_name:
+                    ok, reason = await verify_miner_pod(ready_msg.instance_name)
+                    if not ok:
+                        logger.warning(
+                            "UID %d TrainerReady failed verification: %s", uid, reason,
+                        )
+                        continue
+                result[uid] = ready_msg.trainer_url
+                logger.info("UID %d trainer ready at %s", uid, ready_msg.trainer_url)
+
+            if len(result) >= len(sent_uids):
+                break
+            await asyncio.sleep(Config.TRAINER_READY_POLL_INTERVAL)
+
+        # Fallback proxy for non-responsive miners
+        fallback_uids: set[int] = set()
+        if Config.FALLBACK_PROXY_URL:
+            for uid in sent_uids:
+                if uid not in result:
+                    result[uid] = Config.FALLBACK_PROXY_URL
+                    fallback_uids.add(uid)
+            if fallback_uids:
+                logger.info(
+                    "Routed %d non-responsive trainers to fallback proxy: %s",
+                    len(fallback_uids), sorted(fallback_uids),
+                )
+
+        self._fallback_uids[round_id] = fallback_uids
+
+        logger.info(
+            "prepare_trainers complete: %d ready, %d fallback, %d no response (round %d)",
+            len(result) - len(fallback_uids), len(fallback_uids),
+            len(sent_uids) - len(result), round_id,
+        )
+        return result
+
+    async def release_trainers(
+        self,
+        round_id: int,
+        commitments: dict[int, "ImageCommitment"],
+        released_uids: set[int],
+    ):
+        """Send TrainerRelease to miners whose checkpoints have been collected.
+
+        Skips UIDs that used the fallback proxy.
+        """
+        from validator.db_server import clear_ready_trainers
+
+        fallback_uids = self._fallback_uids.get(round_id, set())
+        released = 0
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            for uid in released_uids:
+                if uid in fallback_uids:
+                    continue
+                commitment = commitments.get(uid)
+                if not commitment or not commitment.listener_url:
+                    continue
+                try:
+                    release = TrainerRelease(
+                        round_id=round_id,
+                        miner_hotkey=(
+                            self.metagraph.hotkeys[uid]
+                            if uid < len(self.metagraph.hotkeys)
+                            else ""
+                        ),
+                    )
+                    body = release.to_json().encode()
+                    headers = sign_request(self.wallet, body)
+                    headers["Content-Type"] = "application/json"
+                    url = f"{commitment.listener_url.rstrip('/')}/release"
+                    await client.post(url, content=body, headers=headers)
+                    released += 1
+                except Exception as e:
+                    logger.debug("Failed to send TrainerRelease to UID %d: %s", uid, e)
+
+        logger.info("Released %d trainers (round %d)", released, round_id)
+        clear_ready_trainers(round_id)
+        self._fallback_uids.pop(round_id, None)

@@ -145,7 +145,7 @@ class TestVerifyMinerPod:
         with patch.dict(sys.modules, {"basilica": fake_mod}):
             ok, reason = await verify_miner_pod("my-pod")
             assert not ok
-            assert "No replicas" in reason
+            assert "No ready replicas" in reason
 
     @pytest.mark.asyncio
     async def test_no_expected_image_configured(self):

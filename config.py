@@ -57,6 +57,19 @@ class Config:
     # ── Training Dispatch ────────────────────────────────────────
     TRAINING_TIMEOUT: int = int(os.getenv("RADAR_TRAINING_TIMEOUT", "1800"))
 
+    # ── Warm-Standby Trainer ────────────────────────────────────
+    TRAINER_PREPARE_TIMEOUT: int = int(os.getenv("RADAR_TRAINER_PREPARE_TIMEOUT", "600"))
+    TRAINER_READY_POLL_INTERVAL: int = int(os.getenv("RADAR_TRAINER_READY_POLL", "15"))
+    TRAINER_RELEASE_SAFETY_MARGIN: float = float(os.getenv("RADAR_TRAINER_SAFETY_MARGIN", "1.1"))
+
+    # Default GPU spec sent in TrainerRequest (validator-controlled)
+    TRAINER_GPU_COUNT: int = int(os.getenv("RADAR_TRAINER_GPU_COUNT", "1"))
+    TRAINER_GPU_MODEL: str = os.getenv("RADAR_TRAINER_GPU_MODEL", "NVIDIA-RTX-A4000")
+    TRAINER_MEMORY: str = os.getenv("RADAR_TRAINER_MEMORY", "16Gi")
+
+    # Subnet-owner fallback proxy — handles jobs from non-responsive trainers
+    FALLBACK_PROXY_URL: str = os.getenv("RADAR_FALLBACK_PROXY_URL", "")
+
     # ── Phase C Eval ─────────────────────────────────────────────
     EVAL_DEVICE: str = os.getenv("RADAR_EVAL_DEVICE", "cpu")
 

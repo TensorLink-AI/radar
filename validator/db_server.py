@@ -40,6 +40,9 @@ _current_frontier = None
 _access_logger: Optional[AccessLogger] = None
 _hotkey_to_uid: dict[str, int] = {}
 
+# Warm-standby trainer readiness: round_id → {uid: TrainerReady}
+_trainer_ready: dict[int, dict[int, "TrainerReady"]] = {}
+
 
 def set_db(experiment_db):
     global db
@@ -76,6 +79,16 @@ def set_access_logger(logger: AccessLogger):
 def set_hotkey_map(mapping: dict[str, int]):
     global _hotkey_to_uid
     _hotkey_to_uid = mapping
+
+
+def get_ready_trainers(round_id: int) -> dict[int, "TrainerReady"]:
+    """Called by coordinator to poll for TrainerReady responses."""
+    return dict(_trainer_ready.get(round_id, {}))
+
+
+def clear_ready_trainers(round_id: int):
+    """Cleanup after round completes."""
+    _trainer_ready.pop(round_id, None)
 
 
 def _require_db():
@@ -157,8 +170,10 @@ async def auth_middleware(request: Request, call_next):
         or path.startswith("/challenge")
         or path.startswith("/frontier")
     )
+    # /trainer/ready handles its own auth (needs body for TrainerReady parsing)
+    skip_middleware_auth = path.startswith("/trainer/")
 
-    if needs_auth and _auth_verify and _metagraph:
+    if needs_auth and not skip_middleware_auth and _auth_verify and _metagraph:
         body = await request.body()
         from shared.auth import verify_request
         ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
@@ -180,6 +195,36 @@ async def auth_middleware(request: Request, call_next):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/trainer/ready")
+async def trainer_ready(request: Request):
+    """Miner POSTs here after spinning up their Basilica pod."""
+    if not _auth_verify or not _metagraph:
+        raise HTTPException(status_code=503, detail="Auth not configured")
+
+    body = await request.body()
+    from shared.auth import verify_request
+    ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
+    if not ok:
+        return JSONResponse(status_code=403, content={"error": err})
+
+    from shared.protocol import TrainerReady
+    try:
+        ready_msg = TrainerReady.from_json(body.decode())
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": f"Invalid TrainerReady: {e}"})
+
+    uid = _hotkey_to_uid.get(hotkey)
+    if uid is None:
+        return JSONResponse(status_code=404, content={"error": "Unknown hotkey"})
+
+    round_id = ready_msg.round_id
+    if round_id not in _trainer_ready:
+        _trainer_ready[round_id] = {}
+    _trainer_ready[round_id][uid] = ready_msg
+
+    return {"status": "ok", "uid": uid, "round_id": round_id}
 
 
 @app.get("/challenge")

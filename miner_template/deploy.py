@@ -1,17 +1,23 @@
-"""Deploy trainer on Basilica + commit agent image to chain.
+"""Deploy guide for Radar miners — warm-standby trainer model.
 
 Miners have two components:
   1. Agent: a Docker image pushed to a registry. Validators pull and run it.
-  2. Trainer: the sanctioned training image deployed on Basilica.
+  2. Trainer listener: a lightweight HTTP server on the miner's neuron process.
+     GPU pods deploy on-demand via Basilica when validators send TrainerRequests,
+     with public_metadata=True for attestation.
+
+No upfront GPU cost — the miner just needs the neuron process running with
+an open port. GPU pods are created during Phase A and auto-teardown via TTL.
 
 Usage:
   # 1. Build and push your agent Docker image
   docker build -t myregistry/my-agent:v1 miner_template/
   docker push myregistry/my-agent:v1
 
-  # 2. Deploy trainer on Basilica + commit to chain
-  python miner_template/deploy.py \\
+  # 2. Start miner with listener (no GPU needed until training starts)
+  python miner/neuron.py \\
       --docker_image myregistry/my-agent:v1 \\
+      --listener_port 8090 \\
       --trainer_image ghcr.io/tensorlink-ai/radar/ts-runner:latest
 """
 
@@ -21,18 +27,6 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def deploy_trainer(image: str) -> str:
-    """Deploy the sanctioned trainer container on Basilica. Returns URL."""
-    # TODO: Implement Basilica deployment via basilica-sdk
-    # from basilica import BasilicaClient
-    # client = BasilicaClient()
-    # pod = client.deploy(name="radar-trainer", image=image, port=8001,
-    #                     gpu_count=1, memory="16Gi")
-    # return pod.url
-    logger.info("Deploy trainer image: %s", image)
-    return ""
-
-
 def main():
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(description="Deploy Radar miner")
@@ -40,20 +34,28 @@ def main():
                         help="Agent Docker image (e.g. myregistry/my-agent:v1)")
     parser.add_argument("--trainer_image", type=str,
                         default="ghcr.io/tensorlink-ai/radar/ts-runner:latest",
-                        help="Sanctioned trainer image")
+                        help="Sanctioned trainer image (deployed on Basilica on-demand)")
+    parser.add_argument("--listener_port", type=int, default=8090,
+                        help="Port for warm-standby trainer listener")
     args = parser.parse_args()
 
-    trainer_url = deploy_trainer(args.trainer_image)
-
-    print(f"Agent image: {args.docker_image}")
-    print(f"Trainer URL: {trainer_url}")
+    print(f"Agent image:    {args.docker_image}")
+    print(f"Trainer image:  {args.trainer_image}")
+    print(f"Listener port:  {args.listener_port}")
     print()
     print("Next steps:")
     print(f"  1. Push your agent image: docker push {args.docker_image}")
     print(f"  2. Start miner:")
     print(f"     python miner/neuron.py \\")
     print(f"       --docker_image {args.docker_image} \\")
-    print(f"       --trainer_url {trainer_url or '<basilica-url>'}")
+    print(f"       --listener_port {args.listener_port} \\")
+    print(f"       --trainer_image {args.trainer_image}")
+    print()
+    print("Notes:")
+    print("  - No GPU needed to start — pods deploy on-demand via Basilica")
+    print("  - Validators control GPU spec (gpu_count, gpu_model, memory)")
+    print("  - Pods auto-teardown via TTL if release signal is missed")
+    print("  - Set BASILICA_API_TOKEN env var for Basilica SDK auth")
 
 
 if __name__ == "__main__":

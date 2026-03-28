@@ -182,8 +182,9 @@ async def verify_miner_pod(
             return False, f"Pod not running: state={meta.state}"
 
         # Check replicas
-        if meta.replicas < 1:
-            return False, f"No replicas: replicas={meta.replicas}"
+        ready = getattr(meta.replicas, "ready", meta.replicas) if hasattr(meta, "replicas") else 0
+        if (ready if isinstance(ready, int) else meta.replicas) < 1:
+            return False, f"No ready replicas: {ready}"
 
         return True, "ok"
     except ImportError:

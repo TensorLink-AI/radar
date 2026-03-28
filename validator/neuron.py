@@ -282,6 +282,17 @@ class Validator:
             logger.warning("No R2 configured — skipping Phase A/B/C")
             return
 
+        # ── PREPARE TRAINERS (warm-standby) ──────────────────
+        # Fire TrainerRequests to ALL miners with listener_urls.
+        # They deploy Basilica pods during Phase A while agents run in parallel.
+        if self.coordinator:
+            dynamic_endpoints = await self.coordinator.prepare_trainers(
+                challenge, commitments,
+                db_url=f"http://localhost:{self.db_port}",
+            )
+        else:
+            dynamic_endpoints = {}
+
         submissions, agent_logs = await run_and_collect_agents(
             wallet=self.wallet,
             metagraph=self.metagraph,
@@ -350,15 +361,15 @@ class Validator:
             )
             my_jobs = list(all_jobs)
 
-        trainer_endpoints = {uid: c.pod_url for uid, c in commitments.items() if c.pod_url}
+        trainer_endpoints = dynamic_endpoints
         logger.info(
             "Phase B: %d total jobs, %d mine (my_uid=%d, validators=%s), %d trainer endpoints",
             len(all_jobs), len(my_jobs), my_uid, dispatch_validators, len(trainer_endpoints),
         )
         if not trainer_endpoints:
             logger.warning(
-                "Phase B: no trainer endpoints! Miners must set --trainer_url "
-                "or trainer pods must be deployed. Training will fail for all jobs."
+                "Phase B: no trainer endpoints! Miners must set --listener_port "
+                "or trainer pods failed to deploy. Training will fail for all jobs."
             )
 
         my_results = await self.coordinator.dispatch_jobs(
@@ -404,6 +415,20 @@ class Validator:
                 meta.get("flops_equivalent_size", 0),
                 meta.get("error", ""),
             )
+
+        # ── RELEASE TRAINERS ─────────────────────────────────
+        if self.coordinator:
+            collected_uids = set(training_metas.keys())
+            await self.coordinator.release_trainers(
+                challenge.round_id, commitments, collected_uids,
+            )
+            # Also release miners who timed out — courtesy signal
+            all_prepared = set(dynamic_endpoints.keys())
+            timed_out = all_prepared - collected_uids
+            if timed_out:
+                await self.coordinator.release_trainers(
+                    challenge.round_id, commitments, timed_out,
+                )
 
         # Fallback for missing validators (off by default)
         missing_trainers = [uid for uid in filtered if uid not in training_metas]
@@ -494,11 +519,18 @@ class Validator:
         # ── SCORING ───────────────────────────────────────────
         penalties = compute_penalties(training_metas, eval_results)
 
-        # Track trainer reliability for future job assignment
+        # Track trainer reliability — penalise non-responsive trainers
+        fallback_uids = (
+            self.coordinator._fallback_uids.get(challenge.round_id, set())
+            if self.coordinator else set()
+        )
         for uid, meta in training_metas.items():
             trainer_uid = meta.get("trainer_uid", uid)
-            status = meta.get("status", "")
-            score = 1.0 if status == "success" else 0.0
+            if trainer_uid in fallback_uids:
+                score = 0.0  # full penalty — training ran on fallback proxy
+            else:
+                status = meta.get("status", "")
+                score = 1.0 if status == "success" else 0.0
             alpha = Config.EMA_ALPHA
             prev = self.trainer_reliability.get(trainer_uid, 1.0)
             self.trainer_reliability[trainer_uid] = alpha * score + (1 - alpha) * prev

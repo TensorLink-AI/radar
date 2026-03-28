@@ -37,9 +37,9 @@ class ImageCommitment:
     image_digest: str = ""    # e.g. "sha256:abc123..."
     subnet_version: str = ""  # e.g. "0.1.0" — must match official
 
-    # Training pod (miner-hosted on Basilica)
-    pod_url: str = ""                    # Basilica pod URL
-    pod_attestation_id: str = ""         # Basilica attestation for training pod
+    # Warm-standby trainer (miner-hosted lightweight listener, no GPU)
+    listener_url: str = ""               # always-on HTTP endpoint on miner's neuron process
+    trainer_image: str = ""              # Docker image miner will deploy on Basilica when requested
 
     # Agent pod (miner-hosted on Basilica)
     agent_url: str = ""                  # Basilica pod URL for agent
@@ -54,8 +54,8 @@ class ImageCommitment:
             "image_url": self.image_url,
             "image_digest": self.image_digest,
             "subnet_version": self.subnet_version,
-            "pod_url": self.pod_url,
-            "pod_attestation_id": self.pod_attestation_id,
+            "listener_url": self.listener_url,
+            "trainer_image": self.trainer_image,
             "agent_url": self.agent_url,
             "agent_attestation_id": self.agent_attestation_id,
         })
@@ -67,8 +67,8 @@ class ImageCommitment:
             image_url=d.get("image_url", ""),
             image_digest=d.get("image_digest", ""),
             subnet_version=d.get("subnet_version", ""),
-            pod_url=d.get("pod_url", ""),
-            pod_attestation_id=d.get("pod_attestation_id", ""),
+            listener_url=d.get("listener_url", ""),
+            trainer_image=d.get("trainer_image", ""),
             agent_url=d.get("agent_url", ""),
             agent_attestation_id=d.get("agent_attestation_id", ""),
             miner_uid=miner_uid,
@@ -77,8 +77,8 @@ class ImageCommitment:
 
     @property
     def is_valid(self) -> bool:
-        """Basic validation: image URL and digest present."""
-        return bool(self.image_url) and bool(self.image_digest)
+        """Basic validation: image URL and listener URL present."""
+        return bool(self.image_url) and bool(self.listener_url)
 
 
 def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, ImageCommitment]:
