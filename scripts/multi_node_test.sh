@@ -157,21 +157,10 @@ if envs:
             docker rm $ORPHANED 2>/dev/null || true
         fi
     done
-    # Delete Basilica deployments if any
-    if [ -f "$LOG_DIR/trainer_urls.txt.deployments" ] 2>/dev/null; then
-        python3 -c "
-from basilica import BasilicaClient
-client = BasilicaClient()
-with open('$LOG_DIR/trainer_urls.txt.deployments') as f:
-    for name in f:
-        name = name.strip()
-        if name:
-            try:
-                client.delete_deployment(name)
-                print(f'Deleted Basilica deployment: {name}')
-            except Exception as e:
-                print(f'Failed to delete {name}: {e}')
-" 2>&1 | while IFS= read -r line; do echo "  $line"; done || warn "Basilica cleanup failed — deployments may need manual deletion (TTL: 1h)"
+    # Clean up Basilica deployments (warm-standby model — miners manage their own,
+    # but TTL safety net ensures cleanup even without explicit teardown)
+    if [ "$USE_BASILICA" = true ]; then
+        info "Basilica deployments auto-cleanup via TTL (no manual teardown needed)"
     fi
     # Clean commitment files
     rm -rf /tmp/radar_commitments 2>/dev/null || true
@@ -524,93 +513,67 @@ fi
 ok "All neurons registered"
 
 # =============================================================================
-# STEP 4b: Start trainer containers (simulates miner-deployed trainers)
+# STEP 4b: Set up trainer infrastructure (warm-standby model)
 # =============================================================================
-step "Step 4b: Starting trainer containers for Phase B"
+step "Step 4b: Setting up trainer infrastructure for Phase B (warm-standby)"
 
-TRAINER_PORT_BASE=8090
-TRAINER_CONTAINERS=()
+# In the warm-standby model, miners don't pre-deploy GPU pods. Instead:
+# - Miners run a lightweight listener (no GPU) on their neuron process
+# - Validators send TrainerRequests at Phase A start
+# - Miners deploy Basilica GPU pods on-demand when notified
+# - A fallback proxy handles jobs from non-responsive miners
+#
+# For localnet testing, we:
+# 1. Start a local trainer server (simulates what a Basilica pod would run)
+# 2. Install a mock Basilica SDK so miners can "deploy" without a real API
+# 3. Set FALLBACK_PROXY_URL to the local trainer so training always works
 
-TRAINER_URLS=()  # populated by whichever path runs
+TRAINER_PORT_BASE=9090  # local trainer server(s)
+LISTENER_PORT_BASE=8090  # miner listener ports
 
 if [ "$CPU_ONLY" = true ]; then
-    info "CPU-only mode: skipping trainer containers"
+    info "CPU-only mode: skipping trainer setup"
 elif [ "$USE_BASILICA" = true ]; then
-    # Deploy trainers on Basilica via affinetes
-    info "Deploying $NUM_MINERS trainer pod(s) on Basilica..."
-    TRAINER_URLS_FILE="$LOG_DIR/trainer_urls.txt"
+    # Real Basilica mode: miners will deploy real GPU pods on-demand.
+    # Start one local trainer as a fallback proxy for non-responsive miners.
+    info "Basilica mode: miners deploy GPU pods on-demand via Basilica SDK"
+    info "Starting fallback proxy trainer server..."
 
-    python3 -c "
-import sys, os, time
-sys.path.insert(0, '.')
+    FALLBACK_PORT=$((TRAINER_PORT_BASE))
+    FALLBACK_CONTAINER="radar-fallback-trainer-$$"
 
-from basilica import BasilicaClient
-
-client = BasilicaClient()
-num_miners = $NUM_MINERS
-ts = int(time.time())
-
-DEPLOY_KWARGS = dict(
-    image='${TRAINER_IMAGE}',
-    port=8081,
-    cpu='2000m',
-    memory='8Gi',
-    gpu_count=1,
-    gpu_models=['RTX-A4000', 'RTX-A6000'],
-    ttl_seconds=3600,
-    timeout=900,
-    public=True,
-    env={
-        'SUBTENSOR_NETWORK': '${NETWORK}',
-        'NETUID': '${NETUID}',
-    },
-)
-
-urls = []
-deployment_names = []
-for i in range(num_miners):
-    name = f'radar-trainer-{i}-{ts}'
-    # Retry up to 3 times with backoff — Basilica scheduler can fail
-    # under concurrent GPU allocation pressure
-    last_err = None
-    for attempt in range(3):
-        try:
-            print(f'Trainer {i}: deploying {name} (attempt {attempt+1})...', file=sys.stderr)
-            dep = client.deploy(name=name, **DEPLOY_KWARGS)
-            print(f'Trainer {i}: READY at {dep.url} (instance={dep.name})', file=sys.stderr)
-            urls.append(dep.url)
-            deployment_names.append(dep.name)
-            last_err = None
-            break
-        except Exception as e:
-            last_err = e
-            # Use a fresh name on retry to avoid name collision
-            name = f'radar-trainer-{i}-{int(time.time())}'
-            wait = 10 * (attempt + 1)
-            print(f'Trainer {i}: deploy failed ({e}), retrying in {wait}s...', file=sys.stderr)
-            time.sleep(wait)
-    if last_err:
-        print(f'Trainer {i}: FAILED after 3 attempts: {last_err}', file=sys.stderr)
-        sys.exit(1)
-
-with open('${TRAINER_URLS_FILE}', 'w') as f:
-    for u in urls:
-        f.write(u + '\n')
-
-with open('${TRAINER_URLS_FILE}.deployments', 'w') as f:
-    for d in deployment_names:
-        f.write(d + '\n')
-" 2>&1 | while IFS= read -r line; do echo "  $line"; done
-
-    if [ -f "$TRAINER_URLS_FILE" ]; then
-        while IFS= read -r url; do
-            TRAINER_URLS+=("$url")
-        done < "$TRAINER_URLS_FILE"
-        ok "Deployed ${#TRAINER_URLS[@]} trainer pod(s) on Basilica"
-    else
-        fail "Failed to deploy trainer pods on Basilica"
+    GPU_FLAGS=""
+    if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+        GPU_FLAGS="--gpus all"
     fi
+
+    docker run -d --name "$FALLBACK_CONTAINER" \
+        $GPU_FLAGS \
+        -p "${FALLBACK_PORT}:8081" \
+        -e TRAINER_PORT=8081 \
+        -e SUBTENSOR_NETWORK="${NETWORK}" \
+        -e NETUID="${NETUID}" \
+        "$TRAINER_IMAGE" >/dev/null 2>&1
+
+    TRAINER_CONTAINERS+=("$FALLBACK_CONTAINER")
+
+    # Wait for health
+    for attempt in $(seq 1 30); do
+        if curl -sf "http://localhost:${FALLBACK_PORT}/health" >/dev/null 2>&1; then
+            ok "Fallback trainer healthy on port $FALLBACK_PORT"
+            break
+        fi
+        [ "$attempt" = 30 ] && warn "Fallback trainer not responding on port $FALLBACK_PORT"
+        sleep 2
+    done
+
+    export RADAR_FALLBACK_PROXY_URL="http://localhost:${FALLBACK_PORT}"
+    ok "Fallback proxy URL: $RADAR_FALLBACK_PROXY_URL"
 else
+    # Local Docker mode: start trainer server(s) and mock Basilica SDK
+    info "Local mode: starting trainer server(s) + mock Basilica SDK"
+
+    TRAINER_URLS=()
     for i in $(seq 0 $((NUM_MINERS - 1))); do
         TRAINER_PORT=$((TRAINER_PORT_BASE + i))
         CONTAINER_NAME="radar-trainer-${i}-$$"
@@ -648,19 +611,105 @@ else
             warn "Trainer $i not responding on port $TRAINER_PORT after 60s"
             docker logs "${TRAINER_CONTAINERS[$i]}" 2>&1 | tail -10
         fi
-    done
-
-    # Populate TRAINER_URLS for local Docker path
-    for i in $(seq 0 $((NUM_MINERS - 1))); do
-        TRAINER_PORT=$((TRAINER_PORT_BASE + i))
         TRAINER_URLS+=("http://localhost:${TRAINER_PORT}")
     done
+
+    # Create mock Basilica SDK — each miner's "deployment" points to their local trainer
+    MOCK_BASILICA_DIR=$(mktemp -d)
+    cat > "$MOCK_BASILICA_DIR/basilica.py" << 'MOCKEOF'
+"""Mock Basilica SDK for multi-node localnet testing.
+
+Each create_deployment call returns a fake deployment pointing to a local
+trainer server. The mock tracks deployments so get_public_deployment_metadata
+returns correct image info for attestation checks.
+"""
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+_deployments = {}
+_trainer_urls = {}  # instance_name -> url
+
+
+class _Replicas:
+    def __init__(self, ready=1, desired=1):
+        self.ready = ready
+        self.desired = desired
+
+
+class _Metadata:
+    def __init__(self, image, image_tag, state, replicas, uptime_seconds=10):
+        self.image = image
+        self.image_tag = image_tag
+        self.state = state
+        self.replicas = replicas
+        self.uptime_seconds = uptime_seconds
+
+
+class _Deployment:
+    def __init__(self, instance_name, image, url):
+        self.instance_name = instance_name
+        self.image = image
+        self.url = url
+
+    def wait_until_ready(self):
+        logger.info("Mock Basilica: deployment %s ready at %s", self.instance_name, self.url)
+
+
+class BasilicaClient:
+    # Round-robin index for assigning trainer URLs
+    _url_index = 0
+
+    def create_deployment(self, instance_name, image, port=8001, replicas=1,
+                          public_metadata=False, ttl_seconds=600,
+                          gpu_count=1, gpu_models=None, memory="16Gi", **kwargs):
+        # Pick a trainer URL from the pool (set via MOCK_TRAINER_URLS env var)
+        urls = os.environ.get("MOCK_TRAINER_URLS", "").split(",")
+        urls = [u.strip() for u in urls if u.strip()]
+        if urls:
+            url = urls[BasilicaClient._url_index % len(urls)]
+            BasilicaClient._url_index += 1
+        else:
+            url = f"http://localhost:9090"  # fallback
+
+        dep = _Deployment(instance_name=instance_name, image=image, url=url)
+        _deployments[instance_name] = {
+            "image": image.rsplit(":", 1)[0] if ":" in image else image,
+            "image_tag": image.rsplit(":", 1)[1] if ":" in image else "latest",
+        }
+        _trainer_urls[instance_name] = url
+        logger.info("Mock Basilica: created %s -> %s", instance_name, url)
+        return dep
+
+    def delete_deployment(self, instance_name):
+        _deployments.pop(instance_name, None)
+        _trainer_urls.pop(instance_name, None)
+        logger.info("Mock Basilica: deleted %s", instance_name)
+
+    def get_public_deployment_metadata(self, instance_name):
+        info = _deployments.get(instance_name, {})
+        return _Metadata(
+            image=info.get("image", "mock-image"),
+            image_tag=info.get("image_tag", "latest"),
+            state="running",
+            replicas=_Replicas(ready=1, desired=1),
+        )
+MOCKEOF
+
+    export PYTHONPATH="${MOCK_BASILICA_DIR}:${PYTHONPATH:-}"
+    export MOCK_TRAINER_URLS=$(IFS=,; echo "${TRAINER_URLS[*]}")
+    ok "Mock Basilica SDK installed (${#TRAINER_URLS[@]} trainer URLs)"
+
+    # Also set fallback proxy to first trainer (safety net)
+    export RADAR_FALLBACK_PROXY_URL="${TRAINER_URLS[0]}"
+    ok "Fallback proxy URL: $RADAR_FALLBACK_PROXY_URL"
 fi
 
 # =============================================================================
-# STEP 5: Start miners (commit trainer URL so validators can dispatch)
+# STEP 5: Start miners (commit listener URL so validators can send TrainerRequests)
 # =============================================================================
-step "Step 5: Starting $NUM_MINERS miner(s)"
+step "Step 5: Starting $NUM_MINERS miner(s) with warm-standby listeners"
 
 NUM_AGENT_TYPES=${#AGENT_GHCR_URLS[@]}
 
@@ -669,22 +718,40 @@ for i in $(seq 0 $((NUM_MINERS - 1))); do
     AGENT_IMAGE="${AGENT_GHCR_URLS[$AGENT_IDX]}"
     MINER_LOG="$LOG_DIR/miner${i}.log"
 
-    # Miner commits this URL so the validator's coordinator can POST to it
-    TRAINER_URL="${TRAINER_URLS[$i]:-}"
+    # Each miner gets a unique listener port
+    LISTENER_PORT=$((LISTENER_PORT_BASE + i))
 
     python3 miner/neuron.py \
         --netuid "$NETUID" \
         --subtensor.network "$NETWORK" \
         --wallet.name "miner${i}" \
         --docker_image "$AGENT_IMAGE" \
-        --trainer_url "$TRAINER_URL" \
+        --listener_port "$LISTENER_PORT" \
+        --trainer_image "$TRAINER_IMAGE" \
         --axon.external_ip 127.0.0.1 \
         > "$MINER_LOG" 2>&1 &
     PIDS+=($!)
-    ok "Miner $i started (PID $!) — $AGENT_IMAGE — trainer: ${TRAINER_URL:-none} — log: $MINER_LOG"
+    ok "Miner $i started (PID $!) — $AGENT_IMAGE — listener: port $LISTENER_PORT — log: $MINER_LOG"
 done
 
-sleep 5  # Let miners commit images
+sleep 5  # Let miners commit images and start listeners
+
+# Verify listener health
+for i in $(seq 0 $((NUM_MINERS - 1))); do
+    LISTENER_PORT=$((LISTENER_PORT_BASE + i))
+    HEALTHY=false
+    for attempt in $(seq 1 10); do
+        if curl -sf "http://localhost:${LISTENER_PORT}/health" >/dev/null 2>&1; then
+            ok "Miner $i listener healthy on port $LISTENER_PORT"
+            HEALTHY=true
+            break
+        fi
+        sleep 1
+    done
+    if [ "$HEALTHY" = false ]; then
+        warn "Miner $i listener not responding on port $LISTENER_PORT"
+    fi
+done
 
 # Verify commitments (localnet uses file fallback, testnet uses chain)
 if [ "$USE_TESTNET" = true ]; then
@@ -746,6 +813,11 @@ else
     # wait for the full window to close on localnet.
     export RADAR_SKIP_TRAINING_WAIT=${RADAR_SKIP_TRAINING_WAIT:-true}
 fi
+
+# ── Warm-standby trainer settings ──
+export RADAR_TRAINER_PREPARE_TIMEOUT=${RADAR_TRAINER_PREPARE_TIMEOUT:-60}
+export RADAR_TRAINER_READY_POLL=${RADAR_TRAINER_READY_POLL:-5}
+# RADAR_FALLBACK_PROXY_URL already set in step 4b
 
 if [ "$CPU_ONLY" = true ]; then
     info "CPU-only mode: training will be skipped"
@@ -946,10 +1018,9 @@ except:
 " 2>/dev/null || echo 0)
 check "Pareto front has members ($PARETO_SIZE)" "$([ "$PARETO_SIZE" -gt 0 ] && echo true || echo false)"
 
-# 8.5 Cross-eval (verify arch_owner != trainer_uid in dispatch logs)
-# coordinator.py logs "Job arch=X trainer=Y: status" — check no job has arch==trainer
-SELF_TRAIN=$(grep -cP "Job arch=(\d+) trainer=\1:" "$LOG_DIR/validator0.log" 2>/dev/null) || SELF_TRAIN=0
-check "No self-training detected ($SELF_TRAIN)" "$([ "$SELF_TRAIN" -eq 0 ] && echo true || echo false)"
+# 8.5 Training dispatch (verify jobs were dispatched — self-training is now allowed)
+JOB_COUNT=$(grep -c "Job arch=" "$LOG_DIR/validator0.log" 2>/dev/null) || JOB_COUNT=0
+check "Training jobs dispatched ($JOB_COUNT)" "$([ "$JOB_COUNT" -gt 0 ] && echo true || echo false)"
 
 # 8.6 Validator consistency (both have same experiment count, within tolerance)
 if [ "$NUM_VALIDATORS" -ge 2 ]; then
