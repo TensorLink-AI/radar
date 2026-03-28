@@ -48,6 +48,13 @@ def score_round(
     """
     from shared.database import DataElement
 
+    # Determine primary metric name from objectives
+    primary_metric = "crps"
+    for obj in objectives:
+        if obj.primary:
+            primary_metric = obj.name
+            break
+
     scores: dict[int, float] = {}
     feasible: dict[int, dict] = {}
 
@@ -55,7 +62,7 @@ def score_round(
     for uid, metrics in eval_results.items():
         if not metrics.get("passed_size_gate", False):
             scores[uid] = 0.0
-        elif metrics.get("crps") is None or not math.isfinite(metrics.get("crps", float("inf"))):
+        elif metrics.get(primary_metric) is None or not math.isfinite(metrics.get(primary_metric, float("inf"))):
             scores[uid] = 0.0
         else:
             feasible[uid] = metrics
@@ -68,8 +75,8 @@ def score_round(
         challenge.min_flops_equivalent, challenge.max_flops_equivalent,
     )
 
-    # 3/4. Rank by CRPS (primary metric, lower is better)
-    ranked = sorted(feasible.items(), key=lambda x: x[1].get("crps", float("inf")))
+    # 3/4. Rank by primary metric (lower is better)
+    ranked = sorted(feasible.items(), key=lambda x: x[1].get(primary_metric, float("inf")))
 
     if not feasible_front:
         # Bootstrapping: pure relative ranking
@@ -77,15 +84,15 @@ def score_round(
         for rank, (uid, metrics) in enumerate(ranked):
             scores[uid] = 1.0 - (rank / max(n, 1))
     else:
-        # Rank by improvement beyond frontier best CRPS
-        best_front_crps = min(
-            (c.element.objectives.get("crps", float("inf")) for c in feasible_front),
+        # Rank by improvement beyond frontier best
+        best_front_val = min(
+            (c.element.objectives.get(primary_metric, float("inf")) for c in feasible_front),
             default=float("inf"),
         )
         for uid, metrics in ranked:
-            crps = metrics.get("crps", float("inf"))
-            if best_front_crps > 1e-9:
-                improvement = (best_front_crps - crps) / max(abs(best_front_crps), 1e-8)
+            val = metrics.get(primary_metric, float("inf"))
+            if best_front_val > 1e-9:
+                improvement = (best_front_val - val) / max(abs(best_front_val), 1e-8)
             else:
                 improvement = 0.0
             scores[uid] = _sigmoid(improvement, steepness=20.0)
@@ -97,7 +104,7 @@ def score_round(
                 merged_objectives.setdefault("exec_time", tm.get("training_time_seconds", float("inf")))
                 merged_objectives.setdefault("memory_mb", tm.get("peak_vram_mb", float("inf")))
             temp = DataElement(
-                metric=crps, success=True,
+                metric=val, success=True,
                 objectives=merged_objectives,
             )
             if frontier.count_dominated_by(temp) > 0:

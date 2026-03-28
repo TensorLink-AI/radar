@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -34,8 +35,17 @@ class Challenge:
     scratchpad_put_url: str = ""   # presigned PUT URL for scratchpad.tar.gz
     scratchpad_max_mb: int = 10    # size limit enforced by agent
 
+    # Graph complexity task parameters (None for other tasks)
+    graph_type: Optional[str] = None       # "er" or "ba"
+    graph_nodes: Optional[int] = None      # e.g. 200, 500, 1000, 2000
+    graph_edges: Optional[int] = None      # total edges (nodes * edges_per_node)
+    kappa: Optional[float] = None          # bias parameter [0.0 .. 3.0]
+    modality: Optional[str] = None         # "tokens", "continuous", "waveform", "rms_energy"
+    vocab_size: Optional[int] = None       # 256, 1024, 4096
+    prediction_mode: Optional[str] = None  # "direct" or "teacher_forced"
+
     def to_json(self) -> str:
-        return json.dumps({
+        d = {
             "challenge_id": self.challenge_id,
             "seed": self.seed,
             "round_id": self.round_id,
@@ -49,7 +59,15 @@ class Challenge:
             "scratchpad_get_url": self.scratchpad_get_url,
             "scratchpad_put_url": self.scratchpad_put_url,
             "scratchpad_max_mb": self.scratchpad_max_mb,
-        })
+            "graph_type": self.graph_type,
+            "graph_nodes": self.graph_nodes,
+            "graph_edges": self.graph_edges,
+            "kappa": self.kappa,
+            "modality": self.modality,
+            "vocab_size": self.vocab_size,
+            "prediction_mode": self.prediction_mode,
+        }
+        return json.dumps(d)
 
     @classmethod
     def from_json(cls, s: str) -> Challenge:

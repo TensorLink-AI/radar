@@ -27,6 +27,9 @@ def generate_challenge(block_hash: str, base_task: dict) -> Challenge:
     Picks a random size bucket, derives round_id, eval_split_seed, and seed.
     All validators with the same block_hash produce the same challenge.
 
+    For graph_complexity tasks, also selects graph structure, modality,
+    vocab_size, kappa, and prediction_mode deterministically.
+
     Override bucket with RADAR_MIN_FLOPS / RADAR_MAX_FLOPS env vars (testing).
     """
     seed_int = int(block_hash[:16], 16)
@@ -43,7 +46,7 @@ def generate_challenge(block_hash: str, base_task: dict) -> Challenge:
     if min_override and max_override:
         bucket = (int(min_override), int(max_override))
 
-    return Challenge(
+    challenge = Challenge(
         challenge_id=f"round_{round_id}",
         seed=seed,
         task=base_task,
@@ -52,6 +55,29 @@ def generate_challenge(block_hash: str, base_task: dict) -> Challenge:
         eval_split_seed=eval_split_seed,
         round_id=round_id,
     )
+
+    # Graph complexity parameters — deterministic from the same RNG sequence
+    task_name = base_task.get("name", "")
+    if task_name == "graph_complexity":
+        graph_type = rng.choice(["er", "ba"])
+        graph_nodes = rng.choice([200, 500, 1000, 2000])
+        edges_per_node = rng.choice([5, 10, 20])
+        kappa = rng.choice([0.0, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0])
+        modality = rng.choice(["tokens", "continuous", "waveform", "rms_energy"])
+        vocab_size = rng.choice([256, 1024, 4096])
+        prediction_mode = "teacher_forced" if modality == "tokens" else "direct"
+        if rng.random() < 0.2:
+            prediction_mode = "teacher_forced"
+
+        challenge.graph_type = graph_type
+        challenge.graph_nodes = graph_nodes
+        challenge.graph_edges = graph_nodes * edges_per_node
+        challenge.kappa = kappa
+        challenge.modality = modality
+        challenge.vocab_size = vocab_size
+        challenge.prediction_mode = prediction_mode
+
+    return challenge
 
 
 def round_start_block(current_block: int, interval: int = 275) -> int:

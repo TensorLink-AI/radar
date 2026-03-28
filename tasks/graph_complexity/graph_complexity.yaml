@@ -1,0 +1,145 @@
+name: graph_complexity
+description: >
+  Next-step prediction on random graph walks projected into different
+  modalities. Universal cross-entropy loss normalised by marginal entropy,
+  enabling direct comparison across modalities and complexity levels.
+
+target_file: submission.py
+seed_file: submission.py
+frozen_files:
+  - harness.py
+  - prepare.py
+  - evaluate.py
+  - complexity.py
+
+run_command: "python /workspace/frozen/harness.py {target}"
+eval_command: "python /workspace/frozen/evaluate.py"
+time_budget: 300
+kill_timeout: 600
+
+runner_dir: runner/graph_complexity
+docker_memory: "8g"
+docker_cpus: "2"
+
+objectives:
+  # PRIMARY — the only metric used for Pareto scoring
+  - name: normalised_ce
+    pattern: "normalised_ce:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 1.0
+    primary: true
+    default: .inf
+
+  # SECONDARY — extracted and stored, weight 0.0 so they never affect scoring
+  - name: universal_ce
+    pattern: "universal_ce:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.0
+    default: .inf
+
+  - name: crps
+    pattern: "crps:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.0
+    default: .inf
+
+  - name: mase
+    pattern: "mase:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.0
+    default: .inf
+
+  - name: perplexity
+    pattern: "perplexity:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.0
+    default: .inf
+
+  - name: mse
+    pattern: "mse:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.0
+    default: .inf
+
+  - name: snr
+    pattern: "snr:\\s*([\\d.]+)"
+    lower_is_better: false
+    weight: 0.0
+    default: 0.0
+
+  # PER-HORIZON CE — stored for scaling law analysis, not scored
+  - name: ce_h1
+    pattern: "ce_h1:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.0
+    default: .inf
+
+  - name: ce_h8
+    pattern: "ce_h8:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.0
+    default: .inf
+
+  - name: ce_h16
+    pattern: "ce_h16:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.0
+    default: .inf
+
+  - name: ce_h32
+    pattern: "ce_h32:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.0
+    default: .inf
+
+  - name: ce_h64
+    pattern: "ce_h64:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.0
+    default: .inf
+
+  - name: exec_time
+    pattern: "training_seconds:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.0
+    default: .inf
+
+  - name: memory_mb
+    pattern: "peak_vram_mb:\\s*([\\d.]+)"
+    lower_is_better: true
+    weight: 0.0
+    default: .inf
+
+domain_system_prompt: >
+  You are building a sequence prediction model for random graph walks
+  projected into different modalities (tokens, continuous signals, audio
+  waveforms, energy envelopes). The primary metric is normalised
+  cross-entropy: model CE divided by the marginal token entropy. A score
+  of 1.0 means you're no better than frequency counting; below 1.0 means
+  you've learned transition structure. The graph parameters, modality,
+  vocabulary size, and complexity level rotate each round — your
+  architecture must be robust across all settings.
+
+constraints:
+  - "Model input: (batch, context_len) LongTensor for direct mode; (batch, context_len + prediction_len - 1) for teacher-forced mode"
+  - "Model output: (batch, prediction_len, vocab_size) logits for direct mode; (batch, seq_len, vocab_size) logits for teacher-forced mode (harness extracts last prediction_len positions)"
+  - "prediction_mode rotates per round — architecture must handle both direct and teacher-forced"
+  - "Direct mode: all horizon steps produced in parallel from context only (like PatchTST/Moirai)"
+  - "Teacher-forced mode: each step conditioned on true previous tokens (like GPT)"
+  - "EVALUATION IS ALWAYS TEACHER-FORCED regardless of training mode"
+  - "Domain-specific losses (CRPS, MASE, MSE, SNR) computed automatically from logits — no extra heads needed"
+  - Every experiment runs for a fixed wall-clock time budget
+  - Code must be runnable on a single GPU
+  - Preserve metric output format
+  - Code must be syntactically valid and crash-free
+
+anti_patterns:
+  - Hardcoding for a specific modality or kappa value
+  - Increasing model size without compensating for time budget
+  - Breaking the evaluation protocol
+  - Adding external dependencies not already available
+
+example_hypotheses:
+  - Rotary positional encoding captures periodic graph structure better than sinusoidal
+  - Mixture-of-experts with modality-aware routing improves cross-modality robustness
+  - A shallow wide model trains faster than deep narrow under the time budget
