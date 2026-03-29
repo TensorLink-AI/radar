@@ -100,6 +100,11 @@ class Miner:
 
     async def handle_prepare(self, request: TrainerRequest):
         """Deploy a Basilica GPU pod and POST TrainerReady back to validator."""
+        logger.info(
+            "Received TrainerRequest for round %d (gpu=%dx%s, memory=%s, budget=%ds)",
+            request.round_id, request.gpu_count, request.gpu_model,
+            request.memory, request.time_budget,
+        )
         try:
             from basilica import BasilicaClient
             client = BasilicaClient()
@@ -123,19 +128,35 @@ class Miner:
                 if val:
                     pod_env[key] = val
 
-            deployment = client.create_deployment(
-                instance_name=instance_name,
-                image=self.trainer_image,
-                port=8001,
-                replicas=1,
-                public_metadata=True,
-                ttl_seconds=ttl,
-                gpu_count=request.gpu_count,
-                gpu_models=[request.gpu_model],
-                memory=request.memory,
-                env=pod_env,
+            logger.info(
+                "Deploying Basilica pod %s (image=%s, ttl=%ds, env_keys=%s)",
+                instance_name, self.trainer_image, ttl, list(pod_env.keys()),
             )
-            deployment.wait_until_ready()
+
+            # Run blocking Basilica SDK calls in executor to avoid blocking event loop
+            import functools
+            loop = asyncio.get_event_loop()
+
+            deployment = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    client.create_deployment,
+                    instance_name=instance_name,
+                    image=self.trainer_image,
+                    port=8001,
+                    replicas=1,
+                    public_metadata=True,
+                    ttl_seconds=ttl,
+                    gpu_count=request.gpu_count,
+                    gpu_models=[request.gpu_model],
+                    memory=request.memory,
+                    env=pod_env,
+                ),
+            )
+            logger.info("Basilica deployment created: %s, waiting for ready...", instance_name)
+
+            await loop.run_in_executor(None, deployment.wait_until_ready)
+            logger.info("Basilica pod ready: %s at %s", instance_name, deployment.url)
 
             # POST signed TrainerReady back to validator
             ready = TrainerReady(
@@ -147,12 +168,11 @@ class Miner:
             body = ready.to_json().encode()
             headers = sign_request(self.wallet, body)
             headers["Content-Type"] = "application/json"
+            url = f"{request.validator_db_url}/trainer/ready"
+            logger.info("Posting TrainerReady to %s", url)
             async with httpx.AsyncClient(timeout=30) as http:
-                await http.post(
-                    f"{request.validator_db_url}/trainer/ready",
-                    content=body,
-                    headers=headers,
-                )
+                resp = await http.post(url, content=body, headers=headers)
+                logger.info("TrainerReady response: HTTP %d", resp.status_code)
 
             self.active_deployments[request.round_id] = deployment
             logger.info(
@@ -160,7 +180,7 @@ class Miner:
                 request.round_id, deployment.url, instance_name,
             )
         except Exception as e:
-            logger.error("Failed to deploy trainer for round %d: %s", request.round_id, e)
+            logger.error("Failed to deploy trainer for round %d: %s", request.round_id, e, exc_info=True)
 
     async def handle_release(self, round_id: int):
         """Tear down the Basilica pod for a completed round."""

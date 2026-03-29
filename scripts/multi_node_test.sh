@@ -873,7 +873,12 @@ else
 fi
 
 # ── Warm-standby trainer settings ──
-export RADAR_TRAINER_PREPARE_TIMEOUT=${RADAR_TRAINER_PREPARE_TIMEOUT:-60}
+if [ "$USE_TESTNET" = true ]; then
+    # Testnet with real Basilica: deployments take 2-5 min to pull image + start
+    export RADAR_TRAINER_PREPARE_TIMEOUT=${RADAR_TRAINER_PREPARE_TIMEOUT:-600}
+else
+    export RADAR_TRAINER_PREPARE_TIMEOUT=${RADAR_TRAINER_PREPARE_TIMEOUT:-60}
+fi
 export RADAR_TRAINER_READY_POLL=${RADAR_TRAINER_READY_POLL:-5}
 # RADAR_FALLBACK_PROXY_URL already set in step 4b
 
