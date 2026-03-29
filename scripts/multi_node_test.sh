@@ -578,41 +578,55 @@ LISTENER_PORT_BASE=8090  # miner listener ports
 if [ "$CPU_ONLY" = true ]; then
     info "CPU-only mode: skipping trainer setup"
 elif [ "$USE_BASILICA" = true ]; then
-    # Real Basilica mode: miners will deploy real GPU pods on-demand.
-    # Start one local trainer as a fallback proxy for non-responsive miners.
+    # Real Basilica mode: miners deploy real GPU pods on-demand via Basilica SDK.
+    # Fallback proxy is optional — if RADAR_FALLBACK_PROXY_URL is already set, use it.
+    # Otherwise try to start a local Docker container as fallback.
     info "Basilica mode: miners deploy GPU pods on-demand via Basilica SDK"
-    info "Starting fallback proxy trainer server..."
 
-    FALLBACK_PORT=$((TRAINER_PORT_BASE))
-    FALLBACK_CONTAINER="radar-fallback-trainer-$$"
+    if [ -n "${RADAR_FALLBACK_PROXY_URL:-}" ]; then
+        ok "Using existing fallback proxy: $RADAR_FALLBACK_PROXY_URL"
+    else
+        # Try to start a local fallback container (best-effort, not required)
+        FALLBACK_PORT=$((TRAINER_PORT_BASE))
+        FALLBACK_CONTAINER="radar-fallback-trainer-$$"
 
-    GPU_FLAGS=""
-    if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
-        GPU_FLAGS="--gpus all"
-    fi
-
-    docker run -d --name "$FALLBACK_CONTAINER" \
-        $GPU_FLAGS \
-        -p "${FALLBACK_PORT}:8081" \
-        -e TRAINER_PORT=8081 \
-        -e SUBTENSOR_NETWORK="${NETWORK}" \
-        -e NETUID="${NETUID}" \
-        "$TRAINER_IMAGE" >/dev/null 2>&1
-
-    TRAINER_CONTAINERS+=("$FALLBACK_CONTAINER")
-
-    # Wait for health
-    for attempt in $(seq 1 30); do
-        if curl -sf "http://localhost:${FALLBACK_PORT}/health" >/dev/null 2>&1; then
-            ok "Fallback trainer healthy on port $FALLBACK_PORT"
-            break
+        GPU_FLAGS=""
+        if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+            GPU_FLAGS="--gpus all"
         fi
-        [ "$attempt" = 30 ] && warn "Fallback trainer not responding on port $FALLBACK_PORT"
-        sleep 2
-    done
 
-    export RADAR_FALLBACK_PROXY_URL="http://localhost:${FALLBACK_PORT}"
-    ok "Fallback proxy URL: $RADAR_FALLBACK_PROXY_URL"
+        if docker run -d --name "$FALLBACK_CONTAINER" \
+            $GPU_FLAGS \
+            -p "${FALLBACK_PORT}:8081" \
+            -e TRAINER_PORT=8081 \
+            -e SUBTENSOR_NETWORK="${NETWORK}" \
+            -e NETUID="${NETUID}" \
+            "$TRAINER_IMAGE" >/dev/null 2>&1; then
+
+            TRAINER_CONTAINERS+=("$FALLBACK_CONTAINER")
+
+            # Wait for health
+            HEALTHY=false
+            for attempt in $(seq 1 30); do
+                if curl -sf "http://localhost:${FALLBACK_PORT}/health" >/dev/null 2>&1; then
+                    HEALTHY=true
+                    break
+                fi
+                sleep 2
+            done
+
+            if [ "$HEALTHY" = true ]; then
+                export RADAR_FALLBACK_PROXY_URL="http://localhost:${FALLBACK_PORT}"
+                ok "Fallback proxy started on port $FALLBACK_PORT"
+            else
+                warn "Fallback proxy failed to start — continuing without it"
+                docker rm -f "$FALLBACK_CONTAINER" 2>/dev/null || true
+            fi
+        else
+            warn "Could not start fallback proxy container (image: $TRAINER_IMAGE)"
+            warn "Continuing without fallback — miners must respond to TrainerRequests"
+        fi
+    fi
 else
     # Local Docker mode: start trainer server(s) and mock Basilica SDK
     info "Local mode: starting trainer server(s) + mock Basilica SDK"
