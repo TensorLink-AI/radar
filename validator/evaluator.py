@@ -47,12 +47,6 @@ checkpoint_path = "{checkpoint_path}"
 device = "{device}"
 
 try:
-    # Verify checkpoint exists before attempting to load
-    if not os.path.exists(checkpoint_path):
-        print(json.dumps({{"crps": float("inf"), "mase": float("inf"),
-            "error": f"Checkpoint not found at {{checkpoint_path}} (cwd={{os.getcwd()}}, exists_parent={{os.path.exists(os.path.dirname(checkpoint_path))}})"}}))
-        sys.exit(0)
-
     import importlib.util
     spec = importlib.util.spec_from_file_location("submission", arch_path)
     mod = importlib.util.module_from_spec(spec)
@@ -110,6 +104,12 @@ def evaluate_checkpoint(
     the temp directory.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
+        # Copy checkpoint into subprocess temp dir so it's co-located
+        # and won't be affected by /tmp cleanup or concurrent access
+        import shutil
+        local_ckpt = os.path.join(tmpdir, "checkpoint.safetensors")
+        shutil.copy2(checkpoint_path, local_ckpt)
+
         # Write architecture code
         arch_path = os.path.join(tmpdir, "submission.py")
         with open(arch_path, "w") as f:
@@ -119,7 +119,7 @@ def evaluate_checkpoint(
         runner_path = os.path.join(tmpdir, "run_eval.py")
         runner_code = _EVAL_RUNNER_TEMPLATE.format(
             arch_path=arch_path,
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=local_ckpt,
             eval_split_seed=eval_split_seed,
             device=device,
         )
