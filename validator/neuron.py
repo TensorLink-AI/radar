@@ -118,6 +118,15 @@ class Validator:
             except Exception as e:
                 logger.warning("R2 audit log unavailable: %s", e)
 
+        # GIFT-Eval R2 client (separate bucket for benchmark data)
+        self.gift_r2 = None
+        if self.r2 and Config.GIFT_EVAL_R2_BUCKET:
+            try:
+                from shared.r2_audit import R2AuditLog
+                self.gift_r2 = R2AuditLog(bucket=Config.GIFT_EVAL_R2_BUCKET)
+            except Exception as e:
+                logger.warning("GIFT-Eval R2 unavailable: %s", e)
+
         # Training coordinator
         my_uid = self._my_uid()
         if self.r2:
@@ -472,14 +481,11 @@ class Validator:
                 training_metas.update(fb_metas)
 
         # ── Pre-cache GIFT-Eval data for Phase C ────────────────
-        if self.r2:
+        if self.gift_r2:
             try:
                 from shared.gift_eval import GiftEvalBenchmark
-                from shared.r2_audit import R2AuditLog
-                # GIFT-Eval data lives in a separate R2 bucket
-                gift_r2 = R2AuditLog(bucket=Config.GIFT_EVAL_R2_BUCKET)
                 gift = GiftEvalBenchmark(
-                    r2=gift_r2,
+                    r2=self.gift_r2,
                     cache_dir=Config.GIFT_EVAL_CACHE_DIR,
                     r2_prefix=Config.GIFT_EVAL_R2_PREFIX,
                 )

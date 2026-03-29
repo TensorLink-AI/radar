@@ -137,6 +137,7 @@ async def _execute_training(
 
     os.environ["SEED"] = str(seed)
     os.environ["TIME_BUDGET"] = str(time_budget)
+    os.environ["RADAR_GIFT_EVAL_CACHE"] = _gift_eval_cache_dir
 
     # 4-6. Build model, measure FLOPs, size gate, train
     import random
@@ -380,9 +381,44 @@ async def _execute_training(
     )
 
 
+# ── GIFT-Eval data cache ────────────────────────────────────────────
+_gift_eval_cache_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "/tmp/radar_gift_eval")
+_gift_eval_ready = False
+
+
+def _precache_gift_eval():
+    """Download GIFT-Eval benchmark data from R2 on startup."""
+    global _gift_eval_ready
+    try:
+        gift_bucket = os.environ.get("RADAR_GIFT_EVAL_BUCKET", "gift-eval-benchmark")
+        gift_prefix = os.environ.get("RADAR_GIFT_EVAL_PREFIX", "gift-eval-full")
+        from shared.r2_audit import R2AuditLog
+        from shared.gift_eval import GiftEvalBenchmark, GIFT_EVAL_DATASETS
+        r2 = R2AuditLog(bucket=gift_bucket)
+        gift = GiftEvalBenchmark(r2=r2, cache_dir=_gift_eval_cache_dir, r2_prefix=gift_prefix)
+        downloaded = 0
+        for name in GIFT_EVAL_DATASETS:
+            try:
+                gift.download_dataset(name)
+                downloaded += 1
+            except Exception as e:
+                logger.warning("GIFT-Eval pre-cache failed for %s: %s", name, e)
+        logger.info("GIFT-Eval: pre-cached %d/%d datasets to %s", downloaded, len(GIFT_EVAL_DATASETS), _gift_eval_cache_dir)
+        _gift_eval_ready = downloaded > 0
+    except Exception as e:
+        logger.warning("GIFT-Eval pre-cache unavailable: %s", e)
+
+
+@app.on_event("startup")
+async def startup():
+    """Pre-cache GIFT-Eval data in background on server start."""
+    import threading
+    threading.Thread(target=_precache_gift_eval, daemon=True).start()
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "gift_eval_ready": _gift_eval_ready}
 
 
 def _result(round_id: int, miner_hotkey: str, status: str, **kwargs) -> dict:
