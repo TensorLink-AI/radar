@@ -786,7 +786,7 @@ for i in $(seq 0 $((NUM_MINERS - 1))); do
         --docker_image "$AGENT_IMAGE" \
         --listener_port "$LISTENER_PORT" \
         --trainer_image "$TRAINER_IMAGE" \
-        --axon.external_ip 127.0.0.1 \
+        --external_ip 127.0.0.1 \
         > "$MINER_LOG" 2>&1 &
     PIDS+=($!)
     ok "Miner $i started (PID $!) — $AGENT_IMAGE — listener: port $LISTENER_PORT — log: $MINER_LOG"

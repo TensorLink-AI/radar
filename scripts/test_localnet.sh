@@ -599,7 +599,7 @@ python3 miner/neuron.py \
     --docker_image systematic:latest \
     --listener_port "$LISTENER_PORT" \
     --trainer_image "$OFFICIAL_TRAINING_IMAGE" \
-    --axon.external_ip 127.0.0.1 \
+    --external_ip 127.0.0.1 \
     > /tmp/radar_miner.log 2>&1 &
 MINER_PID=$!
 PIDS+=("$MINER_PID")

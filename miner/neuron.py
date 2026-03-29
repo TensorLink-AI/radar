@@ -65,6 +65,7 @@ class Miner:
 
         # Listener port for warm-standby HTTP server
         self.listener_port = int(getattr(config, "listener_port", 8090))
+        self.external_ip = getattr(config, "external_ip", "") or "0.0.0.0"
 
         # Active Basilica deployments: round_id → deployment object
         self.active_deployments: dict[int, object] = {}
@@ -82,7 +83,7 @@ class Miner:
             image_url=self.docker_image,
             image_digest=digest,
             subnet_version="0.3.0",
-            listener_url=f"http://0.0.0.0:{self.listener_port}",
+            listener_url=f"http://{self.external_ip}:{self.listener_port}",
             trainer_image=self.trainer_image,
         )
 
@@ -262,6 +263,8 @@ def get_config() -> bt.Config:
     parser.add_argument("--trainer_image", type=str,
                         default=Config.OFFICIAL_TRAINING_IMAGE,
                         help="Trainer Docker image deployed on Basilica on-demand")
+    parser.add_argument("--external_ip", type=str, default="",
+                        help="External IP for listener URL committed to chain")
     bt.Wallet.add_args(parser)
     bt.Subtensor.add_args(parser)
     return bt.Config(parser)
