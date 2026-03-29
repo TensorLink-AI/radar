@@ -244,6 +244,11 @@ async def evaluate_all_checkpoints(
             continue
 
         if not artifacts.architecture_code:
+            logger.warning("UID %d: architecture code missing from R2 — skipping eval", uid)
+            results[uid] = {
+                "crps": float("inf"), "mase": float("inf"),
+                "error": "architecture code not found in R2",
+            }
             continue
 
         # Re-verify checkpoint hash immediately before eval (TOCTOU defense)

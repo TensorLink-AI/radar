@@ -335,10 +335,11 @@ async def _execute_training(
         peak_vram_mb=peak_vram,
     )
 
+    upload_ok = True
     try:
         if upload_urls:
             from shared.artifacts import upload_training_artifacts_presigned
-            upload_training_artifacts_presigned(
+            upload_ok = upload_training_artifacts_presigned(
                 presigned_urls=upload_urls,
                 checkpoint_path=checkpoint_path,
                 architecture_code=architecture_code,
@@ -349,7 +350,7 @@ async def _execute_training(
             # Localnet fallback: use direct R2 credentials
             from shared.artifacts import upload_training_artifacts
             r2 = _get_r2()
-            upload_training_artifacts(
+            upload_ok = upload_training_artifacts(
                 r2=r2,
                 round_id=round_id,
                 miner_hotkey=miner_hotkey,
@@ -360,10 +361,17 @@ async def _execute_training(
             )
     except Exception as e:
         logger.error("R2 upload failed: %s", e)
+        upload_ok = False
 
     # 9. Return training metadata
+    upload_status = "success" if upload_ok else "upload_failed"
+    if not upload_ok:
+        logger.error(
+            "Artifact upload incomplete for round %d miner %s — returning upload_failed",
+            round_id, miner_hotkey,
+        )
     return _result(
-        round_id, miner_hotkey, "success",
+        round_id, miner_hotkey, upload_status,
         flops_equivalent_size=flops_equiv,
         training_time_seconds=training_time,
         num_steps=step,
