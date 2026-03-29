@@ -475,8 +475,11 @@ class Validator:
         if self.r2:
             try:
                 from shared.gift_eval import GiftEvalBenchmark
+                from shared.r2_audit import R2AuditLog
+                # GIFT-Eval data lives in a separate R2 bucket
+                gift_r2 = R2AuditLog(bucket=Config.GIFT_EVAL_R2_BUCKET)
                 gift = GiftEvalBenchmark(
-                    r2=self.r2,
+                    r2=gift_r2,
                     cache_dir=Config.GIFT_EVAL_CACHE_DIR,
                     r2_prefix=Config.GIFT_EVAL_R2_PREFIX,
                 )

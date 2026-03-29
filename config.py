@@ -86,7 +86,8 @@ class Config:
     QUERY_RATE_LIMIT: int = int(os.getenv("RADAR_QUERY_RATE_LIMIT", "10"))
 
     # ── GIFT-Eval Benchmark Data ─────────────────────────────────
-    GIFT_EVAL_R2_PREFIX: str = os.getenv("RADAR_GIFT_EVAL_PREFIX", "gift-eval-benchmark/gift-eval-full")
+    GIFT_EVAL_R2_BUCKET: str = os.getenv("RADAR_GIFT_EVAL_BUCKET", "gift-eval-benchmark")
+    GIFT_EVAL_R2_PREFIX: str = os.getenv("RADAR_GIFT_EVAL_PREFIX", "gift-eval-full")
     GIFT_EVAL_CACHE_DIR: str = os.getenv("RADAR_GIFT_EVAL_CACHE", "/tmp/radar_gift_eval")
     GIFT_EVAL_DATASETS_PER_ROUND: int = int(os.getenv("RADAR_GIFT_EVAL_DATASETS", "0"))  # 0 = all datasets
     GIFT_EVAL_MAX_SERIES_PER_DATASET: int = int(os.getenv("RADAR_GIFT_EVAL_MAX_SERIES", "500"))
