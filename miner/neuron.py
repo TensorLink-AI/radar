@@ -123,6 +123,7 @@ class Miner:
 
         ttl = int(request.time_budget * Config.TRAINER_RELEASE_SAFETY_MARGIN)
         hotkey = self.wallet.hotkey.ss58_address
+        instance_name = f"radar-trainer-r{request.round_id}-{hotkey[:8]}"
 
         try:
             # Build env vars for the trainer pod
@@ -134,8 +135,8 @@ class Miner:
                     pod_env[key] = val
 
             logger.info(
-                "Deploying Basilica pod (image=%s, ttl=%ds, gpu=%dx%s)",
-                self.trainer_image, ttl, request.gpu_count, request.gpu_model,
+                "Deploying Basilica pod %s (image=%s, ttl=%ds, gpu=%dx%s)",
+                instance_name, self.trainer_image, ttl, request.gpu_count, request.gpu_model,
             )
 
             # Run blocking Basilica SDK calls in executor to avoid blocking event loop
@@ -146,6 +147,7 @@ class Miner:
                 None,
                 functools.partial(
                     client.create_deployment,
+                    instance_name=instance_name,
                     image=self.trainer_image,
                     port=8001,
                     replicas=1,
@@ -158,18 +160,10 @@ class Miner:
                 ),
             )
 
-            # Basilica generates the deployment name — capture it
-            deploy_name = (
-                getattr(deployment, 'instance_name', None)
-                or getattr(deployment, 'name', None)
-                or getattr(deployment, 'id', None)
-                or "unknown"
-            )
             trainer_url = deployment.url
             logger.info(
-                "Basilica deployment created: name=%s url=%s (attrs: %s)",
-                deploy_name, trainer_url,
-                [a for a in dir(deployment) if not a.startswith('_')],
+                "Basilica deployment created: name=%s url=%s",
+                instance_name, trainer_url,
             )
 
             # Wait for pod to become reachable via health check
@@ -185,21 +179,21 @@ class Miner:
                 except Exception:
                     pass
                 if _poll % 6 == 0:
-                    logger.info("Health poll #%d for %s — not ready yet", _poll, deploy_name)
+                    logger.info("Health poll #%d for %s — not ready yet", _poll, instance_name)
                 await asyncio.sleep(5)
 
             if not pod_ready:
-                logger.error("Basilica pod %s not reachable after 5 min at %s", deploy_name, trainer_url)
+                logger.error("Basilica pod %s not reachable after 5 min at %s", instance_name, trainer_url)
                 self.active_deployments.pop(request.round_id, None)
                 return
 
-            logger.info("Basilica pod ready: %s at %s", deploy_name, trainer_url)
+            logger.info("Basilica pod ready: %s at %s", instance_name, trainer_url)
 
             # POST signed TrainerReady back to validator
             ready = TrainerReady(
                 round_id=request.round_id,
                 trainer_url=trainer_url,
-                instance_name=deploy_name,
+                instance_name=instance_name,
                 miner_hotkey=hotkey,
             )
             body = ready.to_json().encode()
@@ -223,19 +217,16 @@ class Miner:
         """Tear down the Basilica pod for a completed round."""
         deployment = self.active_deployments.pop(round_id, None)
         if deployment:
-            deploy_name = (
-                getattr(deployment, 'instance_name', None)
-                or getattr(deployment, 'name', None)
-                or getattr(deployment, 'id', None)
-            )
-            if deploy_name and deployment != "pending":
+            if deployment and deployment != "pending":
                 try:
                     from basilica import BasilicaClient
                     client = BasilicaClient()
-                    client.delete_deployment(deploy_name)
-                    logger.info("Released trainer for round %d (deployment=%s)", round_id, deploy_name)
+                    name = getattr(deployment, 'instance_name', None) or getattr(deployment, 'name', None)
+                    if name:
+                        client.delete_deployment(name)
+                        logger.info("Released trainer for round %d (deployment=%s)", round_id, name)
                 except Exception as e:
-                    logger.debug("Teardown failed for %s: %s (TTL will clean up)", deploy_name, e)
+                    logger.debug("Teardown failed: %s (TTL will clean up)", e)
 
     def _setup_listener_routes(self):
         """Register listener endpoints on the FastAPI app."""
