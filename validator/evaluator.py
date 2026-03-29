@@ -47,6 +47,12 @@ checkpoint_path = "{checkpoint_path}"
 device = "{device}"
 
 try:
+    # Verify checkpoint exists before attempting to load
+    if not os.path.exists(checkpoint_path):
+        print(json.dumps({{"crps": float("inf"), "mase": float("inf"),
+            "error": f"Checkpoint not found at {{checkpoint_path}} (cwd={{os.getcwd()}}, exists_parent={{os.path.exists(os.path.dirname(checkpoint_path))}})"}}))
+        sys.exit(0)
+
     import importlib.util
     spec = importlib.util.spec_from_file_location("submission", arch_path)
     mod = importlib.util.module_from_spec(spec)
@@ -264,6 +270,22 @@ async def evaluate_all_checkpoints(
                 continue
 
         # Evaluate
+        if not os.path.exists(artifacts.checkpoint_path):
+            logger.error(
+                "UID %d: checkpoint file missing before eval: %s",
+                uid, artifacts.checkpoint_path,
+            )
+            results[uid] = {
+                "crps": float("inf"), "mase": float("inf"),
+                "error": f"checkpoint file missing: {artifacts.checkpoint_path}",
+            }
+            continue
+
+        logger.info(
+            "UID %d: starting eval (checkpoint=%.2fMB arch=%d bytes)",
+            uid, os.path.getsize(artifacts.checkpoint_path) / (1024 * 1024),
+            len(artifacts.architecture_code),
+        )
         metrics = evaluate_checkpoint(
             artifacts.architecture_code, artifacts.checkpoint_path,
             eval_split_seed=challenge.eval_split_seed,
