@@ -9,6 +9,7 @@ The miner has two components:
 import argparse
 import asyncio
 import logging
+import os
 import subprocess
 
 import bittensor as bt
@@ -110,6 +111,17 @@ class Miner:
         instance_name = f"radar-trainer-r{request.round_id}-{hotkey[:8]}"
 
         try:
+            # Build env vars for the trainer pod
+            pod_env = {}
+            for key in (
+                "R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
+                "R2_BUCKET", "RADAR_GIFT_EVAL_BUCKET", "RADAR_GIFT_EVAL_PREFIX",
+                "RADAR_GIFT_EVAL_CACHE", "SUBTENSOR_NETWORK", "NETUID",
+            ):
+                val = os.environ.get(key, "")
+                if val:
+                    pod_env[key] = val
+
             deployment = client.create_deployment(
                 instance_name=instance_name,
                 image=self.trainer_image,
@@ -120,6 +132,7 @@ class Miner:
                 gpu_count=request.gpu_count,
                 gpu_models=[request.gpu_model],
                 memory=request.memory,
+                env=pod_env,
             )
             deployment.wait_until_ready()
 
