@@ -205,6 +205,17 @@ class TrainingCoordinator:
                 self.r2, challenge.round_id, miner_hotkey, ttl=presigned_ttl,
             )
 
+            if not upload_urls.get("architecture"):
+                logger.error(
+                    "Missing architecture presigned URL for arch_owner=%d miner=%s",
+                    job.arch_owner, miner_hotkey[:16],
+                )
+            else:
+                logger.info(
+                    "Generated %d presigned URLs for arch_owner=%d: %s",
+                    len(upload_urls), job.arch_owner, list(upload_urls.keys()),
+                )
+
             payload = json.dumps({
                 "architecture": proposal.code,
                 "seed": challenge.seed,

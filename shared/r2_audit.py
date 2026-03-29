@@ -31,12 +31,21 @@ class R2AuditLog:
         access_key_id = access_key_id or os.getenv("R2_ACCESS_KEY_ID", "")
         secret_access_key = secret_access_key or os.getenv("R2_SECRET_ACCESS_KEY", "")
 
+        # Allow overriding the endpoint for testing (e.g. local mock S3 server)
+        endpoint_override = os.getenv("MOCK_R2_ENDPOINT", "")
+        if endpoint_override:
+            endpoint_url = endpoint_override
+        elif account_id:
+            endpoint_url = f"https://{account_id}.r2.cloudflarestorage.com"
+        else:
+            endpoint_url = None
+
         import boto3
         from botocore.config import Config as BotoConfig
 
         self._s3 = boto3.client(
             "s3",
-            endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com" if account_id else None,
+            endpoint_url=endpoint_url,
             aws_access_key_id=access_key_id,
             aws_secret_access_key=secret_access_key,
             config=BotoConfig(signature_version="s3v4"),

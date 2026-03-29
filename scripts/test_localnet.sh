@@ -417,6 +417,53 @@ fi
 echo ""
 
 # =============================================================================
+# STEP 6b: Start mock R2 server (local S3-compatible storage)
+# =============================================================================
+echo "-----------------------------------------"
+info "Step 6b: Starting mock R2 server for artifact storage..."
+echo "-----------------------------------------"
+
+MOCK_R2_PORT=9000
+MOCK_R2_STORAGE=$(mktemp -d)
+R2_BUCKET="radar-test"
+
+# Kill anything on this port
+if command -v fuser &>/dev/null; then
+    fuser -k "${MOCK_R2_PORT}/tcp" 2>/dev/null || true
+elif command -v lsof &>/dev/null; then
+    lsof -ti :"$MOCK_R2_PORT" 2>/dev/null | xargs -r kill 2>/dev/null || true
+fi
+
+PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}" python3 "$PROJECT_DIR/scripts/mock_r2_server.py" \
+    --port "$MOCK_R2_PORT" \
+    --storage "$MOCK_R2_STORAGE" \
+    > /tmp/radar_mock_r2.log 2>&1 &
+MOCK_R2_PID=$!
+PIDS+=("$MOCK_R2_PID")
+
+# Wait for mock R2 to be ready
+for attempt in $(seq 1 10); do
+    if curl -sf "http://127.0.0.1:${MOCK_R2_PORT}/" >/dev/null 2>&1; then
+        ok "Mock R2 server ready on port $MOCK_R2_PORT (storage: $MOCK_R2_STORAGE)"
+        break
+    fi
+    [ "$attempt" = 10 ] && { fail "Mock R2 server not responding"; exit 1; }
+    sleep 1
+done
+
+# Configure R2 credentials — these are accepted by the mock server (no auth check)
+export MOCK_R2_ENDPOINT="http://127.0.0.1:${MOCK_R2_PORT}"
+export R2_ACCOUNT_ID="local"
+export R2_ACCESS_KEY_ID="test"
+export R2_SECRET_ACCESS_KEY="test"
+export R2_BUCKET="$R2_BUCKET"
+
+# Create the bucket directory so ListObjects works
+mkdir -p "$MOCK_R2_STORAGE/$R2_BUCKET"
+ok "R2 configured: endpoint=$MOCK_R2_ENDPOINT bucket=$R2_BUCKET"
+echo ""
+
+# =============================================================================
 # STEP 7a: Start local trainer server + mock Basilica SDK
 # =============================================================================
 echo "-----------------------------------------"
@@ -779,4 +826,6 @@ echo "Logs:"
 echo "  Validator: /tmp/radar_validator.log"
 echo "  Miner:     /tmp/radar_miner.log  (includes listener on port $LISTENER_PORT)"
 echo "  Trainer:   /tmp/radar_trainer.log (local trainer server on port $TRAINER_PORT)"
+echo "  Mock R2:   /tmp/radar_mock_r2.log (S3-compatible storage on port $MOCK_R2_PORT)"
+echo "  R2 files:  $MOCK_R2_STORAGE/$R2_BUCKET/"
 echo ""

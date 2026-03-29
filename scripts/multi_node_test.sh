@@ -515,6 +515,50 @@ ok "All neurons registered"
 # =============================================================================
 # STEP 4b: Set up trainer infrastructure (warm-standby model)
 # =============================================================================
+# =============================================================================
+# STEP 4a.5: Start mock R2 server (local S3-compatible storage for artifacts)
+# =============================================================================
+step "Step 4a.5: Mock R2 server (artifact storage)"
+
+if [ -z "${R2_BUCKET:-}" ]; then
+    # No real R2 configured — start a local mock
+    MOCK_R2_PORT=9000
+    MOCK_R2_STORAGE="$LOG_DIR/mock_r2"
+    mkdir -p "$MOCK_R2_STORAGE"
+
+    R2_BUCKET="radar-test"
+
+    if command -v fuser &>/dev/null; then
+        fuser -k "${MOCK_R2_PORT}/tcp" 2>/dev/null || true
+    fi
+
+    PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}" python3 "$PROJECT_DIR/scripts/mock_r2_server.py" \
+        --port "$MOCK_R2_PORT" \
+        --storage "$MOCK_R2_STORAGE" \
+        > "$LOG_DIR/mock_r2.log" 2>&1 &
+    PIDS+=($!)
+
+    for attempt in $(seq 1 10); do
+        if curl -sf "http://127.0.0.1:${MOCK_R2_PORT}/" >/dev/null 2>&1; then
+            break
+        fi
+        [ "$attempt" = 10 ] && { fail "Mock R2 server not responding"; exit 1; }
+        sleep 1
+    done
+
+    mkdir -p "$MOCK_R2_STORAGE/$R2_BUCKET"
+
+    export MOCK_R2_ENDPOINT="http://127.0.0.1:${MOCK_R2_PORT}"
+    export R2_ACCOUNT_ID="local"
+    export R2_ACCESS_KEY_ID="test"
+    export R2_SECRET_ACCESS_KEY="test"
+    export R2_BUCKET="$R2_BUCKET"
+
+    ok "Mock R2 server on port $MOCK_R2_PORT (storage: $MOCK_R2_STORAGE/$R2_BUCKET/)"
+else
+    ok "Using real R2 (bucket: $R2_BUCKET)"
+fi
+
 step "Step 4b: Setting up trainer infrastructure for Phase B (warm-standby)"
 
 # In the warm-standby model, miners don't pre-deploy GPU pods. Instead:
