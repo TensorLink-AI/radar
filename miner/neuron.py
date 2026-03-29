@@ -159,53 +159,43 @@ class Miner:
                     env=pod_env,
                 ),
             )
-            logger.info("Basilica deployment created: %s, waiting for ready...", instance_name)
+            trainer_url = deployment.url
+            logger.info(
+                "Basilica deployment created: %s at %s (attrs: %s)",
+                instance_name, trainer_url,
+                [a for a in dir(deployment) if not a.startswith('_')],
+            )
 
-            # Poll deployment status until ready
-            logger.info("Starting readiness poll for %s (60 iterations, 5s each)", instance_name)
-            for _poll in range(60):
+            # Wait for pod to become reachable via health check
+            logger.info("Waiting for %s to become reachable...", trainer_url)
+            pod_ready = False
+            for _poll in range(60):  # 5 min max
                 try:
-                    meta = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            None,
-                            functools.partial(
-                                client.get_public_deployment_metadata, instance_name,
-                            ),
-                        ),
+                    resp = await asyncio.wait_for(
+                        httpx.AsyncClient().get(f"{trainer_url.rstrip('/')}/health"),
                         timeout=10,
                     )
-                    state = getattr(meta, 'state', 'unknown')
-                    replicas = getattr(meta, 'replicas', None)
-                    if _poll % 6 == 0:  # Log every 30s
-                        logger.info(
-                            "Polling %s: state=%s replicas=%s (type=%s)",
-                            instance_name, state, replicas, type(replicas).__name__,
-                        )
-                    if state in ('running', 'active'):
-                        # Check replicas - could be an object with .ready or a plain int
-                        ready_count = getattr(replicas, 'ready', None)
-                        if ready_count is None and isinstance(replicas, int):
-                            ready_count = replicas
-                        if ready_count and ready_count >= 1:
-                            break
-                except asyncio.TimeoutError:
-                    if _poll % 6 == 0:
-                        logger.warning("Poll timeout for %s (get_public_deployment_metadata hung)", instance_name)
-                except Exception as e:
-                    if _poll % 6 == 0:
-                        logger.warning("Poll error for %s: %s", instance_name, e)
+                    if resp.status_code == 200:
+                        pod_ready = True
+                        break
+                except Exception:
+                    pass
+                if _poll % 6 == 0:
+                    logger.info("Health poll #%d for %s — not ready yet", _poll, instance_name)
                 await asyncio.sleep(5)
-            else:
-                logger.error("Basilica pod %s did not become ready in 5 min", instance_name)
+
+            if not pod_ready:
+                logger.error("Basilica pod %s not reachable after 5 min at %s", instance_name, trainer_url)
+                self.active_deployments.pop(request.round_id, None)
                 return
 
-            logger.info("Basilica pod ready: %s at %s", instance_name, deployment.url)
+            logger.info("Basilica pod ready: %s at %s", instance_name, trainer_url)
 
             # POST signed TrainerReady back to validator
             ready = TrainerReady(
                 round_id=request.round_id,
                 trainer_url=deployment.url,
-                instance_name=deployment.instance_name,
+                instance_name=instance_name,
                 miner_hotkey=hotkey,
             )
             body = ready.to_json().encode()
