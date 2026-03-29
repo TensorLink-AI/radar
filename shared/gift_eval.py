@@ -89,9 +89,11 @@ FREQ_TO_PRED_LEN = {
 
 
 def select_datasets(eval_split_seed: int, n: int) -> list[str]:
-    """Deterministic selection of N datasets for a round."""
+    """Deterministic selection of N datasets for a round. 0 = all."""
+    if n <= 0 or n >= len(GIFT_EVAL_DATASETS):
+        return list(GIFT_EVAL_DATASETS)
     rng = random.Random(eval_split_seed)
-    chosen = rng.sample(GIFT_EVAL_DATASETS, min(n, len(GIFT_EVAL_DATASETS)))
+    chosen = rng.sample(GIFT_EVAL_DATASETS, n)
     return sorted(chosen)
 
 
