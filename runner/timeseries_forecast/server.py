@@ -111,6 +111,11 @@ async def train(request: Request):
     miner_hotkey = data.get("miner_hotkey", "unknown")
     time_budget = data.get("time_budget", 300)
     upload_urls = data.get("upload_urls", {})
+    gift_eval_urls = data.get("gift_eval_urls", {})
+
+    # Download GIFT-Eval data from presigned URLs if provided
+    if gift_eval_urls:
+        _download_gift_eval_from_urls(gift_eval_urls)
 
     if not architecture_code:
         return JSONResponse(status_code=400, content={"error": "Missing architecture code"})
@@ -386,34 +391,34 @@ _gift_eval_cache_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "/tmp/radar_gift_
 _gift_eval_ready = False
 
 
-def _precache_gift_eval():
-    """Download GIFT-Eval benchmark data from R2 on startup."""
+def _download_gift_eval_from_urls(urls: dict[str, str]):
+    """Download GIFT-Eval data from presigned GET URLs.
+
+    Called per-dispatch with URLs from the validator. No R2 creds needed.
+    Skips datasets already cached locally.
+    """
     global _gift_eval_ready
-    try:
-        gift_bucket = os.environ.get("RADAR_GIFT_EVAL_BUCKET", "gift-eval-benchmark")
-        gift_prefix = os.environ.get("RADAR_GIFT_EVAL_PREFIX", "gift-eval-full")
-        from shared.r2_audit import R2AuditLog
-        from shared.gift_eval import GiftEvalBenchmark, GIFT_EVAL_DATASETS
-        r2 = R2AuditLog(bucket=gift_bucket)
-        gift = GiftEvalBenchmark(r2=r2, cache_dir=_gift_eval_cache_dir, r2_prefix=gift_prefix)
-        downloaded = 0
-        for name in GIFT_EVAL_DATASETS:
-            try:
-                gift.download_dataset(name)
-                downloaded += 1
-            except Exception as e:
-                logger.warning("GIFT-Eval pre-cache failed for %s: %s", name, e)
-        logger.info("GIFT-Eval: pre-cached %d/%d datasets to %s", downloaded, len(GIFT_EVAL_DATASETS), _gift_eval_cache_dir)
-        _gift_eval_ready = downloaded > 0
-    except Exception as e:
-        logger.warning("GIFT-Eval pre-cache unavailable: %s", e)
+    import httpx
+    from pathlib import Path
 
-
-@app.on_event("startup")
-async def startup():
-    """Pre-cache GIFT-Eval data in background on server start."""
-    import threading
-    threading.Thread(target=_precache_gift_eval, daemon=True).start()
+    cache = Path(_gift_eval_cache_dir)
+    downloaded = 0
+    for name, url in urls.items():
+        local_dir = cache / name
+        local_path = local_dir / "data-00000-of-00001.arrow"
+        if local_path.exists() and local_path.stat().st_size > 0:
+            continue
+        try:
+            local_dir.mkdir(parents=True, exist_ok=True)
+            resp = httpx.get(url, timeout=120)
+            resp.raise_for_status()
+            local_path.write_bytes(resp.content)
+            downloaded += 1
+        except Exception as e:
+            logger.warning("Failed to download GIFT-Eval %s: %s", name, e)
+    if downloaded:
+        logger.info("Downloaded %d GIFT-Eval datasets from presigned URLs", downloaded)
+    _gift_eval_ready = True
 
 
 @app.get("/health")

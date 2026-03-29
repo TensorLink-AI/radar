@@ -141,6 +141,23 @@ class GiftEvalBenchmark:
         logger.info("Downloaded %s from %s (%d bytes)", dataset_name, r2_key, size)
         return local_path
 
+    def generate_presigned_get_urls(self, ttl: int = 5400) -> dict[str, str]:
+        """Generate presigned GET URLs for all datasets.
+
+        Returns {dataset_key: presigned_url} for passing to trainer pods
+        so they can download GIFT-Eval data without R2 credentials.
+        """
+        if self.r2 is None:
+            return {}
+        urls = {}
+        for name, subpath in GIFT_EVAL_MANIFEST.items():
+            r2_key = f"{self.r2_prefix}/{subpath}/data-00000-of-00001.arrow"
+            url = self.r2.generate_presigned_get_url(r2_key, ttl=ttl)
+            if url:
+                urls[name] = url
+        logger.info("Generated %d presigned GET URLs for GIFT-Eval data", len(urls))
+        return urls
+
 
 def load_dataset(
     dataset_name: str,

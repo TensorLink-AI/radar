@@ -127,12 +127,9 @@ class Miner:
 
         try:
             # Build env vars for the trainer pod
+            # No R2 credentials — trainer uses presigned URLs for uploads
             pod_env = {}
-            for key in (
-                "R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
-                "R2_BUCKET", "RADAR_GIFT_EVAL_BUCKET", "RADAR_GIFT_EVAL_PREFIX",
-                "RADAR_GIFT_EVAL_CACHE", "SUBTENSOR_NETWORK", "NETUID",
-            ):
+            for key in ("SUBTENSOR_NETWORK", "NETUID"):
                 val = os.environ.get(key, "")
                 if val:
                     pod_env[key] = val
@@ -164,7 +161,7 @@ class Miner:
             )
             logger.info("Basilica deployment created: %s, waiting for ready...", instance_name)
 
-            # Poll deployment status until ready (SDK doesn't have wait_until_ready)
+            # Poll deployment status until ready
             for _poll in range(60):
                 try:
                     meta = await loop.run_in_executor(
@@ -173,15 +170,23 @@ class Miner:
                             client.get_public_deployment_metadata, instance_name,
                         ),
                     )
-                    if getattr(meta, 'state', '') in ('running', 'active'):
-                        ready_count = getattr(getattr(meta, 'replicas', None), 'ready', 0)
-                        if isinstance(ready_count, int) and ready_count >= 1:
+                    state = getattr(meta, 'state', 'unknown')
+                    replicas = getattr(meta, 'replicas', None)
+                    if _poll % 6 == 0:  # Log every 30s
+                        logger.info(
+                            "Polling %s: state=%s replicas=%s (type=%s)",
+                            instance_name, state, replicas, type(replicas).__name__,
+                        )
+                    if state in ('running', 'active'):
+                        # Check replicas - could be an object with .ready or a plain int
+                        ready_count = getattr(replicas, 'ready', None)
+                        if ready_count is None and isinstance(replicas, int):
+                            ready_count = replicas
+                        if ready_count and ready_count >= 1:
                             break
-                        # Fallback: replicas might be an int directly
-                        if isinstance(getattr(meta, 'replicas', None), int) and meta.replicas >= 1:
-                            break
-                except Exception:
-                    pass
+                except Exception as e:
+                    if _poll % 6 == 0:
+                        logger.warning("Poll error for %s: %s", instance_name, e)
                 await asyncio.sleep(5)
             else:
                 logger.error("Basilica pod %s did not become ready in 5 min", instance_name)

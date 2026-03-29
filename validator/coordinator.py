@@ -153,6 +153,7 @@ class TrainingCoordinator:
         submissions: dict[int, Proposal],
         trainer_endpoints: dict[int, str],
         commitments: dict[int, "ImageCommitment"] | None = None,
+        gift_eval_urls: dict[str, str] | None = None,
     ) -> list[TrainingResult]:
         """POST to trainer endpoints with Epistula-signed payload.
 
@@ -161,6 +162,7 @@ class TrainingCoordinator:
         is trusted subnet-owner infrastructure.
         """
         commitments = commitments or {}
+        gift_eval_urls = gift_eval_urls or {}
         logger.info("Dispatching %d jobs to %d trainer endpoints", len(jobs), len(trainer_endpoints))
 
         # Per-job timeout: time_budget + 120s buffer for startup/upload overhead
@@ -216,7 +218,7 @@ class TrainingCoordinator:
                     len(upload_urls), job.arch_owner, list(upload_urls.keys()),
                 )
 
-            payload = json.dumps({
+            dispatch_payload = {
                 "architecture": proposal.code,
                 "seed": challenge.seed,
                 "round_id": challenge.round_id,
@@ -225,7 +227,10 @@ class TrainingCoordinator:
                 "miner_hotkey": miner_hotkey,
                 "time_budget": time_budget,
                 "upload_urls": upload_urls,
-            }).encode()
+            }
+            if gift_eval_urls:
+                dispatch_payload["gift_eval_urls"] = gift_eval_urls
+            payload = json.dumps(dispatch_payload).encode()
 
             headers = sign_request(self.wallet, payload)
             headers["Content-Type"] = "application/json"

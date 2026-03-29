@@ -388,9 +388,24 @@ class Validator:
                 "or trainer pods failed to deploy. Training will fail for all jobs."
             )
 
+        # Generate presigned GET URLs for GIFT-Eval data so trainer pods
+        # can download benchmark data without R2 credentials
+        gift_eval_urls = {}
+        if self.gift_r2:
+            try:
+                from shared.gift_eval import GiftEvalBenchmark
+                gift = GiftEvalBenchmark(
+                    r2=self.gift_r2,
+                    r2_prefix=Config.GIFT_EVAL_R2_PREFIX,
+                )
+                gift_eval_urls = gift.generate_presigned_get_urls()
+            except Exception as e:
+                logger.warning("Failed to generate GIFT-Eval presigned URLs: %s", e)
+
         my_results = await self.coordinator.dispatch_jobs(
             my_jobs, challenge, filtered, trainer_endpoints,
             commitments=commitments,
+            gift_eval_urls=gift_eval_urls,
         )
         succeeded = sum(1 for r in my_results if r.status == "success")
         failed = sum(1 for r in my_results if r.status != "success")
