@@ -294,15 +294,18 @@ class Validator:
         # ── PREPARE TRAINERS (warm-standby) ──────────────────
         # Fire TrainerRequests to ALL miners with listener_urls.
         # They deploy Basilica pods during Phase A while agents run in parallel.
+        # Run both concurrently — miners deploy GPU pods while agents design architectures.
         if self.coordinator:
-            dynamic_endpoints = await self.coordinator.prepare_trainers(
+            prepare_coro = self.coordinator.prepare_trainers(
                 challenge, commitments,
                 db_url=f"http://localhost:{self.db_port}",
             )
         else:
-            dynamic_endpoints = {}
+            async def _no_endpoints():
+                return {}
+            prepare_coro = _no_endpoints()
 
-        submissions, agent_logs = await run_and_collect_agents(
+        collect_coro = run_and_collect_agents(
             wallet=self.wallet,
             metagraph=self.metagraph,
             challenge_json=challenge.to_json(),
@@ -313,6 +316,10 @@ class Validator:
             validator_uids=validator_uids,
             commitments=commitments,
             get_my_assignments_fn=get_my_assignments,
+        )
+
+        dynamic_endpoints, (submissions, agent_logs) = await asyncio.gather(
+            prepare_coro, collect_coro,
         )
 
         # Pre-filter: syntax check
