@@ -162,13 +162,17 @@ class Miner:
             logger.info("Basilica deployment created: %s, waiting for ready...", instance_name)
 
             # Poll deployment status until ready
+            logger.info("Starting readiness poll for %s (60 iterations, 5s each)", instance_name)
             for _poll in range(60):
                 try:
-                    meta = await loop.run_in_executor(
-                        None,
-                        functools.partial(
-                            client.get_public_deployment_metadata, instance_name,
+                    meta = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            functools.partial(
+                                client.get_public_deployment_metadata, instance_name,
+                            ),
                         ),
+                        timeout=10,
                     )
                     state = getattr(meta, 'state', 'unknown')
                     replicas = getattr(meta, 'replicas', None)
@@ -184,6 +188,9 @@ class Miner:
                             ready_count = replicas
                         if ready_count and ready_count >= 1:
                             break
+                except asyncio.TimeoutError:
+                    if _poll % 6 == 0:
+                        logger.warning("Poll timeout for %s (get_public_deployment_metadata hung)", instance_name)
                 except Exception as e:
                     if _poll % 6 == 0:
                         logger.warning("Poll error for %s: %s", instance_name, e)
