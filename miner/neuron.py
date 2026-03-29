@@ -105,6 +105,15 @@ class Miner:
             request.round_id, request.gpu_count, request.gpu_model,
             request.memory, request.time_budget,
         )
+
+        # Deduplicate — only one deployment per round
+        if request.round_id in self.active_deployments:
+            logger.info("Already deploying for round %d, skipping duplicate", request.round_id)
+            return
+
+        # Mark as in-progress to prevent duplicate deploys
+        self.active_deployments[request.round_id] = "pending"
+
         try:
             from basilica import BasilicaClient
             client = BasilicaClient()
@@ -155,7 +164,29 @@ class Miner:
             )
             logger.info("Basilica deployment created: %s, waiting for ready...", instance_name)
 
-            await loop.run_in_executor(None, deployment.wait_until_ready)
+            # Poll deployment status until ready (SDK doesn't have wait_until_ready)
+            for _poll in range(60):
+                try:
+                    meta = await loop.run_in_executor(
+                        None,
+                        functools.partial(
+                            client.get_public_deployment_metadata, instance_name,
+                        ),
+                    )
+                    if getattr(meta, 'state', '') in ('running', 'active'):
+                        ready_count = getattr(getattr(meta, 'replicas', None), 'ready', 0)
+                        if isinstance(ready_count, int) and ready_count >= 1:
+                            break
+                        # Fallback: replicas might be an int directly
+                        if isinstance(getattr(meta, 'replicas', None), int) and meta.replicas >= 1:
+                            break
+                except Exception:
+                    pass
+                await asyncio.sleep(5)
+            else:
+                logger.error("Basilica pod %s did not become ready in 5 min", instance_name)
+                return
+
             logger.info("Basilica pod ready: %s at %s", instance_name, deployment.url)
 
             # POST signed TrainerReady back to validator
