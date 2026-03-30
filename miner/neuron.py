@@ -149,7 +149,8 @@ class Miner:
             deploy_kwargs = dict(
                 name=deploy_name,
                 image=self.trainer_image,
-                port=8001,
+                port=8081,
+                public=True,
                 replicas=1,
                 ttl_seconds=ttl,
                 gpu_count=request.gpu_count,
