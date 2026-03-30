@@ -290,9 +290,9 @@ class Miner:
         logger.info("Listener started on port %d", self.listener_port)
 
     async def run(self):
-        """Commit image, start listener, and keep alive."""
-        self.commit_image()
+        """Start listener, commit image, and keep alive."""
         self.start_listener()
+        self.commit_image()
         logger.info(
             "Miner running. Agent: %s (validators pull this image). "
             "Listener: port %d. Trainer image: %s",
