@@ -96,7 +96,7 @@ class TrainerRequest:
 
     # GPU spec — miner must deploy a pod matching these requirements
     gpu_count: int = 1
-    gpu_model: str = "NVIDIA-RTX-A4000"
+    min_gpu_memory_gb: int = 16
     memory: str = "16Gi"
 
     def to_json(self) -> str:
@@ -109,7 +109,7 @@ class TrainerRequest:
             "time_budget": self.time_budget,
             "validator_db_url": self.validator_db_url,
             "gpu_count": self.gpu_count,
-            "gpu_model": self.gpu_model,
+            "min_gpu_memory_gb": self.min_gpu_memory_gb,
             "memory": self.memory,
         })
 

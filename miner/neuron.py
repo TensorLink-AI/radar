@@ -101,8 +101,8 @@ class Miner:
     async def handle_prepare(self, request: TrainerRequest):
         """Deploy a Basilica GPU pod and POST TrainerReady back to validator."""
         logger.info(
-            "Received TrainerRequest for round %d (gpu=%dx%s, memory=%s, budget=%ds)",
-            request.round_id, request.gpu_count, request.gpu_model,
+            "Received TrainerRequest for round %d (gpu=%d x %dGB, memory=%s, budget=%ds)",
+            request.round_id, request.gpu_count, request.min_gpu_memory_gb,
             request.memory, request.time_budget,
         )
 
@@ -138,8 +138,8 @@ class Miner:
                     pod_env[key] = val
 
             logger.info(
-                "Deploying Basilica pod %s (image=%s, ttl=%ds, gpu=%dx%s)",
-                deploy_name, self.trainer_image, ttl, request.gpu_count, request.gpu_model,
+                "Deploying Basilica pod %s (image=%s, ttl=%ds, gpu=%d x %dGB min)",
+                deploy_name, self.trainer_image, ttl, request.gpu_count, request.min_gpu_memory_gb,
             )
 
             # Run blocking Basilica SDK calls in executor to avoid blocking event loop
@@ -156,7 +156,7 @@ class Miner:
                     replicas=1,
                     ttl_seconds=ttl,
                     gpu_count=request.gpu_count,
-                    gpu_models=[m.strip() for m in request.gpu_model.split(",") if m.strip()],
+                    min_gpu_memory_gb=request.min_gpu_memory_gb,
                     memory=request.memory,
                     env=pod_env,
                     timeout=deploy_timeout,

@@ -437,7 +437,7 @@ class TrainingCoordinator:
             time_budget=time_budget,
             validator_db_url=db_url,
             gpu_count=Config.TRAINER_GPU_COUNT,
-            gpu_model=Config.TRAINER_GPU_MODEL,
+            min_gpu_memory_gb=Config.TRAINER_MIN_GPU_MEMORY_GB,
             memory=Config.TRAINER_MEMORY,
         )
         body = req.to_json().encode()
