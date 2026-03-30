@@ -202,15 +202,19 @@ class Validator:
     def _my_uid(self) -> int:
         """Get this validator's UID."""
         hotkey = self.wallet.hotkey.ss58_address
-        if hotkey in self.metagraph.hotkeys:
-            return self.metagraph.hotkeys.index(hotkey)
+        hotkeys = self.metagraph.hotkeys
+        if hotkeys is not None and hotkey in hotkeys:
+            return hotkeys.index(hotkey)
         return -1
 
     def _get_validator_uids(self) -> list[int]:
         """Get UIDs of all validators with permits."""
+        permits = self.metagraph.validator_permit
+        if permits is None:
+            return []
         return [
             uid for uid in range(self.metagraph.n)
-            if self.metagraph.validator_permit[uid]
+            if uid < len(permits) and permits[uid]
         ]
 
     def start_db_server(self):
@@ -260,10 +264,11 @@ class Validator:
 
         # Set up access logging for this round
         self.access_logger.set_round(challenge.round_id)
+        hotkeys = self.metagraph.hotkeys or []
         hotkey_map = {
-            self.metagraph.hotkeys[uid]: uid
+            hotkeys[uid]: uid
             for uid in range(self.metagraph.n)
-            if uid < len(self.metagraph.hotkeys)
+            if uid < len(hotkeys)
         }
         set_hotkey_map(hotkey_map)
 

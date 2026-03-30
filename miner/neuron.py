@@ -87,6 +87,10 @@ class Miner:
             trainer_image=self.trainer_image,
         )
 
+        # Always write to file — ensures localnet and testnet work even if
+        # chain commitment encoding is unreadable by get_commitment().
+        _commit_to_file(self.wallet, self.netuid, commitment)
+
         try:
             self.subtensor.set_commitment(
                 wallet=self.wallet,
@@ -95,8 +99,7 @@ class Miner:
             )
             logger.info("Committed image to chain: %s", self.docker_image)
         except Exception as e:
-            logger.warning("Chain commit failed (%s), using file fallback", e)
-            _commit_to_file(self.wallet, self.netuid, commitment)
+            logger.warning("Chain commit failed (%s), file fallback already written", e)
 
     async def handle_prepare(self, request: TrainerRequest):
         """Deploy a Basilica GPU pod and POST TrainerReady back to validator."""

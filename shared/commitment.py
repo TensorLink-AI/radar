@@ -95,19 +95,26 @@ def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, Image
         logger.info("Found %d commitments from file fallback", len(file_commitments))
         return file_commitments
 
-    # Fall back to chain API
+    # Fall back to chain API (suppress noisy bittensor ERROR logs from
+    # decode_metadata failures that are expected on localnet)
     hotkeys = metagraph.hotkeys if metagraph.hotkeys is not None else []
     commitments = {}
-    for uid in range(metagraph.n):
-        try:
-            raw = subtensor.get_commitment(netuid=netuid, uid=uid)
-            if raw:
-                hotkey = hotkeys[uid] if uid < len(hotkeys) else ""
-                commitment = ImageCommitment.from_json(raw, miner_uid=uid, hotkey=hotkey)
-                if commitment.image_url:
-                    commitments[uid] = commitment
-        except Exception as e:
-            logger.warning("No commitment for UID %d: %s", uid, e, exc_info=True)
+    bt_logger = logging.getLogger("bittensor")
+    prev_level = bt_logger.level
+    bt_logger.setLevel(logging.CRITICAL)
+    try:
+        for uid in range(metagraph.n):
+            try:
+                raw = subtensor.get_commitment(netuid=netuid, uid=uid)
+                if raw:
+                    hotkey = hotkeys[uid] if uid < len(hotkeys) else ""
+                    commitment = ImageCommitment.from_json(raw, miner_uid=uid, hotkey=hotkey)
+                    if commitment.image_url:
+                        commitments[uid] = commitment
+            except Exception as e:
+                logger.debug("No commitment for UID %d: %s", uid, e)
+    finally:
+        bt_logger.setLevel(prev_level)
 
     return commitments
 
