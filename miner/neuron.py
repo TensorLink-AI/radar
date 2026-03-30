@@ -153,40 +153,18 @@ class Miner:
                     replicas=1,
                     ttl_seconds=ttl,
                     gpu_count=request.gpu_count,
-                    gpu_models=[request.gpu_model],
+                    gpu_models=[m.strip() for m in request.gpu_model.split(",") if m.strip()],
                     memory=request.memory,
                     env=pod_env,
+                    timeout=ttl,  # match TTL — deploy() blocks until ready
                 ),
             )
 
             trainer_url = deployment.url
             logger.info(
-                "Basilica deployment created: name=%s url=%s",
+                "Basilica deployment ready: name=%s url=%s",
                 deployment.name, trainer_url,
             )
-
-            # Wait for pod to become reachable via health check
-            logger.info("Waiting for %s to become reachable...", trainer_url)
-            pod_ready = False
-            for _poll in range(60):  # 5 min max
-                try:
-                    async with httpx.AsyncClient(timeout=10) as hc:
-                        resp = await hc.get(f"{trainer_url.rstrip('/')}/health")
-                    if resp.status_code == 200:
-                        pod_ready = True
-                        break
-                except Exception:
-                    pass
-                if _poll % 6 == 0:
-                    logger.info("Health poll #%d for %s — not ready yet", _poll, deployment.name)
-                await asyncio.sleep(5)
-
-            if not pod_ready:
-                logger.error("Basilica pod %s not reachable after 5 min at %s", deployment.name, trainer_url)
-                self.active_deployments.pop(request.round_id, None)
-                return
-
-            logger.info("Basilica pod ready: %s at %s", deployment.name, trainer_url)
 
             # POST signed TrainerReady back to validator
             ready = TrainerReady(
