@@ -122,6 +122,7 @@ class Miner:
             return
 
         ttl = int(request.time_budget * Config.TRAINER_RELEASE_SAFETY_MARGIN)
+        deploy_timeout = max(ttl, 600)  # at least 10 min for GPU allocation
         hotkey = self.wallet.hotkey.ss58_address
         deploy_name = f"radar-trainer-{request.round_id}"
 
@@ -156,7 +157,7 @@ class Miner:
                     gpu_models=[m.strip() for m in request.gpu_model.split(",") if m.strip()],
                     memory=request.memory,
                     env=pod_env,
-                    timeout=ttl,  # match TTL — deploy() blocks until ready
+                    timeout=deploy_timeout,
                 ),
             )
 
