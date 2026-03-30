@@ -107,7 +107,7 @@ def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, Image
                 if commitment.image_url:
                     commitments[uid] = commitment
         except Exception as e:
-            logger.debug("No commitment for UID %d: %s", uid, e)
+            logger.warning("No commitment for UID %d: %s", uid, e, exc_info=True)
 
     return commitments
 
