@@ -65,6 +65,7 @@ class Config:
     # Default GPU spec sent in TrainerRequest (validator-controlled)
     TRAINER_GPU_COUNT: int = int(os.getenv("RADAR_TRAINER_GPU_COUNT", "1"))
     TRAINER_MIN_GPU_MEMORY_GB: int = int(os.getenv("RADAR_TRAINER_MIN_GPU_MEMORY_GB", "16"))
+    TRAINER_GPU_MODELS: str = os.getenv("RADAR_TRAINER_GPU_MODELS", "")  # comma-separated, empty = any GPU
     TRAINER_MEMORY: str = os.getenv("RADAR_TRAINER_MEMORY", "16Gi")
 
     # Subnet-owner fallback proxy — handles jobs from non-responsive trainers
