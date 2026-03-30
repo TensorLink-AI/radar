@@ -174,6 +174,18 @@ class Miner:
                 deployment.name, trainer_url,
             )
 
+            # Enroll for public metadata so validators can verify the pod
+            try:
+                await loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        client.enroll_metadata, deployment.name, enabled=True,
+                    ),
+                )
+                logger.info("Public metadata enrolled for %s", deployment.name)
+            except Exception as e:
+                logger.warning("Failed to enroll public metadata for %s: %s", deployment.name, e)
+
             # POST signed TrainerReady back to validator
             ready = TrainerReady(
                 round_id=request.round_id,
