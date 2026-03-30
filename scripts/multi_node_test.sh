@@ -779,6 +779,13 @@ for i in $(seq 0 $((NUM_MINERS - 1))); do
     # Each miner gets a unique listener port
     LISTENER_PORT=$((LISTENER_PORT_BASE + i))
 
+    # Kill anything on this port from previous runs
+    if command -v fuser &>/dev/null; then
+        fuser -k "${LISTENER_PORT}/tcp" 2>/dev/null || true
+    elif command -v lsof &>/dev/null; then
+        lsof -ti :"$LISTENER_PORT" 2>/dev/null | xargs -r kill 2>/dev/null || true
+    fi
+
     python3 miner/neuron.py \
         --netuid "$NETUID" \
         --subtensor.network "$NETWORK" \

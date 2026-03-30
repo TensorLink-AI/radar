@@ -88,7 +88,7 @@ class Miner:
         )
 
         try:
-            self.subtensor.commit(
+            self.subtensor.set_commitment(
                 wallet=self.wallet,
                 netuid=self.netuid,
                 data=commitment.to_json(),

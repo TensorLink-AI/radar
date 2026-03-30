@@ -204,7 +204,7 @@ def commit_image_to_chain(
         subnet_version=subnet_version,
     )
     try:
-        subtensor.commit(
+        subtensor.set_commitment(
             wallet=wallet,
             netuid=netuid,
             data=commitment.to_json(),
