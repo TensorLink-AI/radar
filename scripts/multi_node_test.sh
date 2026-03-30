@@ -163,7 +163,8 @@ if envs:
         info "Basilica deployments auto-cleanup via TTL (no manual teardown needed)"
     fi
     # Clean commitment files
-    rm -rf /tmp/radar_commitments 2>/dev/null || true
+    # Don't delete commitments — they may be needed across test restarts
+    # rm -rf /tmp/radar_commitments 2>/dev/null || true
     echo ""
     ok "Cleanup complete. Logs preserved at: $LOG_DIR/"
 }
@@ -799,7 +800,7 @@ for i in $(seq 0 $((NUM_MINERS - 1))); do
     ok "Miner $i started (PID $!) — $AGENT_IMAGE — listener: port $LISTENER_PORT — log: $MINER_LOG"
 done
 
-sleep 5  # Let miners commit images and start listeners
+sleep 10  # Let miners commit images (chain call can be slow) and start listeners
 
 # Verify listener health
 for i in $(seq 0 $((NUM_MINERS - 1))); do
