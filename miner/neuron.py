@@ -197,6 +197,14 @@ class Miner:
             )
         except Exception as e:
             logger.error("Failed to deploy trainer for round %d: %s", request.round_id, e, exc_info=True)
+            # Clean up failed deployment so it doesn't consume quota
+            self.active_deployments.pop(request.round_id, None)
+            try:
+                from basilica import BasilicaClient
+                BasilicaClient().delete_deployment(deploy_name)
+                logger.info("Cleaned up failed deployment %s", deploy_name)
+            except Exception:
+                pass  # may not exist or already deleted
 
     async def handle_release(self, round_id: int):
         """Tear down the Basilica pod for a completed round."""
