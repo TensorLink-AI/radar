@@ -200,8 +200,8 @@ def health():
 @app.post("/trainer/ready")
 async def trainer_ready(request: Request):
     """Miner POSTs here after spinning up their Basilica pod."""
-    if not _auth_verify or not _metagraph:
-        raise HTTPException(status_code=503, detail="Auth not configured")
+    if not _metagraph:
+        raise HTTPException(status_code=503, detail="Metagraph not configured")
 
     body = await request.body()
     from shared.auth import verify_request

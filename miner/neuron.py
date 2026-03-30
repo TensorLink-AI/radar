@@ -205,7 +205,7 @@ class Miner:
             self.active_deployments[request.round_id] = deployment
             logger.info(
                 "Trainer ready for round %d at %s (instance=%s)",
-                request.round_id, deployment.url, instance_name,
+                request.round_id, deployment.url, deployment.name,
             )
         except Exception as e:
             logger.error("Failed to deploy trainer for round %d: %s", request.round_id, e, exc_info=True)
