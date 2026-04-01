@@ -416,7 +416,13 @@ class Validator:
         failed = sum(1 for r in my_results if r.status != "success")
         logger.info("Phase B dispatch: %d succeeded, %d failed", succeeded, failed)
         for r in my_results:
-            if r.status != "success":
+            if r.status == "success":
+                logger.info(
+                    "  Job arch=%d trainer=%d: success (%.1fs, %d flops)",
+                    r.arch_owner, r.trainer_uid,
+                    r.training_time_seconds, r.flops_equivalent_size,
+                )
+            else:
                 logger.warning(
                     "  Job arch=%d trainer=%d: %s — %s",
                     r.arch_owner, r.trainer_uid, r.status, r.error,
