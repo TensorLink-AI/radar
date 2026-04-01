@@ -70,6 +70,9 @@ class Miner:
         # Active Basilica deployments: round_id → deployment object
         self.active_deployments: dict[int, object] = {}
 
+        # Validator db_urls to notify when deployment completes: round_id → [urls]
+        self._pending_notify: dict[int, list[str]] = {}
+
         logger.info(
             "Miner initialized. Agent: %s, Trainer image: %s, Listener port: %d",
             self.docker_image, self.trainer_image, self.listener_port,
@@ -87,6 +90,10 @@ class Miner:
             trainer_image=self.trainer_image,
         )
 
+        # Always write to file — ensures localnet and testnet work even if
+        # chain commitment encoding is unreadable by get_commitment().
+        _commit_to_file(self.wallet, self.netuid, commitment)
+
         try:
             self.subtensor.set_commitment(
                 wallet=self.wallet,
@@ -95,8 +102,31 @@ class Miner:
             )
             logger.info("Committed image to chain: %s", self.docker_image)
         except Exception as e:
-            logger.warning("Chain commit failed (%s), using file fallback", e)
-            _commit_to_file(self.wallet, self.netuid, commitment)
+            logger.warning("Chain commit failed (%s), file fallback already written", e)
+
+    async def _post_trainer_ready(
+        self, round_id: int, trainer_url: str,
+        instance_name: str, validator_db_url: str,
+    ):
+        """POST signed TrainerReady to a validator's DB server."""
+        hotkey = self.wallet.hotkey.ss58_address
+        ready = TrainerReady(
+            round_id=round_id,
+            trainer_url=trainer_url,
+            instance_name=instance_name,
+            miner_hotkey=hotkey,
+        )
+        body = ready.to_json().encode()
+        headers = sign_request(self.wallet, body)
+        headers["Content-Type"] = "application/json"
+        url = f"{validator_db_url}/trainer/ready"
+        logger.info("Posting TrainerReady to %s", url)
+        try:
+            async with httpx.AsyncClient(timeout=30) as http:
+                resp = await http.post(url, content=body, headers=headers)
+                logger.info("TrainerReady response: HTTP %d", resp.status_code)
+        except Exception as e:
+            logger.warning("Failed to post TrainerReady to %s: %s", url, e)
 
     async def handle_prepare(self, request: TrainerRequest):
         """Deploy a Basilica GPU pod and POST TrainerReady back to validator."""
@@ -106,9 +136,28 @@ class Miner:
             request.memory, request.time_budget,
         )
 
-        # Deduplicate — only one deployment per round
-        if request.round_id in self.active_deployments:
-            logger.info("Already deploying for round %d, skipping duplicate", request.round_id)
+        # Deduplicate — only one deployment per round, but notify all validators
+        existing = self.active_deployments.get(request.round_id)
+        if existing and existing != "pending":
+            # Pod already deployed — just POST TrainerReady to this validator
+            logger.info(
+                "Already deployed for round %d, notifying validator at %s",
+                request.round_id, request.validator_db_url,
+            )
+            await self._post_trainer_ready(
+                request.round_id, existing.url, existing.name,
+                request.validator_db_url,
+            )
+            return
+        if existing == "pending":
+            # Deployment in progress — queue this validator for notification when ready
+            logger.info(
+                "Deployment in progress for round %d, queuing notification for %s",
+                request.round_id, request.validator_db_url,
+            )
+            self._pending_notify.setdefault(request.round_id, []).append(
+                request.validator_db_url,
+            )
             return
 
         # Mark as in-progress to prevent duplicate deploys
@@ -186,23 +235,24 @@ class Miner:
             except Exception as e:
                 logger.warning("Failed to enroll public metadata for %s: %s", deployment.name, e)
 
-            # POST signed TrainerReady back to validator
-            ready = TrainerReady(
-                round_id=request.round_id,
-                trainer_url=trainer_url,
-                instance_name=deployment.name,
-                miner_hotkey=hotkey,
+            # POST signed TrainerReady back to requesting validator
+            await self._post_trainer_ready(
+                request.round_id, trainer_url, deployment.name,
+                request.validator_db_url,
             )
-            body = ready.to_json().encode()
-            headers = sign_request(self.wallet, body)
-            headers["Content-Type"] = "application/json"
-            url = f"{request.validator_db_url}/trainer/ready"
-            logger.info("Posting TrainerReady to %s", url)
-            async with httpx.AsyncClient(timeout=30) as http:
-                resp = await http.post(url, content=body, headers=headers)
-                logger.info("TrainerReady response: HTTP %d", resp.status_code)
 
             self.active_deployments[request.round_id] = deployment
+
+            # Notify any validators that arrived while deployment was pending
+            pending_urls = self._pending_notify.pop(request.round_id, [])
+            for db_url in pending_urls:
+                logger.info(
+                    "Notifying queued validator at %s for round %d",
+                    db_url, request.round_id,
+                )
+                await self._post_trainer_ready(
+                    request.round_id, trainer_url, deployment.name, db_url,
+                )
             logger.info(
                 "Trainer ready for round %d at %s (instance=%s)",
                 request.round_id, deployment.url, deployment.name,

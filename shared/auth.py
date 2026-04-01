@@ -85,7 +85,10 @@ def verify_request(
 
 def get_uid_for_hotkey(metagraph, hotkey: str) -> Optional[int]:
     """Look up UID for a hotkey in the metagraph."""
+    hotkeys = metagraph.hotkeys
+    if hotkeys is None:
+        return None
     for i in range(metagraph.n):
-        if metagraph.hotkeys[i] == hotkey:
+        if i < len(hotkeys) and hotkeys[i] == hotkey:
             return i
     return None
