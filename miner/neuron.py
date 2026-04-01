@@ -101,6 +101,30 @@ class Miner:
         except Exception as e:
             logger.warning("Chain commit failed (%s), file fallback already written", e)
 
+    async def _post_trainer_ready(
+        self, round_id: int, trainer_url: str,
+        instance_name: str, validator_db_url: str,
+    ):
+        """POST signed TrainerReady to a validator's DB server."""
+        hotkey = self.wallet.hotkey.ss58_address
+        ready = TrainerReady(
+            round_id=round_id,
+            trainer_url=trainer_url,
+            instance_name=instance_name,
+            miner_hotkey=hotkey,
+        )
+        body = ready.to_json().encode()
+        headers = sign_request(self.wallet, body)
+        headers["Content-Type"] = "application/json"
+        url = f"{validator_db_url}/trainer/ready"
+        logger.info("Posting TrainerReady to %s", url)
+        try:
+            async with httpx.AsyncClient(timeout=30) as http:
+                resp = await http.post(url, content=body, headers=headers)
+                logger.info("TrainerReady response: HTTP %d", resp.status_code)
+        except Exception as e:
+            logger.warning("Failed to post TrainerReady to %s: %s", url, e)
+
     async def handle_prepare(self, request: TrainerRequest):
         """Deploy a Basilica GPU pod and POST TrainerReady back to validator."""
         logger.info(
@@ -109,9 +133,21 @@ class Miner:
             request.memory, request.time_budget,
         )
 
-        # Deduplicate — only one deployment per round
-        if request.round_id in self.active_deployments:
-            logger.info("Already deploying for round %d, skipping duplicate", request.round_id)
+        # Deduplicate — only one deployment per round, but notify all validators
+        existing = self.active_deployments.get(request.round_id)
+        if existing and existing != "pending":
+            # Pod already deployed — just POST TrainerReady to this validator
+            logger.info(
+                "Already deployed for round %d, notifying validator at %s",
+                request.round_id, request.validator_db_url,
+            )
+            await self._post_trainer_ready(
+                request.round_id, existing.url, existing.name,
+                request.validator_db_url,
+            )
+            return
+        if existing == "pending":
+            logger.info("Deployment in progress for round %d, skipping", request.round_id)
             return
 
         # Mark as in-progress to prevent duplicate deploys
@@ -129,7 +165,7 @@ class Miner:
         ttl = 900 + int(request.time_budget) + 300  # 15 min alloc + training + 5 min upload
         deploy_timeout = 900  # 15 min max wait for GPU allocation
         hotkey = self.wallet.hotkey.ss58_address
-        deploy_name = f"radar-trainer-{request.round_id}"
+        deploy_name = f"radar-trainer-{hotkey[:16]}-{request.round_id}"
 
         try:
             # Build env vars for the trainer pod
@@ -190,20 +226,10 @@ class Miner:
                 logger.warning("Failed to enroll public metadata for %s: %s", deployment.name, e)
 
             # POST signed TrainerReady back to validator
-            ready = TrainerReady(
-                round_id=request.round_id,
-                trainer_url=trainer_url,
-                instance_name=deployment.name,
-                miner_hotkey=hotkey,
+            await self._post_trainer_ready(
+                request.round_id, trainer_url, deployment.name,
+                request.validator_db_url,
             )
-            body = ready.to_json().encode()
-            headers = sign_request(self.wallet, body)
-            headers["Content-Type"] = "application/json"
-            url = f"{request.validator_db_url}/trainer/ready"
-            logger.info("Posting TrainerReady to %s", url)
-            async with httpx.AsyncClient(timeout=30) as http:
-                resp = await http.post(url, content=body, headers=headers)
-                logger.info("TrainerReady response: HTTP %d", resp.status_code)
 
             self.active_deployments[request.round_id] = deployment
             logger.info(
