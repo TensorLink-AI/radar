@@ -70,6 +70,9 @@ class Miner:
         # Active Basilica deployments: round_id → deployment object
         self.active_deployments: dict[int, object] = {}
 
+        # Validator db_urls to notify when deployment completes: round_id → [urls]
+        self._pending_notify: dict[int, list[str]] = {}
+
         logger.info(
             "Miner initialized. Agent: %s, Trainer image: %s, Listener port: %d",
             self.docker_image, self.trainer_image, self.listener_port,
@@ -147,7 +150,14 @@ class Miner:
             )
             return
         if existing == "pending":
-            logger.info("Deployment in progress for round %d, skipping", request.round_id)
+            # Deployment in progress — queue this validator for notification when ready
+            logger.info(
+                "Deployment in progress for round %d, queuing notification for %s",
+                request.round_id, request.validator_db_url,
+            )
+            self._pending_notify.setdefault(request.round_id, []).append(
+                request.validator_db_url,
+            )
             return
 
         # Mark as in-progress to prevent duplicate deploys
@@ -225,13 +235,24 @@ class Miner:
             except Exception as e:
                 logger.warning("Failed to enroll public metadata for %s: %s", deployment.name, e)
 
-            # POST signed TrainerReady back to validator
+            # POST signed TrainerReady back to requesting validator
             await self._post_trainer_ready(
                 request.round_id, trainer_url, deployment.name,
                 request.validator_db_url,
             )
 
             self.active_deployments[request.round_id] = deployment
+
+            # Notify any validators that arrived while deployment was pending
+            pending_urls = self._pending_notify.pop(request.round_id, [])
+            for db_url in pending_urls:
+                logger.info(
+                    "Notifying queued validator at %s for round %d",
+                    db_url, request.round_id,
+                )
+                await self._post_trainer_ready(
+                    request.round_id, trainer_url, deployment.name, db_url,
+                )
             logger.info(
                 "Trainer ready for round %d at %s (instance=%s)",
                 request.round_id, deployment.url, deployment.name,
