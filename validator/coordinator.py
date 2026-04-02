@@ -246,61 +246,96 @@ class TrainingCoordinator:
         async def _dispatch_one(
             client: httpx.AsyncClient, job: Job, url: str, payload: bytes, headers: dict,
         ) -> TrainingResult:
-            try:
-                resp = await client.post(
-                    f"{url.rstrip('/')}/train",
-                    content=payload,
-                    headers=headers,
-                )
+            max_retries = 2
+            for attempt in range(max_retries + 1):
                 try:
-                    data = resp.json()
-                except (json.JSONDecodeError, ValueError):
-                    body_preview = resp.text[:200] if resp.text else "(empty)"
-                    logger.error(
-                        "Trainer UID %d returned non-JSON (HTTP %d): %s",
-                        job.trainer_uid, resp.status_code, body_preview,
+                    resp = await client.post(
+                        f"{url.rstrip('/')}/train",
+                        content=payload,
+                        headers=headers,
                     )
+
+                    # Retry on transient HTTP errors (429 busy, 503 unavailable)
+                    if resp.status_code in (429, 503) and attempt < max_retries:
+                        wait = 5 * (attempt + 1)
+                        logger.warning(
+                            "Trainer UID %d returned HTTP %d, retrying in %ds (attempt %d/%d)",
+                            job.trainer_uid, resp.status_code, wait, attempt + 1, max_retries,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+
+                    try:
+                        data = resp.json()
+                    except (json.JSONDecodeError, ValueError):
+                        body_preview = resp.text[:200] if resp.text else "(empty)"
+                        logger.error(
+                            "Trainer UID %d returned non-JSON (HTTP %d): %s",
+                            job.trainer_uid, resp.status_code, body_preview,
+                        )
+                        return TrainingResult(
+                            round_id=job.round_id,
+                            arch_owner=job.arch_owner,
+                            trainer_uid=job.trainer_uid,
+                            dispatcher=self.my_uid,
+                            status="failed",
+                            error=f"Non-JSON response (HTTP {resp.status_code}): {body_preview}",
+                        )
+
+                    # Log HTTP errors with the response body for diagnostics
+                    if resp.status_code >= 400:
+                        logger.warning(
+                            "Trainer UID %d returned HTTP %d: %s",
+                            job.trainer_uid, resp.status_code, data.get("error", ""),
+                        )
+
+                    return TrainingResult(
+                        round_id=job.round_id,
+                        arch_owner=job.arch_owner,
+                        trainer_uid=job.trainer_uid,
+                        dispatcher=self.my_uid,
+                        seed=challenge.seed,
+                        flops_equivalent_size=int(data.get("flops_equivalent_size", 0)),
+                        status=data.get("status", "failed"),
+                        error=data.get("error", ""),
+                        training_time_seconds=float(data.get("training_time_seconds", 0)),
+                        checkpoint_key=data.get("checkpoint_key", ""),
+                        architecture_key=data.get("architecture_key", ""),
+                    )
+                except httpx.TimeoutException:
+                    logger.error("Dispatch to trainer UID %d timed out", job.trainer_uid)
+                    return TrainingResult(
+                        round_id=job.round_id,
+                        arch_owner=job.arch_owner,
+                        trainer_uid=job.trainer_uid,
+                        dispatcher=self.my_uid,
+                        status="timeout",
+                        error="Request timed out",
+                    )
+                except Exception as e:
+                    if attempt < max_retries:
+                        wait = 5 * (attempt + 1)
+                        logger.warning(
+                            "Dispatch to trainer UID %d failed (%s), retrying in %ds",
+                            job.trainer_uid, e, wait,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    logger.error("Dispatch to trainer UID %d failed: %s", job.trainer_uid, e)
                     return TrainingResult(
                         round_id=job.round_id,
                         arch_owner=job.arch_owner,
                         trainer_uid=job.trainer_uid,
                         dispatcher=self.my_uid,
                         status="failed",
-                        error=f"Non-JSON response (HTTP {resp.status_code}): {body_preview}",
+                        error=str(e),
                     )
-                return TrainingResult(
-                    round_id=job.round_id,
-                    arch_owner=job.arch_owner,
-                    trainer_uid=job.trainer_uid,
-                    dispatcher=self.my_uid,
-                    seed=challenge.seed,
-                    flops_equivalent_size=int(data.get("flops_equivalent_size", 0)),
-                    status=data.get("status", "failed"),
-                    error=data.get("error", ""),
-                    training_time_seconds=float(data.get("training_time_seconds", 0)),
-                    checkpoint_key=data.get("checkpoint_key", ""),
-                    architecture_key=data.get("architecture_key", ""),
-                )
-            except httpx.TimeoutException:
-                logger.error("Dispatch to trainer UID %d timed out", job.trainer_uid)
-                return TrainingResult(
-                    round_id=job.round_id,
-                    arch_owner=job.arch_owner,
-                    trainer_uid=job.trainer_uid,
-                    dispatcher=self.my_uid,
-                    status="timeout",
-                    error="Request timed out",
-                )
-            except Exception as e:
-                logger.error("Dispatch to trainer UID %d failed: %s", job.trainer_uid, e)
-                return TrainingResult(
-                    round_id=job.round_id,
-                    arch_owner=job.arch_owner,
-                    trainer_uid=job.trainer_uid,
-                    dispatcher=self.my_uid,
-                    status="failed",
-                    error=str(e),
-                )
+            # Should not reach here, but handle defensively
+            return TrainingResult(
+                round_id=job.round_id, arch_owner=job.arch_owner,
+                trainer_uid=job.trainer_uid, dispatcher=self.my_uid,
+                status="failed", error="Retries exhausted",
+            )
 
         async with httpx.AsyncClient(timeout=job_timeout) as client:
             coros = [

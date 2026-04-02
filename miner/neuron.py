@@ -181,10 +181,19 @@ class Miner:
             # Build env vars for the trainer pod
             # No R2 credentials — trainer uses presigned URLs for uploads
             pod_env = {}
-            for key in ("SUBTENSOR_NETWORK", "NETUID"):
-                val = os.environ.get(key, "")
-                if val:
-                    pod_env[key] = val
+            # Propagate network settings: try env vars first, then fall back
+            # to the subtensor config (CLI args like --subtensor.network).
+            network = os.environ.get("SUBTENSOR_NETWORK", "")
+            if not network:
+                network = getattr(self.subtensor, "network", "") or ""
+            if network:
+                pod_env["SUBTENSOR_NETWORK"] = network
+
+            netuid = os.environ.get("NETUID", "")
+            if not netuid:
+                netuid = str(self.netuid)
+            if netuid:
+                pod_env["NETUID"] = netuid
 
             logger.info(
                 "Deploying Basilica pod %s (image=%s, ttl=%ds, gpu=%d x %dGB min)",

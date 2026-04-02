@@ -153,6 +153,7 @@ def evaluate_checkpoint(
             if result.returncode != 0:
                 return {
                     "crps": float("inf"), "mase": float("inf"),
+                    "flops_equivalent_size": 0,
                     "error": f"Eval subprocess failed: {result.stderr[:500]}",
                 }
             # Parse only the last non-empty line of stdout to avoid
@@ -161,11 +162,13 @@ def evaluate_checkpoint(
         except subprocess.TimeoutExpired:
             return {
                 "crps": float("inf"), "mase": float("inf"),
+                "flops_equivalent_size": 0,
                 "error": f"Eval subprocess timed out ({timeout}s)",
             }
         except (OSError, json.JSONDecodeError) as e:
             return {
                 "crps": float("inf"), "mase": float("inf"),
+                "flops_equivalent_size": 0,
                 "error": f"Eval subprocess error: {e}",
             }
 
@@ -180,6 +183,7 @@ def _parse_last_json_line(stdout: str) -> dict:
     if not lines:
         return {
             "crps": float("inf"), "mase": float("inf"),
+            "flops_equivalent_size": 0,
             "error": "Eval subprocess produced no output",
         }
     # Try last line first (expected), then scan backwards
@@ -190,6 +194,7 @@ def _parse_last_json_line(stdout: str) -> dict:
             continue
     return {
         "crps": float("inf"), "mase": float("inf"),
+        "flops_equivalent_size": 0,
         "error": f"Eval subprocess returned no valid JSON line: {lines[-1][:200]}",
     }
 

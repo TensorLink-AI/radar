@@ -122,6 +122,7 @@ async def test_dispatch_success():
          patch("shared.artifacts.generate_upload_urls", return_value={"checkpoint": "http://fake/ckpt"}), \
          patch("shared.auth.sign_request", return_value={"X-Epistula-Signed-By": "hk0"}):
         mock_resp = MagicMock()
+        mock_resp.status_code = 200
         mock_resp.json.return_value = {"status": "success", "flops_equivalent_size": 500000}
         mock_client.return_value.__aenter__ = AsyncMock(return_value=MagicMock(
             post=AsyncMock(return_value=mock_resp),
