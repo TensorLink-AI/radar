@@ -63,7 +63,7 @@ class TestParseImageRef:
         assert tag == "v1.2.3"
 
 
-def _make_meta(image="ghcr.io/tensorlink-ai/radar/ts-runner", image_tag="latest",
+def _make_meta(image="ghcr.io/tensorlink-ai/radar/radar-runner", image_tag="latest",
                state="running", replicas=1):
     """Create a mock PublicDeploymentMetadataResponse."""
     meta = MagicMock()

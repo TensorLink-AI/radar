@@ -325,29 +325,37 @@ for i in "${!AGENT_DIRS[@]}"; do
 done
 
 # =============================================================================
-# STEP 2b: Build trainer Docker image and push to GHCR
+# STEP 2b: Build generalist trainer Docker image and push to GHCR
 # =============================================================================
-step "Step 2b: Building trainer image and pushing to GHCR"
+step "Step 2b: Building generalist trainer image and pushing to GHCR"
 
-TRAINER_IMAGE="${GHCR_REPO}/ts-runner:latest"
+TRAINER_IMAGE="${GHCR_REPO}/radar-runner:latest"
 
-# Copy shared modules into runner build context (Dockerfile expects them)
-cp shared/auth.py runner/timeseries_forecast/auth.py
-cp shared/artifacts.py runner/timeseries_forecast/artifacts.py
-cp shared/r2_audit.py runner/timeseries_forecast/r2_audit.py
+# Copy shared modules into runner/ build context (top-level Dockerfile expects them)
+cp shared/auth.py runner/shared_auth.py
+cp shared/artifacts.py runner/shared_artifacts.py
+cp shared/r2_audit.py runner/shared_r2_audit.py
 
 TRAINER_LOG="${LOG_DIR}/trainer_build.log"
-if ! docker build -t ts-runner:latest runner/timeseries_forecast/ > "$TRAINER_LOG" 2>&1; then
+if ! docker build -t radar-runner:latest -f runner/Dockerfile runner/ > "$TRAINER_LOG" 2>&1; then
+    # Fallback: try the old per-task Dockerfile if the generalist one fails
+    warn "Generalist Dockerfile failed, falling back to timeseries_forecast Dockerfile"
+    cp shared/auth.py runner/timeseries_forecast/auth.py
+    cp shared/artifacts.py runner/timeseries_forecast/artifacts.py
+    cp shared/r2_audit.py runner/timeseries_forecast/r2_audit.py
+    if ! docker build -t radar-runner:latest runner/timeseries_forecast/ >> "$TRAINER_LOG" 2>&1; then
+        rm -f runner/timeseries_forecast/auth.py runner/timeseries_forecast/artifacts.py runner/timeseries_forecast/r2_audit.py
+        echo "  Trainer build log: $TRAINER_LOG"
+        tail -20 "$TRAINER_LOG"
+        fail "Trainer Docker build failed — see log above"
+    fi
     rm -f runner/timeseries_forecast/auth.py runner/timeseries_forecast/artifacts.py runner/timeseries_forecast/r2_audit.py
-    echo "  Trainer build log: $TRAINER_LOG"
-    tail -20 "$TRAINER_LOG"
-    fail "Trainer Docker build failed — see log above"
 fi
 
 # Clean up copied files
-rm -f runner/timeseries_forecast/auth.py runner/timeseries_forecast/artifacts.py runner/timeseries_forecast/r2_audit.py
+rm -f runner/shared_auth.py runner/shared_artifacts.py runner/shared_r2_audit.py
 
-docker tag ts-runner:latest "$TRAINER_IMAGE"
+docker tag radar-runner:latest "$TRAINER_IMAGE"
 if ! docker push "$TRAINER_IMAGE" > /dev/null 2>&1; then
     fail "Failed to push ${TRAINER_IMAGE}"
 fi
@@ -360,7 +368,7 @@ export OFFICIAL_TRAINING_IMAGE="$TRAINER_IMAGE"
 step "Step 2c: Making GHCR packages public"
 
 GHCR_ORG="tensorlink-ai"
-ALL_PACKAGES=("${AGENT_NAMES[@]}" "ts-runner")
+ALL_PACKAGES=("${AGENT_NAMES[@]}" "radar-runner")
 for pkg in "${ALL_PACKAGES[@]}"; do
     # GHCR package names use the repo as a namespace: radar/<name>
     encoded_pkg="radar%2F${pkg}"

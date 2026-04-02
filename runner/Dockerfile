@@ -13,11 +13,12 @@ RUN pip3 install --no-cache-dir \
     bittensor cryptography sentencepiece \
     fastapi uvicorn httpx boto3 safetensors pyarrow
 
-# ── Generalist server ──────────────────────────────────────────────
-COPY server.py /workspace/server.py
+# ── Generic harness ───────────────────────────────────────────────
 RUN mkdir -p /workspace/runner
 COPY __init__.py /workspace/runner/__init__.py
+COPY harness.py /workspace/runner/harness.py
 COPY server.py /workspace/runner/server.py
+COPY server.py /workspace/server.py
 
 # ── Timeseries forecast runner ─────────────────────────────────────
 RUN mkdir -p /workspace/runner/timeseries_forecast
@@ -29,7 +30,7 @@ COPY timeseries_forecast/evaluate.py /workspace/runner/timeseries_forecast/evalu
 COPY timeseries_forecast/flops.py /workspace/runner/timeseries_forecast/flops.py
 
 # Also place ts-forecasting files at /workspace for direct imports
-# (harness.py and prepare.py expect to be importable as top-level modules)
+# (frozen harness.py and prepare.py expect to be importable as top-level modules)
 COPY timeseries_forecast/harness.py /workspace/harness.py
 COPY timeseries_forecast/prepare.py /workspace/prepare.py
 COPY timeseries_forecast/evaluate.py /workspace/evaluate.py
@@ -43,10 +44,11 @@ COPY timeseries_forecast/evaluate.py /workspace/frozen/evaluate.py
 COPY timeseries_forecast/flops.py /workspace/frozen/flops.py
 
 # ── Shared modules (auth, R2 upload) ──────────────────────────────
+# These are copied into the build context by the build script with shared_ prefix
 RUN mkdir -p /workspace/shared
-COPY ../shared/auth.py /workspace/shared/auth.py
-COPY ../shared/artifacts.py /workspace/shared/artifacts.py
-COPY ../shared/r2_audit.py /workspace/shared/r2_audit.py
+COPY shared_auth.py /workspace/shared/auth.py
+COPY shared_artifacts.py /workspace/shared/artifacts.py
+COPY shared_r2_audit.py /workspace/shared/r2_audit.py
 RUN touch /workspace/shared/__init__.py
 
 # Lock down frozen files
