@@ -284,14 +284,31 @@ def upload_training_artifacts_presigned(
         logger.error("No presigned URL for checkpoint")
         ok = False
 
-    # Upload architecture (text)
+    # Upload architecture (text) — retry once on failure since this is critical for eval
     if "architecture" in presigned_urls:
-        try:
-            resp = httpx.put(presigned_urls["architecture"], content=architecture_code.encode(), timeout=30)
-            resp.raise_for_status()
-        except Exception as e:
-            logger.error("Presigned upload failed for architecture: %s", e)
+        arch_bytes = architecture_code.encode()
+        arch_uploaded = False
+        for attempt in range(2):
+            try:
+                if attempt == 0:
+                    logger.info("Uploading architecture (%d bytes) to presigned URL", len(arch_bytes))
+                else:
+                    logger.info("Retrying architecture upload (attempt %d)", attempt + 1)
+                resp = httpx.put(presigned_urls["architecture"], content=arch_bytes, timeout=30)
+                resp.raise_for_status()
+                logger.info("Architecture upload succeeded (HTTP %d)", resp.status_code)
+                arch_uploaded = True
+                break
+            except Exception as e:
+                logger.error(
+                    "Presigned upload failed for architecture (%d bytes, attempt %d): %s",
+                    len(arch_bytes), attempt + 1, e,
+                )
+        if not arch_uploaded:
             ok = False
+    else:
+        logger.error("No presigned URL for architecture — upload_urls keys: %s", list(presigned_urls.keys()))
+        ok = False
 
     # Upload stdout (text)
     if "stdout" in presigned_urls:

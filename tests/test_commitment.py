@@ -19,9 +19,9 @@ class TestImageCommitment:
         assert c2.miner_uid == 5
 
     def test_is_valid(self):
-        assert ImageCommitment(image_url="x", image_digest="y").is_valid
-        assert not ImageCommitment(image_url="", image_digest="y").is_valid
-        assert not ImageCommitment(image_url="x", image_digest="").is_valid
+        assert ImageCommitment(image_url="x", listener_url="http://localhost:8090").is_valid
+        assert not ImageCommitment(image_url="", listener_url="http://localhost:8090").is_valid
+        assert not ImageCommitment(image_url="x", listener_url="").is_valid
         assert not ImageCommitment().is_valid
 
     def test_version_check(self):

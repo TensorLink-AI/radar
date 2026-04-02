@@ -17,18 +17,70 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-GIFT_EVAL_DATASETS = [
-    "LOOP_SEATTLE", "M_DENSE", "SZ_TAXI",
-    "bitbrains_fast_storage", "bitbrains_rnd",
-    "bizitobs_application", "bizitobs_l2c", "bizitobs_service",
-    "car_parts_with_missing", "covid_deaths", "electricity",
-    "ett1", "ett2", "hierarchical_sales", "hospital",
-    "jena_weather", "kdd_cup_2018_with_missing",
-    "m4_daily", "m4_hourly", "m4_monthly", "m4_quarterly",
-    "m4_weekly", "m4_yearly",
-    "restaurant", "saugeenday", "solar",
-    "temperature_rain_with_missing", "us_births",
-]
+# Manifest: dataset key → R2 subpath under the prefix.
+# Keys use format "name__freq" for multi-freq datasets, plain "name" otherwise.
+# Every frequency variant is a separate eval target — full benchmark coverage.
+GIFT_EVAL_MANIFEST: dict[str, str] = {
+    # ── No freq subdirectory (single frequency) ──────────────
+    "bizitobs_application": "bizitobs_application",
+    "bizitobs_service": "bizitobs_service",
+    "car_parts_with_missing": "car_parts_with_missing",
+    "covid_deaths": "covid_deaths",
+    "hospital": "hospital",
+    "m4_daily": "m4_daily",
+    "m4_hourly": "m4_hourly",
+    "m4_monthly": "m4_monthly",
+    "m4_quarterly": "m4_quarterly",
+    "m4_weekly": "m4_weekly",
+    "m4_yearly": "m4_yearly",
+    "restaurant": "restaurant",
+    "temperature_rain_with_missing": "temperature_rain_with_missing",
+    # ── Multi-frequency datasets (all variants) ──────────────
+    "LOOP_SEATTLE__5T": "LOOP_SEATTLE/5T",
+    "LOOP_SEATTLE__D": "LOOP_SEATTLE/D",
+    "LOOP_SEATTLE__H": "LOOP_SEATTLE/H",
+    "M_DENSE__D": "M_DENSE/D",
+    "M_DENSE__H": "M_DENSE/H",
+    "SZ_TAXI__15T": "SZ_TAXI/15T",
+    "SZ_TAXI__H": "SZ_TAXI/H",
+    "bitbrains_fast_storage__5T": "bitbrains_fast_storage/5T",
+    "bitbrains_fast_storage__H": "bitbrains_fast_storage/H",
+    "bitbrains_rnd__5T": "bitbrains_rnd/5T",
+    "bitbrains_rnd__H": "bitbrains_rnd/H",
+    "bizitobs_l2c__5T": "bizitobs_l2c/5T",
+    "bizitobs_l2c__H": "bizitobs_l2c/H",
+    "electricity__15T": "electricity/15T",
+    "electricity__D": "electricity/D",
+    "electricity__H": "electricity/H",
+    "electricity__W": "electricity/W",
+    "ett1__15T": "ett1/15T",
+    "ett1__D": "ett1/D",
+    "ett1__H": "ett1/H",
+    "ett1__W": "ett1/W",
+    "ett2__15T": "ett2/15T",
+    "ett2__D": "ett2/D",
+    "ett2__H": "ett2/H",
+    "ett2__W": "ett2/W",
+    "hierarchical_sales__D": "hierarchical_sales/D",
+    "hierarchical_sales__W": "hierarchical_sales/W",
+    "jena_weather__10T": "jena_weather/10T",
+    "jena_weather__D": "jena_weather/D",
+    "jena_weather__H": "jena_weather/H",
+    "kdd_cup_2018_with_missing__D": "kdd_cup_2018_with_missing/D",
+    "kdd_cup_2018_with_missing__H": "kdd_cup_2018_with_missing/H",
+    "saugeenday__D": "saugeenday/D",
+    "saugeenday__M": "saugeenday/M",
+    "saugeenday__W": "saugeenday/W",
+    "solar__10T": "solar/10T",
+    "solar__D": "solar/D",
+    "solar__H": "solar/H",
+    "solar__W": "solar/W",
+    "us_births__D": "us_births/D",
+    "us_births__M": "us_births/M",
+    "us_births__W": "us_births/W",
+}
+
+GIFT_EVAL_DATASETS = sorted(GIFT_EVAL_MANIFEST.keys())
 
 FREQ_TO_PRED_LEN = {
     "H": 48, "T": 60, "D": 14, "W": 8, "M": 12, "Q": 8, "Y": 4,
@@ -37,9 +89,11 @@ FREQ_TO_PRED_LEN = {
 
 
 def select_datasets(eval_split_seed: int, n: int) -> list[str]:
-    """Deterministic selection of N datasets for a round."""
+    """Deterministic selection of N datasets for a round. 0 = all."""
+    if n <= 0 or n >= len(GIFT_EVAL_DATASETS):
+        return list(GIFT_EVAL_DATASETS)
     rng = random.Random(eval_split_seed)
-    chosen = rng.sample(GIFT_EVAL_DATASETS, min(n, len(GIFT_EVAL_DATASETS)))
+    chosen = rng.sample(GIFT_EVAL_DATASETS, n)
     return sorted(chosen)
 
 
@@ -61,8 +115,12 @@ class GiftEvalBenchmark:
         return select_datasets(eval_split_seed, n)
 
     def download_dataset(self, dataset_name: str) -> Path:
-        """Download Arrow file from R2 to local cache. Skip if cached."""
-        if dataset_name not in GIFT_EVAL_DATASETS:
+        """Download Arrow file from R2 to local cache. Skip if cached.
+
+        Uses GIFT_EVAL_MANIFEST to resolve the R2 subpath (some datasets
+        have a frequency subdirectory like ett2/H/, some don't).
+        """
+        if dataset_name not in GIFT_EVAL_MANIFEST:
             raise ValueError(f"Unknown dataset: {dataset_name}")
         local_dir = self.cache_dir / dataset_name
         local_dir.mkdir(parents=True, exist_ok=True)
@@ -74,10 +132,31 @@ class GiftEvalBenchmark:
         if self.r2 is None:
             raise RuntimeError("R2 client required to download GIFT-Eval data")
 
-        r2_key = f"{self.r2_prefix}/{dataset_name}/data-00000-of-00001.arrow"
-        self.r2.download_file_to_disk(r2_key, str(local_path))
-        logger.info("Downloaded %s (%d bytes)", dataset_name, local_path.stat().st_size)
+        subpath = GIFT_EVAL_MANIFEST[dataset_name]
+        r2_key = f"{self.r2_prefix}/{subpath}/data-00000-of-00001.arrow"
+        if not self.r2.download_file_to_disk(r2_key, str(local_path)):
+            raise FileNotFoundError(f"Failed to download {r2_key} from R2")
+
+        size = local_path.stat().st_size
+        logger.info("Downloaded %s from %s (%d bytes)", dataset_name, r2_key, size)
         return local_path
+
+    def generate_presigned_get_urls(self, ttl: int = 5400) -> dict[str, str]:
+        """Generate presigned GET URLs for all datasets.
+
+        Returns {dataset_key: presigned_url} for passing to trainer pods
+        so they can download GIFT-Eval data without R2 credentials.
+        """
+        if self.r2 is None:
+            return {}
+        urls = {}
+        for name, subpath in GIFT_EVAL_MANIFEST.items():
+            r2_key = f"{self.r2_prefix}/{subpath}/data-00000-of-00001.arrow"
+            url = self.r2.generate_presigned_get_url(r2_key, ttl=ttl)
+            if url:
+                urls[name] = url
+        logger.info("Generated %d presigned GET URLs for GIFT-Eval data", len(urls))
+        return urls
 
 
 def load_dataset(

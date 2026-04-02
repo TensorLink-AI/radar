@@ -104,6 +104,12 @@ def evaluate_checkpoint(
     the temp directory.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
+        # Copy checkpoint into subprocess temp dir so it's co-located
+        # and won't be affected by /tmp cleanup or concurrent access
+        import shutil
+        local_ckpt = os.path.join(tmpdir, "checkpoint.safetensors")
+        shutil.copy2(checkpoint_path, local_ckpt)
+
         # Write architecture code
         arch_path = os.path.join(tmpdir, "submission.py")
         with open(arch_path, "w") as f:
@@ -113,7 +119,7 @@ def evaluate_checkpoint(
         runner_path = os.path.join(tmpdir, "run_eval.py")
         runner_code = _EVAL_RUNNER_TEMPLATE.format(
             arch_path=arch_path,
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=local_ckpt,
             eval_split_seed=eval_split_seed,
             device=device,
         )
@@ -244,6 +250,11 @@ async def evaluate_all_checkpoints(
             continue
 
         if not artifacts.architecture_code:
+            logger.warning("UID %d: architecture code missing from R2 — skipping eval", uid)
+            results[uid] = {
+                "crps": float("inf"), "mase": float("inf"),
+                "error": "architecture code not found in R2",
+            }
             continue
 
         # Re-verify checkpoint hash immediately before eval (TOCTOU defense)
@@ -259,6 +270,22 @@ async def evaluate_all_checkpoints(
                 continue
 
         # Evaluate
+        if not os.path.exists(artifacts.checkpoint_path):
+            logger.error(
+                "UID %d: checkpoint file missing before eval: %s",
+                uid, artifacts.checkpoint_path,
+            )
+            results[uid] = {
+                "crps": float("inf"), "mase": float("inf"),
+                "error": f"checkpoint file missing: {artifacts.checkpoint_path}",
+            }
+            continue
+
+        logger.info(
+            "UID %d: starting eval (checkpoint=%.2fMB arch=%d bytes)",
+            uid, os.path.getsize(artifacts.checkpoint_path) / (1024 * 1024),
+            len(artifacts.architecture_code),
+        )
         metrics = evaluate_checkpoint(
             artifacts.architecture_code, artifacts.checkpoint_path,
             eval_split_seed=challenge.eval_split_seed,

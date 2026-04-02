@@ -314,10 +314,10 @@ class TestMultiValidatorCoordination:
         jobs = compute_assignments("a" * 64, submissions, miner_uids, validator_uids, round_id=1)
 
         assert len(jobs) == 10
+        # Self-training is allowed — just verify all jobs have valid UIDs
         for job in jobs:
-            assert job.arch_owner != job.trainer_uid, (
-                f"Self-training detected: UID {job.arch_owner}"
-            )
+            assert job.arch_owner in miner_uids
+            assert job.trainer_uid in miner_uids
 
     def test_dispatch_distributed_across_validators(self):
         """Jobs are spread across all validators, not concentrated on one."""
@@ -623,10 +623,10 @@ class TestEndToEndMultiRound:
                 round_id=challenge.round_id,
             )
 
-            # Verify cross-eval invariant
+            # Self-training is allowed — verify jobs have valid UIDs
             for job in jobs:
-                if len(all_miner_uids) > 1:
-                    assert job.arch_owner != job.trainer_uid
+                assert job.arch_owner in all_miner_uids
+                assert job.trainer_uid in all_miner_uids
 
             # Verify all archs get trained
             trained_archs = {j.arch_owner for j in jobs}

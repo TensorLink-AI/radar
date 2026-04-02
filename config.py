@@ -57,6 +57,20 @@ class Config:
     # ── Training Dispatch ────────────────────────────────────────
     TRAINING_TIMEOUT: int = int(os.getenv("RADAR_TRAINING_TIMEOUT", "1800"))
 
+    # ── Warm-Standby Trainer ────────────────────────────────────
+    TRAINER_PREPARE_TIMEOUT: int = int(os.getenv("RADAR_TRAINER_PREPARE_TIMEOUT", "600"))
+    TRAINER_READY_POLL_INTERVAL: int = int(os.getenv("RADAR_TRAINER_READY_POLL", "15"))
+    TRAINER_RELEASE_SAFETY_MARGIN: float = float(os.getenv("RADAR_TRAINER_SAFETY_MARGIN", "1.1"))
+
+    # Default GPU spec sent in TrainerRequest (validator-controlled)
+    TRAINER_GPU_COUNT: int = int(os.getenv("RADAR_TRAINER_GPU_COUNT", "1"))
+    TRAINER_MIN_GPU_MEMORY_GB: int = int(os.getenv("RADAR_TRAINER_MIN_GPU_MEMORY_GB", "16"))
+    TRAINER_GPU_MODELS: str = os.getenv("RADAR_TRAINER_GPU_MODELS", "")  # comma-separated, empty = any GPU
+    TRAINER_MEMORY: str = os.getenv("RADAR_TRAINER_MEMORY", "16Gi")
+
+    # Subnet-owner fallback proxy — handles jobs from non-responsive trainers
+    FALLBACK_PROXY_URL: str = os.getenv("RADAR_FALLBACK_PROXY_URL", "")
+
     # ── Phase C Eval ─────────────────────────────────────────────
     EVAL_DEVICE: str = os.getenv("RADAR_EVAL_DEVICE", "cpu")
 
@@ -73,7 +87,8 @@ class Config:
     QUERY_RATE_LIMIT: int = int(os.getenv("RADAR_QUERY_RATE_LIMIT", "10"))
 
     # ── GIFT-Eval Benchmark Data ─────────────────────────────────
-    GIFT_EVAL_R2_PREFIX: str = os.getenv("RADAR_GIFT_EVAL_PREFIX", "gift-eval-benchmark/gift-eval-full")
+    GIFT_EVAL_R2_BUCKET: str = os.getenv("RADAR_GIFT_EVAL_BUCKET", "gift-eval-benchmark")
+    GIFT_EVAL_R2_PREFIX: str = os.getenv("RADAR_GIFT_EVAL_PREFIX", "gift-eval-full")
     GIFT_EVAL_CACHE_DIR: str = os.getenv("RADAR_GIFT_EVAL_CACHE", "/tmp/radar_gift_eval")
-    GIFT_EVAL_DATASETS_PER_ROUND: int = int(os.getenv("RADAR_GIFT_EVAL_DATASETS", "5"))
+    GIFT_EVAL_DATASETS_PER_ROUND: int = int(os.getenv("RADAR_GIFT_EVAL_DATASETS", "0"))  # 0 = all datasets
     GIFT_EVAL_MAX_SERIES_PER_DATASET: int = int(os.getenv("RADAR_GIFT_EVAL_MAX_SERIES", "500"))

@@ -417,13 +417,60 @@ fi
 echo ""
 
 # =============================================================================
-# STEP 7a: Start local trainer server
+# STEP 6b: Start mock R2 server (local S3-compatible storage)
 # =============================================================================
 echo "-----------------------------------------"
-info "Step 7a: Starting local trainer server..."
+info "Step 6b: Starting mock R2 server for artifact storage..."
 echo "-----------------------------------------"
 
-TRAINER_PORT=8090
+MOCK_R2_PORT=9000
+MOCK_R2_STORAGE=$(mktemp -d)
+R2_BUCKET="radar-test"
+
+# Kill anything on this port
+if command -v fuser &>/dev/null; then
+    fuser -k "${MOCK_R2_PORT}/tcp" 2>/dev/null || true
+elif command -v lsof &>/dev/null; then
+    lsof -ti :"$MOCK_R2_PORT" 2>/dev/null | xargs -r kill 2>/dev/null || true
+fi
+
+PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}" python3 "$PROJECT_DIR/scripts/mock_r2_server.py" \
+    --port "$MOCK_R2_PORT" \
+    --storage "$MOCK_R2_STORAGE" \
+    > /tmp/radar_mock_r2.log 2>&1 &
+MOCK_R2_PID=$!
+PIDS+=("$MOCK_R2_PID")
+
+# Wait for mock R2 to be ready
+for attempt in $(seq 1 10); do
+    if curl -sf "http://127.0.0.1:${MOCK_R2_PORT}/" >/dev/null 2>&1; then
+        ok "Mock R2 server ready on port $MOCK_R2_PORT (storage: $MOCK_R2_STORAGE)"
+        break
+    fi
+    [ "$attempt" = 10 ] && { fail "Mock R2 server not responding"; exit 1; }
+    sleep 1
+done
+
+# Configure R2 credentials — these are accepted by the mock server (no auth check)
+export MOCK_R2_ENDPOINT="http://127.0.0.1:${MOCK_R2_PORT}"
+export R2_ACCOUNT_ID="local"
+export R2_ACCESS_KEY_ID="test"
+export R2_SECRET_ACCESS_KEY="test"
+export R2_BUCKET="$R2_BUCKET"
+
+# Create the bucket directory so ListObjects works
+mkdir -p "$MOCK_R2_STORAGE/$R2_BUCKET"
+ok "R2 configured: endpoint=$MOCK_R2_ENDPOINT bucket=$R2_BUCKET"
+echo ""
+
+# =============================================================================
+# STEP 7a: Start local trainer server + mock Basilica SDK
+# =============================================================================
+echo "-----------------------------------------"
+info "Step 7a: Starting local trainer server + Basilica mock..."
+echo "-----------------------------------------"
+
+TRAINER_PORT=8091
 
 # Kill anything on this port
 if command -v fuser &>/dev/null; then
@@ -450,27 +497,114 @@ for attempt in $(seq 1 10); do
 done
 
 TRAINER_URL="http://127.0.0.1:${TRAINER_PORT}"
+
+# Create a mock Basilica module so the miner can "deploy" without a real API.
+# The mock creates a fake deployment that points to our local trainer server.
+MOCK_BASILICA_DIR=$(mktemp -d)
+cat > "$MOCK_BASILICA_DIR/basilica.py" << MOCKEOF
+"""Mock Basilica SDK for localnet testing.
+
+Simulates create_deployment / delete_deployment / get_public_deployment_metadata
+without requiring a real Basilica API token or GPU infrastructure.
+The mock deployment points to a local trainer server already running.
+"""
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+_TRAINER_URL = "${TRAINER_URL}"
+_deployments = {}
+
+
+class _Replicas:
+    def __init__(self, ready=1, desired=1):
+        self.ready = ready
+        self.desired = desired
+
+
+class _Metadata:
+    def __init__(self, image, image_tag, state, replicas, uptime_seconds=10):
+        self.image = image
+        self.image_tag = image_tag
+        self.state = state
+        self.replicas = replicas
+        self.uptime_seconds = uptime_seconds
+
+
+class _Deployment:
+    def __init__(self, instance_name, image, url):
+        self.instance_name = instance_name
+        self.image = image
+        self.url = url
+
+    def wait_until_ready(self):
+        logger.info("Mock Basilica: deployment %s ready at %s", self.instance_name, self.url)
+
+
+class BasilicaClient:
+    def create_deployment(self, instance_name, image, port=8001, replicas=1,
+                          public_metadata=False, ttl_seconds=600,
+                          gpu_count=1, gpu_models=None, memory="16Gi", **kwargs):
+        dep = _Deployment(
+            instance_name=instance_name,
+            image=image,
+            url=_TRAINER_URL,
+        )
+        _deployments[instance_name] = {
+            "image": image.rsplit(":", 1)[0] if ":" in image else image,
+            "image_tag": image.rsplit(":", 1)[1] if ":" in image else "latest",
+        }
+        logger.info("Mock Basilica: created deployment %s -> %s", instance_name, _TRAINER_URL)
+        return dep
+
+    def delete_deployment(self, instance_name):
+        _deployments.pop(instance_name, None)
+        logger.info("Mock Basilica: deleted deployment %s", instance_name)
+
+    def get_public_deployment_metadata(self, instance_name):
+        info = _deployments.get(instance_name, {})
+        return _Metadata(
+            image=info.get("image", "mock-image"),
+            image_tag=info.get("image_tag", "latest"),
+            state="running",
+            replicas=_Replicas(ready=1, desired=1),
+        )
+MOCKEOF
+
+export PYTHONPATH="${MOCK_BASILICA_DIR}:${PYTHONPATH:-}"
+ok "Mock Basilica SDK installed at $MOCK_BASILICA_DIR"
 echo ""
 
 # =============================================================================
-# STEP 7b: Start miner (commits Docker image + trainer URL to chain)
+# STEP 7b: Start miner (commits Docker image + listener URL to chain)
 # =============================================================================
 echo "-----------------------------------------"
-info "Step 7b: Starting miner (commits image + trainer URL to chain)..."
+info "Step 7b: Starting miner (commits image + listener URL to chain)..."
 echo "-----------------------------------------"
+
+LISTENER_PORT=8090
+
+# Kill anything on the listener port
+if command -v fuser &>/dev/null; then
+    fuser -k "${LISTENER_PORT}/tcp" 2>/dev/null || true
+elif command -v lsof &>/dev/null; then
+    lsof -ti :"$LISTENER_PORT" 2>/dev/null | xargs -r kill 2>/dev/null || true
+fi
 
 python3 miner/neuron.py \
     --netuid 1 \
     --subtensor.network local \
     --wallet.name miner \
     --docker_image systematic:latest \
-    --trainer_url "$TRAINER_URL" \
-    --axon.external_ip 127.0.0.1 \
+    --listener_port "$LISTENER_PORT" \
+    --trainer_image "$OFFICIAL_TRAINING_IMAGE" \
+    --external_ip 127.0.0.1 \
     > /tmp/radar_miner.log 2>&1 &
 MINER_PID=$!
 PIDS+=("$MINER_PID")
 
-sleep 5  # Give miner time to commit image to chain
+sleep 5  # Give miner time to commit image and start listener
 
 if kill -0 "$MINER_PID" 2>/dev/null; then
     ok "Miner started (PID $MINER_PID). Logs: /tmp/radar_miner.log"
@@ -479,6 +613,16 @@ else
     tail -20 /tmp/radar_miner.log 2>/dev/null || true
     exit 1
 fi
+
+# Verify listener is responding
+for attempt in $(seq 1 10); do
+    if curl -sf "http://127.0.0.1:${LISTENER_PORT}/health" >/dev/null 2>&1; then
+        ok "Miner listener healthy on port $LISTENER_PORT"
+        break
+    fi
+    [ "$attempt" = 10 ] && warn "Miner listener not responding on port $LISTENER_PORT"
+    sleep 1
+done
 echo ""
 
 # =============================================================================
@@ -493,6 +637,13 @@ export RADAR_DESEARCH_ENABLED=false
 # Pin to medium-small bucket so agents reliably target the midpoint (6M FLOPs).
 export RADAR_MIN_FLOPS=2000000
 export RADAR_MAX_FLOPS=10000000
+# Warm-standby trainer: short timeout for localnet (mock Basilica is instant)
+export RADAR_TRAINER_PREPARE_TIMEOUT=30
+export RADAR_TRAINER_READY_POLL=5
+# Fallback proxy: use the local trainer server so training still works
+# even if the mock Basilica flow doesn't connect in time
+export RADAR_FALLBACK_PROXY_URL="$TRAINER_URL"
+export OFFICIAL_TRAINING_IMAGE=${OFFICIAL_TRAINING_IMAGE:-"ghcr.io/tensorlink-ai/radar/ts-runner:latest"}
 
 DB_DIR=$(mktemp -d)
 DB_PORT=8099  # Use non-standard port to avoid conflicts
@@ -673,6 +824,8 @@ echo "========================================="
 echo ""
 echo "Logs:"
 echo "  Validator: /tmp/radar_validator.log"
-echo "  Miner:     /tmp/radar_miner.log"
-echo "  Trainer:   /tmp/radar_trainer.log"
+echo "  Miner:     /tmp/radar_miner.log  (includes listener on port $LISTENER_PORT)"
+echo "  Trainer:   /tmp/radar_trainer.log (local trainer server on port $TRAINER_PORT)"
+echo "  Mock R2:   /tmp/radar_mock_r2.log (S3-compatible storage on port $MOCK_R2_PORT)"
+echo "  R2 files:  $MOCK_R2_STORAGE/$R2_BUCKET/"
 echo ""

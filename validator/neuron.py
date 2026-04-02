@@ -118,6 +118,15 @@ class Validator:
             except Exception as e:
                 logger.warning("R2 audit log unavailable: %s", e)
 
+        # GIFT-Eval R2 client (separate bucket for benchmark data)
+        self.gift_r2 = None
+        if self.r2 and Config.GIFT_EVAL_R2_BUCKET:
+            try:
+                from shared.r2_audit import R2AuditLog
+                self.gift_r2 = R2AuditLog(bucket=Config.GIFT_EVAL_R2_BUCKET)
+            except Exception as e:
+                logger.warning("GIFT-Eval R2 unavailable: %s", e)
+
         # Training coordinator
         my_uid = self._my_uid()
         if self.r2:
@@ -193,15 +202,19 @@ class Validator:
     def _my_uid(self) -> int:
         """Get this validator's UID."""
         hotkey = self.wallet.hotkey.ss58_address
-        if hotkey in self.metagraph.hotkeys:
-            return self.metagraph.hotkeys.index(hotkey)
+        hotkeys = self.metagraph.hotkeys
+        if hotkeys is not None and hotkey in hotkeys:
+            return hotkeys.index(hotkey)
         return -1
 
     def _get_validator_uids(self) -> list[int]:
         """Get UIDs of all validators with permits."""
+        permits = self.metagraph.validator_permit
+        if permits is None:
+            return []
         return [
             uid for uid in range(self.metagraph.n)
-            if self.metagraph.validator_permit[uid]
+            if uid < len(permits) and permits[uid]
         ]
 
     def start_db_server(self):
@@ -251,10 +264,11 @@ class Validator:
 
         # Set up access logging for this round
         self.access_logger.set_round(challenge.round_id)
+        hotkeys = self.metagraph.hotkeys or []
         hotkey_map = {
-            self.metagraph.hotkeys[uid]: uid
+            hotkeys[uid]: uid
             for uid in range(self.metagraph.n)
-            if uid < len(self.metagraph.hotkeys)
+            if uid < len(hotkeys)
         }
         set_hotkey_map(hotkey_map)
 
@@ -282,7 +296,21 @@ class Validator:
             logger.warning("No R2 configured — skipping Phase A/B/C")
             return
 
-        submissions, agent_logs = await run_and_collect_agents(
+        # ── PREPARE TRAINERS (warm-standby) ──────────────────
+        # Fire TrainerRequests to ALL miners with listener_urls.
+        # They deploy Basilica pods during Phase A while agents run in parallel.
+        # Run both concurrently — miners deploy GPU pods while agents design architectures.
+        if self.coordinator:
+            prepare_coro = self.coordinator.prepare_trainers(
+                challenge, commitments,
+                db_url=f"http://localhost:{self.db_port}",
+            )
+        else:
+            async def _no_endpoints():
+                return {}
+            prepare_coro = _no_endpoints()
+
+        collect_coro = run_and_collect_agents(
             wallet=self.wallet,
             metagraph=self.metagraph,
             challenge_json=challenge.to_json(),
@@ -293,6 +321,10 @@ class Validator:
             validator_uids=validator_uids,
             commitments=commitments,
             get_my_assignments_fn=get_my_assignments,
+        )
+
+        dynamic_endpoints, (submissions, agent_logs) = await asyncio.gather(
+            prepare_coro, collect_coro,
         )
 
         # Pre-filter: syntax check
@@ -350,26 +382,47 @@ class Validator:
             )
             my_jobs = list(all_jobs)
 
-        trainer_endpoints = {uid: c.pod_url for uid, c in commitments.items() if c.pod_url}
+        trainer_endpoints = dynamic_endpoints
         logger.info(
             "Phase B: %d total jobs, %d mine (my_uid=%d, validators=%s), %d trainer endpoints",
             len(all_jobs), len(my_jobs), my_uid, dispatch_validators, len(trainer_endpoints),
         )
         if not trainer_endpoints:
             logger.warning(
-                "Phase B: no trainer endpoints! Miners must set --trainer_url "
-                "or trainer pods must be deployed. Training will fail for all jobs."
+                "Phase B: no trainer endpoints! Miners must set --listener_port "
+                "or trainer pods failed to deploy. Training will fail for all jobs."
             )
+
+        # Generate presigned GET URLs for GIFT-Eval data so trainer pods
+        # can download benchmark data without R2 credentials
+        gift_eval_urls = {}
+        if self.gift_r2:
+            try:
+                from shared.gift_eval import GiftEvalBenchmark
+                gift = GiftEvalBenchmark(
+                    r2=self.gift_r2,
+                    r2_prefix=Config.GIFT_EVAL_R2_PREFIX,
+                )
+                gift_eval_urls = gift.generate_presigned_get_urls()
+            except Exception as e:
+                logger.warning("Failed to generate GIFT-Eval presigned URLs: %s", e)
 
         my_results = await self.coordinator.dispatch_jobs(
             my_jobs, challenge, filtered, trainer_endpoints,
             commitments=commitments,
+            gift_eval_urls=gift_eval_urls,
         )
         succeeded = sum(1 for r in my_results if r.status == "success")
         failed = sum(1 for r in my_results if r.status != "success")
         logger.info("Phase B dispatch: %d succeeded, %d failed", succeeded, failed)
         for r in my_results:
-            if r.status != "success":
+            if r.status == "success":
+                logger.info(
+                    "  Job arch=%d trainer=%d: success (%.1fs, %d flops)",
+                    r.arch_owner, r.trainer_uid,
+                    r.training_time_seconds, r.flops_equivalent_size,
+                )
+            else:
                 logger.warning(
                     "  Job arch=%d trainer=%d: %s — %s",
                     r.arch_owner, r.trainer_uid, r.status, r.error,
@@ -404,6 +457,20 @@ class Validator:
                 meta.get("flops_equivalent_size", 0),
                 meta.get("error", ""),
             )
+
+        # ── RELEASE TRAINERS ─────────────────────────────────
+        if self.coordinator:
+            collected_uids = set(training_metas.keys())
+            await self.coordinator.release_trainers(
+                challenge.round_id, commitments, collected_uids,
+            )
+            # Also release miners who timed out — courtesy signal
+            all_prepared = set(dynamic_endpoints.keys())
+            timed_out = all_prepared - collected_uids
+            if timed_out:
+                await self.coordinator.release_trainers(
+                    challenge.round_id, commitments, timed_out,
+                )
 
         # Fallback for missing validators (off by default)
         missing_trainers = [uid for uid in filtered if uid not in training_metas]
@@ -447,11 +514,11 @@ class Validator:
                 training_metas.update(fb_metas)
 
         # ── Pre-cache GIFT-Eval data for Phase C ────────────────
-        if self.r2:
+        if self.gift_r2:
             try:
                 from shared.gift_eval import GiftEvalBenchmark
                 gift = GiftEvalBenchmark(
-                    r2=self.r2,
+                    r2=self.gift_r2,
                     cache_dir=Config.GIFT_EVAL_CACHE_DIR,
                     r2_prefix=Config.GIFT_EVAL_R2_PREFIX,
                 )
@@ -494,11 +561,18 @@ class Validator:
         # ── SCORING ───────────────────────────────────────────
         penalties = compute_penalties(training_metas, eval_results)
 
-        # Track trainer reliability for future job assignment
+        # Track trainer reliability — penalise non-responsive trainers
+        fallback_uids = (
+            self.coordinator._fallback_uids.get(challenge.round_id, set())
+            if self.coordinator else set()
+        )
         for uid, meta in training_metas.items():
             trainer_uid = meta.get("trainer_uid", uid)
-            status = meta.get("status", "")
-            score = 1.0 if status == "success" else 0.0
+            if trainer_uid in fallback_uids:
+                score = 0.0  # full penalty — training ran on fallback proxy
+            else:
+                status = meta.get("status", "")
+                score = 1.0 if status == "success" else 0.0
             alpha = Config.EMA_ALPHA
             prev = self.trainer_reliability.get(trainer_uid, 1.0)
             self.trainer_reliability[trainer_uid] = alpha * score + (1 - alpha) * prev

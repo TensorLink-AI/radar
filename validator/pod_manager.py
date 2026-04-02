@@ -177,13 +177,17 @@ async def verify_miner_pod(
         if exp_tag and meta.image_tag != exp_tag:
             return False, f"Wrong tag: expected {exp_tag}, got {meta.image_tag}"
 
-        # Check pod is running
-        if meta.state not in ("running", "active"):
+        # Check pod is running (case-insensitive — Basilica returns "Active")
+        state_lower = (meta.state or "").lower()
+        if state_lower not in ("running", "active"):
             return False, f"Pod not running: state={meta.state}"
 
-        # Check replicas
-        if meta.replicas < 1:
-            return False, f"No replicas: replicas={meta.replicas}"
+        # Check replicas — skip if state is active but replicas not yet ready
+        # (Basilica "Active" means deployment exists, replicas may still be scaling)
+        ready = getattr(meta.replicas, "ready", meta.replicas) if hasattr(meta, "replicas") else 0
+        ready_count = ready if isinstance(ready, int) else getattr(meta.replicas, "ready", 0)
+        if isinstance(ready_count, int) and ready_count < 1 and state_lower == "running":
+            return False, f"No ready replicas: {ready_count}"
 
         return True, "ok"
     except ImportError:

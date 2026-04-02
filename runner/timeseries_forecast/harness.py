@@ -310,7 +310,8 @@ def main():
     loss_curve: list[float] = []
     start = time.time()
 
-    for batch in get_dataloader(batch_size=batch_size):
+    gift_cache = os.environ.get("RADAR_GIFT_EVAL_CACHE", "")
+    for batch in get_dataloader(batch_size=batch_size, data_dir=gift_cache if gift_cache else None):
         if time.time() - start > TIME_BUDGET:
             break
 

@@ -111,6 +111,11 @@ async def train(request: Request):
     miner_hotkey = data.get("miner_hotkey", "unknown")
     time_budget = data.get("time_budget", 300)
     upload_urls = data.get("upload_urls", {})
+    gift_eval_urls = data.get("gift_eval_urls", {})
+
+    # Download GIFT-Eval data from presigned URLs if provided
+    if gift_eval_urls:
+        _download_gift_eval_from_urls(gift_eval_urls)
 
     if not architecture_code:
         return JSONResponse(status_code=400, content={"error": "Missing architecture code"})
@@ -137,6 +142,7 @@ async def _execute_training(
 
     os.environ["SEED"] = str(seed)
     os.environ["TIME_BUDGET"] = str(time_budget)
+    os.environ["RADAR_GIFT_EVAL_CACHE"] = _gift_eval_cache_dir
 
     # 4-6. Build model, measure FLOPs, size gate, train
     import random
@@ -335,10 +341,11 @@ async def _execute_training(
         peak_vram_mb=peak_vram,
     )
 
+    upload_ok = True
     try:
         if upload_urls:
             from shared.artifacts import upload_training_artifacts_presigned
-            upload_training_artifacts_presigned(
+            upload_ok = upload_training_artifacts_presigned(
                 presigned_urls=upload_urls,
                 checkpoint_path=checkpoint_path,
                 architecture_code=architecture_code,
@@ -349,7 +356,7 @@ async def _execute_training(
             # Localnet fallback: use direct R2 credentials
             from shared.artifacts import upload_training_artifacts
             r2 = _get_r2()
-            upload_training_artifacts(
+            upload_ok = upload_training_artifacts(
                 r2=r2,
                 round_id=round_id,
                 miner_hotkey=miner_hotkey,
@@ -360,10 +367,17 @@ async def _execute_training(
             )
     except Exception as e:
         logger.error("R2 upload failed: %s", e)
+        upload_ok = False
 
     # 9. Return training metadata
+    upload_status = "success" if upload_ok else "upload_failed"
+    if not upload_ok:
+        logger.error(
+            "Artifact upload incomplete for round %d miner %s — returning upload_failed",
+            round_id, miner_hotkey,
+        )
     return _result(
-        round_id, miner_hotkey, "success",
+        round_id, miner_hotkey, upload_status,
         flops_equivalent_size=flops_equiv,
         training_time_seconds=training_time,
         num_steps=step,
@@ -372,9 +386,44 @@ async def _execute_training(
     )
 
 
+# ── GIFT-Eval data cache ────────────────────────────────────────────
+_gift_eval_cache_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "/tmp/radar_gift_eval")
+_gift_eval_ready = False
+
+
+def _download_gift_eval_from_urls(urls: dict[str, str]):
+    """Download GIFT-Eval data from presigned GET URLs.
+
+    Called per-dispatch with URLs from the validator. No R2 creds needed.
+    Skips datasets already cached locally.
+    """
+    global _gift_eval_ready
+    import httpx
+    from pathlib import Path
+
+    cache = Path(_gift_eval_cache_dir)
+    downloaded = 0
+    for name, url in urls.items():
+        local_dir = cache / name
+        local_path = local_dir / "data-00000-of-00001.arrow"
+        if local_path.exists() and local_path.stat().st_size > 0:
+            continue
+        try:
+            local_dir.mkdir(parents=True, exist_ok=True)
+            resp = httpx.get(url, timeout=120)
+            resp.raise_for_status()
+            local_path.write_bytes(resp.content)
+            downloaded += 1
+        except Exception as e:
+            logger.warning("Failed to download GIFT-Eval %s: %s", name, e)
+    if downloaded:
+        logger.info("Downloaded %d GIFT-Eval datasets from presigned URLs", downloaded)
+    _gift_eval_ready = True
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "gift_eval_ready": _gift_eval_ready}
 
 
 def _result(round_id: int, miner_hotkey: str, status: str, **kwargs) -> dict:
