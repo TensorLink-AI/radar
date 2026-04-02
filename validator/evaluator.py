@@ -5,6 +5,10 @@ Cheap (seconds per model on CPU), fully deterministic, provides consensus.
 
 Miner-submitted architecture code runs in an isolated subprocess to prevent
 access to the validator's environment variables, filesystem, or memory.
+
+Each task runner provides its own EVAL_TEMPLATE with task-specific imports
+and model signatures. The evaluator loads the right template based on
+the challenge's runner_dir.
 """
 
 from __future__ import annotations
@@ -24,70 +28,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_EVAL_RUNNER_TEMPLATE = '''
-import json
-import os
-import random
-import sys
+# ── Runner registry for eval templates ───────────────────────────────
+# Maps runner_dir -> EVAL_TEMPLATE string
+_EVAL_TEMPLATES: dict[str, str] = {}
 
-import torch
-from safetensors.torch import load_file
 
-# Frozen eval imports
-from prepare import validate, CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES
-from flops import compute_flops_equivalent
+def _load_eval_templates():
+    """Lazy-load eval templates from registered runners."""
+    if _EVAL_TEMPLATES:
+        return
+    from runner.timeseries_forecast.train import EVAL_TEMPLATE as ts_template
+    _EVAL_TEMPLATES["runner/timeseries_forecast"] = ts_template
+    _EVAL_TEMPLATES[""] = ts_template  # default fallback
 
-random.seed({eval_split_seed})
-torch.manual_seed({eval_split_seed})
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 
-arch_path = "{arch_path}"
-checkpoint_path = "{checkpoint_path}"
-device = "{device}"
-
-try:
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("submission", arch_path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    if not hasattr(mod, "build_model") or not callable(mod.build_model):
-        print(json.dumps({{"crps": float("inf"), "mase": float("inf"), "error": "Missing build_model()"}}))
-        sys.exit(0)
-
-    model = mod.build_model(CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES).to(device)
-    state_dict = load_file(checkpoint_path, device=device)
-    model.load_state_dict(state_dict)
-
-    flops_equiv = 0
-    try:
-        flops_equiv = compute_flops_equivalent(model, CONTEXT_LEN, NUM_VARIATES, device)
-    except Exception:
-        pass
-
-    param_count = sum(p.numel() for p in model.parameters())
-    if hasattr(model, "reset"):
-        model.reset()
-    model.eval()
-
-    data_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "")
-    metrics = validate(model, seed={eval_split_seed},
-                       data_dir=data_dir if data_dir else None)
-
-    result = {{
-        "crps": metrics["crps"],
-        "ncrps": metrics.get("ncrps", float("inf")),
-        "mase": metrics["mase"],
-        "flops_equivalent_size": flops_equiv,
-        "param_count": param_count,
-    }}
-    if "n_datasets" in metrics:
-        result["n_datasets"] = metrics["n_datasets"]
-    print(json.dumps(result))
-except Exception as e:
-    print(json.dumps({{"crps": float("inf"), "mase": float("inf"), "error": str(e)}}))
-'''
+def _get_eval_template(runner_dir: str) -> str:
+    """Get the eval template for a runner_dir."""
+    _load_eval_templates()
+    template = _EVAL_TEMPLATES.get(runner_dir)
+    if template is None:
+        logger.warning("No eval template for runner_dir=%s, using default", runner_dir)
+        template = _EVAL_TEMPLATES[""]
+    return template
 
 
 def evaluate_checkpoint(
@@ -121,9 +83,10 @@ def evaluate_checkpoint(
         with open(arch_path, "w") as f:
             f.write(architecture_code)
 
-        # Write eval runner script
+        # Write eval runner script (per-task template)
         runner_path = os.path.join(tmpdir, "run_eval.py")
-        runner_code = _EVAL_RUNNER_TEMPLATE.format(
+        template = _get_eval_template(runner_dir)
+        runner_code = template.format(
             arch_path=arch_path,
             checkpoint_path=local_ckpt,
             eval_split_seed=eval_split_seed,
