@@ -1,6 +1,8 @@
 """Tests for trainer server security hardening.
 
 Covers: fail-closed auth, rate limiting, concurrency gate, metagraph caching.
+
+Tests the generalist runner/server.py (the deployed server).
 """
 
 import asyncio
@@ -18,12 +20,13 @@ os.environ.setdefault("RADAR_LOCALNET", "")
 @pytest.fixture(autouse=True)
 def _reset_server_state():
     """Reset module-level state between tests."""
-    import runner.timeseries_forecast.server as srv
+    import runner.server as srv
     srv._metagraph_cache = None
     srv._metagraph_last_refresh = 0.0
     srv._hotkey_last_request.clear()
     # Reset semaphore to unlocked
     srv._train_semaphore = asyncio.Semaphore(1)
+    srv._RUNNERS.clear()
     yield
 
 
@@ -34,6 +37,7 @@ def _make_body(**overrides):
         "round_id": 1,
         "miner_hotkey": "miner_abc",
         "time_budget": 10,
+        "task_name": "ts_forecasting",
     }
     data.update(overrides)
     return json.dumps(data).encode()
@@ -44,36 +48,44 @@ class TestFailClosed:
 
     def test_rejects_when_metagraph_unavailable(self):
         """With no metagraph and not localnet, should return 503."""
-        with patch.dict(os.environ, {"RADAR_LOCALNET": ""}):
-            import runner.timeseries_forecast.server as srv
-            from fastapi.testclient import TestClient
+        import runner.server as srv
+        from fastapi.testclient import TestClient
 
-            srv._metagraph_cache = None
+        srv._metagraph_cache = None
+        srv._RUNNERS["ts_forecasting"] = MagicMock()
 
-            with patch.object(srv, "_load_metagraph", return_value=None):
-                client = TestClient(srv.app)
-                resp = client.post("/train", content=_make_body())
+        with patch.dict(os.environ, {"RADAR_LOCALNET": ""}), \
+             patch.object(srv, "_load_metagraph", return_value=None):
+            client = TestClient(srv.app)
+            resp = client.post("/train", content=_make_body())
 
         assert resp.status_code == 503
         assert "Auth unavailable" in resp.json()["error"]
 
     def test_localnet_skips_auth(self):
         """RADAR_LOCALNET=true should skip auth (for local dev)."""
-        with patch.dict(os.environ, {"RADAR_LOCALNET": "true"}):
-            import runner.timeseries_forecast.server as srv
-            from fastapi.testclient import TestClient
+        import runner.server as srv
+        from fastapi.testclient import TestClient
 
-            with patch.object(srv, "_execute_training", return_value={"status": "ok"}):
-                client = TestClient(srv.app)
-                resp = client.post("/train", content=_make_body())
+        mock_runner = MagicMock(return_value={
+            "status": "success", "round_id": 1, "miner_hotkey": "miner_abc",
+            "checkpoint_path": "/tmp/ckpt",
+        })
+        srv._RUNNERS["ts_forecasting"] = mock_runner
+
+        with patch.dict(os.environ, {"RADAR_LOCALNET": "true"}), \
+             patch("runner.server._upload_artifacts", return_value={"status": "success"}):
+            client = TestClient(srv.app)
+            resp = client.post("/train", content=_make_body())
 
         assert resp.status_code == 200
 
     def test_rejects_invalid_auth(self):
         """Bad Epistula headers should return 403."""
-        import runner.timeseries_forecast.server as srv
+        import runner.server as srv
         from fastapi.testclient import TestClient
 
+        srv._RUNNERS["ts_forecasting"] = MagicMock()
         fake_mg = MagicMock()
         mock_verify = MagicMock(return_value=(False, "Invalid signature", ""))
         with patch.dict(os.environ, {"RADAR_LOCALNET": ""}):
@@ -90,16 +102,22 @@ class TestRateLimiting:
 
     def test_second_request_rate_limited(self):
         """Same hotkey within cooldown should get 429."""
-        import runner.timeseries_forecast.server as srv
+        import runner.server as srv
         from fastapi.testclient import TestClient
 
-        with patch.dict(os.environ, {"RADAR_LOCALNET": "true"}):
-            with patch.object(srv, "_execute_training", return_value={"status": "ok"}):
-                client = TestClient(srv.app)
-                # First request — will get past rate limit
-                resp1 = client.post("/train", content=_make_body())
-                # Second request — should be rate limited
-                resp2 = client.post("/train", content=_make_body())
+        mock_runner = MagicMock(return_value={
+            "status": "success", "round_id": 1, "miner_hotkey": "miner_abc",
+            "checkpoint_path": "/tmp/ckpt",
+        })
+        srv._RUNNERS["ts_forecasting"] = mock_runner
+
+        with patch.dict(os.environ, {"RADAR_LOCALNET": "true"}), \
+             patch("runner.server._upload_artifacts", return_value={"status": "success"}):
+            client = TestClient(srv.app)
+            # First request — will get past rate limit
+            resp1 = client.post("/train", content=_make_body())
+            # Second request — should be rate limited
+            resp2 = client.post("/train", content=_make_body())
 
         assert resp2.status_code == 429
         assert "Rate limited" in resp2.json()["error"]
@@ -110,9 +128,10 @@ class TestConcurrencyGate:
 
     def test_locked_semaphore_returns_429(self):
         """If semaphore is locked, should immediately return 429."""
-        import runner.timeseries_forecast.server as srv
+        import runner.server as srv
         from fastapi.testclient import TestClient
 
+        srv._RUNNERS["ts_forecasting"] = MagicMock()
         # Pre-lock the semaphore
         loop = asyncio.new_event_loop()
         loop.run_until_complete(srv._train_semaphore.acquire())
@@ -131,7 +150,7 @@ class TestMetagraphCache:
 
     def test_returns_cached_within_interval(self):
         """Should not re-fetch if cache is fresh."""
-        import runner.timeseries_forecast.server as srv
+        import runner.server as srv
 
         fake_mg = MagicMock()
         fake_mg.n = 10
@@ -143,7 +162,7 @@ class TestMetagraphCache:
 
     def test_refreshes_after_interval(self):
         """Should re-fetch if cache is stale."""
-        import runner.timeseries_forecast.server as srv
+        import runner.server as srv
 
         old_mg = MagicMock()
         old_mg.n = 10
@@ -162,7 +181,7 @@ class TestMetagraphCache:
 
     def test_returns_stale_on_refresh_failure(self):
         """If refresh fails but stale cache exists, should return stale."""
-        import runner.timeseries_forecast.server as srv
+        import runner.server as srv
 
         old_mg = MagicMock()
         old_mg.n = 10
@@ -176,7 +195,7 @@ class TestMetagraphCache:
 
     def test_returns_none_on_first_failure(self):
         """If no cache and refresh fails, should return None."""
-        import runner.timeseries_forecast.server as srv
+        import runner.server as srv
 
         with patch("bittensor.Subtensor", side_effect=Exception("chain down")):
             result = srv._load_metagraph()
@@ -188,7 +207,7 @@ class TestHealthEndpoint:
     """Health endpoint should remain accessible."""
 
     def test_health_ok(self):
-        import runner.timeseries_forecast.server as srv
+        import runner.server as srv
         from fastapi.testclient import TestClient
         client = TestClient(srv.app)
         assert client.get("/health").status_code == 200

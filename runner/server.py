@@ -128,7 +128,7 @@ async def train(request: Request):
 
     async with _train_semaphore:
         runner_fn = _RUNNERS[task_name]
-        result = runner_fn(architecture_code, training_config)
+        result = await asyncio.to_thread(runner_fn, architecture_code, training_config)
 
     round_id = training_config["round_id"]
     miner_hotkey = training_config["miner_hotkey"]

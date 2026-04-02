@@ -94,7 +94,7 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
     # 1. Load submission
     sub = _load_submission(architecture_code)
     if isinstance(sub, dict):
-        return sub  # error dict
+        return _fail(config, sub.get("status", "build_failed"), sub.get("error", "unknown"))
 
     if not _has_callable(sub, "build_model"):
         return _fail(config, "build_failed", "Missing build_model()")
