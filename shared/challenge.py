@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import os
 import random
+from typing import TYPE_CHECKING
 
 from shared.protocol import Challenge
+
+if TYPE_CHECKING:
+    from shared.task import TaskSpec
 
 SIZE_BUCKETS = [
     (100_000, 500_000),         # tiny
@@ -19,6 +23,19 @@ SIZE_BUCKETS = [
     (10_000_000, 50_000_000),   # medium
     (50_000_000, 125_000_000),  # large
 ]
+
+
+def select_task(block_hash: str, task_names: list[str]) -> str:
+    """Deterministically select a task name from the block hash.
+
+    Uses the same block hash so all validators pick the same task.
+    Task names are sorted before selection for determinism.
+    """
+    if len(task_names) == 1:
+        return task_names[0]
+    seed_int = int(block_hash[:16], 16)
+    rng = random.Random(seed_int + 1)  # +1 to avoid correlation with bucket
+    return rng.choice(sorted(task_names))
 
 
 def generate_challenge(block_hash: str, base_task: dict) -> Challenge:

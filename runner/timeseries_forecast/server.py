@@ -113,6 +113,15 @@ async def train(request: Request):
     upload_urls = data.get("upload_urls", {})
     gift_eval_urls = data.get("gift_eval_urls", {})
 
+    # Task routing — validate task_name matches this runner
+    task_name = data.get("task_name", "")
+    SUPPORTED_TASKS = {"ts_forecasting", "ml_training", ""}
+    if task_name and task_name not in SUPPORTED_TASKS:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Unsupported task '{task_name}'. This runner supports: {sorted(SUPPORTED_TASKS - {''})}"},
+        )
+
     # Download GIFT-Eval data from presigned URLs if provided
     if gift_eval_urls:
         _download_gift_eval_from_urls(gift_eval_urls)

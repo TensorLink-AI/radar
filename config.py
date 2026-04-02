@@ -34,6 +34,10 @@ class Config:
     OFFICIAL_TRAINING_IMAGE: str = os.getenv("OFFICIAL_TRAINING_IMAGE", "ghcr.io/tensorlink-ai/radar/ts-runner:latest")
     OFFICIAL_TRAINING_IMAGE_DIGEST: str = os.getenv("OFFICIAL_TRAINING_IMAGE_DIGEST", "")
 
+    # ── Multi-Task ──────────────────────────────────────────────────
+    # Comma-separated list of enabled task names. Empty or "all" = all built-in tasks.
+    ENABLED_TASKS: str = os.getenv("RADAR_ENABLED_TASKS", "ts_forecasting")
+
     # ── R2 Audit Log ────────────────────────────────────────────────
     R2_ACCOUNT_ID: str = os.getenv("R2_ACCOUNT_ID", "")
     R2_ACCESS_KEY_ID: str = os.getenv("R2_ACCESS_KEY_ID", "")

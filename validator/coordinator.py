@@ -218,6 +218,8 @@ class TrainingCoordinator:
                     len(upload_urls), job.arch_owner, list(upload_urls.keys()),
                 )
 
+            task_name = challenge.task.get("name", "")
+            runner_dir = challenge.task.get("runner_dir", "")
             dispatch_payload = {
                 "architecture": proposal.code,
                 "seed": challenge.seed,
@@ -227,6 +229,8 @@ class TrainingCoordinator:
                 "miner_hotkey": miner_hotkey,
                 "time_budget": time_budget,
                 "upload_urls": upload_urls,
+                "task_name": task_name,
+                "runner_dir": runner_dir,
             }
             if gift_eval_urls:
                 dispatch_payload["gift_eval_urls"] = gift_eval_urls

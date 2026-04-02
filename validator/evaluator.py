@@ -96,12 +96,18 @@ def evaluate_checkpoint(
     eval_split_seed: int = 42,
     device: str = "cpu",
     timeout: int = 120,
+    runner_dir: str = "",
 ) -> dict:
     """Evaluate a single checkpoint in an isolated subprocess.
 
     Runs miner code in a separate process so it cannot access the
     validator's memory, environment variables, or filesystem beyond
     the temp directory.
+
+    Args:
+        runner_dir: Relative path to the runner directory (e.g.
+                    "runner/timeseries_forecast"). Falls back to
+                    runner/timeseries_forecast if empty.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         # Copy checkpoint into subprocess temp dir so it's co-located
@@ -127,12 +133,11 @@ def evaluate_checkpoint(
             f.write(runner_code)
 
         # Run in subprocess with restricted environment
-        runner_path_abs = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast")
-        )
-        shared_path_abs = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..")
-        )
+        # Resolve runner_dir — use task's runner_dir, fall back to ts_forecasting
+        effective_runner_dir = runner_dir or "runner/timeseries_forecast"
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        runner_path_abs = os.path.join(project_root, effective_runner_dir)
+        shared_path_abs = project_root
         clean_env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/usr/local/bin"),
             "HOME": tmpdir,
@@ -286,10 +291,12 @@ async def evaluate_all_checkpoints(
             uid, os.path.getsize(artifacts.checkpoint_path) / (1024 * 1024),
             len(artifacts.architecture_code),
         )
+        runner_dir = challenge.task.get("runner_dir", "") if isinstance(challenge.task, dict) else ""
         metrics = evaluate_checkpoint(
             artifacts.architecture_code, artifacts.checkpoint_path,
             eval_split_seed=challenge.eval_split_seed,
             device=device,
+            runner_dir=runner_dir,
         )
 
         # Verify FLOPs claim
