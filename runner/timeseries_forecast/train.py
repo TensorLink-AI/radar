@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterator
 
+import inspect
+
 from runner.harness import TaskRunner, TrainingConfig, run_training as generic_run_training
 
 logger = logging.getLogger(__name__)
@@ -41,8 +43,10 @@ class TSForecastingRunner:
         ).to(device)
 
     def get_dataloader(self, batch_size: int) -> Iterator:
+        import os
         from prepare import get_dataloader
-        return get_dataloader(batch_size=batch_size)
+        data_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "")
+        return get_dataloader(batch_size=batch_size, data_dir=data_dir if data_dir else None)
 
     def default_loss(self, predictions: Any, targets: Any) -> Any:
         """Quantile loss (pinball) — the ts_forecasting default."""
@@ -53,6 +57,22 @@ class TSForecastingRunner:
         errors = target_expanded - predictions
         q = torch.tensor(quantiles, device=predictions.device)
         return torch.max(q * errors, (q - 1) * errors).mean()
+
+    def wrap_loss(self, sub_loss_fn):
+        """Wrap miner's compute_loss for backward compat.
+
+        Old ts_forecasting harness called compute_loss(preds, targets, QUANTILES).
+        Generic harness calls loss_fn(preds, targets). This adapter handles both.
+        """
+        c = self._load_constants()
+        quantiles = c["quantiles"]
+        sig = inspect.signature(sub_loss_fn)
+        if len(sig.parameters) >= 3:
+            # Old-style 3-arg: compute_loss(preds, targets, quantiles)
+            def wrapped(predictions, targets):
+                return sub_loss_fn(predictions, targets, quantiles)
+            return wrapped
+        return sub_loss_fn
 
     def measure_flops(self, model: Any, device: str) -> int:
         try:

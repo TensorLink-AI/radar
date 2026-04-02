@@ -41,6 +41,14 @@ class TaskRunner(Protocol):
         """Measure FLOPs-equivalent of the model. Return 0 on failure."""
         ...
 
+    def wrap_loss(self, sub_loss_fn: Callable) -> Callable:
+        """Wrap a miner's compute_loss to match the generic (preds, targets) signature.
+
+        Override if your task's old harness passed extra args (e.g. quantiles).
+        Default: return as-is (assumes 2-arg signature).
+        """
+        return sub_loss_fn
+
 
 @dataclass
 class TrainingConfig:
@@ -108,7 +116,15 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
     if gate_result:
         return gate_result
 
-    # 5. Train
+    # 5. torch.compile (opt-in)
+    if getattr(sub, "COMPILE", False):
+        try:
+            import torch as _torch
+            model = _torch.compile(model)
+        except Exception as e:
+            logger.warning("torch.compile failed, using eager mode: %s", e)
+
+    # 6. Train
     start = time.time()
     num_params = sum(p.numel() for p in model.parameters())
 
@@ -217,10 +233,10 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
         except Exception:
             pass
 
-    # Loss: miner's compute_loss() or task's default
+    # Loss: miner's compute_loss() (wrapped for task compat) or task's default
     loss_fn = runner.default_loss
     if _has_callable(sub, "compute_loss"):
-        loss_fn = sub.compute_loss
+        loss_fn = runner.wrap_loss(sub.compute_loss)
 
     has_transform = _has_callable(sub, "transform_batch")
     has_on_step = _has_callable(sub, "on_step_end")
@@ -287,6 +303,14 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
                 except Exception as e:
                     logger.warning("on_step_end() failed: %s", e)
         step += 1
+
+    # Flush trailing gradient accumulation
+    if step > 0 and step % cfg["grad_accum_steps"] != 0:
+        if cfg["grad_clip"] > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        optim_step += 1
 
     return step
 
