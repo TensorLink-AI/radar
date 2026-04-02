@@ -246,7 +246,7 @@ class TrainingCoordinator:
         async def _dispatch_one(
             client: httpx.AsyncClient, job: Job, url: str, payload: bytes, headers: dict,
         ) -> TrainingResult:
-            max_retries = 2
+            max_retries = 3
             for attempt in range(max_retries + 1):
                 try:
                     resp = await client.post(
@@ -255,15 +255,17 @@ class TrainingCoordinator:
                         headers=headers,
                     )
 
-                    # Retry on 503 (auth/metagraph not ready yet — transient).
+                    # Retry on transient server errors:
+                    # - 502: Bad Gateway (trainer pod proxy up, server still starting)
+                    # - 503: Service Unavailable (metagraph/auth not ready yet)
                     # Do NOT retry 429 — means another validator already dispatched
                     # this job (semaphore busy) or rate limit hit. The checkpoint
                     # will appear in R2 from the other validator's dispatch.
-                    if resp.status_code == 503 and attempt < max_retries:
-                        wait = 5 * (attempt + 1)
+                    if resp.status_code in (502, 503) and attempt < max_retries:
+                        wait = 10 * (attempt + 1)
                         logger.warning(
-                            "Trainer UID %d returned HTTP 503, retrying in %ds (attempt %d/%d)",
-                            job.trainer_uid, wait, attempt + 1, max_retries,
+                            "Trainer UID %d returned HTTP %d, retrying in %ds (attempt %d/%d)",
+                            job.trainer_uid, resp.status_code, wait, attempt + 1, max_retries,
                         )
                         await asyncio.sleep(wait)
                         continue
