@@ -16,7 +16,7 @@ import importlib.util
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Protocol
 
 logger = logging.getLogger(__name__)
@@ -126,6 +126,7 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
 
     # 6. Train
     start = time.time()
+
     num_params = sum(p.numel() for p in model.parameters())
 
     # init_weights hook
@@ -146,7 +147,7 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
             training_time_seconds=time.time() - start,
         )
 
-    # 6. Save checkpoint
+    # 7. Save checkpoint
     checkpoint_path = "/workspace/checkpoints/model.safetensors"
     os.makedirs("/workspace/checkpoints", exist_ok=True)
     from safetensors.torch import save_file

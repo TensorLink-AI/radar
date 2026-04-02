@@ -34,12 +34,43 @@ _EVAL_TEMPLATES: dict[str, str] = {}
 
 
 def _load_eval_templates():
-    """Lazy-load eval templates from registered runners."""
+    """Lazy-load eval templates from runner directories.
+
+    Reads EVAL_TEMPLATE strings from runner train.py files by parsing
+    the source, rather than importing the module (which requires
+    Docker-only dependencies like torch, prepare, flops).
+    """
     if _EVAL_TEMPLATES:
         return
-    from runner.timeseries_forecast.train import EVAL_TEMPLATE as ts_template
-    _EVAL_TEMPLATES["runner/timeseries_forecast"] = ts_template
-    _EVAL_TEMPLATES[""] = ts_template  # default fallback
+    import ast
+
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+    # Load ts_forecasting eval template
+    train_path = os.path.join(project_root, "runner", "timeseries_forecast", "train.py")
+    template = _extract_eval_template(train_path)
+    if template:
+        _EVAL_TEMPLATES["runner/timeseries_forecast"] = template
+        _EVAL_TEMPLATES[""] = template  # default fallback
+    else:
+        logger.error("Failed to load eval template from %s", train_path)
+
+
+def _extract_eval_template(path: str) -> str | None:
+    """Extract EVAL_TEMPLATE string constant from a Python file via AST."""
+    import ast
+    try:
+        with open(path) as f:
+            tree = ast.parse(f.read())
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "EVAL_TEMPLATE":
+                        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                            return node.value.value
+    except Exception as e:
+        logger.warning("Could not parse %s: %s", path, e)
+    return None
 
 
 def _get_eval_template(runner_dir: str) -> str:
