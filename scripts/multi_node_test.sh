@@ -1083,19 +1083,25 @@ fi
 for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     DB_PORT=$((DB_PORT_BASE + i))
     STATS=$(curl -sf "http://localhost:${DB_PORT}/experiments/stats" 2>/dev/null || echo "{}")
-    TOTAL=$(echo "$STATS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
-    check "Validator $i DB has experiments ($TOTAL)" "$([ "$TOTAL" -gt 0 ] && echo true || echo false)"
+    TOTAL=$(echo "$STATS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null | head -1 || echo 0)
+    TOTAL="${TOTAL:-0}"
+    check "Validator $i DB has experiments ($TOTAL)" "$([ "$TOTAL" -gt 0 ] 2>/dev/null && echo true || echo false)"
 done
 
 # 8.4 Pareto front
 PARETO_SIZE=$(curl -sf "http://localhost:${DB_PORT_BASE}/experiments/pareto" 2>/dev/null | python3 -c "
 import sys, json
 try:
-    print(len(json.load(sys.stdin)))
-except:
+    data = json.load(sys.stdin)
+    print(len(data))
+except Exception:
     print(0)
-" 2>/dev/null || echo 0)
-check "Pareto front has members ($PARETO_SIZE)" "$([ "$PARETO_SIZE" -gt 0 ] && echo true || echo false)"
+" 2>/dev/null)
+PARETO_SIZE="${PARETO_SIZE:-0}"
+# Strip whitespace/newlines to ensure clean integer
+PARETO_SIZE=$(echo "$PARETO_SIZE" | tr -d '[:space:]' | head -c 10)
+PARETO_SIZE="${PARETO_SIZE:-0}"
+check "Pareto front has members ($PARETO_SIZE)" "$([ "$PARETO_SIZE" -gt 0 ] 2>/dev/null && echo true || echo false)"
 
 # 8.5 Training dispatch (verify jobs were dispatched — self-training is now allowed)
 JOB_COUNT=$(grep -c "Job arch=" "$LOG_DIR/validator0.log" 2>/dev/null) || JOB_COUNT=0
@@ -1103,9 +1109,11 @@ check "Training jobs dispatched ($JOB_COUNT)" "$([ "$JOB_COUNT" -gt 0 ] && echo 
 
 # 8.6 Validator consistency (both have same experiment count, within tolerance)
 if [ "$NUM_VALIDATORS" -ge 2 ]; then
-    TOTAL_V0=$(curl -sf "http://localhost:${DB_PORT_BASE}/experiments/stats" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
-    TOTAL_V1=$(curl -sf "http://localhost:$((DB_PORT_BASE+1))/experiments/stats" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
-    DIFF=$(( TOTAL_V0 > TOTAL_V1 ? TOTAL_V0 - TOTAL_V1 : TOTAL_V1 - TOTAL_V0 ))
+    TOTAL_V0=$(curl -sf "http://localhost:${DB_PORT_BASE}/experiments/stats" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null | head -1 || echo 0)
+    TOTAL_V0="${TOTAL_V0:-0}"
+    TOTAL_V1=$(curl -sf "http://localhost:$((DB_PORT_BASE+1))/experiments/stats" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null | head -1 || echo 0)
+    TOTAL_V1="${TOTAL_V1:-0}"
+    DIFF=$(( ${TOTAL_V0:-0} > ${TOTAL_V1:-0} ? ${TOTAL_V0:-0} - ${TOTAL_V1:-0} : ${TOTAL_V1:-0} - ${TOTAL_V0:-0} ))
     check "Validators consistent (v0=$TOTAL_V0, v1=$TOTAL_V1, diff=$DIFF)" "$([ "$DIFF" -le 2 ] && echo true || echo false)"
 fi
 
