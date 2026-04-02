@@ -1088,23 +1088,33 @@ for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     check "Validator $i DB has experiments ($TOTAL)" "$([ "$TOTAL" -gt 0 ] 2>/dev/null && echo true || echo false)"
 done
 
-# 8.4 Pareto front
-PARETO_SIZE=$(curl -sf "http://localhost:${DB_PORT_BASE}/experiments/pareto" 2>/dev/null | python3 -c "
+# 8.4 Pareto front (check all validators, take max)
+PARETO_SIZE=0
+for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
+    DB_PORT=$((DB_PORT_BASE + i))
+    P=$(curl -sf "http://localhost:${DB_PORT}/experiments/pareto" 2>/dev/null | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
     print(len(data))
 except Exception:
     print(0)
-" 2>/dev/null)
-PARETO_SIZE="${PARETO_SIZE:-0}"
-# Strip whitespace/newlines to ensure clean integer
-PARETO_SIZE=$(echo "$PARETO_SIZE" | tr -d '[:space:]' | head -c 10)
-PARETO_SIZE="${PARETO_SIZE:-0}"
+" 2>/dev/null | head -1)
+    P="${P:-0}"
+    P=$(echo "$P" | tr -d '[:space:]')
+    P="${P:-0}"
+    if [ "$P" -gt "$PARETO_SIZE" ] 2>/dev/null; then
+        PARETO_SIZE="$P"
+    fi
+done
 check "Pareto front has members ($PARETO_SIZE)" "$([ "$PARETO_SIZE" -gt 0 ] 2>/dev/null && echo true || echo false)"
 
-# 8.5 Training dispatch (verify jobs were dispatched — self-training is now allowed)
-JOB_COUNT=$(grep -c "Job arch=" "$LOG_DIR/validator0.log" 2>/dev/null) || JOB_COUNT=0
+# 8.5 Training dispatch (check all validator logs)
+JOB_COUNT=0
+for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
+    J=$(grep -c "Job arch=" "$LOG_DIR/validator${i}.log" 2>/dev/null) || J=0
+    JOB_COUNT=$((JOB_COUNT + J))
+done
 check "Training jobs dispatched ($JOB_COUNT)" "$([ "$JOB_COUNT" -gt 0 ] && echo true || echo false)"
 
 # 8.6 Validator consistency (both have same experiment count, within tolerance)
