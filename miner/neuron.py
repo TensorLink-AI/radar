@@ -175,7 +175,7 @@ class Miner:
         ttl = 900 + int(request.time_budget) + 300  # 15 min alloc + training + 5 min upload
         deploy_timeout = 900  # 15 min max wait for GPU allocation
         hotkey = self.wallet.hotkey.ss58_address
-        deploy_name = f"radar-trainer-{request.round_id}"
+        deploy_name = f"radar-trainer-{hotkey[:8]}-{request.round_id}"
 
         try:
             # Build env vars for the trainer pod

@@ -255,12 +255,15 @@ class TrainingCoordinator:
                         headers=headers,
                     )
 
-                    # Retry on transient HTTP errors (429 busy, 503 unavailable)
-                    if resp.status_code in (429, 503) and attempt < max_retries:
+                    # Retry on 503 (auth/metagraph not ready yet — transient).
+                    # Do NOT retry 429 — means another validator already dispatched
+                    # this job (semaphore busy) or rate limit hit. The checkpoint
+                    # will appear in R2 from the other validator's dispatch.
+                    if resp.status_code == 503 and attempt < max_retries:
                         wait = 5 * (attempt + 1)
                         logger.warning(
-                            "Trainer UID %d returned HTTP %d, retrying in %ds (attempt %d/%d)",
-                            job.trainer_uid, resp.status_code, wait, attempt + 1, max_retries,
+                            "Trainer UID %d returned HTTP 503, retrying in %ds (attempt %d/%d)",
+                            job.trainer_uid, wait, attempt + 1, max_retries,
                         )
                         await asyncio.sleep(wait)
                         continue
