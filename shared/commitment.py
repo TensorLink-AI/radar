@@ -81,33 +81,71 @@ class ImageCommitment:
         return bool(self.image_url) and bool(self.listener_url)
 
 
+def _decode_commitment_raw(metadata: dict) -> str:
+    """Decode commitment metadata, handling Raw* variants the SDK chokes on.
+
+    The bittensor SDK's decode_metadata() fails when the commitment data
+    length maps to a Raw* variant not in its type registry (e.g. Raw279).
+    This function extracts the bytes directly from the metadata dict.
+    """
+    try:
+        # Standard SDK path
+        from bittensor.core.subtensor import decode_metadata
+        return decode_metadata(metadata)
+    except Exception:
+        pass
+
+    # Manual extraction: metadata["info"]["fields"] contains the raw data
+    try:
+        fields = metadata.get("info", {}).get("fields", [])
+        if not fields:
+            return ""
+        commitment = fields[0]
+        # fields[0] is either a dict like {"Raw279": [...]} or a tuple
+        if isinstance(commitment, (list, tuple)):
+            commitment = commitment[0]
+        if isinstance(commitment, dict):
+            raw_bytes = next(iter(commitment.values()))
+            if isinstance(raw_bytes, (list, tuple)):
+                byte_data = raw_bytes[0] if raw_bytes and isinstance(raw_bytes[0], (list, tuple)) else raw_bytes
+                return bytes(byte_data).decode("utf-8", errors="ignore")
+            if isinstance(raw_bytes, str):
+                return raw_bytes
+        return ""
+    except Exception:
+        return ""
+
+
 def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, ImageCommitment]:
     """
     Read image commitments from all miners in the metagraph.
 
-    Tries chain first, falls back to file-based commitments for localnet.
+    Tries chain commitment API first (with raw byte fallback for SDK
+    decode bugs), then falls back to file-based commitments for localnet.
 
     Returns: {uid: ImageCommitment} for miners with valid commitments.
     """
-    # Try file-based commitments first (always available, used by localnet)
-    file_commitments = _read_from_files(netuid, metagraph)
-    if file_commitments:
-        logger.info("Found %d commitments from file fallback", len(file_commitments))
-        return file_commitments
-
-    # Fall back to chain API (suppress noisy bittensor ERROR logs from
-    # decode_metadata failures that are expected on localnet)
     hotkeys = metagraph.hotkeys if metagraph.hotkeys is not None else []
     commitments = {}
+
+    # Suppress noisy bittensor ERROR logs from decode_metadata failures
     bt_logger = logging.getLogger("bittensor")
     prev_level = bt_logger.level
     bt_logger.setLevel(logging.CRITICAL)
     try:
         for uid in range(metagraph.n):
             try:
+                hotkey = hotkeys[uid] if uid < len(hotkeys) else ""
+                if not hotkey:
+                    continue
+                # Try get_commitment first (works when SDK can decode)
                 raw = subtensor.get_commitment(netuid=netuid, uid=uid)
+                if not raw:
+                    # SDK decode failed — try raw metadata extraction
+                    metadata = subtensor.get_commitment_metadata(netuid, hotkey)
+                    if metadata and isinstance(metadata, dict):
+                        raw = _decode_commitment_raw(metadata)
                 if raw:
-                    hotkey = hotkeys[uid] if uid < len(hotkeys) else ""
                     commitment = ImageCommitment.from_json(raw, miner_uid=uid, hotkey=hotkey)
                     if commitment.image_url:
                         commitments[uid] = commitment
@@ -116,7 +154,15 @@ def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, Image
     finally:
         bt_logger.setLevel(prev_level)
 
-    return commitments
+    if commitments:
+        logger.info("Found %d commitments from chain", len(commitments))
+        return commitments
+
+    # Fall back to file-based commitments (localnet)
+    file_commitments = _read_from_files(netuid, metagraph)
+    if file_commitments:
+        logger.info("Found %d commitments from file fallback", len(file_commitments))
+    return file_commitments
 
 
 def _image_exists_locally(image_url: str) -> bool:

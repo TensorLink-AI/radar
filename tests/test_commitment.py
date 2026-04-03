@@ -6,6 +6,7 @@ import pytest
 from shared.commitment import (
     ImageCommitment, verify_subnet_version,
     pull_and_verify_image, _image_exists_locally,
+    _decode_commitment_raw, read_miner_commitments,
 )
 
 
@@ -48,6 +49,61 @@ class TestImageCommitment:
         assert "miner_uid" not in d
         assert "hotkey" not in d
         assert d["image_url"] == "x"
+
+
+class TestDecodeCommitmentRaw:
+    """Tests for raw metadata decoding when SDK fails on Raw* variants."""
+
+    def test_standard_raw_dict(self):
+        """Decode metadata with Raw* key containing byte list."""
+        commitment_json = '{"image_url": "test:latest", "image_digest": ""}'
+        byte_list = list(commitment_json.encode("utf-8"))
+        metadata = {"info": {"fields": [{"Raw279": [byte_list]}]}}
+        result = _decode_commitment_raw(metadata)
+        assert result == commitment_json
+
+    def test_nested_tuple_format(self):
+        """Decode metadata where fields[0] is a list/tuple."""
+        commitment_json = '{"image_url": "x"}'
+        byte_list = list(commitment_json.encode("utf-8"))
+        metadata = {"info": {"fields": [[{"Raw18": [byte_list]}]]}}
+        result = _decode_commitment_raw(metadata)
+        assert result == commitment_json
+
+    def test_flat_byte_list(self):
+        """Decode metadata where Raw* value is a flat byte list (no nesting)."""
+        commitment_json = '{"image_url": "x"}'
+        byte_list = list(commitment_json.encode("utf-8"))
+        metadata = {"info": {"fields": [{"Raw18": byte_list}]}}
+        result = _decode_commitment_raw(metadata)
+        assert result == commitment_json
+
+    def test_empty_metadata(self):
+        assert _decode_commitment_raw({}) == ""
+        assert _decode_commitment_raw({"info": {}}) == ""
+        assert _decode_commitment_raw({"info": {"fields": []}}) == ""
+
+    def test_read_miner_commitments_chain_with_raw_fallback(self):
+        """Validator reads commitments even when SDK decode_metadata fails."""
+        commitment_json = ImageCommitment(
+            image_url="ghcr.io/test:latest",
+            listener_url="http://1.2.3.4:8090",
+        ).to_json()
+        byte_list = list(commitment_json.encode("utf-8"))
+        raw_metadata = {"info": {"fields": [{"Raw200": [byte_list]}]}}
+
+        mock_sub = MagicMock()
+        mock_sub.get_commitment.return_value = ""  # SDK decode fails
+        mock_sub.get_commitment_metadata.return_value = raw_metadata
+
+        mock_mg = MagicMock()
+        mock_mg.n = 1
+        mock_mg.hotkeys = ["5FakeHotkey"]
+
+        result = read_miner_commitments(mock_sub, 279, mock_mg)
+        assert len(result) == 1
+        assert result[0].image_url == "ghcr.io/test:latest"
+        assert result[0].listener_url == "http://1.2.3.4:8090"
 
 
 class TestPullAndVerifyImage:
