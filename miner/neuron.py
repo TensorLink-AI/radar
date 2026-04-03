@@ -355,12 +355,26 @@ class Miner:
             self.docker_image, self.listener_port, self.trainer_image,
         )
 
+        iteration = 0
         while True:
-            await asyncio.sleep(300)
-            try:
-                self.subtensor.metagraph(self.netuid)
-            except Exception:
-                pass
+            await asyncio.sleep(60)
+            iteration += 1
+            active = {
+                rid: (d.name if hasattr(d, "name") else d)
+                for rid, d in self.active_deployments.items()
+            }
+            logger.info(
+                "Heartbeat #%d — listener on port %d, active deployments: %s",
+                iteration, self.listener_port,
+                active if active else "none",
+            )
+            # Refresh metagraph every 5 minutes
+            if iteration % 5 == 0:
+                try:
+                    self.subtensor.metagraph(self.netuid)
+                    logger.info("Metagraph refreshed")
+                except Exception as e:
+                    logger.warning("Metagraph refresh failed: %s", e)
 
 
 def get_config() -> bt.Config:
