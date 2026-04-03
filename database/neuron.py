@@ -63,10 +63,26 @@ class DatabaseNeuron:
 
     async def _init_db(self):
         """Create asyncpg pool and init schemas."""
+        import ssl as _ssl
+
         pg_dsn = getattr(self.config, "pg_dsn", None) or Config.PG_DSN
-        self.pool = await asyncpg.create_pool(
-            pg_dsn, min_size=2, max_size=10,
-        )
+
+        pool_kwargs: dict = {"min_size": 2, "max_size": 10}
+
+        # SSL support (required for Supabase / managed Postgres)
+        if Config.PG_SSL:
+            ctx = _ssl.create_default_context()
+            if Config.PG_SSL == "require":
+                ctx.check_hostname = False
+                ctx.verify_mode = _ssl.CERT_NONE
+            pool_kwargs["ssl"] = ctx
+
+        # Disable prepared-statement cache when using connection poolers
+        # (e.g. Supabase Supavisor in transaction mode).
+        if Config.PG_SSL or "supabase" in pg_dsn:
+            pool_kwargs["statement_cache_size"] = 0
+
+        self.pool = await asyncpg.create_pool(pg_dsn, **pool_kwargs)
         self.store = PgExperimentStore(self.pool)
         await self.store.init_schema()
 

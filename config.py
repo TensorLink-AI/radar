@@ -99,6 +99,8 @@ class Config:
 
     # ── Postgres ──────────────────────────────────────────────
     PG_DSN: str = os.getenv("RADAR_PG_DSN", "postgresql://radar:radar@localhost:5432/radar")
+    # Set to "require" for Supabase/managed Postgres, "" for local
+    PG_SSL: str = os.getenv("RADAR_PG_SSL", "")
 
     # ── Database API ──────────────────────────────────────────
     DB_API_URL: str = os.getenv("RADAR_DB_API_URL", "http://localhost:8090")
