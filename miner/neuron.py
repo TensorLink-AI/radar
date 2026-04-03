@@ -90,15 +90,15 @@ class Miner:
             trainer_image=self.trainer_image,
         )
 
-        # Always write to file — ensures localnet and testnet work even if
-        # chain commitment encoding is unreadable by get_commitment().
+        # Always write full data to file — localnet and testnet fallback
         _commit_to_file(self.wallet, self.netuid, commitment)
 
         try:
+            # On-chain limit is Raw128 (128 bytes) — use compact chain format
             self.subtensor.set_commitment(
                 wallet=self.wallet,
                 netuid=self.netuid,
-                data=commitment.to_json(),
+                data=commitment.to_chain_json(),
             )
             logger.info("Committed image to chain: %s", self.docker_image)
         except Exception as e:
