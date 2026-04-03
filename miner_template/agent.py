@@ -1,7 +1,10 @@
 """LLM-powered miner agent using Chutes for inference.
 
 Reads Challenge JSON from stdin, uses an LLM to design competitive
-time-series forecasting architectures, writes Proposal JSON to stdout.
+ML architectures for any task, writes Proposal JSON to stdout.
+
+The agent is fully task-agnostic — it reads the task spec from the challenge
+and adapts its prompts, validation, and output accordingly.
 
 Requires:
   - CHUTES_API_KEY env var for Chutes inference
@@ -16,7 +19,6 @@ import os
 import sys
 import tarfile
 import tempfile
-import textwrap
 import time
 import traceback
 import urllib.request
@@ -118,7 +120,6 @@ def gather_db_context(challenge: dict) -> dict:
 
     context = {}
 
-    # Recent experiments (what's been tried)
     recent = _db_get(db_url, "/experiments/recent?n=15")
     if recent:
         context["recent_experiments"] = [
@@ -132,7 +133,6 @@ def gather_db_context(challenge: dict) -> dict:
             for e in recent[:15]
         ]
 
-    # Pareto front (best experiments)
     pareto = _db_get(db_url, "/experiments/pareto")
     if pareto:
         context["pareto_front"] = [
@@ -145,17 +145,14 @@ def gather_db_context(challenge: dict) -> dict:
             for e in pareto[:10]
         ]
 
-    # Component stats (which building blocks correlate with success)
     comp_stats = _db_get(db_url, "/provenance/component_stats")
     if comp_stats:
         context["component_stats"] = comp_stats
 
-    # Dead ends (patterns to avoid)
     dead_ends = _db_get(db_url, "/provenance/dead_ends")
     if dead_ends:
         context["dead_ends"] = dead_ends.get("dead_ends", [])[:10]
 
-    # Failure patterns
     failures = _db_get(db_url, "/experiments/failures?n=5")
     if failures:
         context["recent_failures"] = [
@@ -205,104 +202,154 @@ def llm_chat(messages: list[dict], temperature: float = None) -> str:
 # ---------------------------------------------------------------------------
 # Code validation
 # ---------------------------------------------------------------------------
-def validate_code(code: str) -> tuple[bool, str]:
-    """Validate generated architecture code for basic correctness."""
+FORBIDDEN_MODULES = ("subprocess", "socket", "ftplib")
+
+
+def validate_code(code: str, task: dict) -> tuple[bool, str]:
+    """Validate generated code. Checks are task-aware."""
     # 1. Syntax check
     try:
         tree = ast.parse(code)
     except SyntaxError as e:
         return False, f"Syntax error: {e}"
 
-    # 2. Check required functions exist
+    # 2. Collect defined function names
     func_names = {
         node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
     }
-    if "build_model" not in func_names:
-        return False, "Missing build_model() function"
-    if "build_optimizer" not in func_names:
-        return False, "Missing build_optimizer() function"
 
-    # 3. Check no dangerous imports
+    # 3. For harness-based tasks (run_command contains "harness.py"),
+    #    build_model and build_optimizer are required.
+    #    For standalone tasks (run_command is "python {target}"),
+    #    the code just needs to be valid Python — no required functions.
+    run_cmd = task.get("run_command", "python {target}")
+    uses_harness = "harness.py" in run_cmd
+
+    if uses_harness:
+        if "build_model" not in func_names:
+            return False, "Missing build_model() function"
+        if "build_optimizer" not in func_names:
+            return False, "Missing build_optimizer() function"
+
+    # 4. Check no dangerous imports
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name in ("subprocess", "socket", "http", "ftplib"):
+                if alias.name in FORBIDDEN_MODULES:
                     return False, f"Forbidden import: {alias.name}"
         elif isinstance(node, ast.ImportFrom):
-            if node.module and node.module.split(".")[0] in (
-                "subprocess", "socket", "http", "ftplib",
-            ):
+            if node.module and node.module.split(".")[0] in FORBIDDEN_MODULES:
                 return False, f"Forbidden import: {node.module}"
-
-    # 4. Check build_model signature has correct params
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "build_model":
-            params = [arg.arg for arg in node.args.args]
-            expected = {"context_len", "prediction_len", "num_variates", "quantiles"}
-            if not expected.issubset(set(params)):
-                return False, (
-                    f"build_model params {params} missing required: "
-                    f"{expected - set(params)}"
-                )
-            break
 
     return True, "OK"
 
 
 # ---------------------------------------------------------------------------
-# Prompt construction
+# Prompt construction (task-agnostic)
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = textwrap.dedent("""\
-    You are an expert autonomous ML researcher specializing in time-series
-    forecasting models. You design PyTorch architectures that minimize CRPS
-    (Continuous Ranked Probability Score) on diverse forecasting benchmarks.
+def build_system_prompt(task: dict) -> str:
+    """Build system prompt dynamically from the task spec."""
+    task_name = task.get("name", "unknown")
+    domain_prompt = task.get("domain_system_prompt", "")
+    constraints = task.get("constraints", [])
+    anti_patterns = task.get("anti_patterns", [])
+    hypotheses = task.get("example_hypotheses", [])
+    objectives = task.get("objectives", [])
+    run_cmd = task.get("run_command", "python {target}")
+    uses_harness = "harness.py" in run_cmd
 
-    You MUST output a single Python code block containing a complete module.
-    The module MUST define:
-      - build_model(context_len, prediction_len, num_variates, quantiles)
-        -> nn.Module
-      - build_optimizer(model) -> torch.optim.Optimizer
+    parts = []
 
-    Model contract:
-      Input:  (batch, context_len, num_variates) float tensor
-      Output: (batch, prediction_len, num_variates, len(quantiles)) float tensor
+    # Domain expertise
+    if domain_prompt:
+        parts.append(domain_prompt.strip())
+    else:
+        parts.append(
+            "You are an expert autonomous ML researcher. You design PyTorch "
+            "code that achieves state-of-the-art results under compute constraints."
+        )
 
-    Available optional hooks (define them if useful):
-      - training_config() -> dict with batch_size, grad_accum_steps,
-        grad_clip, eval_interval
-      - init_weights(model) -> None (custom init, must NOT change param count)
-      - configure_amp() -> dict with enabled, dtype
-      - transform_batch(batch, step, total_steps) -> dict with "context",
-        "target" keys
-      - on_step_end(model, optimizer, step, total_steps, loss_value) -> None
-      - build_scheduler(optimizer, total_steps) -> LRScheduler
-      - compute_loss(predictions, targets, quantiles_list) -> Tensor
-      - COMPILE = True/False module attribute for torch.compile
+    parts.append("")
+    parts.append("## Output Format")
+    parts.append(
+        "You MUST output a single Python code block (```python ... ```) "
+        "containing a complete, runnable module. No explanations outside "
+        "the code block."
+    )
 
-    Rules:
-      - Only use torch and standard library. No external packages.
-      - FLOPs-equivalent MUST be within the specified [min, max] range.
-        Target ~60% of max for safety margin.
-      - Code must be syntactically valid and runnable.
-      - Output ONLY the Python code block. No explanations outside the block.
-      - Use modern PyTorch best practices.
+    # Task-specific interface requirements
+    if uses_harness:
+        parts.append("")
+        parts.append("## Required Interface (harness-based task)")
+        parts.append("The module MUST define:")
+        parts.append("  - build_model(...) -> nn.Module")
+        parts.append("  - build_optimizer(model) -> torch.optim.Optimizer")
+        parts.append("")
+        parts.append("Optional hooks you can define:")
+        parts.append("  - training_config() -> dict (batch_size, grad_accum_steps, "
+                      "grad_clip, eval_interval)")
+        parts.append("  - init_weights(model) -> None")
+        parts.append("  - configure_amp() -> dict (enabled, dtype)")
+        parts.append("  - transform_batch(batch, step, total_steps) -> dict")
+        parts.append("  - on_step_end(model, optimizer, step, total_steps, "
+                      "loss_value) -> None")
+        parts.append("  - build_scheduler(optimizer, total_steps) -> LRScheduler")
+        parts.append("  - compute_loss(predictions, targets, quantiles_list) "
+                      "-> Tensor")
+        parts.append("  - COMPILE = True/False module attribute")
+    else:
+        parts.append("")
+        parts.append("## Required Interface (standalone task)")
+        parts.append(
+            "The module IS the full training script. It must run end-to-end "
+            "when executed with `python submission.py` and print metrics to "
+            "stdout in the format the runner expects."
+        )
 
-    Scoring priorities (weights):
-      1. CRPS (1.0) — primary metric, lower is better
-      2. MASE (0.5) — secondary, lower is better
-      3. Training time (0.2) — faster is better
-      4. Memory (0.1) — less is better
-      5. Pareto dominance bonus: 1.5x if you beat ALL metrics
+    # Objectives
+    if objectives:
+        parts.append("")
+        parts.append("## Scoring Objectives")
+        for obj in objectives:
+            direction = "lower is better" if obj.get("lower_is_better", True) else "higher is better"
+            primary = " [PRIMARY]" if obj.get("primary") else ""
+            parts.append(
+                f"  - {obj['name']} (weight={obj.get('weight', 1.0)}, "
+                f"{direction}){primary}"
+            )
+        parts.append("  - Pareto dominance bonus: 1.5x if you beat ALL metrics")
 
-    Known effective techniques for time-series:
-      - PatchTST-style patching (patch_size=16 or 32)
-      - Reversible Instance Normalization (RevIN)
-      - Channel-independent processing
-      - Relative/rotary positional encoding
-      - SwiGLU / GeGLU feed-forward layers
-      - Cosine annealing with warmup
-      - Mixture of quantile heads
-""")
+    # Constraints
+    if constraints:
+        parts.append("")
+        parts.append("## Constraints")
+        for c in constraints:
+            parts.append(f"  - {c}")
+
+    # Rules
+    parts.append("")
+    parts.append("## Rules")
+    parts.append("  - Only use torch and standard library. No external packages.")
+    parts.append("  - FLOPs-equivalent MUST be within the specified [min, max] range.")
+    parts.append("  - Target ~60% of max FLOPs for safety margin.")
+    parts.append("  - Code must be syntactically valid and runnable.")
+    parts.append("  - Use modern PyTorch best practices.")
+
+    # Anti-patterns
+    if anti_patterns:
+        parts.append("")
+        parts.append("## Anti-patterns (AVOID)")
+        for ap in anti_patterns:
+            parts.append(f"  - {ap}")
+
+    # Hypotheses for inspiration
+    if hypotheses:
+        parts.append("")
+        parts.append("## Example Hypotheses for Inspiration")
+        for h in hypotheses:
+            parts.append(f"  - {h}")
+
+    return "\n".join(parts)
 
 
 def build_user_prompt(challenge: dict, db_context: dict, history: list) -> str:
@@ -312,27 +359,41 @@ def build_user_prompt(challenge: dict, db_context: dict, history: list) -> str:
     target_flops = int(max_flops * 0.6)
     frontier = challenge.get("feasible_frontier", [])
     seed = challenge.get("seed", 0)
+    task = challenge.get("task", {})
+    task_name = task.get("name", "unknown")
+    task_desc = task.get("description", "")
 
     parts = []
+    parts.append(f"## Task: {task_name}")
+    if task_desc:
+        parts.append(task_desc.strip())
+    parts.append("")
+
     parts.append(f"## Round Context")
     parts.append(f"- FLOPs budget: [{min_flops:,} — {max_flops:,}]")
     parts.append(f"- Target FLOPs (60% of max): ~{target_flops:,}")
     parts.append(f"- Seed: {seed}")
-    parts.append(f"- Context length: 512, Prediction length: 96")
-    parts.append(f"- Num variates: 1 (univariate)")
-    parts.append(f"- Quantiles: [0.1, 0.2, ..., 0.9] (9 quantiles)")
+    parts.append(f"- Time budget: {task.get('time_budget', 300)}s")
     parts.append("")
 
     # Frontier
     if frontier:
         parts.append(f"## Current Frontier ({len(frontier)} members)")
+        primary_obj = None
+        for obj in task.get("objectives", []):
+            if obj.get("primary"):
+                primary_obj = obj
+                break
+        metric_name = primary_obj["name"] if primary_obj else "metric"
         best = min(frontier, key=lambda x: x.get("metric", float("inf")))
-        parts.append(f"Best CRPS: {best.get('metric', '?')}")
+        parts.append(f"Best {metric_name}: {best.get('metric', '?')}")
         for i, f_entry in enumerate(frontier[:5]):
-            parts.append(f"\n### Frontier #{i+1} (CRPS={f_entry.get('metric', '?')})")
+            parts.append(
+                f"\n### Frontier #{i+1} "
+                f"({metric_name}={f_entry.get('metric', '?')})"
+            )
             code = f_entry.get("code", "")
             if code:
-                # Show key parts of the code
                 parts.append(f"```python\n{code[:2000]}\n```")
         parts.append("")
     else:
@@ -381,24 +442,23 @@ def build_user_prompt(challenge: dict, db_context: dict, history: list) -> str:
         for h in history[-5:]:
             parts.append(
                 f"- Round {h.get('round', '?')}: {h.get('name', '?')} "
-                f"(CRPS={h.get('metric', '?')})"
+                f"(metric={h.get('metric', '?')})"
             )
             if h.get("notes"):
                 parts.append(f"  Notes: {h['notes']}")
         parts.append("")
 
-    parts.append("## Task")
+    parts.append("## Instruction")
     if frontier:
         parts.append(
-            "Design an architecture that IMPROVES on the current frontier. "
+            "Design code that IMPROVES on the current frontier. "
             "Study the frontier code carefully and identify weaknesses or "
             "missed opportunities. Be creative but stay within FLOPs budget."
         )
     else:
         parts.append(
-            "Design a strong baseline architecture for this size bucket. "
-            "Focus on proven techniques: patching, RevIN normalization, "
-            "efficient attention. Stay well within the FLOPs budget."
+            "Design a strong baseline for this size bucket. "
+            "Focus on proven techniques. Stay well within the FLOPs budget."
         )
     parts.append(
         "\nOutput ONLY a Python code block (```python ... ```) with the "
@@ -410,181 +470,17 @@ def build_user_prompt(challenge: dict, db_context: dict, history: list) -> str:
 
 def extract_code_block(response: str) -> str:
     """Extract Python code from LLM response."""
-    # Try ```python ... ``` first
     if "```python" in response:
         start = response.index("```python") + len("```python")
         end = response.index("```", start)
         return response[start:end].strip()
 
-    # Try ``` ... ```
     if "```" in response:
         start = response.index("```") + 3
         end = response.index("```", start)
         return response[start:end].strip()
 
-    # Assume the whole response is code
     return response.strip()
-
-
-# ---------------------------------------------------------------------------
-# Fallback: deterministic architecture (no LLM needed)
-# ---------------------------------------------------------------------------
-def _pick_hyperparams(min_flops: int, max_flops: int) -> dict:
-    """Pick hyperparams to fit the FLOPs range. Targets 60% of max."""
-    target = int(max_flops * 0.6)
-    presets = [
-        (16,  2, 1,   32,    150_000),
-        (24,  2, 1,   64,    350_000),
-        (32,  2, 2,   64,    800_000),
-        (48,  4, 2,  128,  1_500_000),
-        (64,  4, 2,  192,  3_500_000),
-        (64,  4, 3,  256,  7_000_000),
-        (96,  4, 3,  384, 20_000_000),
-        (128, 4, 3,  512, 40_000_000),
-        (128, 4, 4,  512, 60_000_000),
-        (160, 8, 4,  640, 90_000_000),
-    ]
-    best = presets[0]
-    for preset in presets:
-        if preset[4] <= target:
-            best = preset
-    return {
-        "d_model": best[0], "nhead": best[1],
-        "num_layers": best[2], "dim_feedforward": best[3],
-    }
-
-
-def fallback_architecture(challenge: dict) -> str:
-    """Generate a solid PatchTST-style architecture without LLM."""
-    min_flops = challenge.get("min_flops_equivalent", 0)
-    max_flops = challenge.get("max_flops_equivalent", 0)
-    hp = _pick_hyperparams(min_flops, max_flops)
-    d = hp["d_model"]
-    nh = hp["nhead"]
-    nl = hp["num_layers"]
-    ff = hp["dim_feedforward"]
-    ps = 16 if d >= 32 else 8
-
-    return textwrap.dedent(f"""\
-        import math
-        import torch
-        import torch.nn as nn
-        import torch.nn.functional as F
-
-
-        class RevIN(nn.Module):
-            \"\"\"Reversible Instance Normalization for cross-domain robustness.\"\"\"
-            def __init__(self, num_features, eps=1e-5):
-                super().__init__()
-                self.eps = eps
-                self.affine_weight = nn.Parameter(torch.ones(1, 1, num_features))
-                self.affine_bias = nn.Parameter(torch.zeros(1, 1, num_features))
-
-            def forward(self, x, mode):
-                if mode == "norm":
-                    self._mean = x.mean(dim=1, keepdim=True).detach()
-                    self._std = (x.std(dim=1, keepdim=True) + self.eps).detach()
-                    x = (x - self._mean) / self._std
-                    x = x * self.affine_weight + self.affine_bias
-                    return x
-                else:
-                    x = (x - self.affine_bias) / self.affine_weight
-                    x = x * self._std + self._mean
-                    return x
-
-
-        class PatchTSForecaster(nn.Module):
-            def __init__(self, context_len, prediction_len, num_variates, quantiles):
-                super().__init__()
-                self.context_len = context_len
-                self.prediction_len = prediction_len
-                self.num_variates = num_variates
-                self.num_quantiles = len(quantiles)
-
-                patch_size = {ps}
-                d_model = {d}
-                num_patches = context_len // patch_size
-                self.patch_size = patch_size
-                self.num_patches = num_patches
-
-                self.revin = RevIN(num_variates)
-                self.patch_embed = nn.Linear(patch_size * num_variates, d_model)
-                self.pos_embed = nn.Parameter(
-                    torch.randn(1, num_patches, d_model) * 0.02
-                )
-                layer = nn.TransformerEncoderLayer(
-                    d_model=d_model, nhead={nh},
-                    dim_feedforward={ff}, dropout=0.1,
-                    batch_first=True, norm_first=True,
-                )
-                self.encoder = nn.TransformerEncoder(layer, num_layers={nl})
-                self.head = nn.Linear(
-                    d_model * num_patches,
-                    prediction_len * num_variates * self.num_quantiles,
-                )
-
-            def forward(self, x):
-                B, T, V = x.shape
-                x = self.revin(x, "norm")
-                patches = x.reshape(B, self.num_patches, self.patch_size * V)
-                h = self.patch_embed(patches) + self.pos_embed
-                h = self.encoder(h)
-                h = h.reshape(B, -1)
-                out = self.head(h)
-                out = out.view(B, self.prediction_len, self.num_variates,
-                               self.num_quantiles)
-                # Denorm the median prediction concept via RevIN
-                # (simplified: denorm all quantiles equally)
-                out_flat = out.permute(0, 3, 1, 2).reshape(
-                    B * self.num_quantiles, self.prediction_len, self.num_variates
-                )
-                out_denorm = self.revin(out_flat, "denorm")
-                out = out_denorm.reshape(
-                    B, self.num_quantiles, self.prediction_len, self.num_variates
-                ).permute(0, 2, 3, 1)
-                return out
-
-
-        def build_model(context_len, prediction_len, num_variates, quantiles):
-            return PatchTSForecaster(
-                context_len, prediction_len, num_variates, quantiles
-            )
-
-
-        def build_optimizer(model):
-            return torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
-
-
-        def build_scheduler(optimizer, total_steps):
-            warmup = min(total_steps // 10, 200)
-            def lr_lambda(step):
-                if step < warmup:
-                    return step / max(warmup, 1)
-                progress = (step - warmup) / max(total_steps - warmup, 1)
-                return 0.5 * (1 + math.cos(math.pi * progress))
-            return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-
-        def configure_amp():
-            return {{"enabled": True, "dtype": "bfloat16"}}
-
-
-        def training_config():
-            return {{
-                "batch_size": 128,
-                "grad_accum_steps": 1,
-                "grad_clip": 1.0,
-                "eval_interval": 100,
-            }}
-
-
-        def init_weights(model):
-            for m in model.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
-    """)
 
 
 # ---------------------------------------------------------------------------
@@ -605,7 +501,7 @@ def save_history(scratch_dir: str, history: list):
     path = os.path.join(scratch_dir, "history.json")
     try:
         with open(path, "w") as f:
-            json.dump(history[-50:], f)  # keep last 50
+            json.dump(history[-50:], f)
     except Exception as e:
         log(f"History save failed: {e}")
 
@@ -614,88 +510,89 @@ def save_history(scratch_dir: str, history: list):
 # Main agent logic
 # ---------------------------------------------------------------------------
 def design_architecture(challenge: dict) -> dict:
-    """Use LLM to design a competitive architecture."""
+    """Use LLM to design a competitive architecture for any task."""
     scratch_dir = load_scratchpad(challenge)
     history = load_history(scratch_dir)
 
     min_flops = challenge.get("min_flops_equivalent", 0)
     max_flops = challenge.get("max_flops_equivalent", 0)
     round_id = challenge.get("round_id", 0)
-    log(f"Round {round_id}: FLOPs [{min_flops:,} — {max_flops:,}]")
+    task = challenge.get("task", {})
+    task_name = task.get("name", "unknown")
+    log(f"Round {round_id}: task={task_name}, FLOPs [{min_flops:,} — {max_flops:,}]")
 
     # Gather context from validator DB
     db_context = gather_db_context(challenge)
     log(f"DB context: {list(db_context.keys())}")
 
-    # Try LLM-powered design
+    # Build task-aware prompts
+    system_prompt = build_system_prompt(task)
+    user_prompt = build_user_prompt(challenge, db_context, history)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
     code = None
-    name = "unknown"
-    motivation = ""
-
-    if CHUTES_API_KEY:
-        user_prompt = build_user_prompt(challenge, db_context, history)
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ]
-
-        for attempt in range(2):
-            try:
-                log(f"LLM attempt {attempt + 1}...")
-                response = llm_chat(messages)
-                candidate = extract_code_block(response)
-
-                ok, err = validate_code(candidate)
-                if ok:
-                    code = candidate
-                    log("LLM code validated OK")
-                    break
-                else:
-                    log(f"Validation failed: {err}")
-                    # Ask LLM to fix
-                    messages.append({"role": "assistant", "content": response})
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"The code has an error: {err}\n"
-                            f"Fix it and output the corrected complete Python "
-                            f"module in a single ```python code block."
-                        ),
-                    })
-            except Exception as e:
-                log(f"LLM attempt {attempt + 1} error: {e}")
-                log(traceback.format_exc())
-
-    # Fallback if LLM failed
-    if code is None:
-        log("Using fallback architecture (no LLM or LLM failed)")
-        code = fallback_architecture(challenge)
-        name = f"fallback_patch_r{round_id}"
-        motivation = "Fallback PatchTST-style architecture with RevIN"
-    else:
-        # Extract a name from the code (look for class definitions)
+    for attempt in range(3):
         try:
-            tree = ast.parse(code)
-            classes = [
-                n.name for n in ast.walk(tree)
-                if isinstance(n, ast.ClassDef)
-            ]
-            name = classes[0] if classes else f"llm_arch_r{round_id}"
-        except Exception:
-            name = f"llm_arch_r{round_id}"
-        motivation = (
-            f"LLM-designed architecture for FLOPs [{min_flops:,}—{max_flops:,}]. "
-            f"Model: {CHUTES_MODEL}"
-        )
+            log(f"LLM attempt {attempt + 1}...")
+            response = llm_chat(messages)
+            candidate = extract_code_block(response)
+
+            ok, err = validate_code(candidate, task)
+            if ok:
+                code = candidate
+                log("LLM code validated OK")
+                break
+            else:
+                log(f"Validation failed: {err}")
+                messages.append({"role": "assistant", "content": response})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"The code has an error: {err}\n"
+                        f"Fix it and output the corrected complete Python "
+                        f"module in a single ```python code block."
+                    ),
+                })
+        except Exception as e:
+            log(f"LLM attempt {attempt + 1} error: {e}")
+            log(traceback.format_exc())
+
+    if code is None:
+        log("ERROR: All LLM attempts failed. No submission.")
+        # Save history even on failure
+        history.append({
+            "round": round_id, "name": "FAILED", "task": task_name,
+            "min_flops": min_flops, "max_flops": max_flops,
+            "used_llm": True, "success": False, "timestamp": time.time(),
+        })
+        save_history(scratch_dir, history)
+        save_scratchpad(challenge, scratch_dir)
+        return {"code": "", "name": "failed", "motivation": "LLM failed"}
+
+    # Extract a name from the code
+    try:
+        tree = ast.parse(code)
+        classes = [
+            n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)
+        ]
+        name = classes[0] if classes else f"llm_{task_name}_r{round_id}"
+    except Exception:
+        name = f"llm_{task_name}_r{round_id}"
+
+    motivation = (
+        f"LLM-designed for {task_name} "
+        f"FLOPs [{min_flops:,}—{max_flops:,}]. "
+        f"Model: {CHUTES_MODEL}"
+    )
 
     # Record in history
     history.append({
-        "round": round_id,
-        "name": name,
-        "min_flops": min_flops,
-        "max_flops": max_flops,
-        "used_llm": code is not None and CHUTES_API_KEY != "",
-        "timestamp": time.time(),
+        "round": round_id, "name": name, "task": task_name,
+        "min_flops": min_flops, "max_flops": max_flops,
+        "used_llm": True, "success": True, "timestamp": time.time(),
     })
     save_history(scratch_dir, history)
     save_scratchpad(challenge, scratch_dir)
@@ -705,7 +602,8 @@ def design_architecture(challenge: dict) -> dict:
 
 def main():
     challenge = json.loads(sys.stdin.read())
-    log("Agent starting (Chutes LLM backend)")
+    task_name = challenge.get("task", {}).get("name", "unknown")
+    log(f"Agent starting (Chutes LLM backend, task={task_name})")
     proposal = design_architecture(challenge)
     log(f"Proposal: {proposal['name']} — {proposal['motivation']}")
     print(json.dumps(proposal))
