@@ -17,7 +17,7 @@ import uvicorn
 
 from config import Config
 from database.server import (
-    app, set_db, set_auth, set_challenge, set_frontier,
+    app, set_db, set_pool, set_auth, set_challenge, set_frontier,
     set_access_logger, set_hotkey_map, set_rate_limit,
 )
 from shared.pareto import ParetoFront
@@ -89,8 +89,14 @@ class DatabaseNeuron:
         self.access_logger = PgAccessLogger(self.pool)
         await self.access_logger.init_schema()
 
+        # Init commitment table
+        from shared.pg_schema import COMMITMENT_SCHEMA
+        async with self.pool.acquire() as conn:
+            await conn.execute(COMMITMENT_SCHEMA)
+
         # Wire into server
         set_db(self.store)
+        set_pool(self.pool)
         set_access_logger(self.access_logger)
         set_auth(self.metagraph)
         set_rate_limit(Config.DB_VALI_RATE_LIMIT)

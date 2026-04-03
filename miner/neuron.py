@@ -79,7 +79,7 @@ class Miner:
         )
 
     def commit_image(self):
-        """Commit Docker agent image + listener URL to chain."""
+        """Commit Docker agent image + listener URL to chain + DB server."""
         digest = _get_image_digest(self.docker_image)
 
         commitment = ImageCommitment(
@@ -90,10 +90,13 @@ class Miner:
             trainer_image=self.trainer_image,
         )
 
-        # Always write to file — ensures localnet and testnet work even if
-        # chain commitment encoding is unreadable by get_commitment().
+        # Always write to file — ensures localnet works
         _commit_to_file(self.wallet, self.netuid, commitment)
 
+        # Register with centralized DB server (primary path for testnet/mainnet)
+        self._commit_to_db(commitment)
+
+        # Also attempt chain commit (may fail due to Raw size limits)
         try:
             self.subtensor.set_commitment(
                 wallet=self.wallet,
@@ -102,7 +105,35 @@ class Miner:
             )
             logger.info("Committed image to chain: %s", self.docker_image)
         except Exception as e:
-            logger.warning("Chain commit failed (%s), file fallback already written", e)
+            logger.warning("Chain commit failed (%s), DB + file fallback used", e)
+
+    def _commit_to_db(self, commitment: ImageCommitment):
+        """POST commitment to centralized DB server."""
+        import json
+        db_url = Config.DB_API_URL
+        if not db_url:
+            logger.debug("No DB_API_URL — skipping DB commitment")
+            return
+        hotkey = self.wallet.hotkey.ss58_address
+        metagraph = self.subtensor.metagraph(self.netuid)
+        hotkeys = metagraph.hotkeys or []
+        uid = hotkeys.index(hotkey) if hotkey in hotkeys else -1
+        payload = {
+            "hotkey": hotkey,
+            "uid": uid,
+            "data": json.loads(commitment.to_json()),
+        }
+        try:
+            resp = httpx.post(
+                f"{db_url}/commitments/register",
+                json=payload, timeout=10,
+            )
+            if resp.status_code == 200:
+                logger.info("Committed to DB server: %s (uid=%d)", self.docker_image, uid)
+            else:
+                logger.warning("DB commitment failed: HTTP %d %s", resp.status_code, resp.text[:100])
+        except Exception as e:
+            logger.warning("DB commitment failed: %s", e)
 
     async def _post_trainer_ready(
         self, round_id: int, trainer_url: str,

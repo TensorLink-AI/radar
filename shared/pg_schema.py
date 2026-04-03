@@ -93,6 +93,16 @@ CREATE INDEX IF NOT EXISTS idx_cc_experiment ON code_components(experiment_id);
 CREATE INDEX IF NOT EXISTS idx_cc_component ON code_components(component);
 """
 
+COMMITMENT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS commitments (
+    hotkey TEXT PRIMARY KEY,
+    uid INTEGER NOT NULL DEFAULT -1,
+    data JSONB NOT NULL DEFAULT '{}',
+    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0.0
+);
+CREATE INDEX IF NOT EXISTS idx_commit_uid ON commitments(uid);
+"""
+
 ACCESS_LOG_SCHEMA = """
 CREATE TABLE IF NOT EXISTS miner_access_log (
     id SERIAL PRIMARY KEY,

@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Injected at startup by database/neuron.py
 db = None  # PgExperimentStore
+_pool = None  # asyncpg.Pool (for direct queries like commitments)
 
 # Auth middleware reference
 _auth_verify = None
@@ -49,6 +50,11 @@ _hotkey_to_uid: dict[str, int] = {}
 def set_db(experiment_db):
     global db
     db = experiment_db
+
+
+def set_pool(pool):
+    global _pool
+    _pool = pool
 
 
 def set_auth(metagraph, verify_fn=None):
@@ -129,6 +135,13 @@ class RecordContextRequest(BaseModel):
 class UpdateFrontierRequest(BaseModel):
     frontier: list[dict]
     task: str = ""
+
+
+class RegisterCommitmentRequest(BaseModel):
+    """Miner registers its commitment (image URLs, listener, etc)."""
+    hotkey: str
+    uid: int = -1
+    data: dict
 
 
 @app.middleware("http")
@@ -354,3 +367,33 @@ async def get_dead_ends(task: str = ""):
 async def get_experiment_graph(experiment_id: int, depth: int = 3):
     prov = _require_provenance()
     return await prov.get_experiment_graph(experiment_id, depth=depth)
+
+
+# ── Commitment endpoints (miners register, validators read) ─
+
+@app.post("/commitments/register")
+async def register_commitment(req: RegisterCommitmentRequest):
+    """Miner registers its image commitment in the DB."""
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="DB not initialized")
+    import time
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO commitments (hotkey, uid, data, updated_at)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (hotkey)
+               DO UPDATE SET uid = $2, data = $3, updated_at = $4""",
+            req.hotkey, req.uid, req.data, time.time(),
+        )
+    logger.info("Commitment registered: hotkey=%s uid=%d", req.hotkey[:16], req.uid)
+    return {"status": "ok"}
+
+
+@app.get("/commitments")
+async def get_commitments():
+    """Validators read all miner commitments."""
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="DB not initialized")
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT hotkey, uid, data FROM commitments")
+    return [{"hotkey": r["hotkey"], "uid": r["uid"], "data": r["data"]} for r in rows]
