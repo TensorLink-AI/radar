@@ -55,6 +55,9 @@ class Miner:
         self.wallet = bt.Wallet(config=config)
         self.subtensor = bt.Subtensor(config=config)
 
+        # Cache metagraph — synced periodically in keep-alive loop
+        self.metagraph = self.subtensor.metagraph(self.netuid)
+
         # Agent is a Docker image validators pull and run
         self.docker_image = getattr(config, "docker_image", "systematic:latest")
 
@@ -291,16 +294,21 @@ class Miner:
         @listener_app.post("/prepare")
         async def prepare(request: Request):
             body = await request.body()
-            # Verify Epistula signature from validator
+            # Verify Epistula signature from validator (use cached metagraph)
             try:
                 ok, err, hotkey = verify_request(
                     dict(request.headers), body,
-                    miner.subtensor.metagraph(miner.netuid),
+                    miner.metagraph,
                 )
                 if not ok:
+                    logger.warning(
+                        "Auth failed on /prepare: %s (signed-by: %s)",
+                        err,
+                        request.headers.get("x-epistula-signed-by", "?")[:16],
+                    )
                     return JSONResponse(status_code=403, content={"error": err})
-            except Exception:
-                pass  # Allow unsigned requests for localnet compat
+            except Exception as exc:
+                logger.debug("Auth verification exception (allowing): %s", exc)
 
             try:
                 req = TrainerRequest.from_json(body.decode())
@@ -351,16 +359,24 @@ class Miner:
         self.commit_image()
         logger.info(
             "Miner running. Agent: %s (validators pull this image). "
-            "Listener: port %d. Trainer image: %s",
+            "Listener: port %d. Trainer image: %s. "
+            "Waiting for validator TrainerRequests on /prepare.",
             self.docker_image, self.listener_port, self.trainer_image,
         )
 
         while True:
             await asyncio.sleep(300)
             try:
-                self.subtensor.metagraph(self.netuid)
-            except Exception:
-                pass
+                self.metagraph = self.subtensor.metagraph(self.netuid)
+                logger.info(
+                    "Heartbeat: metagraph synced (%d neurons). "
+                    "Active deployments: %d. Listening on port %d.",
+                    self.metagraph.n,
+                    len(self.active_deployments),
+                    self.listener_port,
+                )
+            except Exception as e:
+                logger.warning("Metagraph sync failed: %s", e)
 
 
 def get_config() -> bt.Config:
