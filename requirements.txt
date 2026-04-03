@@ -8,5 +8,8 @@ tiktoken>=0.5
 # Data processing
 pyarrow
 
+# Postgres (async)
+asyncpg>=0.29.0
+
 # Cloud execution (optional — only needed for RUNNER_BACKEND=basilica)
 basilica-sdk

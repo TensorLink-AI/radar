@@ -3,6 +3,9 @@
 Phase A: Collect architecture submissions from miner agents
 Phase B: Dispatch training to miner trainers (cross-eval)
 Phase C: Every validator independently evaluates every checkpoint (trust anchor)
+
+Validators no longer run a local database. They proxy reads to the
+centralized DB server and write results via DatabaseClient.
 """
 
 from __future__ import annotations
@@ -21,26 +24,23 @@ import bittensor as bt
 import uvicorn
 
 from config import Config
-from shared.access_logger import AccessLogger
 from shared.challenge import (
     generate_challenge, round_start_block, current_phase, select_task,
 )
 from shared.commitment import read_miner_commitments
 from shared.database import DataElement
-from shared.sqlite_store import SQLiteExperimentStore
-from shared.pareto import ParetoFront
+from shared.db_client import DatabaseClient
 from shared.protocol import Challenge, Proposal
 from shared.provenance import detect_components
 from shared.scoring import score_round, scores_to_weights, ema_update, compute_penalties
 from shared.task import TaskSpec, load_task, load_enabled_tasks
-from validator.analyzer import analyze
 from validator.collection import run_and_collect_agents
 from validator.coordinator import (
     TrainingCoordinator, compute_assignments, compute_fallback,
 )
-from validator.db_server import (
-    app as db_app, set_db, set_auth, set_challenge, set_frontier,
-    set_access_logger, set_hotkey_map,
+from validator.db_proxy import (
+    app as proxy_app, set_config as set_proxy_config, set_metagraph,
+    set_hotkey_map,
 )
 from validator.evaluator import evaluate_all_checkpoints
 from validator.pod_manager import pre_validate_code
@@ -86,24 +86,16 @@ class Validator:
 
         # Tasks — load all enabled tasks for multi-task rounds
         self.tasks = load_enabled_tasks(Config.ENABLED_TASKS)
-        # Keep self.task as default for backwards compat (first enabled task)
         task_path = getattr(config, "task", "")
         if task_path and task_path in self.tasks:
             self.task = self.tasks[task_path]
         else:
             self.task = next(iter(self.tasks.values()))
 
-        # Experiment DB
-        db_dir = getattr(config, "db_dir", "./experiments")
-        self.db = SQLiteExperimentStore(
-            db_path=os.path.join(db_dir, "experiments.db"),
+        # Database client — talks to centralized DB server
+        self.db_client = DatabaseClient(
+            db_url=Config.DB_API_URL, wallet=self.wallet,
         )
-        set_db(self.db)
-
-        # Per-task Pareto fronts
-        self._task_cache: dict[str, TaskSpec] = dict(self.tasks)
-        self.pareto_fronts: dict[str, ParetoFront] = {}
-        self._rebuild_pareto()
 
         # EMA scores per UID
         self.ema_scores: dict[int, float] = {}
@@ -111,8 +103,8 @@ class Validator:
         # Trainer reliability tracking (keyed by trainer UID)
         self.trainer_reliability: dict[int, float] = {}
 
-        # DB server config
-        self.db_port = int(getattr(config, "db_port", 8080))
+        # Proxy port
+        self.proxy_port = int(getattr(config, "db_port", Config.PROXY_PORT))
 
         # R2 audit log
         self.r2 = None
@@ -142,7 +134,7 @@ class Validator:
         else:
             self.coordinator = None
 
-        # Desearch proxy
+        # Desearch proxy — mounted on proxy app
         self.desearch_proxy = None
         if Config.DESEARCH_ENABLED:
             from validator.desearch_proxy import DesearchProxy, set_proxy, register_routes
@@ -151,58 +143,21 @@ class Validator:
                 max_queries=Config.DESEARCH_MAX_QUERIES,
             )
             set_proxy(self.desearch_proxy)
-            register_routes(db_app)
+            register_routes(proxy_app)
 
-        # Access logger — shares the same SQLite connection
-        self.access_logger = AccessLogger(conn=self.db.conn)
-        set_access_logger(self.access_logger)
-
-        # Auth on DB server
-        set_auth(self.metagraph)
-
-        logger.info(
-            "Validator initialized. Task: %s, DB: %d experiments, R2: %s",
-            list(self.tasks.keys()), self.db.size, "enabled" if self.r2 else "disabled",
+        # Configure proxy
+        set_proxy_config(
+            db_api_url=Config.DB_API_URL,
+            wallet=self.wallet,
+            metagraph=self.metagraph,
+            rate_limit=Config.PROXY_RATE_LIMIT,
         )
 
-    def _load_task_spec(self, task_name: str) -> TaskSpec:
-        """Load a TaskSpec by name, with caching."""
-        if task_name not in self._task_cache:
-            self._task_cache[task_name] = load_task(task_name)
-        return self._task_cache[task_name]
-
-    def _get_pareto(self, task_name: str) -> ParetoFront:
-        """Get or create a ParetoFront for a task."""
-        if task_name not in self.pareto_fronts:
-            ts = self._load_task_spec(task_name)
-            objective_fn = lambda elem, _ts=ts: _ts.objective_vector(elem.objectives)
-            self.pareto_fronts[task_name] = ParetoFront(
-                max_size=50, objective_fn=objective_fn,
-            )
-        return self.pareto_fronts[task_name]
-
-    def _rebuild_pareto(self):
-        """Rebuild Pareto fronts from all DB elements, grouped by task."""
-        self.pareto_fronts = {}
-        skipped = 0
-        all_elements = self.db.get_pareto_elements()
-        for elem in all_elements:
-            if not elem.task:
-                skipped += 1
-                continue
-            try:
-                self._get_pareto(elem.task).update(elem)
-            except Exception:
-                logger.warning(
-                    "Skipping experiment %d: unknown task %r (no YAML definition)",
-                    elem.index, elem.task,
-                )
-        if skipped:
-            logger.warning(
-                "Pareto rebuild: skipped %d/%d experiments with empty task "
-                "(pre-migration data excluded from Pareto fronts)",
-                skipped, len(all_elements),
-            )
+        logger.info(
+            "Validator initialized. Task: %s, DB API: %s, R2: %s",
+            list(self.tasks.keys()), Config.DB_API_URL,
+            "enabled" if self.r2 else "disabled",
+        )
 
     def _my_uid(self) -> int:
         """Get this validator's UID."""
@@ -222,13 +177,13 @@ class Validator:
             if uid < len(permits) and permits[uid]
         ]
 
-    def start_db_server(self):
-        """Start the experiment DB server in a background thread."""
+    def start_proxy_server(self):
+        """Start the reverse proxy server in a background thread."""
         def _run():
-            uvicorn.run(db_app, host="0.0.0.0", port=self.db_port, log_level="warning")
+            uvicorn.run(proxy_app, host="0.0.0.0", port=self.proxy_port, log_level="warning")
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
-        logger.info("DB server started on port %d", self.db_port)
+        logger.info("Proxy server started on port %d", self.proxy_port)
 
     async def _wait_until_block(self, target_block: int):
         """Wait until the chain reaches target_block."""
@@ -236,13 +191,21 @@ class Validator:
             current = self.subtensor.block
             if current >= target_block:
                 return
-            remaining = (target_block - current) * 12  # ~12s per block
+            remaining = (target_block - current) * 12
             await asyncio.sleep(min(remaining, 30))
 
     async def run_round(self):
         """Execute one full 3-phase round."""
         # ── SETUP ──────────────────────────────────────────────
         self.metagraph.sync()
+        set_metagraph(self.metagraph)
+        hotkeys = self.metagraph.hotkeys or []
+        hotkey_map = {
+            hotkeys[uid]: uid
+            for uid in range(self.metagraph.n)
+            if uid < len(hotkeys)
+        }
+        set_hotkey_map(hotkey_map)
         current_block = self.subtensor.block
         round_start = round_start_block(current_block, Config.ROUND_INTERVAL_BLOCKS)
         block_hash = hashlib.sha256(str(round_start).encode()).hexdigest()
@@ -252,50 +215,38 @@ class Validator:
         round_task = self.tasks[task_name]
         challenge = generate_challenge(block_hash, round_task.to_dict())
 
-        # Include the feasible frontier for this size bucket (per-task)
-        pareto = self._get_pareto(task_name)
-        feasible = pareto.get_feasible(
-            challenge.min_flops_equivalent, challenge.max_flops_equivalent,
-        )
-        challenge.feasible_frontier = [
-            {
-                "code": c.element.code,
-                "metric": c.element.metric,
-                "objectives": c.element.objectives,
-                "parent_diff": self.db.get_diff(c.element.index),
-                "motivation": c.element.motivation,
-                "task": task_name,
-            }
-            for c in feasible
-        ]
+        # Fetch feasible frontier from centralized DB
+        pareto_elements = await self.db_client.get_pareto_elements(task=task_name)
+        feasible_frontier = []
+        for elem_dict in pareto_elements:
+            objectives = elem_dict.get("results", {})
+            flops = objectives.get("flops_equivalent_size", 0)
+            if challenge.min_flops_equivalent <= flops <= challenge.max_flops_equivalent:
+                diff_data = await self.db_client.get_diff(elem_dict.get("index", -1))
+                parent_diff = diff_data.get("diff", "") if diff_data else ""
+                feasible_frontier.append({
+                    "code": elem_dict.get("code", ""),
+                    "metric": elem_dict.get("results", {}).get("metric"),
+                    "objectives": objectives,
+                    "parent_diff": parent_diff,
+                    "motivation": elem_dict.get("motivation", ""),
+                    "task": task_name,
+                })
 
-        # Set up access logging for this round
-        self.access_logger.set_round(challenge.round_id)
-        hotkeys = self.metagraph.hotkeys or []
-        hotkey_map = {
-            hotkeys[uid]: uid
-            for uid in range(self.metagraph.n)
-            if uid < len(hotkeys)
-        }
-        set_hotkey_map(hotkey_map)
+        challenge.feasible_frontier = feasible_frontier
 
-        challenge.db_url = f"http://localhost:{self.db_port}"
+        challenge.db_url = f"http://localhost:{self.proxy_port}"
         challenge.desearch_url = (
-            f"http://localhost:{self.db_port}/desearch" if self.desearch_proxy else ""
+            f"http://localhost:{self.proxy_port}/desearch" if self.desearch_proxy else ""
         )
-
-        # Set challenge on DB server for miners to query
-        set_challenge(challenge.to_json())
 
         logger.info(
             "Round %d: size bucket [%d, %d], frontier points in range: %d",
             challenge.round_id, challenge.min_flops_equivalent,
-            challenge.max_flops_equivalent, len(feasible),
+            challenge.max_flops_equivalent, len(feasible_frontier),
         )
 
         # ── PHASE A: RUN AGENTS + COLLECT ────────────────────
-        # Run agents DURING Phase A (not after), then wait for the window
-        # to close so all validators finish before Phase B starts.
         validator_uids = self._get_validator_uids()
         commitments = read_miner_commitments(self.subtensor, self.netuid, self.metagraph)
 
@@ -304,13 +255,10 @@ class Validator:
             return
 
         # ── PREPARE TRAINERS (warm-standby) ──────────────────
-        # Fire TrainerRequests to ALL miners with listener_urls.
-        # They deploy Basilica pods during Phase A while agents run in parallel.
-        # Run both concurrently — miners deploy GPU pods while agents design architectures.
         if self.coordinator:
             prepare_coro = self.coordinator.prepare_trainers(
                 challenge, commitments,
-                db_url=f"http://localhost:{self.db_port}",
+                db_url=f"http://localhost:{self.proxy_port}",
             )
         else:
             async def _no_endpoints():
@@ -357,11 +305,6 @@ class Validator:
             return
 
         my_uid = self._my_uid()
-
-        # Use only UIDs with validator_permit so ALL validators compute
-        # the same job assignments deterministically.  If my_uid has no
-        # permit yet (common on localnet/testnet), it will get 0 jobs from
-        # round-robin and the safety net below dispatches everything.
         dispatch_validators = list(validator_uids)
         if my_uid >= 0 and my_uid not in dispatch_validators:
             logger.info(
@@ -377,10 +320,6 @@ class Validator:
         )
         my_jobs = [j for j in all_jobs if j.dispatcher == my_uid]
 
-        # Safety net: if round-robin gave us 0 jobs (assigned to offline
-        # validators like the subnet owner), dispatch ALL jobs so training
-        # isn't lost.  R2 uploads are keyed by miner hotkey, so duplicate
-        # dispatches from multiple validators are harmless.
         if not my_jobs and all_jobs:
             logger.warning(
                 "Round-robin assigned 0 of %d jobs to my_uid=%d — "
@@ -400,8 +339,7 @@ class Validator:
                 "or trainer pods failed to deploy. Training will fail for all jobs."
             )
 
-        # Generate presigned GET URLs for GIFT-Eval data so trainer pods
-        # can download benchmark data without R2 credentials
+        # Generate presigned GET URLs for GIFT-Eval data
         gift_eval_urls = {}
         if self.gift_r2:
             try:
@@ -437,8 +375,6 @@ class Validator:
 
         await self.coordinator.write_dispatch_record(challenge.round_id, my_results)
 
-        # Wait for training window to close (keeps validators in sync on mainnet).
-        # In test environments, skip the wait since local dispatch already finished.
         if Config.SKIP_TRAINING_WAIT:
             logger.info("SKIP_TRAINING_WAIT enabled — skipping block wait after dispatch")
         else:
@@ -471,7 +407,6 @@ class Validator:
             await self.coordinator.release_trainers(
                 challenge.round_id, commitments, collected_uids,
             )
-            # Also release miners who timed out — courtesy signal
             all_prepared = set(dynamic_endpoints.keys())
             timed_out = all_prepared - collected_uids
             if timed_out:
@@ -479,7 +414,7 @@ class Validator:
                     challenge.round_id, commitments, timed_out,
                 )
 
-        # Fallback for missing validators (off by default)
+        # Fallback for missing validators
         missing_trainers = [uid for uid in filtered if uid not in training_metas]
         if missing_trainers:
             logger.info("Missing checkpoints from %d miners: %s", len(missing_trainers), missing_trainers)
@@ -505,14 +440,12 @@ class Validator:
                         challenge.round_id, fb_results,
                     )
 
-                # Wait for fallback window
                 await self._wait_until_block(
                     round_start + Config.SUBMISSION_WINDOW_BLOCKS
                     + Config.TRAINING_WINDOW_BLOCKS
                     + Config.FALLBACK_WINDOW_BLOCKS
                 )
 
-                # Re-read checkpoints
                 fb_metas = await self.coordinator.wait_for_checkpoints(
                     challenge.round_id,
                     expected_miners=missing_trainers,
@@ -568,7 +501,7 @@ class Validator:
         # ── SCORING ───────────────────────────────────────────
         penalties = compute_penalties(training_metas, eval_results)
 
-        # Track trainer reliability — penalise non-responsive trainers
+        # Track trainer reliability
         fallback_uids = (
             self.coordinator._fallback_uids.get(challenge.round_id, set())
             if self.coordinator else set()
@@ -576,7 +509,7 @@ class Validator:
         for uid, meta in training_metas.items():
             trainer_uid = meta.get("trainer_uid", uid)
             if trainer_uid in fallback_uids:
-                score = 0.0  # full penalty — training ran on fallback proxy
+                score = 0.0
             else:
                 status = meta.get("status", "")
                 score = 1.0 if status == "success" else 0.0
@@ -584,22 +517,42 @@ class Validator:
             prev = self.trainer_reliability.get(trainer_uid, 1.0)
             self.trainer_reliability[trainer_uid] = alpha * score + (1 - alpha) * prev
 
-        # Record which frontier experiments were shown this round
+        # Record frontier context via DB client
         for entry in challenge.feasible_frontier:
             entry_code = entry.get("code", "")
             if entry_code:
-                # Find matching experiment by code (use DB lock)
-                with self.db._lock:
-                    match = self.db.conn.execute(
-                        "SELECT id FROM experiments WHERE code = ? LIMIT 1",
-                        (entry_code,),
-                    ).fetchone()
-                if match:
-                    self.db.provenance.record_round_context(
-                        challenge.round_id, match[0], "frontier",
-                    )
+                # Look up experiment by querying DB
+                pareto_data = await self.db_client.get_pareto_elements(task=task_name)
+                for pe in pareto_data:
+                    if pe.get("code", "") == entry_code:
+                        await self.db_client.record_round_context(
+                            challenge.round_id, pe.get("index", -1), "frontier",
+                        )
+                        break
 
-        # Update frontier with eval-verified metrics
+        # Write experiments to centralized DB
+        # Build a local ParetoFront for scoring purposes
+        from shared.pareto import ParetoFront
+        ts = round_task
+        objective_fn = lambda elem, _ts=ts: _ts.objective_vector(elem.objectives)
+        pareto = ParetoFront(max_size=50, objective_fn=objective_fn)
+
+        # Populate pareto from fetched elements for scoring
+        for elem_dict in pareto_elements:
+            try:
+                de = DataElement.from_dict({
+                    "index": elem_dict.get("index", -1),
+                    "code": elem_dict.get("code", ""),
+                    "metric": elem_dict.get("results", {}).get("metric"),
+                    "success": elem_dict.get("results", {}).get("success", True),
+                    "objectives": {k: v for k, v in elem_dict.get("results", {}).items()
+                                   if k not in ("success", "metric", "loss_curve")},
+                    "task": elem_dict.get("task", task_name),
+                })
+                pareto.update(de)
+            except Exception:
+                pass
+
         gate_passed = 0
         gate_failed = 0
         for uid, metrics in eval_results.items():
@@ -621,13 +574,17 @@ class Validator:
                     task=task_name,
                     round_id=challenge.round_id,
                 )
-                self.db.add(element)
+
+                # Write to centralized DB
+                new_idx = await self.db_client.add_experiment(element.to_dict())
+                if new_idx is not None:
+                    element.index = new_idx
                 pareto.update(element)
 
                 # Detect and store architectural components
                 components = detect_components(proposal.code)
-                if components:
-                    self.db.provenance.record_components(element.index, components)
+                if components and element.index >= 0:
+                    await self.db_client.record_components(element.index, components)
             else:
                 gate_failed += 1
                 logger.warning(
@@ -638,9 +595,8 @@ class Validator:
                 )
 
         logger.info(
-            "Experiment recording: %d passed size gate, %d failed, "
-            "DB size: %d, Pareto size: %d",
-            gate_passed, gate_failed, self.db.size, pareto.size,
+            "Experiment recording: %d passed size gate, %d failed, Pareto size: %d",
+            gate_passed, gate_failed, pareto.size,
         )
 
         round_scores = score_round(
@@ -663,7 +619,11 @@ class Validator:
         self.ema_scores = ema_update(self.ema_scores, round_scores, all_uids, Config.EMA_ALPHA)
         self._set_weights()
 
-        # Write frontier to R2
+        # Write frontier to centralized DB + R2
+        await self.db_client.update_frontier(
+            [c.element.to_dict() for c in pareto.candidates],
+            task=task_name,
+        )
         if self.coordinator:
             await self.coordinator.write_frontier(
                 [c.element.to_dict() for c in pareto.candidates],
@@ -672,13 +632,13 @@ class Validator:
 
         nonzero_scored = sum(1 for s in round_scores.values() if s > 0)
         logger.info(
-            "Round %d complete. DB: %d, Pareto: %d, scored: %d (%d nonzero)",
-            challenge.round_id, self.db.size, pareto.size,
+            "Round %d complete. Pareto: %d, scored: %d (%d nonzero)",
+            challenge.round_id, pareto.size,
             len(round_scores), nonzero_scored,
         )
 
     def _set_weights(self):
-        """Set weights on chain — softmax on EMA scores (single normalization)."""
+        """Set weights on chain — softmax on EMA scores."""
         if not self.ema_scores:
             logger.warning("No EMA scores — skipping weight setting")
             return
@@ -707,7 +667,7 @@ class Validator:
 
     async def run(self):
         """Main validator loop."""
-        self.start_db_server()
+        self.start_proxy_server()
         while True:
             try:
                 if self.desearch_proxy:
@@ -723,7 +683,7 @@ def get_config() -> bt.Config:
     parser.add_argument("--netuid", type=int, default=1)
     parser.add_argument("--task", type=str, default="ml_training")
     parser.add_argument("--db_dir", type=str, default="./experiments")
-    parser.add_argument("--db_port", type=int, default=8080)
+    parser.add_argument("--db_port", type=int, default=Config.PROXY_PORT)
     bt.Wallet.add_args(parser)
     bt.Subtensor.add_args(parser)
     return bt.Config(parser)

@@ -466,7 +466,7 @@ class TrainingCoordinator:
         Returns {uid: trainer_url} for all miners that responded or fell back.
         """
         from config import Config
-        from validator.db_server import get_ready_trainers
+        from validator.db_proxy import get_ready_trainers
         from validator.pod_manager import verify_miner_pod
 
         round_id = challenge.round_id
@@ -562,7 +562,7 @@ class TrainingCoordinator:
 
         Skips UIDs that used the fallback proxy.
         """
-        from validator.db_server import clear_ready_trainers
+        from validator.db_proxy import clear_ready_trainers
 
         fallback_uids = self._fallback_uids.get(round_id, set())
         released = 0

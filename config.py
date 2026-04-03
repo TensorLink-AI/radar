@@ -96,3 +96,17 @@ class Config:
     GIFT_EVAL_CACHE_DIR: str = os.getenv("RADAR_GIFT_EVAL_CACHE", "/tmp/radar_gift_eval")
     GIFT_EVAL_DATASETS_PER_ROUND: int = int(os.getenv("RADAR_GIFT_EVAL_DATASETS", "0"))  # 0 = all datasets
     GIFT_EVAL_MAX_SERIES_PER_DATASET: int = int(os.getenv("RADAR_GIFT_EVAL_MAX_SERIES", "500"))
+
+    # ── Postgres ──────────────────────────────────────────────
+    PG_DSN: str = os.getenv("RADAR_PG_DSN", "postgresql://radar:radar@localhost:5432/radar")
+
+    # ── Database API ──────────────────────────────────────────
+    DB_API_URL: str = os.getenv("RADAR_DB_API_URL", "http://localhost:8090")
+    DB_API_PORT: int = int(os.getenv("RADAR_DB_API_PORT", "8090"))
+
+    # ── Validator Proxy ───────────────────────────────────────
+    PROXY_PORT: int = int(os.getenv("RADAR_PROXY_PORT", "8080"))
+    PROXY_RATE_LIMIT: int = int(os.getenv("RADAR_PROXY_RATE_LIMIT", "10"))
+
+    # ── Database Auth ─────────────────────────────────────────
+    DB_VALI_RATE_LIMIT: int = int(os.getenv("RADAR_DB_VALI_RATE_LIMIT", "60"))

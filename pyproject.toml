@@ -20,6 +20,7 @@ dependencies = [
     "boto3>=1.28",
     "python-dotenv>=1.0",
     "safetensors>=0.4.0",
+    "asyncpg>=0.29.0",
 ]
 
 [project.optional-dependencies]
@@ -32,7 +33,7 @@ lightning = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["shared*", "validator*", "miner*", "learners*"]
+include = ["shared*", "validator*", "miner*", "learners*", "database*"]
 
 [tool.setuptools]
 py-modules = ["config"]

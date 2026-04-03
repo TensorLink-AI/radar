@@ -12,15 +12,42 @@ Phase B (Training):  Cross-eval training on miner Basilica pods (~30 min, runs O
 Phase C (Evaluation): Every validator evals every checkpoint (seconds, TRUST ANCHOR)
 ```
 
+### Database Architecture
+
 ```
-shared/          Core libraries shared by validator and miner
-validator/       Validator neuron + DB server + Phase C evaluator
+Subnet Owner (database/ module)
+  ├── Runs Postgres (single source of truth)
+  ├── FastAPI on RADAR_DB_API_PORT (default 8090)
+  │   ├── All /experiments/* read routes
+  │   ├── POST /experiments/add (validators write after Phase C)
+  │   ├── /challenge, /frontier
+  │   ├── /provenance/* routes
+  │   └── POST /provenance/record_components, record_context
+  └── Epistula auth: only registered validators
+
+Validators (validator/ module)
+  ├── Phase A, B, C logic unchanged
+  ├── NO local database — HTTP client of database server
+  ├── Reverse-proxy FastAPI on RADAR_PROXY_PORT (default 8080)
+  │   ├── Proxies /experiments/*, /challenge, /frontier → database server
+  │   ├── Hosts /desearch/* locally (desearch_proxy.py)
+  │   └── Rate limits per miner
+  └── After Phase C: POST experiments via DatabaseClient
+
+Miners (unchanged)
+  └── Query validator proxy URL from challenge["db_url"]
+```
+
+```
+database/        Centralized Postgres DB server (subnet owner)
+shared/          Core libraries shared by all components
+validator/       Validator neuron + proxy + Phase C evaluator
 miner/           Miner neuron (Basilica deployment)
 miner_template/  Starter kit for miners (agent + deploy scripts)
 runner/          Per-task frozen environments (runner/timeseries_forecast/)
 tasks/           Task definitions (YAML)
 tests/           Unit + integration tests
-scripts/         Localnet test script
+scripts/         Localnet test script + Postgres startup
 ```
 
 ## Key Files
@@ -28,25 +55,35 @@ scripts/         Localnet test script
 | File | Purpose |
 |------|---------|
 | `shared/protocol.py` | Challenge/Proposal wire format (JSON serializable) |
-| `shared/auth.py` | Epistula signing/verification (extracted from gossip.py) |
+| `shared/auth.py` | Epistula signing/verification |
 | `shared/challenge.py` | Deterministic challenge generation, phase timing, size buckets |
 | `shared/task.py` | TaskSpec, Objective, YAML loader |
-| `shared/database.py` | ExperimentDB — append-only store with flops range + snapshot |
-| `shared/pareto.py` | ParetoFront — non-dominated sorting, UCT sampling, get_feasible() |
+| `shared/database.py` | DataElement dataclass + deprecated ExperimentDB (JSON) |
+| `shared/pg_schema.py` | Postgres DDL, row conversion, diff helpers |
+| `shared/pg_store.py` | PgExperimentStore — async Postgres experiment store |
+| `shared/pg_provenance.py` | PgProvenanceQuery — async Postgres provenance |
+| `shared/pg_access_logger.py` | PgAccessLogger — async Postgres access logger |
+| `shared/db_client.py` | DatabaseClient — HTTP client for validators → DB server |
+| `shared/provenance.py` | Pure-Python helpers (detect_components, compute_similarity) |
+| `shared/access_logger.py` | Pure-Python helper (_extract_experiment_ids) |
+| `shared/pareto.py` | ParetoFront — non-dominated sorting, UCT sampling |
 | `shared/dedup.py` | Code similarity (provenance queries) |
 | `shared/scoring.py` | Size-gated Pareto frontier scoring (Phase C) |
 | `shared/commitment.py` | On-chain Docker image + endpoint commitment |
 | `shared/r2_audit.py` | R2 storage for checkpoints, snapshots, dispatch records |
+| `database/server.py` | Centralized DB API (FastAPI, all experiment routes) |
+| `database/neuron.py` | Subnet owner process (Postgres + API server) |
 | `validator/neuron.py` | Main validator loop (3-phase: collect → train → evaluate) |
+| `validator/db_proxy.py` | Reverse proxy for miners (forwards to DB server) |
 | `validator/collection.py` | Phase A: collect submissions from miner agents |
 | `validator/coordinator.py` | Phase B: deterministic job assignment, dispatch, R2 I/O |
 | `validator/evaluator.py` | Phase C: evaluate checkpoints (trust anchor) |
-| `validator/db_server.py` | FastAPI experiment DB with auth + rate limiting |
+| `validator/desearch_proxy.py` | Rate-limited arxiv search proxy |
 | `validator/analyzer.py` | Template-based experiment analysis |
 | `validator/pod_manager.py` | Affinetes pod lifecycle + code pre-validation |
 | `miner/neuron.py` | Miner neuron (deploy agent + trainer on Basilica) |
-| `miner_template/agent.py` | Starter miner agent (FastAPI GET /submission/{round_id}) |
-| `runner/timeseries_forecast/harness.py` | Frozen training loop with recipe hooks (init_weights, transform_batch, on_step_end, configure_amp) |
+| `miner_template/agent.py` | Starter miner agent |
+| `runner/timeseries_forecast/harness.py` | Frozen training loop with recipe hooks |
 | `runner/timeseries_forecast/server.py` | Trainer HTTP endpoint (POST /train) |
 | `runner/timeseries_forecast/flops.py` | FLOPs-equivalent wallclock calibration |
 | `runner/timeseries_forecast/prepare.py` | Data pipeline + validate() |
@@ -59,8 +96,14 @@ scripts/         Localnet test script
 # Install
 pip install -e .
 
-# Run tests (185 tests, all passing)
+# Start Postgres (local dev)
+scripts/start_pg.sh
+
+# Run tests (315+ tests, all passing; Postgres tests need TEST_PG_DSN)
 python -m pytest tests/ -v
+
+# Start database server (subnet owner)
+python database/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <name>
 
 # Start validator (requires subtensor or mainnet)
 python validator/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <name>
@@ -73,6 +116,22 @@ python miner/neuron.py --netuid <N> --subtensor.network <network> --wallet.name 
 docker build -t ts-runner:latest runner/timeseries_forecast/
 ```
 
+## Postgres Setup
+
+```bash
+# Local dev (Docker)
+docker run -d --name radar-pg \
+  -e POSTGRES_USER=radar -e POSTGRES_PASSWORD=radar -e POSTGRES_DB=radar \
+  -p 5432:5432 -v radar-pg-data:/var/lib/postgresql/data \
+  postgres:16-alpine
+
+# Set in .env
+RADAR_PG_DSN=postgresql://radar:radar@localhost:5432/radar
+
+# Production (Supabase or managed Postgres)
+RADAR_PG_DSN=postgresql://postgres.[ref]:[password]@db.[ref].supabase.co:5432/postgres
+```
+
 ## Scoring Formula
 
 ```
@@ -82,9 +141,9 @@ docker build -t ts-runner:latest runner/timeseries_forecast/
 # 2. Frontier comparison:
 #    - No frontier in bucket? Pure relative ranking (bootstrapping)
 #    - Frontier exists? Sigmoid of improvement over best frontier CRPS
-# 3. Pareto dominance bonus: 1.5× if dominates existing front members
+# 3. Pareto dominance bonus: 1.5x if dominates existing front members
 # 4. Penalties: trainer FLOPs mismatch (0.3), trainer failure/timeout (0.5)
-# 5. Cross-miner: softmax(temperature=0.1) then EMA(α=0.3) before setting weights
+# 5. Cross-miner: softmax(temperature=0.1) then EMA(alpha=0.3) before setting weights
 ```
 
 ## Size Buckets (FLOPs-equivalent)
@@ -122,7 +181,7 @@ frontier/latest.json                                        # Current Pareto fro
 
 ## What's Done
 
-- [x] Phase-split validation pipeline (A → B → C)
+- [x] Phase-split validation pipeline (A -> B -> C)
 - [x] Epistula authentication (`shared/auth.py`)
 - [x] Deterministic challenge generation with size buckets (`shared/challenge.py`)
 - [x] Size-gated Pareto frontier scoring (`shared/scoring.py`)
@@ -133,8 +192,10 @@ frontier/latest.json                                        # Current Pareto fro
 - [x] Training coordinator with cross-eval (`validator/coordinator.py`)
 - [x] DB snapshot for frozen miner state
 - [x] Miner template (starter agent + deploy)
-- [x] 185 unit + integration tests all passing
-- [x] DB server with Epistula auth + rate limiting
+- [x] 315+ unit + integration tests all passing
+- [x] Centralized Postgres DB with async API (`database/`, `shared/pg_*.py`)
+- [x] Validator reverse proxy for miners (`validator/db_proxy.py`)
+- [x] DatabaseClient for validator -> DB server communication (`shared/db_client.py`)
 
 ## What's Outstanding
 
@@ -144,7 +205,6 @@ frontier/latest.json                                        # Current Pareto fro
 - [ ] **Real GIFT-Eval data** — swap placeholder prepare.py with real data pipeline
 - [ ] **Mainnet registration** — register subnet, set hyperparameters, deploy
 - [ ] **Docker network isolation** — whitelist network for trainer containers
-- [ ] **Persistent DB storage** — move from JSON to proper storage
 - [ ] **Cross-tempo EMA** — weight smoothing across rounds
 
 ## Bittensor SDK

@@ -169,24 +169,17 @@ def test_bug4_round_id_in_api_dict():
     assert api["round_id"] == 99
 
 
-def test_bug4_round_id_sqlite_persistence():
-    """round_id persists through SQLite round-trip."""
-    import tempfile
-    import os
-    from shared.sqlite_store import SQLiteExperimentStore
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db = SQLiteExperimentStore(os.path.join(tmpdir, "test.db"))
-        elem = DataElement(
-            name="test", code="x=1", success=True, metric=0.5,
-            miner_uid=7, miner_hotkey="hotkey_abc",
-            round_id=42, task="ml_training",
-        )
-        idx = db.add(elem)
-        loaded = db.get(idx)
-        assert loaded.round_id == 42
-        assert loaded.miner_hotkey == "hotkey_abc"
-        db.close()
+def test_bug4_round_id_dataclass_roundtrip():
+    """round_id persists through DataElement dict round-trip."""
+    elem = DataElement(
+        name="test", code="x=1", success=True, metric=0.5,
+        miner_uid=7, miner_hotkey="hotkey_abc",
+        round_id=42, task="ml_training",
+    )
+    d = elem.to_dict()
+    loaded = DataElement.from_dict(d)
+    assert loaded.round_id == 42
+    assert loaded.miner_hotkey == "hotkey_abc"
 
 
 # ── Bug 6: current_phase scoring window ──
