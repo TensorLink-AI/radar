@@ -175,16 +175,25 @@ class Miner:
         ttl = 900 + int(request.time_budget) + 300  # 15 min alloc + training + 5 min upload
         deploy_timeout = 900  # 15 min max wait for GPU allocation
         hotkey = self.wallet.hotkey.ss58_address
-        deploy_name = f"radar-trainer-{request.round_id}"
+        deploy_name = f"radar-trainer-{hotkey[:8]}-{request.round_id}"
 
         try:
             # Build env vars for the trainer pod
             # No R2 credentials — trainer uses presigned URLs for uploads
             pod_env = {}
-            for key in ("SUBTENSOR_NETWORK", "NETUID"):
-                val = os.environ.get(key, "")
-                if val:
-                    pod_env[key] = val
+            # Propagate network settings: try env vars first, then fall back
+            # to the subtensor config (CLI args like --subtensor.network).
+            network = os.environ.get("SUBTENSOR_NETWORK", "")
+            if not network:
+                network = getattr(self.subtensor, "network", "") or ""
+            if network:
+                pod_env["SUBTENSOR_NETWORK"] = network
+
+            netuid = os.environ.get("NETUID", "")
+            if not netuid:
+                netuid = str(self.netuid)
+            if netuid:
+                pod_env["NETUID"] = netuid
 
             logger.info(
                 "Deploying Basilica pod %s (image=%s, ttl=%ds, gpu=%d x %dGB min)",

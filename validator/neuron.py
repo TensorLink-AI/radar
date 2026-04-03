@@ -600,8 +600,11 @@ class Validator:
                     )
 
         # Update frontier with eval-verified metrics
+        gate_passed = 0
+        gate_failed = 0
         for uid, metrics in eval_results.items():
             if metrics.get("passed_size_gate"):
+                gate_passed += 1
                 proposal = filtered.get(uid, Proposal())
 
                 miner_hk = self.metagraph.hotkeys[uid] if uid < len(self.metagraph.hotkeys) else ""
@@ -625,6 +628,20 @@ class Validator:
                 components = detect_components(proposal.code)
                 if components:
                     self.db.provenance.record_components(element.index, components)
+            else:
+                gate_failed += 1
+                logger.warning(
+                    "UID %d failed size gate: flops=%d range=[%d, %d] error=%s",
+                    uid, metrics.get("flops_equivalent_size", 0),
+                    challenge.min_flops_equivalent, challenge.max_flops_equivalent,
+                    metrics.get("error", ""),
+                )
+
+        logger.info(
+            "Experiment recording: %d passed size gate, %d failed, "
+            "DB size: %d, Pareto size: %d",
+            gate_passed, gate_failed, self.db.size, pareto.size,
+        )
 
         round_scores = score_round(
             eval_results, challenge, pareto, round_task.objectives, penalties,
