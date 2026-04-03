@@ -15,17 +15,10 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-# File-based fallback directory for localnet (no chain commitment API)
-_COMMITMENT_DIR = Path(os.environ.get(
-    "RADAR_COMMITMENT_DIR", "/tmp/radar_commitments"
-))
 
 
 @dataclass
@@ -122,16 +115,10 @@ def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, Image
     """
     Read image commitments from all miners in the metagraph.
 
-    Priority: file (localnet) → get_all_commitments (single RPC) → per-UID fallback.
+    Priority: get_all_commitments (single RPC) → per-UID fallback.
 
     Returns: {uid: ImageCommitment} for miners with valid commitments.
     """
-    # Try file-based commitments first (localnet / same-machine)
-    file_commitments = _read_from_files(netuid, metagraph)
-    if file_commitments:
-        logger.info("Found %d commitments from file fallback", len(file_commitments))
-        return file_commitments
-
     hotkeys = metagraph.hotkeys if metagraph.hotkeys is not None else []
 
     # Build hotkey→uid map and miner UID set
@@ -319,59 +306,11 @@ def commit_image_to_chain(
         image_digest=image_digest,
         subnet_version=subnet_version,
     )
-    try:
-        subtensor.set_commitment(
-            wallet=wallet,
-            netuid=netuid,
-            data=commitment.to_chain_json(),
-        )
-        logger.info("Committed image to chain: %s @ %s", image_url, image_digest[:16])
-        return True
-    except Exception as e:
-        logger.warning("Chain commit unavailable (%s), using file fallback", e)
-        return _commit_to_file(wallet, netuid, commitment)
-
-
-def _commit_to_file(wallet, netuid: int, commitment: ImageCommitment) -> bool:
-    """Write commitment to a shared temp directory (localnet fallback)."""
-    try:
-        d = _COMMITMENT_DIR / str(netuid)
-        d.mkdir(parents=True, exist_ok=True)
-        hotkey = wallet.hotkey.ss58_address
-        path = d / f"{hotkey}.json"
-        path.write_text(commitment.to_json())
-        logger.info("Committed image to file: %s -> %s", commitment.image_url, path)
-        return True
-    except Exception as e:
-        logger.error("File commitment failed: %s", e)
-        return False
-
-
-def _read_from_files(netuid: int, metagraph) -> dict[int, ImageCommitment]:
-    """Read commitments from shared temp directory (localnet fallback)."""
-    commitments = {}
-    d = _COMMITMENT_DIR / str(netuid)
-    if not d.exists():
-        return commitments
-
-    # Map hotkeys to UIDs
-    hotkeys = metagraph.hotkeys if metagraph.hotkeys is not None else []
-    hotkey_to_uid = {}
-    for uid in range(metagraph.n):
-        if uid < len(hotkeys):
-            hotkey_to_uid[hotkeys[uid]] = uid
-
-    for path in d.glob("*.json"):
-        try:
-            hotkey = path.stem
-            uid = hotkey_to_uid.get(hotkey)
-            if uid is None:
-                continue
-            commitment = ImageCommitment.from_json(
-                path.read_text(), miner_uid=uid, hotkey=hotkey,
-            )
-            if commitment.image_url:
-                commitments[uid] = commitment
-        except Exception as e:
-            logger.debug("Bad commitment file %s: %s", path, e)
-    return commitments
+    chain_json = commitment.to_chain_json()
+    subtensor.set_commitment(
+        wallet=wallet,
+        netuid=netuid,
+        data=chain_json,
+    )
+    logger.info("Committed image to chain: %s @ %s", image_url, image_digest[:16])
+    return True

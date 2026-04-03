@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 
 from config import Config
 from shared.auth import sign_request, verify_request
-from shared.commitment import ImageCommitment, _commit_to_file
+from shared.commitment import ImageCommitment
 from shared.protocol import TrainerRequest, TrainerReady, TrainerRelease
 
 logger = logging.getLogger(__name__)
@@ -90,19 +90,16 @@ class Miner:
             trainer_image=self.trainer_image,
         )
 
-        # Always write full data to file — localnet and testnet fallback
-        _commit_to_file(self.wallet, self.netuid, commitment)
-
-        try:
-            # On-chain limit is Raw128 (128 bytes) — use compact chain format
-            self.subtensor.set_commitment(
-                wallet=self.wallet,
-                netuid=self.netuid,
-                data=commitment.to_chain_json(),
-            )
-            logger.info("Committed image to chain: %s", self.docker_image)
-        except Exception as e:
-            logger.warning("Chain commit failed (%s), file fallback already written", e)
+        chain_json = commitment.to_chain_json()
+        logger.info("Committing to chain (%d bytes): %s", len(chain_json), chain_json)
+        response = self.subtensor.set_commitment(
+            wallet=self.wallet,
+            netuid=self.netuid,
+            data=chain_json,
+        )
+        if hasattr(response, "success") and not response.success:
+            raise RuntimeError(f"Chain commit failed: {getattr(response, 'message', response)}")
+        logger.info("Committed image to chain: %s", self.docker_image)
 
     async def _post_trainer_ready(
         self, round_id: int, trainer_url: str,

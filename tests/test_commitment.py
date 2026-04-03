@@ -179,22 +179,8 @@ class TestReadMinerCommitments:
             "info": {"fields": [[{"Raw100": [json_bytes]}]]},
         }
 
-        with patch("shared.commitment._read_from_files", return_value={}):
-            result = read_miner_commitments(subtensor, netuid=1, metagraph=mg)
-
+        result = read_miner_commitments(subtensor, netuid=1, metagraph=mg)
         assert len(result) == 2
-
-    def test_file_fallback_takes_priority(self):
-        """File-based commitments should be returned first."""
-        mg = self._make_metagraph()
-        subtensor = MagicMock()
-        file_result = {
-            0: ImageCommitment(image_url="file:v1", miner_uid=0),
-        }
-        with patch("shared.commitment._read_from_files", return_value=file_result):
-            result = read_miner_commitments(subtensor, netuid=1, metagraph=mg)
-        assert result == file_result
-        subtensor.get_all_commitments.assert_not_called()
 
 
 class TestPullAndVerifyImage:
