@@ -99,20 +99,27 @@ def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, Image
     """
     Read image commitments from all miners in the metagraph.
 
-    Tries chain first, falls back to file-based commitments for localnet.
+    Priority: file (localnet) → chain raw query → SDK get_commitment.
 
     Returns: {uid: ImageCommitment} for miners with valid commitments.
     """
-    # Try file-based commitments first (always available, used by localnet)
+    # Try file-based commitments first (localnet / same-machine)
     file_commitments = _read_from_files(netuid, metagraph)
     if file_commitments:
         logger.info("Found %d commitments from file fallback", len(file_commitments))
         return file_commitments
 
-    # Fall back to chain API (suppress noisy bittensor ERROR logs from
-    # decode_metadata failures that are expected on localnet)
     hotkeys = metagraph.hotkeys if metagraph.hotkeys is not None else []
-    commitments = {}
+    commitments: dict[int, ImageCommitment] = {}
+
+    # Try raw substrate query — bypasses SDK type decoder that chokes
+    # on Raw241+ variants not in its type_mapping.
+    raw_commitments = _read_from_chain_raw(subtensor, netuid, hotkeys, metagraph.n)
+    if raw_commitments:
+        logger.info("Found %d commitments from chain (raw query)", len(raw_commitments))
+        return raw_commitments
+
+    # Final fallback: SDK get_commitment (works for short commitments)
     bt_logger = logging.getLogger("bittensor")
     prev_level = bt_logger.level
     bt_logger.setLevel(logging.CRITICAL)
@@ -131,6 +138,89 @@ def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, Image
         bt_logger.setLevel(prev_level)
 
     return commitments
+
+
+def _read_from_chain_raw(
+    subtensor, netuid: int, hotkeys: list, n: int,
+) -> dict[int, ImageCommitment]:
+    """Read commitments via raw substrate query, bypassing type decoder.
+
+    The bittensor SDK's get_commitment() fails when commitment data is
+    encoded as Raw241+ (not in type_mapping). We query the raw storage
+    directly and decode the bytes ourselves.
+    """
+    commitments = {}
+    substrate = getattr(subtensor, "substrate", None)
+    if substrate is None:
+        return commitments
+
+    for uid in range(n):
+        hotkey = hotkeys[uid] if uid < len(hotkeys) else ""
+        if not hotkey:
+            continue
+        try:
+            result = substrate.query(
+                module="Commitments",
+                storage_function="CommitmentOf",
+                params=[netuid, hotkey],
+            )
+            if result is None or result.value is None:
+                continue
+            # result.value is the commitment info map
+            # Extract the 'info' field which contains the 'fields' list
+            info = result.value
+            if isinstance(info, dict):
+                fields = info.get("info", {}).get("fields", [])
+                if not fields:
+                    fields = info.get("fields", [])
+                # Each field is a dict like {"Raw241": "0x..."} or a string
+                for field in fields:
+                    text = _decode_raw_field(field)
+                    if text:
+                        try:
+                            c = ImageCommitment.from_json(
+                                text, miner_uid=uid, hotkey=hotkey,
+                            )
+                            if c.image_url:
+                                commitments[uid] = c
+                                break
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.debug("Raw chain query failed for UID %d: %s", uid, e)
+    return commitments
+
+
+def _decode_raw_field(field) -> str:
+    """Decode a substrate Data enum field to a UTF-8 string.
+
+    Fields come as dicts like {"Raw241": "0x7b2269..."} where the hex
+    is the UTF-8 encoded commitment JSON.
+    """
+    if isinstance(field, str):
+        # Already decoded string
+        if field.startswith("{"):
+            return field
+        if field.startswith("0x"):
+            try:
+                return bytes.fromhex(field[2:]).decode("utf-8", errors="ignore")
+            except Exception:
+                return ""
+        return field
+    if isinstance(field, dict):
+        for key, val in field.items():
+            if key == "None" or val is None:
+                continue
+            if isinstance(val, str):
+                if val.startswith("0x"):
+                    try:
+                        return bytes.fromhex(val[2:]).decode("utf-8", errors="ignore")
+                    except Exception:
+                        continue
+                if val.startswith("{"):
+                    return val
+                return val
+    return ""
 
 
 def _image_exists_locally(image_url: str) -> bool:
