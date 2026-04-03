@@ -18,7 +18,7 @@ Usage:
   python miner/neuron.py \\
       --docker_image myregistry/my-agent:v1 \\
       --listener_port 8090 \\
-      --trainer_image ghcr.io/tensorlink-ai/radar/ts-runner:latest
+      --trainer_image ghcr.io/tensorlink-ai/radar/radar-runner:latest
 """
 
 import argparse
@@ -33,7 +33,7 @@ def main():
     parser.add_argument("--docker_image", type=str, required=True,
                         help="Agent Docker image (e.g. myregistry/my-agent:v1)")
     parser.add_argument("--trainer_image", type=str,
-                        default="ghcr.io/tensorlink-ai/radar/ts-runner:latest",
+                        default="ghcr.io/tensorlink-ai/radar/radar-runner:latest",
                         help="Sanctioned trainer image (deployed on Basilica on-demand)")
     parser.add_argument("--listener_port", type=int, default=8090,
                         help="Port for warm-standby trainer listener")

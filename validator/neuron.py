@@ -23,7 +23,7 @@ import uvicorn
 from config import Config
 from shared.access_logger import AccessLogger
 from shared.challenge import (
-    generate_challenge, round_start_block, current_phase,
+    generate_challenge, round_start_block, current_phase, select_task,
 )
 from shared.commitment import read_miner_commitments
 from shared.database import DataElement
@@ -32,7 +32,7 @@ from shared.pareto import ParetoFront
 from shared.protocol import Challenge, Proposal
 from shared.provenance import detect_components
 from shared.scoring import score_round, scores_to_weights, ema_update, compute_penalties
-from shared.task import TaskSpec, load_task
+from shared.task import TaskSpec, load_task, load_enabled_tasks
 from validator.analyzer import analyze
 from validator.collection import run_and_collect_agents
 from validator.coordinator import (
@@ -84,9 +84,14 @@ class Validator:
         self.subtensor = bt.Subtensor(config=config)
         self.metagraph = self.subtensor.metagraph(self.netuid)
 
-        # Task
-        task_path = getattr(config, "task", "ml_training")
-        self.task = load_task(task_path)
+        # Tasks — load all enabled tasks for multi-task rounds
+        self.tasks = load_enabled_tasks(Config.ENABLED_TASKS)
+        # Keep self.task as default for backwards compat (first enabled task)
+        task_path = getattr(config, "task", "")
+        if task_path and task_path in self.tasks:
+            self.task = self.tasks[task_path]
+        else:
+            self.task = next(iter(self.tasks.values()))
 
         # Experiment DB
         db_dir = getattr(config, "db_dir", "./experiments")
@@ -96,7 +101,7 @@ class Validator:
         set_db(self.db)
 
         # Per-task Pareto fronts
-        self._task_cache: dict[str, TaskSpec] = {self.task.name: self.task}
+        self._task_cache: dict[str, TaskSpec] = dict(self.tasks)
         self.pareto_fronts: dict[str, ParetoFront] = {}
         self._rebuild_pareto()
 
@@ -157,7 +162,7 @@ class Validator:
 
         logger.info(
             "Validator initialized. Task: %s, DB: %d experiments, R2: %s",
-            self.task.name, self.db.size, "enabled" if self.r2 else "disabled",
+            list(self.tasks.keys()), self.db.size, "enabled" if self.r2 else "disabled",
         )
 
     def _load_task_spec(self, task_name: str) -> TaskSpec:
@@ -242,8 +247,10 @@ class Validator:
         round_start = round_start_block(current_block, Config.ROUND_INTERVAL_BLOCKS)
         block_hash = hashlib.sha256(str(round_start).encode()).hexdigest()
 
-        challenge = generate_challenge(block_hash, self.task.to_dict())
-        task_name = self.task.name
+        # Select task for this round (deterministic from block hash)
+        task_name = select_task(block_hash, list(self.tasks.keys()))
+        round_task = self.tasks[task_name]
+        challenge = generate_challenge(block_hash, round_task.to_dict())
 
         # Include the feasible frontier for this size bucket (per-task)
         pareto = self._get_pareto(task_name)
@@ -544,7 +551,7 @@ class Validator:
             round_id=challenge.round_id,
             training_metas=training_metas,
             challenge=challenge,
-            task=self.task,
+            task=round_task,
         )
 
         logger.info("Phase C: evaluated %d checkpoints", len(eval_results))
@@ -593,8 +600,11 @@ class Validator:
                     )
 
         # Update frontier with eval-verified metrics
+        gate_passed = 0
+        gate_failed = 0
         for uid, metrics in eval_results.items():
             if metrics.get("passed_size_gate"):
+                gate_passed += 1
                 proposal = filtered.get(uid, Proposal())
 
                 miner_hk = self.metagraph.hotkeys[uid] if uid < len(self.metagraph.hotkeys) else ""
@@ -618,9 +628,23 @@ class Validator:
                 components = detect_components(proposal.code)
                 if components:
                     self.db.provenance.record_components(element.index, components)
+            else:
+                gate_failed += 1
+                logger.warning(
+                    "UID %d failed size gate: flops=%d range=[%d, %d] error=%s",
+                    uid, metrics.get("flops_equivalent_size", 0),
+                    challenge.min_flops_equivalent, challenge.max_flops_equivalent,
+                    metrics.get("error", ""),
+                )
+
+        logger.info(
+            "Experiment recording: %d passed size gate, %d failed, "
+            "DB size: %d, Pareto size: %d",
+            gate_passed, gate_failed, self.db.size, pareto.size,
+        )
 
         round_scores = score_round(
-            eval_results, challenge, pareto, self.task.objectives, penalties,
+            eval_results, challenge, pareto, round_task.objectives, penalties,
             training_metas=training_metas,
         )
 

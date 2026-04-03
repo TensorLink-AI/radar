@@ -643,7 +643,7 @@ export RADAR_TRAINER_READY_POLL=5
 # Fallback proxy: use the local trainer server so training still works
 # even if the mock Basilica flow doesn't connect in time
 export RADAR_FALLBACK_PROXY_URL="$TRAINER_URL"
-export OFFICIAL_TRAINING_IMAGE=${OFFICIAL_TRAINING_IMAGE:-"ghcr.io/tensorlink-ai/radar/ts-runner:latest"}
+export OFFICIAL_TRAINING_IMAGE=${OFFICIAL_TRAINING_IMAGE:-"ghcr.io/tensorlink-ai/radar/radar-runner:latest"}
 
 DB_DIR=$(mktemp -d)
 DB_PORT=8099  # Use non-standard port to avoid conflicts

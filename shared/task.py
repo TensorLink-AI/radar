@@ -272,3 +272,28 @@ def load_task(name_or_path: str) -> TaskSpec:
         f"Built-in tasks: {list(BUILT_IN_TASKS.keys())}. "
         f"Or provide a path to a .yaml/.json task definition."
     )
+
+
+def load_enabled_tasks(enabled_csv: str = "") -> dict[str, TaskSpec]:
+    """Load all enabled tasks as a {name: TaskSpec} dict.
+
+    Args:
+        enabled_csv: Comma-separated task names. Empty or "all" loads all
+                     built-in tasks.
+
+    Returns:
+        Dict mapping task name to TaskSpec, with at least one entry.
+    """
+    if not enabled_csv or enabled_csv.strip().lower() == "all":
+        names = list(BUILT_IN_TASKS.keys())
+    else:
+        names = [n.strip() for n in enabled_csv.split(",") if n.strip()]
+
+    tasks: dict[str, TaskSpec] = {}
+    for name in names:
+        tasks[name] = load_task(name)
+
+    if not tasks:
+        raise ValueError(f"No valid tasks in ENABLED_TASKS='{enabled_csv}'")
+
+    return tasks

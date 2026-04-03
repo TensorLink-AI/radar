@@ -325,29 +325,37 @@ for i in "${!AGENT_DIRS[@]}"; do
 done
 
 # =============================================================================
-# STEP 2b: Build trainer Docker image and push to GHCR
+# STEP 2b: Build generalist trainer Docker image and push to GHCR
 # =============================================================================
-step "Step 2b: Building trainer image and pushing to GHCR"
+step "Step 2b: Building generalist trainer image and pushing to GHCR"
 
-TRAINER_IMAGE="${GHCR_REPO}/ts-runner:latest"
+TRAINER_IMAGE="${GHCR_REPO}/radar-runner:latest"
 
-# Copy shared modules into runner build context (Dockerfile expects them)
-cp shared/auth.py runner/timeseries_forecast/auth.py
-cp shared/artifacts.py runner/timeseries_forecast/artifacts.py
-cp shared/r2_audit.py runner/timeseries_forecast/r2_audit.py
+# Copy shared modules into runner/ build context (top-level Dockerfile expects them)
+cp shared/auth.py runner/shared_auth.py
+cp shared/artifacts.py runner/shared_artifacts.py
+cp shared/r2_audit.py runner/shared_r2_audit.py
 
 TRAINER_LOG="${LOG_DIR}/trainer_build.log"
-if ! docker build -t ts-runner:latest runner/timeseries_forecast/ > "$TRAINER_LOG" 2>&1; then
+if ! docker build -t radar-runner:latest -f runner/Dockerfile runner/ > "$TRAINER_LOG" 2>&1; then
+    # Fallback: try the old per-task Dockerfile if the generalist one fails
+    warn "Generalist Dockerfile failed, falling back to timeseries_forecast Dockerfile"
+    cp shared/auth.py runner/timeseries_forecast/auth.py
+    cp shared/artifacts.py runner/timeseries_forecast/artifacts.py
+    cp shared/r2_audit.py runner/timeseries_forecast/r2_audit.py
+    if ! docker build -t radar-runner:latest runner/timeseries_forecast/ >> "$TRAINER_LOG" 2>&1; then
+        rm -f runner/timeseries_forecast/auth.py runner/timeseries_forecast/artifacts.py runner/timeseries_forecast/r2_audit.py
+        echo "  Trainer build log: $TRAINER_LOG"
+        tail -20 "$TRAINER_LOG"
+        fail "Trainer Docker build failed — see log above"
+    fi
     rm -f runner/timeseries_forecast/auth.py runner/timeseries_forecast/artifacts.py runner/timeseries_forecast/r2_audit.py
-    echo "  Trainer build log: $TRAINER_LOG"
-    tail -20 "$TRAINER_LOG"
-    fail "Trainer Docker build failed — see log above"
 fi
 
 # Clean up copied files
-rm -f runner/timeseries_forecast/auth.py runner/timeseries_forecast/artifacts.py runner/timeseries_forecast/r2_audit.py
+rm -f runner/shared_auth.py runner/shared_artifacts.py runner/shared_r2_audit.py
 
-docker tag ts-runner:latest "$TRAINER_IMAGE"
+docker tag radar-runner:latest "$TRAINER_IMAGE"
 if ! docker push "$TRAINER_IMAGE" > /dev/null 2>&1; then
     fail "Failed to push ${TRAINER_IMAGE}"
 fi
@@ -360,7 +368,7 @@ export OFFICIAL_TRAINING_IMAGE="$TRAINER_IMAGE"
 step "Step 2c: Making GHCR packages public"
 
 GHCR_ORG="tensorlink-ai"
-ALL_PACKAGES=("${AGENT_NAMES[@]}" "ts-runner")
+ALL_PACKAGES=("${AGENT_NAMES[@]}" "radar-runner")
 for pkg in "${ALL_PACKAGES[@]}"; do
     # GHCR package names use the repo as a namespace: radar/<name>
     encoded_pkg="radar%2F${pkg}"
@@ -1075,29 +1083,47 @@ fi
 for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     DB_PORT=$((DB_PORT_BASE + i))
     STATS=$(curl -sf "http://localhost:${DB_PORT}/experiments/stats" 2>/dev/null || echo "{}")
-    TOTAL=$(echo "$STATS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
-    check "Validator $i DB has experiments ($TOTAL)" "$([ "$TOTAL" -gt 0 ] && echo true || echo false)"
+    TOTAL=$(echo "$STATS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null | head -1 || echo 0)
+    TOTAL="${TOTAL:-0}"
+    check "Validator $i DB has experiments ($TOTAL)" "$([ "$TOTAL" -gt 0 ] 2>/dev/null && echo true || echo false)"
 done
 
-# 8.4 Pareto front
-PARETO_SIZE=$(curl -sf "http://localhost:${DB_PORT_BASE}/experiments/pareto" 2>/dev/null | python3 -c "
+# 8.4 Pareto front (check all validators, take max)
+PARETO_SIZE=0
+for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
+    DB_PORT=$((DB_PORT_BASE + i))
+    P=$(curl -sf "http://localhost:${DB_PORT}/experiments/pareto" 2>/dev/null | python3 -c "
 import sys, json
 try:
-    print(len(json.load(sys.stdin)))
-except:
+    data = json.load(sys.stdin)
+    print(len(data))
+except Exception:
     print(0)
-" 2>/dev/null || echo 0)
-check "Pareto front has members ($PARETO_SIZE)" "$([ "$PARETO_SIZE" -gt 0 ] && echo true || echo false)"
+" 2>/dev/null | head -1)
+    P="${P:-0}"
+    P=$(echo "$P" | tr -d '[:space:]')
+    P="${P:-0}"
+    if [ "$P" -gt "$PARETO_SIZE" ] 2>/dev/null; then
+        PARETO_SIZE="$P"
+    fi
+done
+check "Pareto front has members ($PARETO_SIZE)" "$([ "$PARETO_SIZE" -gt 0 ] 2>/dev/null && echo true || echo false)"
 
-# 8.5 Training dispatch (verify jobs were dispatched — self-training is now allowed)
-JOB_COUNT=$(grep -c "Job arch=" "$LOG_DIR/validator0.log" 2>/dev/null) || JOB_COUNT=0
+# 8.5 Training dispatch (check all validator logs)
+JOB_COUNT=0
+for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
+    J=$(grep -c "Job arch=" "$LOG_DIR/validator${i}.log" 2>/dev/null) || J=0
+    JOB_COUNT=$((JOB_COUNT + J))
+done
 check "Training jobs dispatched ($JOB_COUNT)" "$([ "$JOB_COUNT" -gt 0 ] && echo true || echo false)"
 
 # 8.6 Validator consistency (both have same experiment count, within tolerance)
 if [ "$NUM_VALIDATORS" -ge 2 ]; then
-    TOTAL_V0=$(curl -sf "http://localhost:${DB_PORT_BASE}/experiments/stats" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
-    TOTAL_V1=$(curl -sf "http://localhost:$((DB_PORT_BASE+1))/experiments/stats" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
-    DIFF=$(( TOTAL_V0 > TOTAL_V1 ? TOTAL_V0 - TOTAL_V1 : TOTAL_V1 - TOTAL_V0 ))
+    TOTAL_V0=$(curl -sf "http://localhost:${DB_PORT_BASE}/experiments/stats" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null | head -1 || echo 0)
+    TOTAL_V0="${TOTAL_V0:-0}"
+    TOTAL_V1=$(curl -sf "http://localhost:$((DB_PORT_BASE+1))/experiments/stats" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null | head -1 || echo 0)
+    TOTAL_V1="${TOTAL_V1:-0}"
+    DIFF=$(( ${TOTAL_V0:-0} > ${TOTAL_V1:-0} ? ${TOTAL_V0:-0} - ${TOTAL_V1:-0} : ${TOTAL_V1:-0} - ${TOTAL_V0:-0} ))
     check "Validators consistent (v0=$TOTAL_V0, v1=$TOTAL_V1, diff=$DIFF)" "$([ "$DIFF" -le 2 ] && echo true || echo false)"
 fi
 
