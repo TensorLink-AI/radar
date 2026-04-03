@@ -52,6 +52,51 @@ class TestImageCommitment:
         assert d["i"] == "x"
 
 
+    def test_to_chain_json_under_128_bytes(self):
+        """Chain JSON must fit within Raw128 (128 bytes)."""
+        c = ImageCommitment(
+            image_url="ghcr.io/tensorlink-ai/radar-miner-frontier_sniper:latest",
+            image_digest="sha256:abc123",
+            subnet_version="0.3.0",
+            listener_url="http://123.456.789.012:8090",
+            trainer_image="ghcr.io/tensorlink-ai/radar/radar-runner:latest",
+        )
+        chain = c.to_chain_json()
+        assert len(chain) <= 128
+        d = json.loads(chain)
+        # Essential fields present
+        assert d["i"] == c.image_url
+        assert d["l"] == c.listener_url
+        # Non-essential fields excluded from chain JSON
+        assert "d" not in d  # image_digest
+        assert "t" not in d  # trainer_image
+
+    def test_to_chain_json_drops_version_if_over_limit(self):
+        """Version should be dropped if needed to stay under 128 bytes."""
+        c = ImageCommitment(
+            image_url="ghcr.io/tensorlink-ai/radar-miner-really-long-name:latest",
+            subnet_version="0.3.0",
+            listener_url="http://very-long-hostname.example.com:8090",
+        )
+        chain = c.to_chain_json()
+        assert len(chain) <= 128
+        d = json.loads(chain)
+        assert d["i"] == c.image_url
+        assert d["l"] == c.listener_url
+
+    def test_to_chain_json_roundtrips_via_from_json(self):
+        """Chain JSON should be parseable by from_json."""
+        c = ImageCommitment(
+            image_url="docker.io/test:v1",
+            listener_url="http://host:8090",
+            subnet_version="0.3.0",
+        )
+        c2 = ImageCommitment.from_json(c.to_chain_json(), miner_uid=5)
+        assert c2.image_url == c.image_url
+        assert c2.listener_url == c.listener_url
+        assert c2.miner_uid == 5
+
+
 class TestReadMinerCommitments:
     """Tests for reading commitments from chain."""
 

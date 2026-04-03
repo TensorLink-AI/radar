@@ -49,8 +49,7 @@ class ImageCommitment:
     miner_uid: int = -1
     hotkey: str = ""
 
-    # Compact key mapping — keeps on-chain commitment under 256 bytes
-    # so bittensor SDK can encode it (Raw256 max).
+    # Compact key mapping for serialization.
     _KEY_MAP = {
         "i": "image_url",
         "d": "image_digest",
@@ -62,6 +61,10 @@ class ImageCommitment:
     }
     _REV_MAP = {v: k for k, v in _KEY_MAP.items()}
 
+    # On-chain limit is Raw128 (128 bytes). Only essential fields go on-chain.
+    _CHAIN_KEYS = ("i", "l", "v")
+    _MAX_CHAIN_BYTES = 128
+
     def to_json(self) -> str:
         """Serialize to compact JSON (short keys, no empty values)."""
         data = {}
@@ -70,6 +73,26 @@ class ImageCommitment:
             if val:
                 data[short] = val
         return json.dumps(data, separators=(",", ":"))
+
+    def to_chain_json(self) -> str:
+        """Serialize for on-chain storage (<=128 bytes, essential fields only).
+
+        The bittensor Commitments pallet Data enum supports Raw0-Raw128.
+        Only image_url and listener_url (+ version if space allows) are included.
+        Full data should be committed to file or fetched via the listener.
+        """
+        data: dict[str, str] = {}
+        for short in self._CHAIN_KEYS:
+            field = self._KEY_MAP[short]
+            val = getattr(self, field, "")
+            if val:
+                data[short] = val
+        result = json.dumps(data, separators=(",", ":"))
+        # If still over limit, drop version to save space
+        if len(result) > self._MAX_CHAIN_BYTES and "v" in data:
+            del data["v"]
+            result = json.dumps(data, separators=(",", ":"))
+        return result
 
     @classmethod
     def from_json(cls, s: str, miner_uid: int = -1, hotkey: str = "") -> ImageCommitment:
@@ -300,7 +323,7 @@ def commit_image_to_chain(
         subtensor.set_commitment(
             wallet=wallet,
             netuid=netuid,
-            data=commitment.to_json(),
+            data=commitment.to_chain_json(),
         )
         logger.info("Committed image to chain: %s @ %s", image_url, image_digest[:16])
         return True
