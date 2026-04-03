@@ -110,21 +110,36 @@ def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, Image
         return file_commitments
 
     hotkeys = metagraph.hotkeys if metagraph.hotkeys is not None else []
-    commitments: dict[int, ImageCommitment] = {}
+
+    # Build list of non-validator UIDs (miners) to avoid querying everyone
+    validator_permits = metagraph.validator_permit
+    miner_uids = []
+    for uid in range(metagraph.n):
+        is_validator = (
+            validator_permits is not None
+            and uid < len(validator_permits)
+            and validator_permits[uid]
+        )
+        if not is_validator:
+            miner_uids.append(uid)
+    logger.info("Checking %d miner UIDs for commitments", len(miner_uids))
 
     # Try raw substrate query — bypasses SDK type decoder that chokes
     # on Raw241+ variants not in its type_mapping.
-    raw_commitments = _read_from_chain_raw(subtensor, netuid, hotkeys, metagraph.n)
+    raw_commitments = _read_from_chain_raw(
+        subtensor, netuid, hotkeys, metagraph.n, miner_uids=miner_uids,
+    )
     if raw_commitments:
         logger.info("Found %d commitments from chain (raw query)", len(raw_commitments))
         return raw_commitments
 
     # Final fallback: SDK get_commitment (works for short commitments)
+    commitments: dict[int, ImageCommitment] = {}
     bt_logger = logging.getLogger("bittensor")
     prev_level = bt_logger.level
     bt_logger.setLevel(logging.CRITICAL)
     try:
-        for uid in range(metagraph.n):
+        for uid in miner_uids:
             try:
                 raw = subtensor.get_commitment(netuid=netuid, uid=uid)
                 if raw:
@@ -142,19 +157,23 @@ def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, Image
 
 def _read_from_chain_raw(
     subtensor, netuid: int, hotkeys: list, n: int,
+    miner_uids: list[int] | None = None,
 ) -> dict[int, ImageCommitment]:
     """Read commitments via raw substrate query, bypassing type decoder.
 
     The bittensor SDK's get_commitment() fails when commitment data is
     encoded as Raw241+ (not in type_mapping). We query the raw storage
     directly and decode the bytes ourselves.
+
+    If miner_uids is provided, only queries those UIDs (much faster).
     """
     commitments = {}
     substrate = getattr(subtensor, "substrate", None)
     if substrate is None:
         return commitments
 
-    for uid in range(n):
+    uids_to_check = miner_uids if miner_uids is not None else range(n)
+    for uid in uids_to_check:
         hotkey = hotkeys[uid] if uid < len(hotkeys) else ""
         if not hotkey:
             continue
