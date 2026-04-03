@@ -99,17 +99,11 @@ def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, Image
     """
     Read image commitments from all miners in the metagraph.
 
-    Priority: DB server → file fallback → chain.
+    Tries chain first, falls back to file-based commitments for localnet.
 
     Returns: {uid: ImageCommitment} for miners with valid commitments.
     """
-    # Try DB server first (primary path for testnet/mainnet)
-    db_commitments = _read_from_db(metagraph)
-    if db_commitments:
-        logger.info("Found %d commitments from DB server", len(db_commitments))
-        return db_commitments
-
-    # Try file-based commitments (localnet / same-machine)
+    # Try file-based commitments first (always available, used by localnet)
     file_commitments = _read_from_files(netuid, metagraph)
     if file_commitments:
         logger.info("Found %d commitments from file fallback", len(file_commitments))
@@ -136,47 +130,6 @@ def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, Image
     finally:
         bt_logger.setLevel(prev_level)
 
-    return commitments
-
-
-def _read_from_db(metagraph) -> dict[int, ImageCommitment]:
-    """Read commitments from the centralized DB server."""
-    import httpx
-    from config import Config
-
-    db_url = Config.DB_API_URL
-    if not db_url:
-        return {}
-    try:
-        resp = httpx.get(f"{db_url}/commitments", timeout=10)
-        if resp.status_code != 200:
-            return {}
-        rows = resp.json()
-    except Exception as e:
-        logger.debug("DB commitment read failed: %s", e)
-        return {}
-
-    hotkeys = metagraph.hotkeys if metagraph.hotkeys is not None else []
-    hotkey_to_uid = {
-        hotkeys[uid]: uid
-        for uid in range(metagraph.n)
-        if uid < len(hotkeys)
-    }
-    commitments = {}
-    for row in rows:
-        hotkey = row.get("hotkey", "")
-        uid = hotkey_to_uid.get(hotkey)
-        if uid is None:
-            continue
-        try:
-            data = row.get("data", {})
-            commitment = ImageCommitment.from_json(
-                json.dumps(data), miner_uid=uid, hotkey=hotkey,
-            )
-            if commitment.image_url:
-                commitments[uid] = commitment
-        except Exception as e:
-            logger.debug("Bad DB commitment for %s: %s", hotkey[:16], e)
     return commitments
 
 
