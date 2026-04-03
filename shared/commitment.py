@@ -49,28 +49,42 @@ class ImageCommitment:
     miner_uid: int = -1
     hotkey: str = ""
 
+    # Compact key mapping — keeps on-chain commitment under 256 bytes
+    # so bittensor SDK can encode it (Raw256 max).
+    _KEY_MAP = {
+        "i": "image_url",
+        "d": "image_digest",
+        "v": "subnet_version",
+        "l": "listener_url",
+        "t": "trainer_image",
+        "a": "agent_url",
+        "at": "agent_attestation_id",
+    }
+    _REV_MAP = {v: k for k, v in _KEY_MAP.items()}
+
     def to_json(self) -> str:
-        return json.dumps({
-            "image_url": self.image_url,
-            "image_digest": self.image_digest,
-            "subnet_version": self.subnet_version,
-            "listener_url": self.listener_url,
-            "trainer_image": self.trainer_image,
-            "agent_url": self.agent_url,
-            "agent_attestation_id": self.agent_attestation_id,
-        })
+        """Serialize to compact JSON (short keys, no empty values)."""
+        data = {}
+        for short, field in self._KEY_MAP.items():
+            val = getattr(self, field, "")
+            if val:
+                data[short] = val
+        return json.dumps(data, separators=(",", ":"))
 
     @classmethod
     def from_json(cls, s: str, miner_uid: int = -1, hotkey: str = "") -> ImageCommitment:
         d = json.loads(s)
+        # Support both compact (short) and legacy (full) keys
+        def _get(short: str, full: str) -> str:
+            return d.get(short, d.get(full, ""))
         return cls(
-            image_url=d.get("image_url", ""),
-            image_digest=d.get("image_digest", ""),
-            subnet_version=d.get("subnet_version", ""),
-            listener_url=d.get("listener_url", ""),
-            trainer_image=d.get("trainer_image", ""),
-            agent_url=d.get("agent_url", ""),
-            agent_attestation_id=d.get("agent_attestation_id", ""),
+            image_url=_get("i", "image_url"),
+            image_digest=_get("d", "image_digest"),
+            subnet_version=_get("v", "subnet_version"),
+            listener_url=_get("l", "listener_url"),
+            trainer_image=_get("t", "trainer_image"),
+            agent_url=_get("a", "agent_url"),
+            agent_attestation_id=_get("at", "agent_attestation_id"),
             miner_uid=miner_uid,
             hotkey=hotkey,
         )

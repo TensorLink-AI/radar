@@ -47,7 +47,8 @@ class TestImageCommitment:
         d = json.loads(c.to_json())
         assert "miner_uid" not in d
         assert "hotkey" not in d
-        assert d["image_url"] == "x"
+        # Compact format uses short key "i" for image_url
+        assert d["i"] == "x"
 
 
 class TestPullAndVerifyImage:
