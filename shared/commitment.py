@@ -99,7 +99,7 @@ def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, Image
     """
     Read image commitments from all miners in the metagraph.
 
-    Priority: file (localnet) → chain raw query → SDK get_commitment.
+    Priority: file (localnet) → get_all_commitments (single RPC) → per-UID fallback.
 
     Returns: {uid: ImageCommitment} for miners with valid commitments.
     """
@@ -111,135 +111,98 @@ def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, Image
 
     hotkeys = metagraph.hotkeys if metagraph.hotkeys is not None else []
 
-    # Build list of non-validator UIDs (miners) to avoid querying everyone
+    # Build hotkey→uid map and miner UID set
+    hotkey_to_uid: dict[str, int] = {}
     validator_permits = metagraph.validator_permit
-    miner_uids = []
+    miner_uids: set[int] = set()
     for uid in range(metagraph.n):
+        if uid < len(hotkeys) and hotkeys[uid]:
+            hotkey_to_uid[hotkeys[uid]] = uid
         is_validator = (
             validator_permits is not None
             and uid < len(validator_permits)
             and validator_permits[uid]
         )
         if not is_validator:
-            miner_uids.append(uid)
+            miner_uids.add(uid)
     logger.info("Checking %d miner UIDs for commitments", len(miner_uids))
 
-    # Try raw substrate query — bypasses SDK type decoder that chokes
-    # on Raw241+ variants not in its type_mapping.
-    raw_commitments = _read_from_chain_raw(
-        subtensor, netuid, hotkeys, metagraph.n, miner_uids=miner_uids,
+    # Primary: get_all_commitments — single RPC call, SDK handles decoding
+    commitments = _read_all_commitments(
+        subtensor, netuid, hotkey_to_uid, miner_uids,
     )
-    if raw_commitments:
-        logger.info("Found %d commitments from chain (raw query)", len(raw_commitments))
-        return raw_commitments
+    if commitments:
+        logger.info("Found %d commitments via get_all_commitments", len(commitments))
+        return commitments
 
-    # Final fallback: SDK get_commitment (works for short commitments)
+    # Fallback: per-UID get_commitment (slower, but works if map query fails)
+    commitments = _read_per_uid_commitments(
+        subtensor, netuid, hotkeys, sorted(miner_uids),
+    )
+    if commitments:
+        logger.info("Found %d commitments via per-UID fallback", len(commitments))
+    return commitments
+
+
+def _read_all_commitments(
+    subtensor, netuid: int,
+    hotkey_to_uid: dict[str, int],
+    miner_uids: set[int],
+) -> dict[int, ImageCommitment]:
+    """Read all commitments in a single RPC call via SDK get_all_commitments."""
+    commitments: dict[int, ImageCommitment] = {}
+    try:
+        all_raw = subtensor.get_all_commitments(netuid=netuid)
+    except Exception as e:
+        logger.debug("get_all_commitments failed: %s", e)
+        return commitments
+
+    for hotkey, raw_text in all_raw.items():
+        uid = hotkey_to_uid.get(hotkey)
+        if uid is None or uid not in miner_uids:
+            continue
+        if not raw_text:
+            continue
+        try:
+            c = ImageCommitment.from_json(raw_text, miner_uid=uid, hotkey=hotkey)
+            if c.image_url:
+                commitments[uid] = c
+        except Exception as e:
+            logger.debug("Bad commitment JSON for UID %d: %s", uid, e)
+    return commitments
+
+
+def _read_per_uid_commitments(
+    subtensor, netuid: int, hotkeys: list, miner_uids: list[int],
+) -> dict[int, ImageCommitment]:
+    """Per-UID commitment reads via get_commitment_metadata + decode."""
     commitments: dict[int, ImageCommitment] = {}
     bt_logger = logging.getLogger("bittensor")
     prev_level = bt_logger.level
     bt_logger.setLevel(logging.CRITICAL)
     try:
         for uid in miner_uids:
+            hotkey = hotkeys[uid] if uid < len(hotkeys) else ""
+            if not hotkey:
+                continue
             try:
-                raw = subtensor.get_commitment(netuid=netuid, uid=uid)
+                metadata = subtensor.get_commitment_metadata(
+                    netuid=netuid, hotkey_ss58=hotkey,
+                )
+                if not metadata or not isinstance(metadata, dict):
+                    continue
+                # Use SDK decoding — handles current on-chain byte tuple format
+                from bittensor.core.async_subtensor import decode_metadata
+                raw = decode_metadata(metadata)
                 if raw:
-                    hotkey = hotkeys[uid] if uid < len(hotkeys) else ""
-                    commitment = ImageCommitment.from_json(raw, miner_uid=uid, hotkey=hotkey)
-                    if commitment.image_url:
-                        commitments[uid] = commitment
+                    c = ImageCommitment.from_json(raw, miner_uid=uid, hotkey=hotkey)
+                    if c.image_url:
+                        commitments[uid] = c
             except Exception as e:
                 logger.debug("No commitment for UID %d: %s", uid, e)
     finally:
         bt_logger.setLevel(prev_level)
-
     return commitments
-
-
-def _read_from_chain_raw(
-    subtensor, netuid: int, hotkeys: list, n: int,
-    miner_uids: list[int] | None = None,
-) -> dict[int, ImageCommitment]:
-    """Read commitments via raw substrate query, bypassing type decoder.
-
-    The bittensor SDK's get_commitment() fails when commitment data is
-    encoded as Raw241+ (not in type_mapping). We query the raw storage
-    directly and decode the bytes ourselves.
-
-    If miner_uids is provided, only queries those UIDs (much faster).
-    """
-    commitments = {}
-    substrate = getattr(subtensor, "substrate", None)
-    if substrate is None:
-        return commitments
-
-    uids_to_check = miner_uids if miner_uids is not None else range(n)
-    for uid in uids_to_check:
-        hotkey = hotkeys[uid] if uid < len(hotkeys) else ""
-        if not hotkey:
-            continue
-        try:
-            result = substrate.query(
-                module="Commitments",
-                storage_function="CommitmentOf",
-                params=[netuid, hotkey],
-            )
-            if result is None or result.value is None:
-                continue
-            # result.value is the commitment info map
-            # Extract the 'info' field which contains the 'fields' list
-            info = result.value
-            if isinstance(info, dict):
-                fields = info.get("info", {}).get("fields", [])
-                if not fields:
-                    fields = info.get("fields", [])
-                # Each field is a dict like {"Raw241": "0x..."} or a string
-                for field in fields:
-                    text = _decode_raw_field(field)
-                    if text:
-                        try:
-                            c = ImageCommitment.from_json(
-                                text, miner_uid=uid, hotkey=hotkey,
-                            )
-                            if c.image_url:
-                                commitments[uid] = c
-                                break
-                        except Exception:
-                            pass
-        except Exception as e:
-            logger.debug("Raw chain query failed for UID %d: %s", uid, e)
-    return commitments
-
-
-def _decode_raw_field(field) -> str:
-    """Decode a substrate Data enum field to a UTF-8 string.
-
-    Fields come as dicts like {"Raw241": "0x7b2269..."} where the hex
-    is the UTF-8 encoded commitment JSON.
-    """
-    if isinstance(field, str):
-        # Already decoded string
-        if field.startswith("{"):
-            return field
-        if field.startswith("0x"):
-            try:
-                return bytes.fromhex(field[2:]).decode("utf-8", errors="ignore")
-            except Exception:
-                return ""
-        return field
-    if isinstance(field, dict):
-        for key, val in field.items():
-            if key == "None" or val is None:
-                continue
-            if isinstance(val, str):
-                if val.startswith("0x"):
-                    try:
-                        return bytes.fromhex(val[2:]).decode("utf-8", errors="ignore")
-                    except Exception:
-                        continue
-                if val.startswith("{"):
-                    return val
-                return val
-    return ""
 
 
 def _image_exists_locally(image_url: str) -> bool:

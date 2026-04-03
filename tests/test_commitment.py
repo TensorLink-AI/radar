@@ -6,6 +6,7 @@ import pytest
 from shared.commitment import (
     ImageCommitment, verify_subnet_version,
     pull_and_verify_image, _image_exists_locally,
+    read_miner_commitments, _read_all_commitments, _read_per_uid_commitments,
 )
 
 
@@ -49,6 +50,106 @@ class TestImageCommitment:
         assert "hotkey" not in d
         # Compact format uses short key "i" for image_url
         assert d["i"] == "x"
+
+
+class TestReadMinerCommitments:
+    """Tests for reading commitments from chain."""
+
+    def _make_metagraph(self, n=3, hotkeys=None, validator_permits=None):
+        mg = MagicMock()
+        mg.n = n
+        mg.hotkeys = hotkeys or [f"hotkey_{i}" for i in range(n)]
+        mg.validator_permit = validator_permits or [False] * n
+        return mg
+
+    def test_read_all_commitments_parses_sdk_output(self):
+        """get_all_commitments returns {hotkey: json_str}, should parse correctly."""
+        commitment = ImageCommitment(
+            image_url="docker.io/test:v1", listener_url="http://host:8090",
+        )
+        subtensor = MagicMock()
+        subtensor.get_all_commitments.return_value = {
+            "hotkey_1": commitment.to_json(),
+        }
+        result = _read_all_commitments(
+            subtensor, netuid=1,
+            hotkey_to_uid={"hotkey_0": 0, "hotkey_1": 1},
+            miner_uids={0, 1},
+        )
+        assert 1 in result
+        assert result[1].image_url == "docker.io/test:v1"
+        assert result[1].listener_url == "http://host:8090"
+        assert result[1].miner_uid == 1
+        assert result[1].hotkey == "hotkey_1"
+
+    def test_read_all_commitments_skips_validators(self):
+        """Commitments from validator UIDs should be skipped."""
+        subtensor = MagicMock()
+        subtensor.get_all_commitments.return_value = {
+            "hotkey_0": ImageCommitment(image_url="x", listener_url="y").to_json(),
+        }
+        result = _read_all_commitments(
+            subtensor, netuid=1,
+            hotkey_to_uid={"hotkey_0": 0},
+            miner_uids={1, 2},  # UID 0 is not a miner
+        )
+        assert len(result) == 0
+
+    def test_read_all_commitments_handles_exception(self):
+        """Should return empty dict if get_all_commitments raises."""
+        subtensor = MagicMock()
+        subtensor.get_all_commitments.side_effect = Exception("RPC error")
+        result = _read_all_commitments(
+            subtensor, netuid=1, hotkey_to_uid={}, miner_uids=set(),
+        )
+        assert result == {}
+
+    def test_read_all_commitments_skips_bad_json(self):
+        """Should skip entries with invalid JSON."""
+        subtensor = MagicMock()
+        subtensor.get_all_commitments.return_value = {
+            "hotkey_0": "not-json",
+            "hotkey_1": ImageCommitment(image_url="ok", listener_url="y").to_json(),
+        }
+        result = _read_all_commitments(
+            subtensor, netuid=1,
+            hotkey_to_uid={"hotkey_0": 0, "hotkey_1": 1},
+            miner_uids={0, 1},
+        )
+        assert len(result) == 1
+        assert 1 in result
+
+    def test_falls_back_to_per_uid_when_all_empty(self):
+        """If get_all_commitments returns empty, fall back to per-UID."""
+        mg = self._make_metagraph(n=2, validator_permits=[False, False])
+        subtensor = MagicMock()
+        subtensor.get_all_commitments.return_value = {}
+        # Per-UID fallback returns metadata
+        commitment_json = ImageCommitment(
+            image_url="img:v1", listener_url="http://h:8090",
+        ).to_json()
+        json_bytes = list(commitment_json.encode("utf-8"))
+
+        subtensor.get_commitment_metadata.return_value = {
+            "info": {"fields": [[{"Raw100": [json_bytes]}]]},
+        }
+
+        with patch("shared.commitment._read_from_files", return_value={}):
+            result = read_miner_commitments(subtensor, netuid=1, metagraph=mg)
+
+        assert len(result) == 2
+
+    def test_file_fallback_takes_priority(self):
+        """File-based commitments should be returned first."""
+        mg = self._make_metagraph()
+        subtensor = MagicMock()
+        file_result = {
+            0: ImageCommitment(image_url="file:v1", miner_uid=0),
+        }
+        with patch("shared.commitment._read_from_files", return_value=file_result):
+            result = read_miner_commitments(subtensor, netuid=1, metagraph=mg)
+        assert result == file_result
+        subtensor.get_all_commitments.assert_not_called()
 
 
 class TestPullAndVerifyImage:
