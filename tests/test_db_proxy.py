@@ -20,7 +20,7 @@ def _setup_proxy():
         db_api_url="http://fake-db:8090",
         wallet=None,
         metagraph=None,
-        rate_limits={"db": 100, "desearch": 100, "llm": 100, "agent_code": 100},
+        rate_limits={"db": (100, 60), "desearch": (100, 60), "llm": (100, 60), "agent_code": (100, 60)},
     )
 
 
@@ -55,7 +55,7 @@ def test_proxy_no_db_url():
         db_api_url="",
         wallet=None,
         metagraph=None,
-        rate_limits={"db": 100, "desearch": 100, "llm": 100, "agent_code": 100},
+        rate_limits={"db": (100, 60), "desearch": (100, 60), "llm": (100, 60), "agent_code": (100, 60)},
     )
     client = TestClient(app, raise_server_exceptions=False)
     r = client.get("/experiments/recent", headers=_auth_headers())
@@ -72,7 +72,7 @@ def test_per_category_rate_limits():
         db_api_url="http://fake-db:8090",
         wallet=None,
         metagraph=None,
-        rate_limits={"db": 2, "llm": 2, "desearch": 2, "agent_code": 2},
+        rate_limits={"db": (2, 60), "llm": (2, 60), "desearch": (2, 60), "agent_code": (1, 3600)},
     )
     identity = "test-miner-99"
     # Clear any existing state
@@ -91,3 +91,7 @@ def test_per_category_rate_limits():
 
     # "desearch" still independent
     assert _check_rate_limit(identity, "desearch") is True
+
+    # "agent_code" allows 1 per hour
+    assert _check_rate_limit(identity, "agent_code") is True
+    assert _check_rate_limit(identity, "agent_code") is False

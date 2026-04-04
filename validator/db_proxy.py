@@ -75,16 +75,16 @@ _wallet = None
 _metagraph = None
 _client: Optional[httpx.AsyncClient] = None
 
-# Per-route-category rate limits (req/min per miner per category).
+# Per-route-category rate limits: (max_requests, window_seconds).
 # Each category gets its own independent bucket so heavy DB reads
 # don't starve LLM or search budgets.
-_CATEGORY_LIMITS: dict[str, int] = {
-    "db": 30,       # /experiments, /challenge, /frontier, /provenance
-    "desearch": 10, # /desearch
-    "llm": 15,      # /llm
-    "agent_code": 5,  # /agent_code
+_CATEGORY_LIMITS: dict[str, tuple[int, int]] = {
+    "db":         (30, 60),    # 30 req / 60s
+    "desearch":   (10, 60),    # 10 req / 60s
+    "llm":        (15, 60),    # 15 req / 60s
+    "agent_code": (1, 3600),   #  1 req / hour
 }
-_DEFAULT_LIMIT: int = 20  # fallback for uncategorised routes
+_DEFAULT_LIMIT: tuple[int, int] = (20, 60)
 
 # Rate limiter: "category:identity" -> list of timestamps
 _rate_window: dict[str, list[float]] = defaultdict(list)
@@ -103,11 +103,14 @@ def _route_category(path: str) -> str:
     return "db"
 
 
-def set_config(db_api_url: str, wallet, metagraph, rate_limits: dict[str, int] | None = None):
+def set_config(
+    db_api_url: str, wallet, metagraph,
+    rate_limits: dict[str, tuple[int, int]] | None = None,
+):
     """Configure the proxy at startup.
 
-    ``rate_limits`` overrides per-category limits, e.g.
-    ``{"db": 40, "llm": 20}``.
+    ``rate_limits`` overrides per-category limits as
+    ``{category: (max_requests, window_seconds)}``.
     """
     global _db_api_url, _wallet, _metagraph
     _db_api_url = db_api_url.rstrip("/")
@@ -132,13 +135,13 @@ async def _get_client() -> httpx.AsyncClient:
 
 def _check_rate_limit(identity: str, category: str) -> bool:
     """Check per-category rate limit for a given identity (hotkey or UID)."""
-    limit = _CATEGORY_LIMITS.get(category, _DEFAULT_LIMIT)
+    max_req, window_secs = _CATEGORY_LIMITS.get(category, _DEFAULT_LIMIT)
     key = f"{category}:{identity}"
     with _rate_lock:
         now = time.time()
         window = _rate_window[key]
-        _rate_window[key] = [t for t in window if now - t < 60]
-        if len(_rate_window[key]) >= limit:
+        _rate_window[key] = [t for t in window if now - t < window_secs]
+        if len(_rate_window[key]) >= max_req:
             return False
         _rate_window[key].append(now)
         return True
