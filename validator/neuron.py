@@ -672,6 +672,27 @@ class Validator:
         self.start_proxy_server()
         while True:
             try:
+                current_block = self.subtensor.block
+                round_start = round_start_block(current_block, Config.ROUND_INTERVAL_BLOCKS)
+                phase = current_phase(
+                    current_block, round_start,
+                    submission_window=Config.SUBMISSION_WINDOW_BLOCKS,
+                    training_window=Config.TRAINING_WINDOW_BLOCKS,
+                    eval_window=Config.EVAL_WINDOW_BLOCKS,
+                    scoring_window=Config.FALLBACK_WINDOW_BLOCKS,
+                )
+                if phase != "submission":
+                    next_round = round_start + Config.ROUND_INTERVAL_BLOCKS
+                    wait_blocks = next_round - current_block
+                    wait_secs = wait_blocks * 12
+                    logger.info(
+                        "Current phase is '%s' (block %d, round started at %d) "
+                        "— waiting %d blocks (~%ds) for next round at block %d",
+                        phase, current_block, round_start,
+                        wait_blocks, wait_secs, next_round,
+                    )
+                    await self._wait_until_block(next_round)
+                    continue
                 await self.run_round()
             except Exception:
                 logger.error("Round error:\n%s", traceback.format_exc())
