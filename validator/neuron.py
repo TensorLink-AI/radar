@@ -101,6 +101,9 @@ class Validator:
         # EMA scores per UID
         self.ema_scores: dict[int, float] = {}
 
+        # Track last completed round to avoid re-running on restart
+        self._last_completed_round: Optional[int] = None
+
         # Trainer reliability tracking (keyed by trainer UID)
         self.trainer_reliability: dict[int, float] = {}
 
@@ -693,7 +696,17 @@ class Validator:
                     )
                     await self._wait_until_block(next_round)
                     continue
+                if self._last_completed_round == round_start:
+                    next_round = round_start + Config.ROUND_INTERVAL_BLOCKS
+                    wait_blocks = next_round - current_block
+                    logger.info(
+                        "Round %d already processed — waiting %d blocks for next round at %d",
+                        round_start, wait_blocks, next_round,
+                    )
+                    await self._wait_until_block(next_round)
+                    continue
                 await self.run_round()
+                self._last_completed_round = round_start
             except Exception:
                 logger.error("Round error:\n%s", traceback.format_exc())
             await asyncio.sleep(60)
