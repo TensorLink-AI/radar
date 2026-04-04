@@ -93,6 +93,25 @@ CREATE INDEX IF NOT EXISTS idx_cc_experiment ON code_components(experiment_id);
 CREATE INDEX IF NOT EXISTS idx_cc_component ON code_components(component);
 """
 
+PROXY_QUERY_LOG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS proxy_query_log (
+    id SERIAL PRIMARY KEY,
+    service TEXT NOT NULL,
+    miner_uid INTEGER NOT NULL DEFAULT -1,
+    miner_hotkey TEXT NOT NULL DEFAULT '',
+    query_text TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    response_summary TEXT NOT NULL DEFAULT '',
+    tokens_used INTEGER NOT NULL DEFAULT 0,
+    timestamp DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    round_id INTEGER NOT NULL DEFAULT -1
+);
+CREATE INDEX IF NOT EXISTS idx_pql_service ON proxy_query_log(service);
+CREATE INDEX IF NOT EXISTS idx_pql_miner ON proxy_query_log(miner_hotkey);
+CREATE INDEX IF NOT EXISTS idx_pql_round ON proxy_query_log(round_id);
+CREATE INDEX IF NOT EXISTS idx_pql_timestamp ON proxy_query_log(timestamp);
+"""
+
 AGENT_CODE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS agent_submissions (
     id SERIAL PRIMARY KEY,

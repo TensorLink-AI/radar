@@ -1,8 +1,11 @@
 """
-Desearch proxy — HTTP proxy for miners to search arxiv via SN22.
+Desearch proxy — HTTP proxy for miner agents to search arxiv via SN22.
 
-Rate-limited to 20 queries per miner per tempo. Runs as additional routes
-on the existing FastAPI DB server.
+Runs on the subnet owner's database server (NOT on validators).
+Validators forward /desearch/* requests here.
+
+All queries are logged to Postgres (proxy_query_log table).
+Rate-limited to RADAR_DESEARCH_MAX_QUERIES per miner per tempo.
 """
 
 from __future__ import annotations
@@ -67,10 +70,12 @@ class DesearchProxy:
         sn22_url: str = DEFAULT_SN22_URL,
         max_queries: int = MAX_QUERIES_PER_TEMPO,
         tempo_seconds: int = TEMPO_DURATION_SECONDS,
+        pool=None,
     ):
         self.sn22_url = sn22_url
         self.max_queries = max_queries
         self.tempo_seconds = tempo_seconds
+        self.pool = pool  # asyncpg pool for query logging
 
         # miner_uid -> list of query timestamps in current window
         self._query_counts: dict[int, list[float]] = defaultdict(list)
@@ -96,6 +101,27 @@ class DesearchProxy:
     def _record_query(self, miner_uid: int):
         """Record a query for rate limiting."""
         self._query_counts[miner_uid].append(time.time())
+
+    async def _log_query(
+        self, miner_uid: int, miner_hotkey: str,
+        query: str, num_results: int,
+    ):
+        """Log query to Postgres (best-effort, never raises)."""
+        if not self.pool:
+            return
+        try:
+            await self.pool.execute(
+                """
+                INSERT INTO proxy_query_log
+                    (service, miner_uid, miner_hotkey, query_text,
+                     response_summary, timestamp)
+                VALUES ($1, $2, $3, $4, $5, extract(epoch from now()))
+                """,
+                "desearch", miner_uid, miner_hotkey, query[:500],
+                f"{num_results} results",
+            )
+        except Exception as e:
+            logger.debug("Desearch query log failed: %s", e)
 
     async def search(
         self, miner_uid: int, query: str, max_results: int = 5,
@@ -133,6 +159,10 @@ class DesearchProxy:
             raise HTTPException(status_code=502, detail="Desearch upstream unreachable")
 
         results = _parse_sn22_response(data)
+
+        # Log to Postgres (best-effort)
+        await self._log_query(miner_uid, miner_hotkey, query, len(results))
+
         return SearchResponse(results=results[:max_results], remaining_queries=remaining)
 
     async def close(self):

@@ -134,35 +134,11 @@ class Validator:
         else:
             self.coordinator = None
 
-        # Desearch proxy — mounted on proxy app
-        self.desearch_proxy = None
-        if Config.DESEARCH_ENABLED:
-            from validator.desearch_proxy import DesearchProxy, set_proxy, register_routes
-            self.desearch_proxy = DesearchProxy(
-                sn22_url=Config.DESEARCH_SN22_URL,
-                max_queries=Config.DESEARCH_MAX_QUERIES,
-            )
-            set_proxy(self.desearch_proxy)
-            register_routes(proxy_app)
-
-        # LLM proxy (Chutes AI) — mounted on proxy app
-        self.llm_proxy = None
-        if Config.LLM_ENABLED:
-            from validator.llm_proxy import LLMProxy
-            from validator.llm_proxy import set_proxy as set_llm_proxy
-            from validator.llm_proxy import register_routes as register_llm_routes
-            allowed_models = [
-                m.strip() for m in Config.CHUTES_ALLOWED_MODELS.split(",")
-                if m.strip()
-            ]
-            self.llm_proxy = LLMProxy(
-                chutes_url=Config.CHUTES_API_URL,
-                chutes_api_key=Config.CHUTES_API_KEY,
-                allowed_models=allowed_models,
-                max_queries=Config.LLM_MAX_QUERIES,
-            )
-            set_llm_proxy(self.llm_proxy)
-            register_llm_routes(proxy_app)
+        # Desearch and LLM proxies run on the DB server (subnet owner).
+        # Validators just forward /desearch/* and /llm/* via db_proxy.py.
+        # These flags control whether URLs are injected into the challenge.
+        self.desearch_enabled = Config.DESEARCH_ENABLED
+        self.llm_enabled = Config.LLM_ENABLED
 
         # Configure proxy
         set_proxy_config(
@@ -256,10 +232,10 @@ class Validator:
 
         challenge.db_url = f"http://localhost:{self.proxy_port}"
         challenge.desearch_url = (
-            f"http://localhost:{self.proxy_port}/desearch" if self.desearch_proxy else ""
+            f"http://localhost:{self.proxy_port}/desearch" if self.desearch_enabled else ""
         )
         challenge.llm_url = (
-            f"http://localhost:{self.proxy_port}/llm" if self.llm_proxy else ""
+            f"http://localhost:{self.proxy_port}/llm" if self.llm_enabled else ""
         )
 
         # Rotate agent token for this round — agents use it to auth proxy requests
@@ -695,8 +671,6 @@ class Validator:
         self.start_proxy_server()
         while True:
             try:
-                if self.desearch_proxy:
-                    self.desearch_proxy.reset_limits()
                 await self.run_round()
             except Exception:
                 logger.error("Round error:\n%s", traceback.format_exc())

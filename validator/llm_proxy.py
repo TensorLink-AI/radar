@@ -1,10 +1,10 @@
 """LLM proxy — rate-limited proxy for miner agents to query Chutes AI.
 
-Subnet owner configures which models are allowed and the API key.
-Validators run this as additional routes on the proxy FastAPI app.
-Agents authenticate via the per-round ``X-Agent-Token`` header
-(verified by the proxy middleware in db_proxy.py).
+Runs on the subnet owner's database server (NOT on validators).
+Validators forward /llm/* requests here. The Chutes API key never
+leaves the owner's machine.
 
+All queries are logged to Postgres (proxy_query_log table).
 Rate-limited to RADAR_LLM_MAX_QUERIES per miner per tempo.
 """
 
@@ -72,12 +72,14 @@ class LLMProxy:
         allowed_models: list[str] | None = None,
         max_queries: int = MAX_QUERIES_PER_TEMPO,
         tempo_seconds: int = TEMPO_DURATION_SECONDS,
+        pool=None,
     ):
         self.chutes_url = chutes_url.rstrip("/")
         self.chutes_api_key = chutes_api_key
         self.allowed_models = allowed_models or []
         self.max_queries = max_queries
         self.tempo_seconds = tempo_seconds
+        self.pool = pool  # asyncpg pool for query logging
 
         # miner_uid -> list of query timestamps in current window
         self._query_counts: dict[int, list[float]] = defaultdict(list)
@@ -116,8 +118,30 @@ class LLMProxy:
                 ),
             )
 
+    async def _log_query(
+        self, miner_uid: int, miner_hotkey: str,
+        req: ChatRequest, content: str, tokens: int,
+    ):
+        """Log query to Postgres (best-effort, never raises)."""
+        if not self.pool:
+            return
+        try:
+            query_text = req.messages[-1].content[:500] if req.messages else ""
+            await self.pool.execute(
+                """
+                INSERT INTO proxy_query_log
+                    (service, miner_uid, miner_hotkey, query_text, model,
+                     response_summary, tokens_used, timestamp)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, extract(epoch from now()))
+                """,
+                "llm", miner_uid, miner_hotkey, query_text, req.model,
+                content[:200], tokens,
+            )
+        except Exception as e:
+            logger.debug("LLM query log failed: %s", e)
+
     async def chat(
-        self, miner_uid: int, req: ChatRequest,
+        self, miner_uid: int, req: ChatRequest, miner_hotkey: str = "",
     ) -> ChatResponse:
         """Forward a chat completion request to Chutes AI.
 
@@ -169,10 +193,16 @@ class LLMProxy:
             msg = choices[0].get("message", {})
             content = msg.get("content", "")
 
+        usage = data.get("usage", {})
+        tokens = usage.get("total_tokens", 0)
+
+        # Log to Postgres (best-effort)
+        await self._log_query(miner_uid, miner_hotkey, req, content, tokens)
+
         return ChatResponse(
             model=data.get("model", req.model),
             content=content,
-            usage=data.get("usage", {}),
+            usage=usage,
             remaining_queries=remaining,
         )
 
@@ -206,10 +236,11 @@ def register_routes(app: FastAPI):
 
     @app.post("/llm/chat")
     async def llm_chat(req: ChatRequest, request: Request):
-        """Chat completion. Requires X-Miner-UID and X-Agent-Token headers."""
+        """Chat completion. Requires X-Miner-UID header."""
         proxy = get_proxy()
         miner_uid = _extract_miner_uid(request)
-        return await proxy.chat(miner_uid, req)
+        miner_hotkey = request.headers.get("X-Miner-Hotkey", "")
+        return await proxy.chat(miner_uid, req, miner_hotkey)
 
     @app.get("/llm/models")
     def llm_models():
