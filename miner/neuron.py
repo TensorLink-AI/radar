@@ -1,16 +1,19 @@
-"""Radar Miner — commits Docker agent image to chain, hosts warm-standby trainer.
+"""Radar Miner — commits agent code hash to chain, hosts warm-standby trainer.
 
-The miner has two components:
-  1. Agent: a Docker image committed to chain. Validators pull and run it.
+The miner has three components:
+  1. Agent code: .py files served from the listener. Validators fetch and
+     run them inside the official sandboxed agent image.
   2. Trainer listener: a lightweight FastAPI server (no GPU). Deploys
      Basilica GPU pods on-demand when validators send TrainerRequests.
+  3. Agent code endpoint: GET /agent_code returns a JSON bundle of the
+     miner's agent .py files plus a content hash for verification.
 """
 
 import argparse
 import asyncio
+import json
 import logging
 import os
-import subprocess
 
 import bittensor as bt
 import httpx
@@ -19,6 +22,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from config import Config
+from shared.agent_code import bundle_from_directory, compute_code_hash
 from shared.auth import sign_request, verify_request
 from shared.commitment import ImageCommitment
 from shared.protocol import TrainerRequest, TrainerReady, TrainerRelease
@@ -26,23 +30,6 @@ from shared.protocol import TrainerRequest, TrainerReady, TrainerRelease
 logger = logging.getLogger(__name__)
 
 listener_app = FastAPI(title="RADAR Miner Listener")
-
-
-def _get_image_digest(image_url: str) -> str:
-    """Get the sha256 digest of a local Docker image."""
-    try:
-        result = subprocess.run(
-            ["docker", "inspect", "--format",
-             "{{index .RepoDigests 0}}", image_url],
-            capture_output=True, text=True, timeout=30,
-        )
-        digest = result.stdout.strip()
-        if "@" in digest:
-            digest = digest.split("@")[1]
-        return digest
-    except Exception:
-        logger.warning("Could not get image digest for %s", image_url)
-        return ""
 
 
 class Miner:
@@ -58,8 +45,9 @@ class Miner:
         # Cache metagraph — synced periodically in keep-alive loop
         self.metagraph = self.subtensor.metagraph(self.netuid)
 
-        # Agent is a Docker image validators pull and run
-        self.docker_image = getattr(config, "docker_image", "systematic:latest")
+        # Agent code directory — validators fetch the code and run it
+        # in the official sandboxed image
+        self.agent_dir = getattr(config, "agent_dir", "agent/")
 
         # Trainer image deployed on-demand via Basilica
         self.trainer_image = getattr(
@@ -76,18 +64,74 @@ class Miner:
         # Validator db_urls to notify when deployment completes: round_id → [urls]
         self._pending_notify: dict[int, list[str]] = {}
 
+        # Cached code hash — set after first submission
+        self._code_hash: str = ""
+
         logger.info(
-            "Miner initialized. Agent: %s, Trainer image: %s, Listener port: %d",
-            self.docker_image, self.trainer_image, self.listener_port,
+            "Miner initialized. Agent dir: %s, Trainer image: %s, Listener port: %d",
+            self.agent_dir, self.trainer_image, self.listener_port,
         )
 
-    def commit_image(self):
-        """Commit Docker agent image + listener URL to chain."""
-        digest = _get_image_digest(self.docker_image)
+    async def submit_agent_code(self, db_url: str = ""):
+        """Submit agent code to the DB server and commit hash on-chain.
 
+        Reads .py files from self.agent_dir, bundles them, POSTs to the
+        DB server (which stores in R2 + Postgres), then commits the
+        code_hash on-chain.
+        """
+        import os
+        if not os.path.isdir(self.agent_dir):
+            logger.error("Agent directory not found: %s", self.agent_dir)
+            return
+
+        bundle = bundle_from_directory(self.agent_dir)
+        code_hash = bundle["code_hash"]
+
+        # Skip if unchanged
+        if code_hash == self._code_hash:
+            logger.info("Agent code unchanged (hash=%s), skipping submission", code_hash[:24])
+            return
+
+        # POST to DB server via validator proxy
+        target_url = db_url or Config.DB_API_URL
+        body = json.dumps({
+            "files": bundle["files"],
+            "entry_point": bundle["entry_point"],
+        }).encode()
+        headers = sign_request(self.wallet, body)
+        headers["Content-Type"] = "application/json"
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{target_url.rstrip('/')}/agent_code",
+                    content=body, headers=headers,
+                )
+                if resp.status_code != 200:
+                    logger.error(
+                        "Agent code submission failed: HTTP %d %s",
+                        resp.status_code, resp.text[:200],
+                    )
+                    return
+                result = resp.json()
+                logger.info(
+                    "Agent code submitted: hash=%s files=%s",
+                    result.get("code_hash", "?")[:24],
+                    sorted(bundle["files"].keys()),
+                )
+        except Exception as e:
+            logger.error("Agent code submission failed: %s", e)
+            return
+
+        self._code_hash = code_hash
+
+        # Commit hash + listener URL on-chain
+        self._commit_to_chain(code_hash)
+
+    def _commit_to_chain(self, code_hash: str):
+        """Commit code_hash + listener URL to chain."""
         commitment = ImageCommitment(
-            image_url=self.docker_image,
-            image_digest=digest,
+            code_hash=code_hash,
             subnet_version="0.3.0",
             listener_url=f"http://{self.external_ip}:{self.listener_port}",
             trainer_image=self.trainer_image,
@@ -102,7 +146,7 @@ class Miner:
         )
         if hasattr(response, "success") and not response.success:
             raise RuntimeError(f"Chain commit failed: {getattr(response, 'message', response)}")
-        logger.info("Committed image to chain: %s", self.docker_image)
+        logger.info("Committed to chain: code_hash=%s", code_hash[:24])
 
     async def _post_trainer_ready(
         self, round_id: int, trainer_url: str,
@@ -354,14 +398,14 @@ class Miner:
         logger.info("Listener started on port %d", self.listener_port)
 
     async def run(self):
-        """Start listener, commit image, and keep alive."""
+        """Start listener, submit agent code, and keep alive."""
         self.start_listener()
-        self.commit_image()
+        await self.submit_agent_code()
         logger.info(
-            "Miner running. Agent: %s (validators pull this image). "
+            "Miner running. Agent dir: %s (code submitted to DB server). "
             "Listener: port %d. Trainer image: %s. "
             "Waiting for validator TrainerRequests on /prepare.",
-            self.docker_image, self.listener_port, self.trainer_image,
+            self.agent_dir, self.listener_port, self.trainer_image,
         )
 
         while True:
@@ -382,8 +426,8 @@ class Miner:
 def get_config() -> bt.Config:
     parser = argparse.ArgumentParser(description="Radar Miner")
     parser.add_argument("--netuid", type=int, default=1)
-    parser.add_argument("--docker_image", type=str, default="systematic:latest",
-                        help="Docker agent image (validators pull and run this)")
+    parser.add_argument("--agent_dir", type=str, default="agent/",
+                        help="Directory containing agent .py files")
     parser.add_argument("--listener_port", type=int, default=8090,
                         help="Port for warm-standby trainer listener")
     parser.add_argument("--trainer_image", type=str,

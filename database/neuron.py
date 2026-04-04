@@ -19,6 +19,7 @@ from config import Config
 from database.server import (
     app, set_db, set_auth, set_challenge, set_frontier,
     set_access_logger, set_hotkey_map, set_rate_limit,
+    set_r2, set_pool,
 )
 from shared.pareto import ParetoFront
 from shared.pg_access_logger import PgAccessLogger
@@ -89,8 +90,16 @@ class DatabaseNeuron:
         self.access_logger = PgAccessLogger(self.pool)
         await self.access_logger.init_schema()
 
+        # Init agent_submissions table
+        from shared.pg_schema import AGENT_CODE_SCHEMA
+        async with self.pool.acquire() as conn:
+            await conn.execute(AGENT_CODE_SCHEMA)
+
         # Wire into server
         set_db(self.store)
+        set_pool(self.pool)
+        if self.r2:
+            set_r2(self.r2)
         set_access_logger(self.access_logger)
         set_auth(self.metagraph)
         set_rate_limit(Config.DB_VALI_RATE_LIMIT)

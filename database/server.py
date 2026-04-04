@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 # Injected at startup by database/neuron.py
 db = None  # PgExperimentStore
+_r2 = None  # R2AuditLog (for agent code storage)
+_pool = None  # asyncpg pool (for agent_submissions table)
 
 # Auth middleware reference
 _auth_verify = None
@@ -49,6 +51,16 @@ _hotkey_to_uid: dict[str, int] = {}
 def set_db(experiment_db):
     global db
     db = experiment_db
+
+
+def set_r2(r2):
+    global _r2
+    _r2 = r2
+
+
+def set_pool(pool):
+    global _pool
+    _pool = pool
 
 
 def set_auth(metagraph, verify_fn=None):
@@ -140,6 +152,7 @@ async def auth_middleware(request: Request, call_next):
         or path.startswith("/challenge")
         or path.startswith("/frontier")
         or path.startswith("/provenance")
+        or path.startswith("/agent_code")
     )
     if needs_auth and _auth_verify and _metagraph:
         body = await request.body()
@@ -354,3 +367,115 @@ async def get_dead_ends(task: str = ""):
 async def get_experiment_graph(experiment_id: int, depth: int = 3):
     prov = _require_provenance()
     return await prov.get_experiment_graph(experiment_id, depth=depth)
+
+
+# ── Agent code endpoints ───────────────────────────────────
+
+
+class SubmitAgentCodeRequest(BaseModel):
+    """Miner POSTs their agent code bundle."""
+    files: dict[str, str]          # filename -> source code
+    entry_point: str = "agent.py"  # which file has design_architecture()
+
+
+@app.post("/agent_code")
+async def submit_agent_code(request: Request, req: SubmitAgentCodeRequest):
+    """Miner submits agent code. Validated, stored in R2, recorded in Postgres."""
+    if _r2 is None:
+        raise HTTPException(status_code=503, detail="R2 not configured")
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="DB pool not configured")
+
+    hotkey = getattr(request.state, "caller_hotkey", "")
+    if not hotkey:
+        raise HTTPException(status_code=403, detail="Auth required")
+
+    miner_uid = _hotkey_to_uid.get(hotkey, -1)
+
+    from shared.agent_code import compute_code_hash, validate_bundle
+
+    bundle = {
+        "files": req.files,
+        "entry_point": req.entry_point,
+    }
+
+    # Validate
+    ok, err = validate_bundle(bundle)
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": err})
+
+    code_hash = compute_code_hash(req.files)
+    bundle["code_hash"] = code_hash
+
+    # Upload to R2
+    r2_key = f"agents/{hotkey}/latest.json"
+    try:
+        _r2.upload_json(r2_key, bundle)
+    except Exception as e:
+        logger.error("R2 upload failed for agent code %s: %s", hotkey[:16], e)
+        raise HTTPException(status_code=500, detail="Failed to store agent code")
+
+    # Upsert into Postgres
+    try:
+        await _pool.execute(
+            """
+            INSERT INTO agent_submissions
+                (hotkey, miner_uid, code_hash, entry_point, r2_key, timestamp)
+            VALUES ($1, $2, $3, $4, $5, extract(epoch from now()))
+            ON CONFLICT (hotkey) DO UPDATE SET
+                miner_uid = $2,
+                code_hash = $3,
+                entry_point = $4,
+                r2_key = $5,
+                timestamp = extract(epoch from now())
+            """,
+            hotkey, miner_uid, code_hash, req.entry_point, r2_key,
+        )
+    except Exception as e:
+        logger.error("Postgres write failed for agent code %s: %s", hotkey[:16], e)
+        raise HTTPException(status_code=500, detail="Failed to record submission")
+
+    logger.info(
+        "Agent code submitted: hotkey=%s uid=%d hash=%s files=%s",
+        hotkey[:16], miner_uid, code_hash[:24], sorted(req.files.keys()),
+    )
+    return {"status": "ok", "code_hash": code_hash, "r2_key": r2_key}
+
+
+@app.get("/agent_code/{hotkey}")
+async def get_agent_code(hotkey: str):
+    """Validator fetches a miner's latest agent code bundle."""
+    if _r2 is None:
+        raise HTTPException(status_code=503, detail="R2 not configured")
+
+    r2_key = f"agents/{hotkey}/latest.json"
+    try:
+        bundle = _r2.download_json(r2_key)
+    except Exception:
+        bundle = None
+
+    if not bundle:
+        raise HTTPException(status_code=404, detail="No agent code for this hotkey")
+
+    return bundle
+
+
+@app.get("/agent_code/{hotkey}/meta")
+async def get_agent_code_meta(hotkey: str):
+    """Get metadata about a miner's agent submission (no code)."""
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="DB pool not configured")
+
+    row = await _pool.fetchrow(
+        "SELECT code_hash, entry_point, timestamp FROM agent_submissions WHERE hotkey = $1",
+        hotkey,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="No agent submission for this hotkey")
+
+    return {
+        "hotkey": hotkey,
+        "code_hash": row["code_hash"],
+        "entry_point": row["entry_point"],
+        "timestamp": row["timestamp"],
+    }

@@ -1,13 +1,18 @@
 """Reverse proxy — validators run this for their miners.
 
 Forwards /experiments/*, /challenge, /frontier, /provenance/* to the
-centralized database server. Hosts /desearch/* locally. Rate limits
-per miner hotkey.
+centralized database server. Hosts /desearch/*, /llm/* locally. Rate
+limits per miner hotkey or agent token.
+
+Agent pods authenticate via a per-round ephemeral token injected into
+the challenge JSON (``X-Agent-Token`` header). Miner neuron processes
+authenticate via Epistula signatures.
 """
 
 from __future__ import annotations
 
 import logging
+import secrets
 import threading
 import time
 from collections import defaultdict
@@ -26,6 +31,28 @@ app = FastAPI(title="RADAR Validator Proxy")
 # Warm-standby trainer readiness: round_id → {uid: TrainerReady}
 _trainer_ready: dict[int, dict[int, object]] = {}
 _hotkey_to_uid: dict[str, int] = {}
+
+# ── Per-round agent token ──────────────────────────────────────────
+# A short-lived random token generated each round by the validator.
+# Injected into the challenge JSON and required on all agent-facing
+# proxy routes via the ``X-Agent-Token`` header.
+_agent_token: str = ""
+
+
+def rotate_agent_token() -> str:
+    """Generate a new agent token for the current round.
+
+    Returns the new token (caller injects it into the challenge JSON).
+    """
+    global _agent_token
+    _agent_token = secrets.token_urlsafe(32)
+    logger.info("Agent token rotated (token=%s...)", _agent_token[:8])
+    return _agent_token
+
+
+def get_agent_token() -> str:
+    """Return the current agent token."""
+    return _agent_token
 
 
 def get_ready_trainers(round_id: int) -> dict:
@@ -87,18 +114,60 @@ def _check_rate_limit(hotkey: str) -> bool:
         return True
 
 
+def _verify_agent_token(request: Request) -> bool:
+    """Check if the request carries a valid agent token."""
+    if not _agent_token:
+        return False
+    token = request.headers.get("X-Agent-Token", "")
+    return secrets.compare_digest(token, _agent_token)
+
+
+# Routes that accept agent token auth (used by agent pods)
+_AGENT_TOKEN_PREFIXES = (
+    "/experiments", "/challenge", "/frontier",
+    "/provenance", "/desearch", "/llm",
+)
+
+# Routes that require Epistula wallet auth (used by miner neuron)
+_EPISTULA_ONLY_PREFIXES = ("/agent_code",)
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Epistula auth for miner requests on proxied routes."""
-    path = request.url.path
-    needs_auth = (
-        path.startswith("/experiments")
-        or path.startswith("/challenge")
-        or path.startswith("/frontier")
-        or path.startswith("/provenance")
-    )
+    """Auth for proxy routes.
 
-    if needs_auth and _metagraph:
+    Agent pods use ``X-Agent-Token`` (ephemeral per-round secret).
+    Miner neuron processes use Epistula wallet signatures.
+    """
+    path = request.url.path
+
+    # Check if route needs agent-token auth
+    needs_agent_auth = any(path.startswith(p) for p in _AGENT_TOKEN_PREFIXES)
+    # Check if route needs Epistula-only auth
+    needs_epistula = any(path.startswith(p) for p in _EPISTULA_ONLY_PREFIXES)
+
+    if needs_agent_auth:
+        # Agent token is the primary auth for pod requests
+        if _verify_agent_token(request):
+            # Rate-limit by token (all agents share one token per round,
+            # but individual rate limiting is done at the route level via
+            # X-Miner-UID header where applicable)
+            response = await call_next(request)
+            return response
+        # Fall back to Epistula for backward compat (miner neuron calls)
+        if _metagraph:
+            body = await request.body()
+            from shared.auth import verify_request
+            ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
+            if ok:
+                request.state.miner_hotkey = hotkey
+                if not _check_rate_limit(hotkey):
+                    return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+                response = await call_next(request)
+                return response
+        return JSONResponse(status_code=403, content={"error": "Invalid agent token or signature"})
+
+    if needs_epistula and _metagraph:
         body = await request.body()
         from shared.auth import verify_request
         ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
@@ -207,3 +276,18 @@ async def proxy_experiments(request: Request, path: str):
 @app.api_route("/provenance/{path:path}", methods=["GET", "POST"])
 async def proxy_provenance(request: Request, path: str):
     return await _proxy_request(request, f"/provenance/{path}")
+
+
+@app.post("/agent_code")
+async def proxy_submit_agent_code(request: Request):
+    return await _proxy_request(request, "/agent_code")
+
+
+@app.get("/agent_code/{hotkey}")
+async def proxy_get_agent_code(request: Request, hotkey: str):
+    return await _proxy_request(request, f"/agent_code/{hotkey}")
+
+
+@app.get("/agent_code/{hotkey}/meta")
+async def proxy_get_agent_code_meta(request: Request, hotkey: str):
+    return await _proxy_request(request, f"/agent_code/{hotkey}/meta")

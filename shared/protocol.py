@@ -24,6 +24,10 @@ class Challenge:
     task: dict = field(default_factory=dict)
     db_url: str = ""
     desearch_url: str = ""
+    llm_url: str = ""
+
+    # Per-round ephemeral token for authenticating agent pod → proxy requests
+    agent_token: str = ""
 
     # Pareto front filtered to this round's size bucket
     # Each entry: {code, metric, objectives} for frontier points in range
@@ -45,6 +49,8 @@ class Challenge:
             "task": self.task,
             "db_url": self.db_url,
             "desearch_url": self.desearch_url,
+            "llm_url": self.llm_url,
+            "agent_token": self.agent_token,
             "feasible_frontier": self.feasible_frontier,
             "scratchpad_get_url": self.scratchpad_get_url,
             "scratchpad_put_url": self.scratchpad_put_url,

@@ -1,7 +1,8 @@
 """Phase A: run miner agents and collect architecture proposals.
 
-Validators pull miner Docker images, launch agent pods, send challenges,
-collect proposals. Work-split across validators — each runs a subset.
+Validators fetch miner agent code from the DB server, inject it into
+the OFFICIAL agent image, send challenges, collect proposals.
+Work-split across validators — each runs a subset.
 Proposals uploaded to R2 so all validators see all submissions.
 
 Agent stderr (reasoning trace) is captured and stored alongside proposals.
@@ -16,10 +17,15 @@ import logging
 from typing import Optional
 
 from config import Config
+from shared.agent_code import compute_code_hash, validate_bundle
 from shared.artifacts import generate_scratchpad_urls
-from shared.commitment import ImageCommitment, pull_and_verify_image
+from shared.commitment import ImageCommitment
+from shared.db_client import DatabaseClient
 from shared.protocol import Proposal
-from validator.pod_manager import get_mode, launch_agent_pod, run_agent_on_pod
+from shared.url_gate import parse_allowed_urls
+from validator.pod_manager import (
+    launch_agent_pod, pre_validate_agent_code, run_agent_on_pod,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +52,122 @@ def _attach_scratchpad_urls(challenge_json: str, r2, hotkey: str) -> str:
         return challenge_json
 
 
+def _build_allowed_urls(challenge_json: str) -> str:
+    """Build the allowed URL prefix string for agent pods.
+
+    Combines the static config allowlist with dynamic URLs derived
+    from the challenge (validator proxy, desearch proxy).
+    """
+    prefixes: list[str] = parse_allowed_urls(Config.AGENT_ALLOWED_URLS)
+    try:
+        data = json.loads(challenge_json)
+        for key in ("db_url", "desearch_url", "llm_url"):
+            url = data.get(key, "")
+            if url:
+                base = url.rstrip("/") + "/"
+                if base not in prefixes:
+                    prefixes.append(base)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return ",".join(prefixes)
+
+
+async def _fetch_agent_bundle(
+    db_client: DatabaseClient,
+    commitment: ImageCommitment,
+) -> Optional[dict]:
+    """Fetch a miner's agent code bundle from the DB server.
+
+    Verifies the code_hash against the on-chain commitment.
+    Returns the validated bundle dict or None.
+    """
+    if not commitment.hotkey:
+        return None
+
+    bundle = await db_client.get_agent_code(commitment.hotkey)
+    if not bundle or "files" not in bundle:
+        logger.warning(
+            "No agent code found for %s (uid=%d)",
+            commitment.hotkey[:16], commitment.miner_uid,
+        )
+        return None
+
+    # Validate bundle structure
+    ok, err = validate_bundle(bundle)
+    if not ok:
+        logger.warning(
+            "UID %d agent bundle validation failed: %s",
+            commitment.miner_uid, err,
+        )
+        return None
+
+    # Verify code hash matches on-chain commitment
+    if commitment.code_hash:
+        actual_hash = compute_code_hash(bundle["files"])
+        if actual_hash != commitment.code_hash:
+            logger.warning(
+                "UID %d code hash mismatch: on-chain=%s actual=%s",
+                commitment.miner_uid,
+                commitment.code_hash[:24],
+                actual_hash[:24],
+            )
+            return None
+
+    return bundle
+
+
+async def _run_single_agent(
+    uid: int,
+    commitment: ImageCommitment,
+    challenge_json: str,
+    r2,
+    round_id: int,
+    allowed_urls: str,
+    bundle: dict,
+) -> tuple[Optional[Proposal], str]:
+    """Run a single miner agent and return (proposal, agent_log) or (None, "")."""
+    miner_challenge_json = _attach_scratchpad_urls(
+        challenge_json, r2, commitment.hotkey,
+    )
+
+    agent_env = await launch_agent_pod(
+        image_url=Config.OFFICIAL_AGENT_IMAGE,
+        mem_limit="8192Mi",
+        agent_code=bundle,
+        allowed_urls=allowed_urls,
+    )
+
+    try:
+        result = await run_agent_on_pod(
+            agent_env, miner_challenge_json,
+            timeout=Config.AGENT_TIMEOUT,
+            allowed_urls=allowed_urls,
+        )
+        if result and isinstance(result, dict) and "code" in result:
+            proposal = Proposal(
+                code=result.get("code", ""),
+                name=result.get("name", ""),
+                motivation=result.get("motivation", ""),
+            )
+            agent_log = result.get("agent_log", "")
+            r2.upload_json(
+                f"round_{round_id}/proposals/{uid}.json",
+                {
+                    "code": proposal.code,
+                    "name": proposal.name,
+                    "motivation": proposal.motivation,
+                    "agent_log": agent_log,
+                },
+            )
+            return proposal, agent_log
+    finally:
+        try:
+            await agent_env.cleanup()
+        except Exception:
+            pass
+    return None, ""
+
+
 async def run_and_collect_agents(
     wallet,
     metagraph,
@@ -57,15 +179,17 @@ async def run_and_collect_agents(
     validator_uids: list[int],
     commitments: dict[int, ImageCommitment],
     get_my_assignments_fn,
+    db_client: Optional[DatabaseClient] = None,
 ) -> tuple[dict[int, Proposal], dict[int, str]]:
     """Phase A: run assigned miner agents, upload proposals to R2, read all.
 
     1. Work-split: get_my_assignments() for which agents this validator runs
     2. For each assigned miner:
-       a. pull_and_verify_image()
-       b. launch_agent_pod() via affinetes
-       c. run_agent_on_pod() with challenge JSON
-       d. Upload proposal + agent_log to R2: round_{id}/proposals/{uid}.json
+       a. Fetch agent code bundle from DB server
+       b. Verify code_hash against on-chain commitment
+       c. launch_agent_pod() with official image + code injection
+       d. run_agent_on_pod() with challenge JSON + URL allowlist
+       e. Upload proposal + agent_log to R2: round_{id}/proposals/{uid}.json
     3. Wait for other validators to upload
     4. Read all proposals from R2
     5. Dedup by code hash
@@ -76,56 +200,41 @@ async def run_and_collect_agents(
         all_uids, validator_uids, my_uid, seed,
     )
 
-    # Run my assigned agents
-    proposals: dict[int, Proposal] = {}
-    agent_logs: dict[int, str] = {}
+    # Build URL allowlist once for all agents this round
+    allowed_urls = _build_allowed_urls(challenge_json)
+
+    # Build DB client if not provided
+    if db_client is None:
+        db_client = DatabaseClient(Config.DB_API_URL, wallet)
+
+    # Pre-fetch all agent bundles for my assigned miners
+    bundles: dict[int, dict] = {}
     for uid in my_agent_uids:
         if uid not in commitments:
             continue
         commitment = commitments[uid]
-        if not commitment.image_url:
-            continue
         try:
-            if not pull_and_verify_image(commitment):
-                logger.warning("UID %d: image verification failed", uid)
-                continue
+            bundle = await _fetch_agent_bundle(db_client, commitment)
+            if bundle:
+                bundles[uid] = bundle
+        except Exception as e:
+            logger.error("UID %d failed to fetch agent code: %s", uid, e)
 
-            miner_challenge_json = _attach_scratchpad_urls(
-                challenge_json, r2, commitment.hotkey,
+    # Run my assigned agents
+    proposals: dict[int, Proposal] = {}
+    agent_logs: dict[int, str] = {}
+    for uid in my_agent_uids:
+        if uid not in bundles:
+            continue
+        commitment = commitments[uid]
+        try:
+            proposal, agent_log = await _run_single_agent(
+                uid, commitment, challenge_json, r2, round_id,
+                allowed_urls, bundles[uid],
             )
-
-            agent_env = await launch_agent_pod(
-                image_url=commitment.image_url,
-                mem_limit="8192Mi",
-            )
-            try:
-                result = await run_agent_on_pod(
-                    agent_env, miner_challenge_json,
-                    timeout=Config.AGENT_TIMEOUT,
-                )
-                if result and isinstance(result, dict) and "code" in result:
-                    proposal = Proposal(
-                        code=result.get("code", ""),
-                        name=result.get("name", ""),
-                        motivation=result.get("motivation", ""),
-                    )
-                    proposals[uid] = proposal
-                    agent_logs[uid] = result.get("agent_log", "")
-                    # Upload proposal + reasoning trace to R2
-                    r2.upload_json(
-                        f"round_{round_id}/proposals/{uid}.json",
-                        {
-                            "code": proposal.code,
-                            "name": proposal.name,
-                            "motivation": proposal.motivation,
-                            "agent_log": agent_logs[uid],
-                        },
-                    )
-            finally:
-                try:
-                    await agent_env.cleanup()
-                except Exception:
-                    pass
+            if proposal:
+                proposals[uid] = proposal
+                agent_logs[uid] = agent_log
         except Exception as e:
             logger.error("UID %d agent failed: %s", uid, e)
 
@@ -133,10 +242,10 @@ async def run_and_collect_agents(
         "Ran %d agents, got %d proposals", len(my_agent_uids), len(proposals),
     )
 
-    # Poll R2 for other validators' proposals (replaces fixed sleep)
+    # Poll R2 for other validators' proposals
     expected_from_others = {
         uid for uid in all_uids
-        if uid not in proposals and uid in commitments and commitments[uid].image_url
+        if uid not in proposals and uid in commitments
     }
 
     if expected_from_others and len(validator_uids) > 1:
@@ -170,7 +279,6 @@ async def run_and_collect_agents(
                 int(deadline - _time.monotonic()),
             )
     else:
-        # Single validator or no expected proposals — just try once
         for uid in all_uids:
             if uid in proposals:
                 continue
@@ -188,59 +296,30 @@ async def run_and_collect_agents(
             except Exception:
                 pass
 
-    # Fallback: only run agents locally for UIDs still missing after full polling
+    # Fallback: run agents locally for UIDs still missing after polling
     missing_uids = [
         uid for uid in all_uids
         if uid not in proposals and uid not in my_agent_uids
-        and uid in commitments and commitments[uid].image_url
+        and uid in commitments
     ]
     if missing_uids:
         logger.info(
-            "R2 sync missed %d proposals — running agents locally: %s",
+            "R2 sync missed %d proposals — fetching code + running locally: %s",
             len(missing_uids), missing_uids,
         )
         for uid in missing_uids:
             commitment = commitments[uid]
             try:
-                if not pull_and_verify_image(commitment):
-                    logger.warning("UID %d: image verification failed (fallback)", uid)
+                bundle = await _fetch_agent_bundle(db_client, commitment)
+                if not bundle:
                     continue
-
-                fallback_challenge_json = _attach_scratchpad_urls(
-                    challenge_json, r2, commitment.hotkey,
+                proposal, agent_log = await _run_single_agent(
+                    uid, commitment, challenge_json, r2, round_id,
+                    allowed_urls, bundle,
                 )
-
-                agent_env = await launch_agent_pod(
-                    image_url=commitment.image_url,
-                    mem_limit="8192Mi",
-                )
-                try:
-                    result = await run_agent_on_pod(
-                        agent_env, fallback_challenge_json,
-                        timeout=Config.AGENT_TIMEOUT,
-                    )
-                    if result and isinstance(result, dict) and "code" in result:
-                        proposal = Proposal(
-                            code=result.get("code", ""),
-                            name=result.get("name", ""),
-                            motivation=result.get("motivation", ""),
-                        )
-                        proposals[uid] = proposal
-                        agent_logs[uid] = result.get("agent_log", "")
-                        r2.upload_json(
-                            f"round_{round_id}/proposals/{uid}.json",
-                            {
-                                "code": proposal.code,
-                                "name": proposal.name,
-                                "motivation": proposal.motivation,
-                                "agent_log": agent_logs[uid],
-                            },
-                        )
-                finally:
-                    try:
-                        await agent_env.cleanup()
-                    except Exception:
-                        pass
+                if proposal:
+                    proposals[uid] = proposal
+                    agent_logs[uid] = agent_log
             except Exception as e:
                 logger.error("UID %d agent failed (fallback): %s", uid, e)
 

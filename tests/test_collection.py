@@ -12,14 +12,21 @@ from validator.collection import run_and_collect_agents
 
 def _mock_commitments():
     return {
-        0: ImageCommitment(image_url="agent:v1", image_digest="sha256:abc", miner_uid=0),
-        1: ImageCommitment(image_url="agent:v2", image_digest="sha256:def", miner_uid=1),
+        0: ImageCommitment(code_hash="sha256:abc", miner_uid=0, hotkey="hk0"),
+        1: ImageCommitment(code_hash="sha256:def", miner_uid=1, hotkey="hk1"),
     }
 
 
 def _identity_assignments(all_uids, validator_uids, my_uid, seed):
     """All UIDs assigned to the single validator."""
     return list(all_uids)
+
+
+def _mock_db_client():
+    """DB client that returns no agent code (forces R2 fallback path)."""
+    client = AsyncMock()
+    client.get_agent_code = AsyncMock(return_value=None)
+    return client
 
 
 @pytest.mark.asyncio
@@ -37,6 +44,7 @@ async def test_collect_empty_commitments():
         validator_uids=[0],
         commitments={},
         get_my_assignments_fn=_identity_assignments,
+        db_client=_mock_db_client(),
     )
     assert proposals == {}
     assert agent_logs == {}
@@ -53,26 +61,25 @@ async def test_dedup_removes_identical_code():
     }
 
     commitments = {
-        0: ImageCommitment(image_url="", miner_uid=0),  # no image -> skip
-        1: ImageCommitment(image_url="", miner_uid=1),
+        0: ImageCommitment(miner_uid=0, hotkey="hk0"),
+        1: ImageCommitment(miner_uid=1, hotkey="hk1"),
     }
 
-    with patch("validator.collection.pull_and_verify_image", return_value=True):
-        proposals, agent_logs = await run_and_collect_agents(
-            wallet=MagicMock(),
-            metagraph=MagicMock(),
-            challenge_json='{"round_id": 1}',
-            round_id=1,
-            seed=42,
-            r2=mock_r2,
-            my_uid=0,
-            validator_uids=[0],
-            commitments=commitments,
-            get_my_assignments_fn=_identity_assignments,
-        )
+    proposals, agent_logs = await run_and_collect_agents(
+        wallet=MagicMock(),
+        metagraph=MagicMock(),
+        challenge_json='{"round_id": 1}',
+        round_id=1,
+        seed=42,
+        r2=mock_r2,
+        my_uid=0,
+        validator_uids=[0],
+        commitments=commitments,
+        get_my_assignments_fn=_identity_assignments,
+        db_client=_mock_db_client(),
+    )
 
-    # Both have no image_url so neither runs locally;
-    # both read from R2 with same code -> dedup to 1
+    # Both have no agent code from DB, both read from R2 with same code -> dedup to 1
     assert len(proposals) == 1
 
 
@@ -102,6 +109,7 @@ async def test_r2_proposal_read_on_other_validator_submissions():
         validator_uids=[10, 11],
         commitments=commitments,
         get_my_assignments_fn=assign_none,
+        db_client=_mock_db_client(),
     )
 
     # Should have read both from R2

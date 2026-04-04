@@ -20,9 +20,10 @@ class TestImageCommitment:
         assert c2.miner_uid == 5
 
     def test_is_valid(self):
-        assert ImageCommitment(image_url="x", listener_url="http://localhost:8090").is_valid
-        assert not ImageCommitment(image_url="", listener_url="http://localhost:8090").is_valid
-        assert not ImageCommitment(image_url="x", listener_url="").is_valid
+        assert ImageCommitment(code_hash="sha256:abc", listener_url="http://localhost:8090").is_valid
+        # image_url alone is no longer sufficient — code_hash required
+        assert not ImageCommitment(image_url="x", listener_url="http://localhost:8090").is_valid
+        assert not ImageCommitment(code_hash="sha256:abc", listener_url="").is_valid
         assert not ImageCommitment().is_valid
 
     def test_version_check(self):
@@ -55,8 +56,7 @@ class TestImageCommitment:
     def test_to_chain_json_under_128_bytes(self):
         """Chain JSON must fit within Raw128 (128 bytes)."""
         c = ImageCommitment(
-            image_url="ghcr.io/tensorlink-ai/radar-miner-frontier_sniper:latest",
-            image_digest="sha256:abc123",
+            code_hash="sha256:abc123def456",
             subnet_version="0.3.0",
             listener_url="http://123.456.789.012:8090",
             trainer_image="ghcr.io/tensorlink-ai/radar/radar-runner:latest",
@@ -65,34 +65,35 @@ class TestImageCommitment:
         assert len(chain) <= 128
         d = json.loads(chain)
         # Essential fields present
-        assert d["i"] == c.image_url
+        assert d["ch"] == c.code_hash
         assert d["l"] == c.listener_url
         # Non-essential fields excluded from chain JSON
-        assert "d" not in d  # image_digest
-        assert "t" not in d  # trainer_image
+        assert "i" not in d   # image_url (deprecated)
+        assert "d" not in d   # image_digest
+        assert "t" not in d   # trainer_image
 
     def test_to_chain_json_drops_version_if_over_limit(self):
         """Version should be dropped if needed to stay under 128 bytes."""
         c = ImageCommitment(
-            image_url="ghcr.io/tensorlink-ai/radar-miner-really-long-name:latest",
+            code_hash="sha256:abcdef0123456789abcdef0123456789abcdef01234567",
             subnet_version="0.3.0",
             listener_url="http://very-long-hostname.example.com:8090",
         )
         chain = c.to_chain_json()
         assert len(chain) <= 128
         d = json.loads(chain)
-        assert d["i"] == c.image_url
+        assert d["ch"] == c.code_hash
         assert d["l"] == c.listener_url
 
     def test_to_chain_json_roundtrips_via_from_json(self):
         """Chain JSON should be parseable by from_json."""
         c = ImageCommitment(
-            image_url="docker.io/test:v1",
+            code_hash="sha256:abc123",
             listener_url="http://host:8090",
             subnet_version="0.3.0",
         )
         c2 = ImageCommitment.from_json(c.to_chain_json(), miner_uid=5)
-        assert c2.image_url == c.image_url
+        assert c2.code_hash == c.code_hash
         assert c2.listener_url == c.listener_url
         assert c2.miner_uid == 5
 
@@ -110,7 +111,7 @@ class TestReadMinerCommitments:
     def test_read_all_commitments_parses_sdk_output(self):
         """get_all_commitments returns {hotkey: json_str}, should parse correctly."""
         commitment = ImageCommitment(
-            image_url="docker.io/test:v1", listener_url="http://host:8090",
+            code_hash="sha256:abc123", listener_url="http://host:8090",
         )
         subtensor = MagicMock()
         subtensor.get_all_commitments.return_value = {
@@ -122,7 +123,7 @@ class TestReadMinerCommitments:
             miner_uids={0, 1},
         )
         assert 1 in result
-        assert result[1].image_url == "docker.io/test:v1"
+        assert result[1].code_hash == "sha256:abc123"
         assert result[1].listener_url == "http://host:8090"
         assert result[1].miner_uid == 1
         assert result[1].hotkey == "hotkey_1"
@@ -131,7 +132,7 @@ class TestReadMinerCommitments:
         """Commitments from validator UIDs should be skipped."""
         subtensor = MagicMock()
         subtensor.get_all_commitments.return_value = {
-            "hotkey_0": ImageCommitment(image_url="x", listener_url="y").to_json(),
+            "hotkey_0": ImageCommitment(code_hash="sha256:abc", listener_url="y").to_json(),
         }
         result = _read_all_commitments(
             subtensor, netuid=1,
@@ -154,7 +155,7 @@ class TestReadMinerCommitments:
         subtensor = MagicMock()
         subtensor.get_all_commitments.return_value = {
             "hotkey_0": "not-json",
-            "hotkey_1": ImageCommitment(image_url="ok", listener_url="y").to_json(),
+            "hotkey_1": ImageCommitment(code_hash="sha256:ok", listener_url="y").to_json(),
         }
         result = _read_all_commitments(
             subtensor, netuid=1,
@@ -171,7 +172,7 @@ class TestReadMinerCommitments:
         subtensor.get_all_commitments.return_value = {}
         # Per-UID fallback returns metadata
         commitment_json = ImageCommitment(
-            image_url="img:v1", listener_url="http://h:8090",
+            code_hash="sha256:abc", listener_url="http://h:8090",
         ).to_json()
         json_bytes = list(commitment_json.encode("utf-8"))
 

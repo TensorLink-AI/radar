@@ -6,13 +6,19 @@ Supports three modes:
   - mode="docker"   -> local Docker (via affinetes)
   - mode="basilica" -> Basilica cloud (via affinetes)
   - mode="url"      -> connect to miner-hosted pod (future)
+
+Agent pods use the OFFICIAL agent image (subnet-owner controlled).
+Miner code (.py files) is injected at launch time — miners never
+supply their own Docker images for agents.
 """
 
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
+import tempfile
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -60,7 +66,7 @@ def _build_env_vars() -> dict[str, str]:
 # ── Static Pre-validation ────────────────────────────────────────
 
 def pre_validate_code(code: str) -> tuple[bool, str]:
-    """Validate miner submission has required functions."""
+    """Validate miner architecture submission has required functions."""
     try:
         tree = ast.parse(code)
     except SyntaxError as e:
@@ -73,53 +79,140 @@ def pre_validate_code(code: str) -> tuple[bool, str]:
     return True, ""
 
 
+def pre_validate_agent_code(code: str) -> tuple[bool, str]:
+    """Validate miner agent code has required entry point.
+
+    Agent modules must define ``design_architecture(challenge, client)``.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return False, f"Syntax error: {e}"
+    names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    if "design_architecture" not in names:
+        return False, "Missing design_architecture"
+    return True, ""
+
+
 # ── Agent Pod Operations ─────────────────────────────────────────
 
+def _build_agent_env_vars(allowed_urls: str = "") -> dict[str, str]:
+    """Build env vars for agent pods (more restricted than trainer)."""
+    env_vars = {}
+    # Subtensor for read-only chain queries
+    for key in ("SUBTENSOR_NETWORK", "NETUID"):
+        val = os.getenv(key, "")
+        if val:
+            env_vars[key] = val
+    # URL allowlist — the harness reads this to build the GatedClient
+    if allowed_urls:
+        env_vars["AGENT_ALLOWED_URLS"] = allowed_urls
+    # Note: NO Basilica token, NO R2 credentials, NO RADAR_BASILICA_ENV
+    return env_vars
+
+
+def _write_agent_code(agent_code: dict | str) -> str:
+    """Write miner's agent code to a temp dir for volume-mounting.
+
+    Accepts either a bundle dict (``{"files": {"agent.py": "..."}, ...}``)
+    or a single string (written as ``agent.py``).
+
+    Returns the temp directory path containing agent/*.py.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="radar_agent_")
+    agent_dir = os.path.join(tmpdir, "agent")
+    os.makedirs(agent_dir, exist_ok=True)
+
+    if isinstance(agent_code, dict) and "files" in agent_code:
+        for filename, code in agent_code["files"].items():
+            with open(os.path.join(agent_dir, filename), "w") as f:
+                f.write(code)
+    else:
+        with open(os.path.join(agent_dir, "agent.py"), "w") as f:
+            f.write(str(agent_code))
+    return tmpdir
+
+
+def _inject_allowed_urls_into_challenge(
+    challenge_json: str, allowed_urls: str,
+) -> str:
+    """Add allowed_urls field to challenge JSON so harness can read it."""
+    try:
+        data = json.loads(challenge_json)
+        data["allowed_urls"] = allowed_urls
+        return json.dumps(data)
+    except (json.JSONDecodeError, TypeError):
+        return challenge_json
+
+
 async def launch_agent_pod(
-    image_url: str,
+    image_url: str = "",
     mode: Optional[str] = None,
     mem_limit: str = "8192Mi",
-    miner_hosted_url: Optional[str] = None,
+    agent_code: dict | str = "",
+    allowed_urls: str = "",
 ):
     """
-    Launch a miner's agent pod via affinetes.
+    Launch a sandboxed agent pod via affinetes.
+
+    Uses the official agent image (subnet-owner controlled).  The miner's
+    .py files are volume-mounted into /workspace/agent/.  A URL allowlist
+    restricts which endpoints the agent can reach.
 
     Args:
-        image_url: Docker image to launch
-        mode: "docker", "basilica", or "url"
-        mem_limit: Memory limit for the container
-        miner_hosted_url: If set, connect to miner's pod (future mode)
+        image_url: Override official image (testing only).
+        mode: "docker" or "basilica".
+        mem_limit: Memory limit for the container.
+        agent_code: Bundle dict (``{"files": {...}, "entry_point": "..."}``),
+            or a single code string.
+        allowed_urls: Comma-separated URL prefixes the agent may access.
 
     Returns: environment object with process_challenge() and cleanup()
     """
     if mode is None:
         mode = get_mode()
 
-    # Future: miner-hosted mode
-    if miner_hosted_url:
-        logger.info("Connecting to miner-hosted agent at %s", miner_hosted_url)
-        return _af().load_env(
-            mode="url",
-            base_url=miner_hosted_url,
-        )
+    from config import Config
+    official_image = image_url or Config.OFFICIAL_AGENT_IMAGE
 
-    # Docker or Basilica: both go through affinetes
-    logger.info("Launching agent pod: image=%s mode=%s", image_url, mode)
+    tmpdir = _write_agent_code(agent_code)
+    env_vars = _build_agent_env_vars(allowed_urls)
+
+    # Tell the harness which file is the entry point
+    if isinstance(agent_code, dict):
+        entry = agent_code.get("entry_point", "agent.py")
+        env_vars["AGENT_MODULE"] = f"/workspace/agent/{entry}"
+
+    logger.info(
+        "Launching sandboxed agent pod: image=%s mode=%s allowed_urls=%d prefixes",
+        official_image, mode, len(allowed_urls.split(",")) if allowed_urls else 0,
+    )
     return _af().load_env(
-        image=image_url,
+        image=official_image,
         mode=mode,
-        env_vars=_build_env_vars(),
+        env_vars=env_vars,
         mem_limit=mem_limit,
         cleanup=True,
+        volumes={f"{tmpdir}/agent": "/workspace/agent"},
     )
 
 
-async def run_agent_on_pod(env, challenge_json: str, timeout: int = 300) -> Optional[dict]:
+async def run_agent_on_pod(
+    env, challenge_json: str, timeout: int = 300,
+    allowed_urls: str = "",
+) -> Optional[dict]:
     """
     Send a Challenge to a running agent pod and get the Proposal back.
 
+    If *allowed_urls* is set, injects it into the challenge JSON so the
+    frozen harness can build its GatedClient allowlist.
+
     Returns: dict with code/name/motivation, or dict with "error" key, or None.
     """
+    if allowed_urls:
+        challenge_json = _inject_allowed_urls_into_challenge(
+            challenge_json, allowed_urls,
+        )
     try:
         result = await env.process_challenge(
             challenge_json=challenge_json,
