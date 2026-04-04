@@ -133,6 +133,14 @@ def _write_agent_code(agent_code: dict | str) -> str:
     return tmpdir
 
 
+def _normalise_agent_code(agent_code: dict | str) -> dict:
+    """Convert agent_code to a bundle dict suitable for inline delivery."""
+    if isinstance(agent_code, dict) and "files" in agent_code:
+        return agent_code
+    # Single string → wrap as agent.py bundle
+    return {"files": {"agent.py": str(agent_code)}, "entry_point": "agent.py"}
+
+
 def _inject_allowed_urls_into_challenge(
     challenge_json: str, allowed_urls: str,
 ) -> str:
@@ -156,8 +164,9 @@ async def launch_agent_pod(
     Launch a sandboxed agent pod via affinetes.
 
     Uses the official agent image (subnet-owner controlled).  The miner's
-    .py files are volume-mounted into /workspace/agent/.  A URL allowlist
-    restricts which endpoints the agent can reach.
+    .py files are volume-mounted (Docker) or delivered inline via
+    ``process_challenge`` (Basilica).  A URL allowlist restricts which
+    endpoints the agent can reach.
 
     Args:
         image_url: Override official image (testing only).
@@ -167,7 +176,9 @@ async def launch_agent_pod(
             or a single code string.
         allowed_urls: Comma-separated URL prefixes the agent may access.
 
-    Returns: environment object with process_challenge() and cleanup()
+    Returns: environment object with process_challenge() and cleanup().
+        For Basilica mode the returned wrapper carries ``_agent_code``
+        so ``run_agent_on_pod`` can pass code inline.
     """
     if mode is None:
         mode = get_mode()
@@ -175,7 +186,6 @@ async def launch_agent_pod(
     from config import Config
     official_image = image_url or Config.OFFICIAL_AGENT_IMAGE
 
-    tmpdir = _write_agent_code(agent_code)
     env_vars = _build_agent_env_vars(allowed_urls)
 
     # Tell the harness which file is the entry point
@@ -187,14 +197,30 @@ async def launch_agent_pod(
         "Launching sandboxed agent pod: image=%s mode=%s allowed_urls=%d prefixes",
         official_image, mode, len(allowed_urls.split(",")) if allowed_urls else 0,
     )
-    return _af().load_env(
+
+    load_kwargs: dict = dict(
         image=official_image,
         mode=mode,
         env_vars=env_vars,
         mem_limit=mem_limit,
         cleanup=True,
-        volumes={f"{tmpdir}/agent": "/workspace/agent"},
     )
+
+    if mode == "basilica":
+        # Basilica (cloud): no volume mounts.  Agent code is delivered
+        # inline as a kwarg to process_challenge — the Actor writes it
+        # to /workspace/agent/ before running the harness.
+        env = _af().load_env(**load_kwargs)
+        # Stash code bundle so run_agent_on_pod can forward it.
+        env._agent_code = _normalise_agent_code(agent_code)
+    else:
+        # Docker (local): volume-mount the code into the container.
+        tmpdir = _write_agent_code(agent_code)
+        load_kwargs["volumes"] = {f"{tmpdir}/agent": "/workspace/agent"}
+        env = _af().load_env(**load_kwargs)
+        env._agent_code = None
+
+    return env
 
 
 async def run_agent_on_pod(
@@ -207,17 +233,28 @@ async def run_agent_on_pod(
     If *allowed_urls* is set, injects it into the challenge JSON so the
     frozen harness can build its GatedClient allowlist.
 
+    For Basilica mode the agent code bundle (stashed on *env* by
+    ``launch_agent_pod``) is passed inline so the Actor can write the
+    files before running the harness.
+
     Returns: dict with code/name/motivation, or dict with "error" key, or None.
     """
     if allowed_urls:
         challenge_json = _inject_allowed_urls_into_challenge(
             challenge_json, allowed_urls,
         )
+
+    # Build kwargs — include inline agent code for Basilica pods
+    call_kwargs: dict = dict(
+        challenge_json=challenge_json,
+        _timeout=timeout,
+    )
+    agent_code = getattr(env, "_agent_code", None)
+    if agent_code:
+        call_kwargs["agent_code"] = agent_code
+
     try:
-        result = await env.process_challenge(
-            challenge_json=challenge_json,
-            _timeout=timeout,
-        )
+        result = await env.process_challenge(**call_kwargs)
         return result
     except Exception as e:
         logger.error("Agent pod call failed: %s: %s", type(e).__name__, e)
