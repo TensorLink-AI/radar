@@ -297,11 +297,52 @@ class TestRunAgentOnPod:
 
     @pytest.mark.asyncio
     async def test_returns_none_on_exception(self):
-        """Exception from process_challenge returns None."""
+        """Exception from process_challenge returns None after retries."""
         mock_env = MagicMock()
         mock_env._agent_code = None
         mock_env.process_challenge = AsyncMock(
             side_effect=RuntimeError("deployment failed"),
         )
-        result = await run_agent_on_pod(mock_env, '{}', timeout=60)
+        with patch("config.Config.AGENT_POD_RETRIES", 0):
+            result = await run_agent_on_pod(mock_env, '{}', timeout=60)
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_passes_timeout_kwarg(self):
+        """timeout is passed as regular kwarg for BasilicaBackend TTL."""
+        mock_env = MagicMock()
+        mock_env._agent_code = None
+        mock_env.process_challenge = AsyncMock(return_value={"code": "x"})
+
+        await run_agent_on_pod(mock_env, '{}', timeout=600)
+        call_kwargs = mock_env.process_challenge.call_args.kwargs
+        assert call_kwargs["timeout"] == 600
+        assert call_kwargs["_timeout"] == 600
+
+    @pytest.mark.asyncio
+    async def test_retries_on_transient_failure(self):
+        """Retries on first failure, succeeds on second attempt."""
+        mock_env = MagicMock()
+        mock_env._agent_code = None
+        mock_env.process_challenge = AsyncMock(
+            side_effect=[RuntimeError("transient"), {"code": "ok"}],
+        )
+        with patch("config.Config.AGENT_POD_RETRIES", 2), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await run_agent_on_pod(mock_env, '{}', timeout=60)
+        assert result == {"code": "ok"}
+        assert mock_env.process_challenge.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_retries_exhausted_returns_none(self):
+        """All retries exhausted returns None."""
+        mock_env = MagicMock()
+        mock_env._agent_code = None
+        mock_env.process_challenge = AsyncMock(
+            side_effect=RuntimeError("always fails"),
+        )
+        with patch("config.Config.AGENT_POD_RETRIES", 1), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await run_agent_on_pod(mock_env, '{}', timeout=60)
+        assert result is None
+        assert mock_env.process_challenge.call_count == 2
