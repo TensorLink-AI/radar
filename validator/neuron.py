@@ -234,12 +234,17 @@ class Validator:
 
         challenge.feasible_frontier = feasible_frontier
 
-        challenge.db_url = f"http://localhost:{self.proxy_port}"
+        proxy_base = (
+            Config.VALIDATOR_EXTERNAL_URL.rstrip("/")
+            if Config.VALIDATOR_EXTERNAL_URL
+            else f"http://localhost:{self.proxy_port}"
+        )
+        challenge.db_url = proxy_base
         challenge.desearch_url = (
-            f"http://localhost:{self.proxy_port}/desearch" if self.desearch_enabled else ""
+            f"{proxy_base}/desearch" if self.desearch_enabled else ""
         )
         challenge.llm_url = (
-            f"http://localhost:{self.proxy_port}/llm" if self.llm_enabled else ""
+            f"{proxy_base}/llm" if self.llm_enabled else ""
         )
 
         # Rotate agent token for this round — agents use it to auth proxy requests
@@ -263,7 +268,7 @@ class Validator:
         if self.coordinator:
             prepare_coro = self.coordinator.prepare_trainers(
                 challenge, commitments,
-                db_url=f"http://localhost:{self.proxy_port}",
+                db_url=proxy_base,
             )
         else:
             async def _no_endpoints():

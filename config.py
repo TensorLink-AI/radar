@@ -133,6 +133,10 @@ class Config:
 
     # ── Validator Proxy ───────────────────────────────────────
     PROXY_PORT: int = int(os.getenv("RADAR_PROXY_PORT", "8080"))
+    # External URL for the validator proxy — used in challenge JSON so
+    # agent pods on Basilica can reach this validator.  If empty, falls
+    # back to http://localhost:{PROXY_PORT} (only works for local Docker).
+    VALIDATOR_EXTERNAL_URL: str = os.getenv("RADAR_VALIDATOR_EXTERNAL_URL", "")
 
     # ── Database Auth ─────────────────────────────────────────
     DB_VALI_RATE_LIMIT: int = int(os.getenv("RADAR_DB_VALI_RATE_LIMIT", "60"))
