@@ -14,6 +14,7 @@ supply their own Docker images for agents.
 
 from __future__ import annotations
 
+import asyncio
 import ast
 import json
 import logging
@@ -225,6 +226,9 @@ async def run_agent_on_pod(
     passed inline so the Actor can write the files before running the
     harness.  This works identically for Docker and Basilica modes.
 
+    Retries up to ``RADAR_AGENT_POD_RETRIES`` times (default 2) with
+    exponential backoff for transient Basilica deployment failures.
+
     Returns: dict with code/name/motivation, or dict with "error" key, or None.
     """
     if allowed_urls:
@@ -235,17 +239,34 @@ async def run_agent_on_pod(
     call_kwargs: dict = dict(
         challenge_json=challenge_json,
         _timeout=timeout,
+        # Pass timeout as regular kwarg so BasilicaBackend uses it for
+        # TTL calculation instead of its 1800s default.
+        timeout=timeout,
     )
     agent_code = getattr(env, "_agent_code", None)
     if agent_code:
         call_kwargs["agent_code"] = agent_code
 
-    try:
-        result = await env.process_challenge(**call_kwargs)
-        return result
-    except Exception as e:
-        logger.error("Agent pod call failed: %s: %s", type(e).__name__, e)
-        return None
+    from config import Config
+    max_retries = Config.AGENT_POD_RETRIES
+    for attempt in range(1 + max_retries):
+        try:
+            result = await env.process_challenge(**call_kwargs)
+            return result
+        except Exception as e:
+            if attempt < max_retries:
+                wait = 2 ** (attempt + 1)
+                logger.warning(
+                    "Agent pod attempt %d/%d failed: %s — retrying in %ds",
+                    attempt + 1, 1 + max_retries, e, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                logger.error(
+                    "Agent pod call failed after %d attempt(s): %s: %s",
+                    1 + max_retries, type(e).__name__, e,
+                )
+    return None
 
 
 # ── Pod Verification (Basilica public metadata) ──────────────────

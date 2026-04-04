@@ -69,6 +69,7 @@ class Config:
 
     # ── Agent (Phase A) ──────────────────────────────────────────
     AGENT_TIMEOUT: int = int(os.getenv("RADAR_AGENT_TIMEOUT", "600"))
+    AGENT_POD_RETRIES: int = int(os.getenv("RADAR_AGENT_POD_RETRIES", "2"))
 
     # Official agent image (subnet-owner controlled, locked down)
     OFFICIAL_AGENT_IMAGE: str = os.getenv(
