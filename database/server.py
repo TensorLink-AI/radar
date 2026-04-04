@@ -51,6 +51,9 @@ _MAX_BODY_BYTES: int = 5 * 1024 * 1024
 _MAX_AGENT_FILES: int = 10          # max .py files per submission
 _MAX_AGENT_FILE_BYTES: int = 50_000  # 50 KB per file
 
+# Shared subnet API key — cheap gate before expensive Epistula checks
+_api_key: str = ""
+
 # Nonce replay protection: track recently seen nonces
 _nonce_cache: set[str] = set()
 _nonce_timestamps: list[tuple[float, str]] = []  # (time, nonce)
@@ -78,6 +81,11 @@ def set_r2(r2):
 def set_pool(pool):
     global _pool
     _pool = pool
+
+
+def set_api_key(key: str):
+    global _api_key
+    _api_key = key
 
 
 def set_auth(metagraph, verify_fn=None):
@@ -217,6 +225,14 @@ async def auth_middleware(request: Request, call_next):
         return JSONResponse(status_code=429, content={"error": "Too many requests"})
 
     path = request.url.path
+
+    # ── API key gate (cheap string check before any body read/crypto) ──
+    if _api_key and path != "/health":
+        import secrets as _secrets
+        provided = request.headers.get("X-Radar-API-Key", "")
+        if not provided or not _secrets.compare_digest(provided, _api_key):
+            return JSONResponse(status_code=401, content={"error": "Invalid API key"})
+
     needs_auth = (
         path.startswith("/experiments")
         or path.startswith("/challenge")

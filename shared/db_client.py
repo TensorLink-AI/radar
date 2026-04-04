@@ -19,9 +19,10 @@ logger = logging.getLogger(__name__)
 class DatabaseClient:
     """Async HTTP client for the centralized database API."""
 
-    def __init__(self, db_url: str, wallet):
+    def __init__(self, db_url: str, wallet, api_key: str = ""):
         self.db_url = db_url.rstrip("/")
         self.wallet = wallet
+        self.api_key = api_key
         self._client: Optional[httpx.AsyncClient] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -30,7 +31,10 @@ class DatabaseClient:
         return self._client
 
     def _sign(self, body: bytes) -> dict[str, str]:
-        return sign_request(self.wallet, body)
+        headers = sign_request(self.wallet, body)
+        if self.api_key:
+            headers["X-Radar-API-Key"] = self.api_key
+        return headers
 
     async def _post(self, path: str, json_data: dict) -> Optional[dict]:
         """POST with Epistula signing. Returns JSON response or None."""

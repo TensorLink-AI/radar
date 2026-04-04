@@ -73,6 +73,7 @@ def set_hotkey_map(mapping: dict[str, int]):
 _db_api_url: str = ""
 _wallet = None
 _metagraph = None
+_api_key: str = ""
 _client: Optional[httpx.AsyncClient] = None
 
 # Per-route-category rate limits: (max_requests, window_seconds).
@@ -102,6 +103,7 @@ def _route_category(path: str) -> str:
 
 def set_config(
     db_api_url: str, wallet, metagraph,
+    api_key: str = "",
     rate_limits: dict[str, tuple[int, int]] | None = None,
 ):
     """Configure the proxy at startup.
@@ -109,10 +111,11 @@ def set_config(
     ``rate_limits`` overrides per-category limits as
     ``{category: (max_requests, window_seconds)}``.
     """
-    global _db_api_url, _wallet, _metagraph
+    global _db_api_url, _wallet, _metagraph, _api_key
     _db_api_url = db_api_url.rstrip("/")
     _wallet = wallet
     _metagraph = metagraph
+    _api_key = api_key
     if rate_limits:
         _CATEGORY_LIMITS.update(rate_limits)
 
@@ -217,6 +220,8 @@ async def _proxy_request(request: Request, path: str) -> Response:
     headers = {}
     if _wallet:
         headers = sign_request(_wallet, body)
+    if _api_key:
+        headers["X-Radar-API-Key"] = _api_key
     if body:
         headers["Content-Type"] = request.headers.get("content-type", "application/json")
 

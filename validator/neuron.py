@@ -95,6 +95,7 @@ class Validator:
         # Database client — talks to centralized DB server
         self.db_client = DatabaseClient(
             db_url=Config.DB_API_URL, wallet=self.wallet,
+            api_key=Config.DB_API_KEY,
         )
 
         # EMA scores per UID
@@ -145,6 +146,7 @@ class Validator:
             db_api_url=Config.DB_API_URL,
             wallet=self.wallet,
             metagraph=self.metagraph,
+            api_key=Config.DB_API_KEY,
         )
 
         logger.info(
