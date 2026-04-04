@@ -72,7 +72,7 @@ def test_per_category_rate_limits():
         db_api_url="http://fake-db:8090",
         wallet=None,
         metagraph=None,
-        rate_limits={"db": (2, 60), "llm": (2, 60), "desearch": (2, 60), "agent_code": (1, 3600)},
+        rate_limits={"db": (2, 60), "llm": (2, 60), "desearch": (2, 60)},
     )
     identity = "test-miner-99"
     # Clear any existing state
@@ -91,7 +91,3 @@ def test_per_category_rate_limits():
 
     # "desearch" still independent
     assert _check_rate_limit(identity, "desearch") is True
-
-    # "agent_code" allows 1 per hour
-    assert _check_rate_limit(identity, "agent_code") is True
-    assert _check_rate_limit(identity, "agent_code") is False

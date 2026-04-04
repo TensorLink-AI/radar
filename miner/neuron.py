@@ -72,31 +72,8 @@ class Miner:
             self.agent_dir, self.trainer_image, self.listener_port,
         )
 
-    def _get_proxy_url(self) -> str:
-        """Resolve a validator proxy URL for API calls.
-
-        Priority: RADAR_VALIDATOR_PROXY_URL env var > metagraph discovery.
-        """
-        explicit = os.environ.get("RADAR_VALIDATOR_PROXY_URL", "")
-        if explicit:
-            return explicit.rstrip("/")
-
-        permits = self.metagraph.validator_permit
-        axons = self.metagraph.axons
-        if permits is None or axons is None:
-            return ""
-
-        proxy_port = int(os.environ.get("RADAR_PROXY_PORT", "8080"))
-        for uid in range(self.metagraph.n):
-            if uid < len(permits) and permits[uid] and uid < len(axons):
-                axon = axons[uid]
-                ip = getattr(axon, "ip", "") or ""
-                if ip and ip != "0.0.0.0":
-                    return f"http://{ip}:{proxy_port}"
-        return ""
-
     async def submit_agent_code(self):
-        """Submit agent code via DatabaseClient and commit hash on-chain."""
+        """Submit agent code directly to the DB server and commit hash on-chain."""
         if not os.path.isdir(self.agent_dir):
             logger.error("Agent directory not found: %s", self.agent_dir)
             return
@@ -108,18 +85,9 @@ class Miner:
             logger.info("Agent code unchanged (hash=%s), skipping", code_hash[:24])
             return
 
-        proxy_url = self._get_proxy_url()
-        if not proxy_url:
-            logger.warning(
-                "No validator proxy found (set RADAR_VALIDATOR_PROXY_URL). "
-                "Will retry on next heartbeat.",
-            )
-            self._code_hash = code_hash
-            self._commit_to_chain(code_hash)
-            return
-
+        db_url = Config.DB_API_URL
         from shared.db_client import DatabaseClient
-        db = DatabaseClient(db_url=proxy_url, wallet=self.wallet)
+        db = DatabaseClient(db_url=db_url, wallet=self.wallet)
         try:
             result = await db.submit_agent_code(
                 files=bundle["files"],
@@ -127,12 +95,12 @@ class Miner:
             )
             if result:
                 logger.info(
-                    "Agent code submitted: hash=%s files=%s",
-                    result.get("code_hash", "?")[:24],
+                    "Agent code submitted to %s: hash=%s files=%s",
+                    db_url, result.get("code_hash", "?")[:24],
                     sorted(bundle["files"].keys()),
                 )
             else:
-                logger.error("Agent code submission failed (no response)")
+                logger.error("Agent code submission failed")
                 return
         finally:
             await db.close()
@@ -431,8 +399,7 @@ class Miner:
                     len(self.active_deployments),
                     self.listener_port,
                 )
-                # Retry agent code submission if it failed at startup
-                # (e.g. metagraph wasn't populated, no proxy found)
+                # Retry if DB server was unreachable at startup
                 if not self._code_hash:
                     await self.submit_agent_code()
             except Exception as e:
