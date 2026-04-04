@@ -22,7 +22,7 @@ class DatabaseClient:
     def __init__(self, db_url: str, wallet, api_key: str = ""):
         self.db_url = db_url.rstrip("/")
         self.wallet = wallet
-        self.api_key = api_key
+        self.api_key = api_key or ""
         self._client: Optional[httpx.AsyncClient] = None
 
     async def _get_client(self) -> httpx.AsyncClient:

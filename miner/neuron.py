@@ -87,7 +87,7 @@ class Miner:
 
         db_url = Config.DB_API_URL
         from shared.db_client import DatabaseClient
-        db = DatabaseClient(db_url=db_url, wallet=self.wallet, api_key=Config.DB_API_KEY)
+        db = DatabaseClient(db_url=db_url, wallet=self.wallet)
         try:
             result = await db.submit_agent_code(
                 files=bundle["files"],

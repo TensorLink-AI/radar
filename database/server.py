@@ -51,9 +51,6 @@ _MAX_BODY_BYTES: int = 5 * 1024 * 1024
 _MAX_AGENT_FILES: int = 10          # max .py files per submission
 _MAX_AGENT_FILE_BYTES: int = 50_000  # 50 KB per file
 
-# Shared subnet API key — cheap gate before expensive Epistula checks
-_api_key: str = ""
-
 # Nonce replay protection: track recently seen nonces
 _nonce_cache: set[str] = set()
 _nonce_timestamps: list[tuple[float, str]] = []  # (time, nonce)
@@ -81,11 +78,6 @@ def set_r2(r2):
 def set_pool(pool):
     global _pool
     _pool = pool
-
-
-def set_api_key(key: str):
-    global _api_key
-    _api_key = key
 
 
 def set_auth(metagraph, verify_fn=None):
@@ -226,13 +218,6 @@ async def auth_middleware(request: Request, call_next):
 
     path = request.url.path
 
-    # ── API key gate (cheap string check before any body read/crypto) ──
-    if _api_key and path != "/health":
-        import secrets as _secrets
-        provided = request.headers.get("X-Radar-API-Key", "")
-        if not provided or not _secrets.compare_digest(provided, _api_key):
-            return JSONResponse(status_code=401, content={"error": "Invalid API key"})
-
     needs_auth = (
         path.startswith("/experiments")
         or path.startswith("/challenge")
@@ -242,7 +227,7 @@ async def auth_middleware(request: Request, call_next):
         or path.startswith("/desearch")
         or path.startswith("/llm")
     )
-    if needs_auth and _auth_verify and _metagraph:
+    if needs_auth:
         # ── Reject oversized bodies before reading fully ──
         content_length = request.headers.get("content-length")
         if content_length and int(content_length) > _MAX_BODY_BYTES:
@@ -256,24 +241,37 @@ async def auth_middleware(request: Request, call_next):
                 status_code=413, content={"error": "Request body too large"},
             )
 
-        from shared.auth import verify_request
-        ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
-        if not ok:
-            return JSONResponse(status_code=403, content={"error": err})
+        # ── Validator API key: trusted proxy, skip Epistula ──
+        from config import Config
+        if Config.DB_API_KEY:
+            import secrets as _secrets
+            provided = request.headers.get("X-Radar-API-Key", "")
+            if provided and _secrets.compare_digest(provided, Config.DB_API_KEY):
+                # Trusted validator proxy — rate-limit by IP instead of hotkey
+                if not _check_rate_limit(client_ip):
+                    return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+                response = await call_next(request)
+                return response
 
-        # ── Nonce replay protection ──
-        nonce = request.headers.get("x-epistula-nonce", "")
-        if nonce and not _check_nonce(nonce):
-            return JSONResponse(status_code=403, content={"error": "Replayed request"})
+        # ── Epistula auth: miners and validators without API key ──
+        if _metagraph:
+            from shared.auth import verify_request
+            ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
+            if not ok:
+                return JSONResponse(status_code=403, content={"error": err})
 
-        request.state.caller_hotkey = hotkey
-        if not _check_rate_limit(hotkey):
-            return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+            nonce = request.headers.get("x-epistula-nonce", "")
+            if nonce and not _check_nonce(nonce):
+                return JSONResponse(status_code=403, content={"error": "Replayed request"})
 
-        # ── Role enforcement ──
-        is_vali_route = any(path.startswith(p) for p in _VALIDATOR_ONLY_PREFIXES)
-        if is_vali_route and not _is_validator(hotkey):
-            return JSONResponse(status_code=403, content={"error": "Validators only"})
+            request.state.caller_hotkey = hotkey
+            if not _check_rate_limit(hotkey):
+                return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+
+            # ── Role enforcement ──
+            is_vali_route = any(path.startswith(p) for p in _VALIDATOR_ONLY_PREFIXES)
+            if is_vali_route and not _is_validator(hotkey):
+                return JSONResponse(status_code=403, content={"error": "Validators only"})
 
     response = await call_next(request)
     return response

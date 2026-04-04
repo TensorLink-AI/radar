@@ -17,7 +17,7 @@ import uvicorn
 
 from config import Config
 from database.server import (
-    app, set_db, set_auth, set_api_key, set_challenge, set_frontier,
+    app, set_db, set_auth, set_challenge, set_frontier,
     set_access_logger, set_hotkey_map, set_rate_limit,
     set_r2, set_pool,
 )
@@ -108,9 +108,6 @@ class DatabaseNeuron:
         set_access_logger(self.access_logger)
         set_auth(self.metagraph)
         set_rate_limit(Config.DB_VALI_RATE_LIMIT)
-        if Config.DB_API_KEY:
-            set_api_key(Config.DB_API_KEY)
-            logger.info("API key gate enabled")
 
         # Desearch proxy (SN22 arxiv search)
         if Config.DESEARCH_ENABLED:
