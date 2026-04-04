@@ -160,6 +160,17 @@ async def _run_single_agent(
                 },
             )
             return proposal, agent_log
+        else:
+            error_msg = ""
+            if isinstance(result, dict):
+                error_msg = result.get("error", "")
+                stderr = result.get("stderr", "")
+                if stderr:
+                    error_msg = f"{error_msg} | stderr: {stderr[:500]}"
+            logger.warning(
+                "UID %d agent returned no proposal: %s",
+                uid, error_msg or repr(result),
+            )
     finally:
         try:
             await agent_env.cleanup()

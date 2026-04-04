@@ -1,13 +1,14 @@
 """Tests for validator.collection — agent pod execution + R2 proposal sharing."""
 
 import hashlib
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from shared.commitment import ImageCommitment
 from shared.protocol import Proposal
-from validator.collection import run_and_collect_agents
+from validator.collection import run_and_collect_agents, _run_single_agent
 
 
 def _mock_commitments():
@@ -116,3 +117,35 @@ async def test_r2_proposal_read_on_other_validator_submissions():
     assert len(proposals) == 2
     assert 0 in proposals
     assert 1 in proposals
+
+
+@pytest.mark.asyncio
+async def test_run_single_agent_logs_error_result(caplog):
+    """Agent returning an error dict should log the error, not silently drop."""
+    commitment = ImageCommitment(miner_uid=0, hotkey="hk0")
+    bundle = {"files": {"agent.py": "def design_architecture(c,cl): ..."}, "entry_point": "agent.py"}
+    mock_r2 = MagicMock()
+
+    error_result = {"error": "Agent load failed: SyntaxError", "stderr": "trace..."}
+
+    with patch("validator.collection.launch_agent_pod") as mock_launch, \
+         patch("validator.collection.run_agent_on_pod", new_callable=AsyncMock) as mock_run:
+        mock_env = AsyncMock()
+        mock_launch.return_value = mock_env
+        mock_run.return_value = error_result
+
+        with caplog.at_level(logging.WARNING, logger="validator.collection"):
+            proposal, agent_log = await _run_single_agent(
+                uid=0,
+                commitment=commitment,
+                challenge_json='{"round_id": 1}',
+                r2=mock_r2,
+                round_id=1,
+                allowed_urls="",
+                bundle=bundle,
+            )
+
+    assert proposal is None
+    assert agent_log == ""
+    assert "UID 0 agent returned no proposal" in caplog.text
+    assert "SyntaxError" in caplog.text
