@@ -13,11 +13,13 @@ import pytest
 class TestScratchpadHelpers:
     def test_load_empty_scratchpad(self):
         """First round — no scratchpad exists, returns empty dir."""
-        from miner_template.agent import load_scratchpad
+        from runner.agent.harness import load_scratchpad
+        from shared.url_gate import GatedClient
 
+        client = GatedClient([])
         with tempfile.TemporaryDirectory() as d:
             challenge = {"scratchpad_get_url": ""}
-            result = load_scratchpad(challenge, local_dir=d)
+            result = load_scratchpad(challenge, client, local_dir=d)
             assert os.path.isdir(result)
 
     def test_save_and_load_roundtrip(self):
@@ -39,35 +41,36 @@ class TestScratchpadHelpers:
 
     def test_size_limit_default(self):
         """Scratchpad over 10MB (default) should not be saved."""
-        from miner_template.agent import save_scratchpad
+        from runner.agent.harness import save_scratchpad
+        from shared.url_gate import GatedClient
 
+        client = GatedClient(["http://fake-url/"])
         with tempfile.TemporaryDirectory() as d:
             Path(f"{d}/big.bin").write_bytes(b"x" * (11 * 1024 * 1024))
             challenge = {"scratchpad_put_url": "http://fake-url"}
-            result = save_scratchpad(challenge, local_dir=d)
+            result = save_scratchpad(challenge, client, local_dir=d)
             assert result is False
 
     def test_size_limit_from_challenge(self):
         """Scratchpad respects scratchpad_max_mb from challenge."""
-        from miner_template.agent import save_scratchpad
+        from runner.agent.harness import save_scratchpad
+        from shared.url_gate import GatedClient
 
+        client = GatedClient(["http://fake-url/"])
         with tempfile.TemporaryDirectory() as d:
             # 3MB file — under default 10MB but over custom 2MB limit
             Path(f"{d}/medium.bin").write_bytes(b"x" * (3 * 1024 * 1024))
             challenge = {"scratchpad_put_url": "http://fake-url", "scratchpad_max_mb": 2}
-            result = save_scratchpad(challenge, local_dir=d)
+            result = save_scratchpad(challenge, client, local_dir=d)
             assert result is False
 
     def test_nested_directories_preserved(self):
         """Scratchpad should archive nested directory trees."""
-        from miner_template.agent import save_scratchpad
-
         with tempfile.TemporaryDirectory() as d:
             nested = os.path.join(d, "sub", "deep")
             os.makedirs(nested)
             Path(os.path.join(nested, "file.txt")).write_text("nested content")
 
-            # save_scratchpad will create the archive; we just verify the tar
             archive_path = os.path.join(tempfile.gettempdir(), "scratchpad_upload.tar.gz")
             try:
                 import tarfile as tf
