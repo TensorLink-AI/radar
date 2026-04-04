@@ -153,6 +153,8 @@ async def auth_middleware(request: Request, call_next):
         or path.startswith("/frontier")
         or path.startswith("/provenance")
         or path.startswith("/agent_code")
+        or path.startswith("/desearch")
+        or path.startswith("/llm")
     )
     if needs_auth and _auth_verify and _metagraph:
         body = await request.body()

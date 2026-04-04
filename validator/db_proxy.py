@@ -196,6 +196,12 @@ async def _proxy_request(request: Request, path: str) -> Response:
     if body:
         headers["Content-Type"] = request.headers.get("content-type", "application/json")
 
+    # Forward miner identity headers (used by LLM/desearch proxies on DB server)
+    for fwd_header in ("X-Miner-UID", "X-Miner-Hotkey"):
+        val = request.headers.get(fwd_header, "")
+        if val:
+            headers[fwd_header] = val
+
     # Build target URL with query string
     target = f"{_db_api_url}{path}"
     query = str(request.url.query)
@@ -291,3 +297,17 @@ async def proxy_get_agent_code(request: Request, hotkey: str):
 @app.get("/agent_code/{hotkey}/meta")
 async def proxy_get_agent_code_meta(request: Request, hotkey: str):
     return await _proxy_request(request, f"/agent_code/{hotkey}/meta")
+
+
+# ── LLM proxy (forwarded to DB server) ────────────────────
+
+@app.api_route("/llm/{path:path}", methods=["GET", "POST"])
+async def proxy_llm(request: Request, path: str):
+    return await _proxy_request(request, f"/llm/{path}")
+
+
+# ── Desearch proxy (forwarded to DB server) ────────────────
+
+@app.api_route("/desearch/{path:path}", methods=["GET", "POST"])
+async def proxy_desearch(request: Request, path: str):
+    return await _proxy_request(request, f"/desearch/{path}")

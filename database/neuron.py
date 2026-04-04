@@ -95,6 +95,11 @@ class DatabaseNeuron:
         async with self.pool.acquire() as conn:
             await conn.execute(AGENT_CODE_SCHEMA)
 
+        # Init proxy query log table
+        from shared.pg_schema import PROXY_QUERY_LOG_SCHEMA
+        async with self.pool.acquire() as conn:
+            await conn.execute(PROXY_QUERY_LOG_SCHEMA)
+
         # Wire into server
         set_db(self.store)
         set_pool(self.pool)
@@ -103,6 +108,41 @@ class DatabaseNeuron:
         set_access_logger(self.access_logger)
         set_auth(self.metagraph)
         set_rate_limit(Config.DB_VALI_RATE_LIMIT)
+
+        # Desearch proxy (SN22 arxiv search)
+        if Config.DESEARCH_ENABLED:
+            from validator.desearch_proxy import DesearchProxy, set_proxy, register_routes
+            desearch = DesearchProxy(
+                sn22_url=Config.DESEARCH_SN22_URL,
+                max_queries=Config.DESEARCH_MAX_QUERIES,
+                pool=self.pool,
+            )
+            set_proxy(desearch)
+            register_routes(app)
+            logger.info("Desearch proxy enabled (SN22: %s)", Config.DESEARCH_SN22_URL)
+
+        # LLM proxy (Chutes AI)
+        if Config.LLM_ENABLED:
+            from validator.llm_proxy import LLMProxy
+            from validator.llm_proxy import set_proxy as set_llm_proxy
+            from validator.llm_proxy import register_routes as register_llm_routes
+            allowed_models = [
+                m.strip() for m in Config.CHUTES_ALLOWED_MODELS.split(",")
+                if m.strip()
+            ]
+            llm = LLMProxy(
+                chutes_url=Config.CHUTES_API_URL,
+                chutes_api_key=Config.CHUTES_API_KEY,
+                allowed_models=allowed_models,
+                max_queries=Config.LLM_MAX_QUERIES,
+                pool=self.pool,
+            )
+            set_llm_proxy(llm)
+            register_llm_routes(app)
+            logger.info(
+                "LLM proxy enabled (Chutes: %s, models: %s)",
+                Config.CHUTES_API_URL, allowed_models or "all",
+            )
 
         logger.info("Database initialized, schemas created")
 
