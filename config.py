@@ -58,6 +58,15 @@ class Config:
     # ── Agent (Phase A) ──────────────────────────────────────────
     AGENT_TIMEOUT: int = int(os.getenv("RADAR_AGENT_TIMEOUT", "600"))
 
+    # Official agent image (subnet-owner controlled, locked down)
+    OFFICIAL_AGENT_IMAGE: str = os.getenv(
+        "RADAR_OFFICIAL_AGENT_IMAGE",
+        "ghcr.io/tensorlink-ai/radar/radar-agent:latest",
+    )
+    # Comma-separated URL prefixes that agent pods are allowed to reach.
+    # The validator proxy and presigned R2 URLs are added automatically.
+    AGENT_ALLOWED_URLS: str = os.getenv("RADAR_AGENT_ALLOWED_URLS", "")
+
     # ── Training Dispatch ────────────────────────────────────────
     TRAINING_TIMEOUT: int = int(os.getenv("RADAR_TRAINING_TIMEOUT", "1800"))
 
