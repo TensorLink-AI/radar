@@ -132,7 +132,7 @@ class Config:
 
     # ── Validator Proxy ───────────────────────────────────────
     PROXY_PORT: int = int(os.getenv("RADAR_PROXY_PORT", "8080"))
-    PROXY_RATE_LIMIT: int = int(os.getenv("RADAR_PROXY_RATE_LIMIT", "10"))
+    PROXY_RATE_LIMIT: int = int(os.getenv("RADAR_PROXY_RATE_LIMIT", "20"))
 
     # ── Database Auth ─────────────────────────────────────────
     DB_VALI_RATE_LIMIT: int = int(os.getenv("RADAR_DB_VALI_RATE_LIMIT", "60"))
