@@ -138,6 +138,14 @@ class DatabaseClient:
         """GET a miner's agent code bundle from the DB server."""
         return await self._get(f"/agent_code/{hotkey}")
 
+    async def submit_agent_code(
+        self, files: dict[str, str], entry_point: str = "agent.py",
+    ) -> Optional[dict]:
+        """POST agent code bundle. Returns {"code_hash", "r2_key"} or None."""
+        return await self._post("/agent_code", {
+            "files": files, "entry_point": entry_point,
+        })
+
     async def close(self):
         """Close the underlying HTTP client."""
         if self._client and not self._client.is_closed:
