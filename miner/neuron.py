@@ -1,9 +1,12 @@
-"""Radar Miner — commits Docker agent image to chain, hosts warm-standby trainer.
+"""Radar Miner — commits agent code hash to chain, hosts warm-standby trainer.
 
-The miner has two components:
-  1. Agent: a Docker image committed to chain. Validators pull and run it.
+The miner has three components:
+  1. Agent code: .py files served from the listener. Validators fetch and
+     run them inside the official sandboxed agent image.
   2. Trainer listener: a lightweight FastAPI server (no GPU). Deploys
      Basilica GPU pods on-demand when validators send TrainerRequests.
+  3. Agent code endpoint: GET /agent_code returns a JSON bundle of the
+     miner's agent .py files plus a content hash for verification.
 """
 
 import argparse

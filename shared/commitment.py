@@ -23,12 +23,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ImageCommitment:
-    """A miner's committed image reference with pod URLs."""
+    """A miner's committed identity: agent code hash + listener URL.
 
-    # Agent image (existing)
-    image_url: str = ""       # e.g. "docker.io/myminer/agent:v2"
-    image_digest: str = ""    # e.g. "sha256:abc123..."
-    subnet_version: str = ""  # e.g. "0.1.0" — must match official
+    Agent code is served from the miner's listener (GET /agent_code).
+    The code_hash is committed on-chain so validators can verify
+    integrity after fetching.
+    """
+
+    # Agent code (new — replaces Docker image)
+    code_hash: str = ""       # e.g. "sha256:abc123..." — hash of agent code bundle
+    image_url: str = ""       # DEPRECATED: Docker image (kept for backward compat reads)
+    image_digest: str = ""    # DEPRECATED
+
+    subnet_version: str = ""  # e.g. "0.3.0" — must match official
 
     # Warm-standby trainer (miner-hosted lightweight listener, no GPU)
     listener_url: str = ""               # always-on HTTP endpoint on miner's neuron process
@@ -51,11 +58,12 @@ class ImageCommitment:
         "t": "trainer_image",
         "a": "agent_url",
         "at": "agent_attestation_id",
+        "ch": "code_hash",
     }
     _REV_MAP = {v: k for k, v in _KEY_MAP.items()}
 
     # On-chain limit is Raw128 (128 bytes). Only essential fields go on-chain.
-    _CHAIN_KEYS = ("i", "l", "v")
+    _CHAIN_KEYS = ("ch", "l", "v")
     _MAX_CHAIN_BYTES = 128
 
     def to_json(self) -> str:
