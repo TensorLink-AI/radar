@@ -255,7 +255,9 @@ async def run_agent_on_pod(
             return result
         except Exception as e:
             if attempt < max_retries:
-                wait = 2 ** (attempt + 1)
+                # Basilica pods can take ~5 min to spin up; use longer
+                # backoff to give the cluster time to recover.
+                wait = 15 * (attempt + 1)  # 15s, 30s
                 logger.warning(
                     "Agent pod attempt %d/%d failed: %s — retrying in %ds",
                     attempt + 1, 1 + max_retries, e, wait,
