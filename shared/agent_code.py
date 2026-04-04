@@ -62,8 +62,10 @@ def validate_bundle(bundle: dict) -> tuple[bool, str]:
     for name, code in files.items():
         if not isinstance(name, str) or not isinstance(code, str):
             return False, f"File names and contents must be strings, got {type(name)}/{type(code)}"
-        if "/" in name or "\\" in name or ".." in name:
-            return False, f"Invalid filename (no paths allowed): {name!r}"
+        if "\\" in name or ".." in name:
+            return False, f"Invalid filename (no path traversal allowed): {name!r}"
+        if name.startswith("/"):
+            return False, f"Invalid filename (must be relative): {name!r}"
         if not name.endswith(".py"):
             return False, f"Only .py files allowed: {name!r}"
 
@@ -82,20 +84,22 @@ def validate_bundle(bundle: dict) -> tuple[bool, str]:
 
 
 def bundle_from_directory(directory: str, entry_point: str = "agent.py") -> dict:
-    """Load all .py files from a directory into a bundle dict.
+    """Load all .py files from a directory (recursively) into a bundle dict.
 
     Used by miners to build their submission from a local directory.
+    Subdirectories are included with relative paths (e.g. ``core/llm.py``).
     """
     import os
 
     files: dict[str, str] = {}
-    for name in sorted(os.listdir(directory)):
-        if not name.endswith(".py"):
-            continue
-        path = os.path.join(directory, name)
-        if os.path.isfile(path):
+    for root, _dirs, filenames in os.walk(directory):
+        for name in sorted(filenames):
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, directory)
             with open(path) as f:
-                files[name] = f.read()
+                files[rel] = f.read()
 
     if not files:
         raise ValueError(f"No .py files found in {directory}")
