@@ -245,51 +245,30 @@ class TestWriteAgentCode:
 
 class TestLaunchAgentPod:
     @pytest.mark.asyncio
-    async def test_basilica_mode_no_volumes_stashes_code(self):
-        """Basilica mode: no volume mounts, agent code stashed on env."""
+    async def test_stashes_code_for_inline_delivery(self):
+        """Both modes stash agent code for inline delivery via process_challenge."""
         mock_env = MagicMock()
         mock_af = MagicMock()
         mock_af.load_env.return_value = mock_env
 
         bundle = {"files": {"agent.py": "code"}, "entry_point": "agent.py"}
-        with patch("validator.pod_manager._af", return_value=mock_af):
-            env = await launch_agent_pod(
-                image_url="test:latest",
-                mode="basilica",
-                agent_code=bundle,
-            )
+        for mode in ("docker", "basilica"):
+            with patch("validator.pod_manager._af", return_value=mock_af):
+                env = await launch_agent_pod(
+                    image_url="test:latest",
+                    mode=mode,
+                    agent_code=bundle,
+                )
 
-        # No volumes kwarg in basilica mode
-        call_kwargs = mock_af.load_env.call_args
-        assert "volumes" not in call_kwargs.kwargs
-        assert call_kwargs.kwargs["mode"] == "basilica"
-        # Agent code stashed for inline delivery
-        assert env._agent_code == bundle
-
-    @pytest.mark.asyncio
-    async def test_docker_mode_uses_volumes(self):
-        """Docker mode: volume-mounts code, no stashed code."""
-        mock_env = MagicMock()
-        mock_af = MagicMock()
-        mock_af.load_env.return_value = mock_env
-
-        bundle = {"files": {"agent.py": "code"}, "entry_point": "agent.py"}
-        with patch("validator.pod_manager._af", return_value=mock_af):
-            env = await launch_agent_pod(
-                image_url="test:latest",
-                mode="docker",
-                agent_code=bundle,
-            )
-
-        call_kwargs = mock_af.load_env.call_args
-        assert "volumes" in call_kwargs.kwargs
-        assert env._agent_code is None
+            call_kwargs = mock_af.load_env.call_args
+            assert call_kwargs.kwargs["mode"] == mode
+            assert env._agent_code == bundle
 
 
 class TestRunAgentOnPod:
     @pytest.mark.asyncio
-    async def test_passes_inline_code_when_stashed(self):
-        """Basilica env with stashed code passes it to process_challenge."""
+    async def test_passes_inline_code(self):
+        """Stashed agent code is always passed to process_challenge."""
         mock_env = MagicMock()
         mock_env._agent_code = {"files": {"agent.py": "code"}}
         mock_env.process_challenge = AsyncMock(
@@ -303,8 +282,8 @@ class TestRunAgentOnPod:
         assert result["code"] == "x"
 
     @pytest.mark.asyncio
-    async def test_no_inline_code_for_docker(self):
-        """Docker env (no stashed code) does not pass agent_code."""
+    async def test_no_code_stashed_skips_kwarg(self):
+        """When no agent code is stashed, agent_code kwarg is omitted."""
         mock_env = MagicMock()
         mock_env._agent_code = None
         mock_env.process_challenge = AsyncMock(

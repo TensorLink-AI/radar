@@ -164,9 +164,9 @@ async def launch_agent_pod(
     Launch a sandboxed agent pod via affinetes.
 
     Uses the official agent image (subnet-owner controlled).  The miner's
-    .py files are volume-mounted (Docker) or delivered inline via
-    ``process_challenge`` (Basilica).  A URL allowlist restricts which
-    endpoints the agent can reach.
+    .py files are delivered inline via ``process_challenge`` — the Actor
+    writes them to /workspace/agent/ before running the harness.  This
+    works identically for both Docker and Basilica modes.
 
     Args:
         image_url: Override official image (testing only).
@@ -177,8 +177,8 @@ async def launch_agent_pod(
         allowed_urls: Comma-separated URL prefixes the agent may access.
 
     Returns: environment object with process_challenge() and cleanup().
-        For Basilica mode the returned wrapper carries ``_agent_code``
-        so ``run_agent_on_pod`` can pass code inline.
+        The returned wrapper carries ``_agent_code`` so
+        ``run_agent_on_pod`` can pass code inline.
     """
     if mode is None:
         mode = get_mode()
@@ -198,29 +198,17 @@ async def launch_agent_pod(
         official_image, mode, len(allowed_urls.split(",")) if allowed_urls else 0,
     )
 
-    load_kwargs: dict = dict(
+    env = _af().load_env(
         image=official_image,
         mode=mode,
         env_vars=env_vars,
         mem_limit=mem_limit,
         cleanup=True,
     )
-
-    if mode == "basilica":
-        # Basilica (cloud): no volume mounts.  Agent code is delivered
-        # inline as a kwarg to process_challenge — the Actor writes it
-        # to /workspace/agent/ before running the harness.
-        env = _af().load_env(**load_kwargs)
-        # Stash code bundle so run_agent_on_pod can forward it.
-        env._agent_code = _normalise_agent_code(agent_code)
-    else:
-        # Docker (local): volume-mount the code into the container.
-        tmpdir = _write_agent_code(agent_code)
-        load_kwargs["volumes"] = {f"{tmpdir}/agent": "/workspace/agent"}
-        env = _af().load_env(**load_kwargs)
-        env._agent_code = None
-
+    # Stash code bundle — run_agent_on_pod passes it inline to process_challenge
+    env._agent_code = _normalise_agent_code(agent_code)
     return env
+
 
 
 async def run_agent_on_pod(
@@ -233,9 +221,9 @@ async def run_agent_on_pod(
     If *allowed_urls* is set, injects it into the challenge JSON so the
     frozen harness can build its GatedClient allowlist.
 
-    For Basilica mode the agent code bundle (stashed on *env* by
-    ``launch_agent_pod``) is passed inline so the Actor can write the
-    files before running the harness.
+    Agent code (stashed on *env* by ``launch_agent_pod``) is always
+    passed inline so the Actor can write the files before running the
+    harness.  This works identically for Docker and Basilica modes.
 
     Returns: dict with code/name/motivation, or dict with "error" key, or None.
     """
@@ -244,7 +232,6 @@ async def run_agent_on_pod(
             challenge_json, allowed_urls,
         )
 
-    # Build kwargs — include inline agent code for Basilica pods
     call_kwargs: dict = dict(
         challenge_json=challenge_json,
         _timeout=timeout,
