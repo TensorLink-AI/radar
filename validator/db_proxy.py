@@ -78,13 +78,14 @@ _client: Optional[httpx.AsyncClient] = None
 # Per-route-category rate limits: (max_requests, window_seconds).
 # Each category gets its own independent bucket so heavy DB reads
 # don't starve LLM or search budgets.
+# Round duration is ~55 min; round-scoped limits use 3600s (1 hour).
 _CATEGORY_LIMITS: dict[str, tuple[int, int]] = {
-    "db":         (30, 60),    # 30 req / 60s
-    "desearch":   (10, 60),    # 10 req / 60s
-    "llm":        (15, 60),    # 15 req / 60s
-    "agent_code": (1, 3600),   #  1 req / hour
+    "db":         (5, 60),      #  5 req / min
+    "desearch":   (10, 3600),   # 10 req / round
+    "llm":        (30, 3600),   # 30 req / round
+    "agent_code": (1, 3600),    #  1 req / hour
 }
-_DEFAULT_LIMIT: tuple[int, int] = (20, 60)
+_DEFAULT_LIMIT: tuple[int, int] = (5, 60)
 
 # Rate limiter: "category:identity" -> list of timestamps
 _rate_window: dict[str, list[float]] = defaultdict(list)

@@ -72,14 +72,40 @@ class Miner:
             self.agent_dir, self.trainer_image, self.listener_port,
         )
 
-    async def submit_agent_code(self, db_url: str = ""):
-        """Submit agent code to the DB server and commit hash on-chain.
+    def _discover_validator_proxy_url(self) -> str:
+        """Find a reachable validator proxy URL from the metagraph.
 
-        Reads .py files from self.agent_dir, bundles them, POSTs to the
-        DB server (which stores in R2 + Postgres), then commits the
-        code_hash on-chain.
+        Validators run a reverse proxy (default port 8080) that forwards
+        /agent_code to the DB server.  We try the configured env var first,
+        then fall back to discovering a validator axon from the metagraph.
         """
-        import os
+        # Explicit config takes priority
+        explicit = os.environ.get("RADAR_VALIDATOR_PROXY_URL", "")
+        if explicit:
+            return explicit.rstrip("/")
+
+        # Discover from metagraph — pick first validator with a permit
+        permits = self.metagraph.validator_permit
+        axons = self.metagraph.axons
+        if permits is None or axons is None:
+            return ""
+
+        proxy_port = int(os.environ.get("RADAR_PROXY_PORT", "8080"))
+        for uid in range(self.metagraph.n):
+            if uid < len(permits) and permits[uid] and uid < len(axons):
+                axon = axons[uid]
+                ip = getattr(axon, "ip", "") or ""
+                if ip and ip != "0.0.0.0":
+                    return f"http://{ip}:{proxy_port}"
+        return ""
+
+    async def submit_agent_code(self):
+        """Submit agent code via a validator proxy and commit hash on-chain.
+
+        Reads .py files from self.agent_dir, bundles them, POSTs to a
+        validator's reverse proxy (which forwards to the DB server), then
+        commits the code_hash on-chain.
+        """
         if not os.path.isdir(self.agent_dir):
             logger.error("Agent directory not found: %s", self.agent_dir)
             return
@@ -92,17 +118,19 @@ class Miner:
             logger.info("Agent code unchanged (hash=%s), skipping submission", code_hash[:24])
             return
 
-        # POST to DB server via validator proxy
-        target_url = db_url or os.environ.get("RADAR_DB_API_URL", "")
-        if not target_url:
+        # Discover validator proxy — never POST directly to DB server
+        proxy_url = self._discover_validator_proxy_url()
+        if not proxy_url:
             logger.warning(
-                "No DB server URL configured (set RADAR_DB_API_URL). "
-                "Agent code will be submitted when a validator provides the URL.",
+                "No validator proxy URL found (set RADAR_VALIDATOR_PROXY_URL "
+                "or wait for metagraph to populate). "
+                "Agent code will be submitted on next heartbeat.",
             )
-            # Still compute and cache the hash for on-chain commitment
+            # Still commit hash on-chain so validators know our code
             self._code_hash = code_hash
             self._commit_to_chain(code_hash)
             return
+
         body = json.dumps({
             "files": bundle["files"],
             "entry_point": bundle["entry_point"],
@@ -113,7 +141,7 @@ class Miner:
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
-                    f"{target_url.rstrip('/')}/agent_code",
+                    f"{proxy_url}/agent_code",
                     content=body, headers=headers,
                 )
                 if resp.status_code != 200:
@@ -124,12 +152,12 @@ class Miner:
                     return
                 result = resp.json()
                 logger.info(
-                    "Agent code submitted: hash=%s files=%s",
-                    result.get("code_hash", "?")[:24],
+                    "Agent code submitted via proxy %s: hash=%s files=%s",
+                    proxy_url, result.get("code_hash", "?")[:24],
                     sorted(bundle["files"].keys()),
                 )
         except Exception as e:
-            logger.error("Agent code submission failed: %s", e)
+            logger.error("Agent code submission to %s failed: %s", proxy_url, e)
             return
 
         self._code_hash = code_hash
@@ -411,7 +439,7 @@ class Miner:
         self.start_listener()
         await self.submit_agent_code()
         logger.info(
-            "Miner running. Agent dir: %s (code submitted to DB server). "
+            "Miner running. Agent dir: %s. "
             "Listener: port %d. Trainer image: %s. "
             "Waiting for validator TrainerRequests on /prepare.",
             self.agent_dir, self.listener_port, self.trainer_image,
@@ -428,6 +456,10 @@ class Miner:
                     len(self.active_deployments),
                     self.listener_port,
                 )
+                # Retry agent code submission if it failed at startup
+                # (e.g. metagraph wasn't populated, no proxy found)
+                if not self._code_hash:
+                    await self.submit_agent_code()
             except Exception as e:
                 logger.warning("Metagraph sync failed: %s", e)
 
