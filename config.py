@@ -127,6 +127,9 @@ class Config:
     DB_API_URL: str = os.getenv("RADAR_DB_API_URL", "http://localhost:8090")
     DB_API_PORT: int = int(os.getenv("RADAR_DB_API_PORT", "8090"))
 
+    # ── Miner Listener ───────────────────────────────────────
+    MINER_LISTENER_PORT: int = int(os.getenv("RADAR_MINER_LISTENER_PORT", "8091"))
+
     # ── Validator Proxy ───────────────────────────────────────
     PROXY_PORT: int = int(os.getenv("RADAR_PROXY_PORT", "8080"))
     PROXY_RATE_LIMIT: int = int(os.getenv("RADAR_PROXY_RATE_LIMIT", "10"))

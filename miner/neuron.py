@@ -55,7 +55,7 @@ class Miner:
         )
 
         # Listener port for warm-standby HTTP server
-        self.listener_port = int(getattr(config, "listener_port", 8090))
+        self.listener_port = int(getattr(config, "listener_port", Config.MINER_LISTENER_PORT))
         self.external_ip = getattr(config, "external_ip", "") or "0.0.0.0"
 
         # Active Basilica deployments: round_id → deployment object
@@ -93,7 +93,16 @@ class Miner:
             return
 
         # POST to DB server via validator proxy
-        target_url = db_url or Config.DB_API_URL
+        target_url = db_url or os.environ.get("RADAR_DB_API_URL", "")
+        if not target_url:
+            logger.warning(
+                "No DB server URL configured (set RADAR_DB_API_URL). "
+                "Agent code will be submitted when a validator provides the URL.",
+            )
+            # Still compute and cache the hash for on-chain commitment
+            self._code_hash = code_hash
+            self._commit_to_chain(code_hash)
+            return
         body = json.dumps({
             "files": bundle["files"],
             "entry_point": bundle["entry_point"],
@@ -428,7 +437,7 @@ def get_config() -> bt.Config:
     parser.add_argument("--netuid", type=int, default=1)
     parser.add_argument("--agent_dir", type=str, default="agent/",
                         help="Directory containing agent .py files")
-    parser.add_argument("--listener_port", type=int, default=8090,
+    parser.add_argument("--listener_port", type=int, default=Config.MINER_LISTENER_PORT,
                         help="Port for warm-standby trainer listener")
     parser.add_argument("--trainer_image", type=str,
                         default=Config.OFFICIAL_TRAINING_IMAGE,
