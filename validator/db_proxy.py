@@ -1,12 +1,12 @@
-"""Reverse proxy — validators run this for their miners.
+"""Reverse proxy — validators run this for agent pods.
 
 Forwards /experiments/*, /challenge, /frontier, /provenance/* to the
-centralized database server. Hosts /desearch/*, /llm/* locally. Rate
-limits per miner hotkey or agent token.
+centralized database server. Also proxies /desearch/*, /llm/*.
+Rate limits per miner UID per route category.
 
 Agent pods authenticate via a per-round ephemeral token injected into
 the challenge JSON (``X-Agent-Token`` header). Miner neuron processes
-authenticate via Epistula signatures.
+submit agent code directly to the DB server (not through this proxy).
 """
 
 from __future__ import annotations
@@ -73,21 +73,51 @@ def set_hotkey_map(mapping: dict[str, int]):
 _db_api_url: str = ""
 _wallet = None
 _metagraph = None
+_api_key: str = ""
 _client: Optional[httpx.AsyncClient] = None
 
-# Rate limiter: hotkey -> list of timestamps
+# Per-route-category rate limits: (max_requests, window_seconds).
+# Each category gets its own independent bucket so heavy DB reads
+# don't starve LLM or search budgets.
+# Round duration is ~55 min; round-scoped limits use 3600s (1 hour).
+_CATEGORY_LIMITS: dict[str, tuple[int, int]] = {
+    "db":         (5, 60),      #  5 req / min
+    "desearch":   (10, 3600),   # 10 req / round
+    "llm":        (30, 3600),   # 30 req / round
+}
+_DEFAULT_LIMIT: tuple[int, int] = (5, 60)
+
+# Rate limiter: "category:identity" -> list of timestamps
 _rate_window: dict[str, list[float]] = defaultdict(list)
 _rate_lock = threading.Lock()
-_rate_limit: int = 10
 
 
-def set_config(db_api_url: str, wallet, metagraph, rate_limit: int = 10):
-    """Configure the proxy at startup."""
-    global _db_api_url, _wallet, _metagraph, _rate_limit
+def _route_category(path: str) -> str:
+    """Map a request path to its rate-limit category."""
+    if path.startswith("/desearch"):
+        return "desearch"
+    if path.startswith("/llm"):
+        return "llm"
+    return "db"
+
+
+def set_config(
+    db_api_url: str, wallet, metagraph,
+    api_key: str = "",
+    rate_limits: dict[str, tuple[int, int]] | None = None,
+):
+    """Configure the proxy at startup.
+
+    ``rate_limits`` overrides per-category limits as
+    ``{category: (max_requests, window_seconds)}``.
+    """
+    global _db_api_url, _wallet, _metagraph, _api_key
     _db_api_url = db_api_url.rstrip("/")
     _wallet = wallet
     _metagraph = metagraph
-    _rate_limit = rate_limit
+    _api_key = api_key
+    if rate_limits:
+        _CATEGORY_LIMITS.update(rate_limits)
 
 
 def set_metagraph(metagraph):
@@ -103,14 +133,17 @@ async def _get_client() -> httpx.AsyncClient:
     return _client
 
 
-def _check_rate_limit(hotkey: str) -> bool:
+def _check_rate_limit(identity: str, category: str) -> bool:
+    """Check per-category rate limit for a given identity (hotkey or UID)."""
+    max_req, window_secs = _CATEGORY_LIMITS.get(category, _DEFAULT_LIMIT)
+    key = f"{category}:{identity}"
     with _rate_lock:
         now = time.time()
-        window = _rate_window[hotkey]
-        _rate_window[hotkey] = [t for t in window if now - t < 60]
-        if len(_rate_window[hotkey]) >= _rate_limit:
+        window = _rate_window[key]
+        _rate_window[key] = [t for t in window if now - t < window_secs]
+        if len(_rate_window[key]) >= max_req:
             return False
-        _rate_window[hotkey].append(now)
+        _rate_window[key].append(now)
         return True
 
 
@@ -128,57 +161,48 @@ _AGENT_TOKEN_PREFIXES = (
     "/provenance", "/desearch", "/llm",
 )
 
-# Routes that require Epistula wallet auth (used by miner neuron)
-_EPISTULA_ONLY_PREFIXES = ("/agent_code",)
 
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     """Auth for proxy routes.
 
-    Agent pods use ``X-Agent-Token`` (ephemeral per-round secret).
-    Miner neuron processes use Epistula wallet signatures.
+    Agent pods authenticate via ``X-Agent-Token`` (ephemeral per-round secret).
     """
     path = request.url.path
 
-    # Check if route needs agent-token auth
-    needs_agent_auth = any(path.startswith(p) for p in _AGENT_TOKEN_PREFIXES)
-    # Check if route needs Epistula-only auth
-    needs_epistula = any(path.startswith(p) for p in _EPISTULA_ONLY_PREFIXES)
+    needs_auth = any(path.startswith(p) for p in _AGENT_TOKEN_PREFIXES)
+    if not needs_auth:
+        response = await call_next(request)
+        return response
 
-    if needs_agent_auth:
-        # Agent token is the primary auth for pod requests
-        if _verify_agent_token(request):
-            # Rate-limit by token (all agents share one token per round,
-            # but individual rate limiting is done at the route level via
-            # X-Miner-UID header where applicable)
-            response = await call_next(request)
-            return response
-        # Fall back to Epistula for backward compat (miner neuron calls)
-        if _metagraph:
-            body = await request.body()
-            from shared.auth import verify_request
-            ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
-            if ok:
-                request.state.miner_hotkey = hotkey
-                if not _check_rate_limit(hotkey):
-                    return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
-                response = await call_next(request)
-                return response
-        return JSONResponse(status_code=403, content={"error": "Invalid agent token or signature"})
+    category = _route_category(path)
 
-    if needs_epistula and _metagraph:
+    # Agent token is the primary auth for pod requests
+    if _verify_agent_token(request):
+        rate_key = request.headers.get("X-Miner-UID", "agent-shared")
+        if not _check_rate_limit(f"agent:{rate_key}", category):
+            return JSONResponse(status_code=429, content={
+                "error": f"Rate limit exceeded for {category}",
+            })
+        response = await call_next(request)
+        return response
+
+    # Fall back to Epistula for backward compat
+    if _metagraph:
         body = await request.body()
         from shared.auth import verify_request
         ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
-        if not ok:
-            return JSONResponse(status_code=403, content={"error": err})
-        request.state.miner_hotkey = hotkey
-        if not _check_rate_limit(hotkey):
-            return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+        if ok:
+            request.state.miner_hotkey = hotkey
+            if not _check_rate_limit(hotkey, category):
+                return JSONResponse(status_code=429, content={
+                    "error": f"Rate limit exceeded for {category}",
+                })
+            response = await call_next(request)
+            return response
 
-    response = await call_next(request)
-    return response
+    return JSONResponse(status_code=403, content={"error": "Invalid agent token or signature"})
 
 
 async def _proxy_request(request: Request, path: str) -> Response:
@@ -193,6 +217,8 @@ async def _proxy_request(request: Request, path: str) -> Response:
     headers = {}
     if _wallet:
         headers = sign_request(_wallet, body)
+    if _api_key:
+        headers["X-Radar-API-Key"] = _api_key
     if body:
         headers["Content-Type"] = request.headers.get("content-type", "application/json")
 
@@ -282,21 +308,6 @@ async def proxy_experiments(request: Request, path: str):
 @app.api_route("/provenance/{path:path}", methods=["GET", "POST"])
 async def proxy_provenance(request: Request, path: str):
     return await _proxy_request(request, f"/provenance/{path}")
-
-
-@app.post("/agent_code")
-async def proxy_submit_agent_code(request: Request):
-    return await _proxy_request(request, "/agent_code")
-
-
-@app.get("/agent_code/{hotkey}")
-async def proxy_get_agent_code(request: Request, hotkey: str):
-    return await _proxy_request(request, f"/agent_code/{hotkey}")
-
-
-@app.get("/agent_code/{hotkey}/meta")
-async def proxy_get_agent_code_meta(request: Request, hotkey: str):
-    return await _proxy_request(request, f"/agent_code/{hotkey}/meta")
 
 
 # ── LLM proxy (forwarded to DB server) ────────────────────

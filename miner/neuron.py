@@ -55,7 +55,7 @@ class Miner:
         )
 
         # Listener port for warm-standby HTTP server
-        self.listener_port = int(getattr(config, "listener_port", 8090))
+        self.listener_port = int(getattr(config, "listener_port", Config.MINER_LISTENER_PORT))
         self.external_ip = getattr(config, "external_ip", "") or "0.0.0.0"
 
         # Active Basilica deployments: round_id → deployment object
@@ -72,14 +72,8 @@ class Miner:
             self.agent_dir, self.trainer_image, self.listener_port,
         )
 
-    async def submit_agent_code(self, db_url: str = ""):
-        """Submit agent code to the DB server and commit hash on-chain.
-
-        Reads .py files from self.agent_dir, bundles them, POSTs to the
-        DB server (which stores in R2 + Postgres), then commits the
-        code_hash on-chain.
-        """
-        import os
+    async def submit_agent_code(self):
+        """Submit agent code directly to the DB server and commit hash on-chain."""
         if not os.path.isdir(self.agent_dir):
             logger.error("Agent directory not found: %s", self.agent_dir)
             return
@@ -87,45 +81,31 @@ class Miner:
         bundle = bundle_from_directory(self.agent_dir)
         code_hash = bundle["code_hash"]
 
-        # Skip if unchanged
         if code_hash == self._code_hash:
-            logger.info("Agent code unchanged (hash=%s), skipping submission", code_hash[:24])
+            logger.info("Agent code unchanged (hash=%s), skipping", code_hash[:24])
             return
 
-        # POST to DB server via validator proxy
-        target_url = db_url or Config.DB_API_URL
-        body = json.dumps({
-            "files": bundle["files"],
-            "entry_point": bundle["entry_point"],
-        }).encode()
-        headers = sign_request(self.wallet, body)
-        headers["Content-Type"] = "application/json"
-
+        db_url = Config.DB_API_URL
+        from shared.db_client import DatabaseClient
+        db = DatabaseClient(db_url=db_url, wallet=self.wallet)
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(
-                    f"{target_url.rstrip('/')}/agent_code",
-                    content=body, headers=headers,
-                )
-                if resp.status_code != 200:
-                    logger.error(
-                        "Agent code submission failed: HTTP %d %s",
-                        resp.status_code, resp.text[:200],
-                    )
-                    return
-                result = resp.json()
+            result = await db.submit_agent_code(
+                files=bundle["files"],
+                entry_point=bundle["entry_point"],
+            )
+            if result:
                 logger.info(
-                    "Agent code submitted: hash=%s files=%s",
-                    result.get("code_hash", "?")[:24],
+                    "Agent code submitted to %s: hash=%s files=%s",
+                    db_url, result.get("code_hash", "?")[:24],
                     sorted(bundle["files"].keys()),
                 )
-        except Exception as e:
-            logger.error("Agent code submission failed: %s", e)
-            return
+            else:
+                logger.error("Agent code submission failed")
+                return
+        finally:
+            await db.close()
 
         self._code_hash = code_hash
-
-        # Commit hash + listener URL on-chain
         self._commit_to_chain(code_hash)
 
     def _commit_to_chain(self, code_hash: str):
@@ -402,7 +382,7 @@ class Miner:
         self.start_listener()
         await self.submit_agent_code()
         logger.info(
-            "Miner running. Agent dir: %s (code submitted to DB server). "
+            "Miner running. Agent dir: %s. "
             "Listener: port %d. Trainer image: %s. "
             "Waiting for validator TrainerRequests on /prepare.",
             self.agent_dir, self.listener_port, self.trainer_image,
@@ -419,6 +399,9 @@ class Miner:
                     len(self.active_deployments),
                     self.listener_port,
                 )
+                # Retry if DB server was unreachable at startup
+                if not self._code_hash:
+                    await self.submit_agent_code()
             except Exception as e:
                 logger.warning("Metagraph sync failed: %s", e)
 
@@ -428,7 +411,7 @@ def get_config() -> bt.Config:
     parser.add_argument("--netuid", type=int, default=1)
     parser.add_argument("--agent_dir", type=str, default="agent/",
                         help="Directory containing agent .py files")
-    parser.add_argument("--listener_port", type=int, default=8090,
+    parser.add_argument("--listener_port", type=int, default=Config.MINER_LISTENER_PORT,
                         help="Port for warm-standby trainer listener")
     parser.add_argument("--trainer_image", type=str,
                         default=Config.OFFICIAL_TRAINING_IMAGE,

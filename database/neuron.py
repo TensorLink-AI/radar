@@ -209,6 +209,8 @@ class DatabaseNeuron:
         # Start uvicorn in background
         server_config = uvicorn.Config(
             app, host="0.0.0.0", port=self.port, log_level="warning",
+            limit_concurrency=200,  # DDoS: cap concurrent connections
+            limit_max_requests=50000,  # Recycle worker after N requests
         )
         server = uvicorn.Server(server_config)
         server_task = asyncio.create_task(server.serve())

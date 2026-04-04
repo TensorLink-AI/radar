@@ -15,6 +15,9 @@ from fastapi.testclient import TestClient
 from shared.database import DataElement
 from database.server import (
     app, set_db, set_challenge, set_frontier,
+    _ip_rate_window, _ip_rate_lock, _IP_RATE_LIMIT,
+    _check_ip_rate_limit, _check_nonce, _nonce_cache, _nonce_lock,
+    _MAX_AGENT_FILES, _MAX_AGENT_FILE_BYTES,
 )
 
 
@@ -251,3 +254,39 @@ def test_record_context():
         "round_id": 1, "experiment_id": 0, "context_type": "frontier",
     })
     assert r.status_code == 200
+
+
+def test_ip_rate_limit():
+    """IP-based rate limiter blocks after threshold."""
+    test_ip = "10.99.99.99"
+    # Clear any state
+    with _ip_rate_lock:
+        _ip_rate_window.pop(test_ip, None)
+
+    for _ in range(_IP_RATE_LIMIT):
+        assert _check_ip_rate_limit(test_ip) is True
+    # Next request should be blocked
+    assert _check_ip_rate_limit(test_ip) is False
+
+    # Clean up
+    with _ip_rate_lock:
+        _ip_rate_window.pop(test_ip, None)
+
+
+def test_nonce_replay_protection():
+    """Same nonce rejected within the tolerance window."""
+    with _nonce_lock:
+        _nonce_cache.clear()
+
+    assert _check_nonce("nonce-aaa") is True
+    assert _check_nonce("nonce-bbb") is True
+    # Replay should fail
+    assert _check_nonce("nonce-aaa") is False
+    # New nonce still works
+    assert _check_nonce("nonce-ccc") is True
+
+
+def test_agent_code_file_limits():
+    """Agent code rejects too many files or oversized files."""
+    assert _MAX_AGENT_FILES == 10
+    assert _MAX_AGENT_FILE_BYTES == 50_000

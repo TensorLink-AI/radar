@@ -8,7 +8,6 @@ Auth: Epistula verify, caller must be a validator.
 from __future__ import annotations
 
 import logging
-import re
 import threading
 import time
 from collections import defaultdict
@@ -18,7 +17,6 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from shared.access_logger import _extract_experiment_ids
 from shared.pg_access_logger import PgAccessLogger
 
 app = FastAPI(title="RADAR Experiment DB (Centralized)")
@@ -31,13 +29,29 @@ _r2 = None  # R2AuditLog (for agent code storage)
 _pool = None  # asyncpg pool (for agent_submissions table)
 
 # Auth middleware reference
-_auth_verify = None
 _metagraph = None
 
 # Rate limiter: hotkey -> list of timestamps
 _rate_window: dict[str, list[float]] = defaultdict(list)
 _rate_lock = threading.Lock()
 _rate_limit: int = 60  # requests per minute per validator
+
+# IP-based rate limiter for unauthenticated / pre-auth flood protection
+_ip_rate_window: dict[str, list[float]] = defaultdict(list)
+_ip_rate_lock = threading.Lock()
+_IP_RATE_LIMIT: int = 120  # max requests per minute per IP (pre-auth)
+
+# Maximum request body size (5 MB) — reject oversized payloads early
+_MAX_BODY_BYTES: int = 5 * 1024 * 1024
+
+# Agent code limits
+_MAX_AGENT_FILES: int = 10          # max .py files per submission
+_MAX_AGENT_FILE_BYTES: int = 50_000  # 50 KB per file
+
+# Nonce replay protection: track recently seen nonces
+_nonce_cache: set[str] = set()
+_nonce_timestamps: list[tuple[float, str]] = []  # (time, nonce)
+_nonce_lock = threading.Lock()
 
 # Current challenge and frontier (set by database neuron)
 _current_challenge = None
@@ -63,10 +77,9 @@ def set_pool(pool):
     _pool = pool
 
 
-def set_auth(metagraph, verify_fn=None):
-    global _auth_verify, _metagraph
+def set_auth(metagraph):
+    global _metagraph
     _metagraph = metagraph
-    _auth_verify = verify_fn
 
 
 def set_rate_limit(limit: int):
@@ -118,6 +131,32 @@ def _check_rate_limit(hotkey: str) -> bool:
         return True
 
 
+def _is_validator(hotkey: str) -> bool:
+    """Check if a hotkey belongs to a validator (has permit)."""
+    if not _metagraph:
+        return False
+    permits = _metagraph.validator_permit
+    hotkeys = _metagraph.hotkeys
+    if permits is None or hotkeys is None:
+        return False
+    for uid in range(_metagraph.n):
+        if uid < len(hotkeys) and hotkeys[uid] == hotkey:
+            return uid < len(permits) and bool(permits[uid])
+    return False
+
+
+def _check_ip_rate_limit(ip: str) -> bool:
+    """Pre-auth IP-based rate limit to mitigate unauthenticated floods."""
+    with _ip_rate_lock:
+        now = time.time()
+        window = _ip_rate_window[ip]
+        _ip_rate_window[ip] = [t for t in window if now - t < 60]
+        if len(_ip_rate_window[ip]) >= _IP_RATE_LIMIT:
+            return False
+        _ip_rate_window[ip].append(now)
+        return True
+
+
 class SearchRequest(BaseModel):
     query: str
 
@@ -143,10 +182,38 @@ class UpdateFrontierRequest(BaseModel):
     task: str = ""
 
 
+# Routes that only validators (hotkeys with permit) may call
+_VALIDATOR_ONLY_PREFIXES = ("/experiments/add", "/frontier/update", "/provenance/record")
+
+
+def _check_nonce(nonce: str) -> bool:
+    """Reject replayed nonces within the timestamp tolerance window."""
+    from shared.auth import EPISTULA_TIMESTAMP_TOLERANCE
+    with _nonce_lock:
+        now = time.time()
+        # Evict expired nonces
+        cutoff = now - EPISTULA_TIMESTAMP_TOLERANCE
+        while _nonce_timestamps and _nonce_timestamps[0][0] < cutoff:
+            _, old = _nonce_timestamps.pop(0)
+            _nonce_cache.discard(old)
+        # Check for replay
+        if nonce in _nonce_cache:
+            return False
+        _nonce_cache.add(nonce)
+        _nonce_timestamps.append((now, nonce))
+        return True
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Epistula auth on protected routes."""
+    """Epistula auth on protected routes with IP-level flood protection."""
+    # ── IP-level rate limit (pre-auth, blocks unauthenticated floods) ──
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_ip_rate_limit(client_ip):
+        return JSONResponse(status_code=429, content={"error": "Too many requests"})
+
     path = request.url.path
+
     needs_auth = (
         path.startswith("/experiments")
         or path.startswith("/challenge")
@@ -156,15 +223,51 @@ async def auth_middleware(request: Request, call_next):
         or path.startswith("/desearch")
         or path.startswith("/llm")
     )
-    if needs_auth and _auth_verify and _metagraph:
+    if needs_auth:
+        # ── Reject oversized bodies before reading fully ──
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > _MAX_BODY_BYTES:
+            return JSONResponse(
+                status_code=413, content={"error": "Request body too large"},
+            )
+
         body = await request.body()
-        from shared.auth import verify_request
-        ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
-        if not ok:
-            return JSONResponse(status_code=403, content={"error": err})
-        request.state.caller_hotkey = hotkey
-        if not _check_rate_limit(hotkey):
-            return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+        if len(body) > _MAX_BODY_BYTES:
+            return JSONResponse(
+                status_code=413, content={"error": "Request body too large"},
+            )
+
+        # ── Validator API key: trusted proxy, skip Epistula ──
+        from config import Config
+        if Config.DB_API_KEY:
+            import secrets as _secrets
+            provided = request.headers.get("X-Radar-API-Key", "")
+            if provided and _secrets.compare_digest(provided, Config.DB_API_KEY):
+                # Trusted validator proxy — rate-limit by IP instead of hotkey
+                if not _check_rate_limit(client_ip):
+                    return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+                response = await call_next(request)
+                return response
+
+        # ── Epistula auth: miners and validators without API key ──
+        if _metagraph:
+            from shared.auth import verify_request
+            ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
+            if not ok:
+                return JSONResponse(status_code=403, content={"error": err})
+
+            nonce = request.headers.get("x-epistula-nonce", "")
+            if nonce and not _check_nonce(nonce):
+                return JSONResponse(status_code=403, content={"error": "Replayed request"})
+
+            request.state.caller_hotkey = hotkey
+            if not _check_rate_limit(hotkey):
+                return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+
+            # ── Role enforcement ──
+            is_vali_route = any(path.startswith(p) for p in _VALIDATOR_ONLY_PREFIXES)
+            if is_vali_route and not _is_validator(hotkey):
+                return JSONResponse(status_code=403, content={"error": "Validators only"})
 
     response = await call_next(request)
     return response
@@ -394,6 +497,18 @@ async def submit_agent_code(request: Request, req: SubmitAgentCodeRequest):
 
     miner_uid = _hotkey_to_uid.get(hotkey, -1)
 
+    # ── Size limits ──
+    if len(req.files) > _MAX_AGENT_FILES:
+        return JSONResponse(status_code=400, content={
+            "error": f"Too many files ({len(req.files)}), max {_MAX_AGENT_FILES}",
+        })
+    for fname, code in req.files.items():
+        if len(code.encode()) > _MAX_AGENT_FILE_BYTES:
+            return JSONResponse(status_code=400, content={
+                "error": f"File {fname!r} too large ({len(code.encode())} bytes), "
+                         f"max {_MAX_AGENT_FILE_BYTES}",
+            })
+
     from shared.agent_code import compute_code_hash, validate_bundle
 
     bundle = {
@@ -401,7 +516,7 @@ async def submit_agent_code(request: Request, req: SubmitAgentCodeRequest):
         "entry_point": req.entry_point,
     }
 
-    # Validate
+    # Validate structure, syntax, entry point
     ok, err = validate_bundle(bundle)
     if not ok:
         return JSONResponse(status_code=400, content={"error": err})
