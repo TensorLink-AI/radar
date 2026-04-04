@@ -47,6 +47,15 @@ _IP_RATE_LIMIT: int = 120  # max requests per minute per IP (pre-auth)
 # Maximum request body size (5 MB) — reject oversized payloads early
 _MAX_BODY_BYTES: int = 5 * 1024 * 1024
 
+# Agent code limits
+_MAX_AGENT_FILES: int = 10          # max .py files per submission
+_MAX_AGENT_FILE_BYTES: int = 50_000  # 50 KB per file
+
+# Nonce replay protection: track recently seen nonces
+_nonce_cache: set[str] = set()
+_nonce_timestamps: list[tuple[float, str]] = []  # (time, nonce)
+_nonce_lock = threading.Lock()
+
 # Current challenge and frontier (set by database neuron)
 _current_challenge = None
 _current_frontier = None
@@ -126,6 +135,20 @@ def _check_rate_limit(hotkey: str) -> bool:
         return True
 
 
+def _is_validator(hotkey: str) -> bool:
+    """Check if a hotkey belongs to a validator (has permit)."""
+    if not _metagraph:
+        return False
+    permits = _metagraph.validator_permit
+    hotkeys = _metagraph.hotkeys
+    if permits is None or hotkeys is None:
+        return False
+    for uid in range(_metagraph.n):
+        if uid < len(hotkeys) and hotkeys[uid] == hotkey:
+            return uid < len(permits) and bool(permits[uid])
+    return False
+
+
 def _check_ip_rate_limit(ip: str) -> bool:
     """Pre-auth IP-based rate limit to mitigate unauthenticated floods."""
     with _ip_rate_lock:
@@ -161,6 +184,28 @@ class RecordContextRequest(BaseModel):
 class UpdateFrontierRequest(BaseModel):
     frontier: list[dict]
     task: str = ""
+
+
+# Routes that only validators (hotkeys with permit) may call
+_VALIDATOR_ONLY_PREFIXES = ("/experiments/add", "/frontier/update", "/provenance/record")
+
+
+def _check_nonce(nonce: str) -> bool:
+    """Reject replayed nonces within the timestamp tolerance window."""
+    from shared.auth import EPISTULA_TIMESTAMP_TOLERANCE
+    with _nonce_lock:
+        now = time.time()
+        # Evict expired nonces
+        cutoff = now - EPISTULA_TIMESTAMP_TOLERANCE
+        while _nonce_timestamps and _nonce_timestamps[0][0] < cutoff:
+            _, old = _nonce_timestamps.pop(0)
+            _nonce_cache.discard(old)
+        # Check for replay
+        if nonce in _nonce_cache:
+            return False
+        _nonce_cache.add(nonce)
+        _nonce_timestamps.append((now, nonce))
+        return True
 
 
 @app.middleware("http")
@@ -199,9 +244,20 @@ async def auth_middleware(request: Request, call_next):
         ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
         if not ok:
             return JSONResponse(status_code=403, content={"error": err})
+
+        # ── Nonce replay protection ──
+        nonce = request.headers.get("x-epistula-nonce", "")
+        if nonce and not _check_nonce(nonce):
+            return JSONResponse(status_code=403, content={"error": "Replayed request"})
+
         request.state.caller_hotkey = hotkey
         if not _check_rate_limit(hotkey):
             return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+
+        # ── Role enforcement ──
+        is_vali_route = any(path.startswith(p) for p in _VALIDATOR_ONLY_PREFIXES)
+        if is_vali_route and not _is_validator(hotkey):
+            return JSONResponse(status_code=403, content={"error": "Validators only"})
 
     response = await call_next(request)
     return response
@@ -431,6 +487,18 @@ async def submit_agent_code(request: Request, req: SubmitAgentCodeRequest):
 
     miner_uid = _hotkey_to_uid.get(hotkey, -1)
 
+    # ── Size limits ──
+    if len(req.files) > _MAX_AGENT_FILES:
+        return JSONResponse(status_code=400, content={
+            "error": f"Too many files ({len(req.files)}), max {_MAX_AGENT_FILES}",
+        })
+    for fname, code in req.files.items():
+        if len(code.encode()) > _MAX_AGENT_FILE_BYTES:
+            return JSONResponse(status_code=400, content={
+                "error": f"File {fname!r} too large ({len(code.encode())} bytes), "
+                         f"max {_MAX_AGENT_FILE_BYTES}",
+            })
+
     from shared.agent_code import compute_code_hash, validate_bundle
 
     bundle = {
@@ -438,7 +506,7 @@ async def submit_agent_code(request: Request, req: SubmitAgentCodeRequest):
         "entry_point": req.entry_point,
     }
 
-    # Validate
+    # Validate structure, syntax, entry point
     ok, err = validate_bundle(bundle)
     if not ok:
         return JSONResponse(status_code=400, content={"error": err})
