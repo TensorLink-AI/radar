@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import tempfile
 
 import pytest
@@ -80,14 +81,27 @@ class TestBuildAgentEnvVars:
 # ── _write_agent_code ────────────────────────────────────────────
 
 class TestWriteAgentCode:
-    def test_writes_file(self):
+    def test_writes_string(self):
         tmpdir = _write_agent_code("print('hello')")
         agent_path = os.path.join(tmpdir, "agent", "agent.py")
         assert os.path.exists(agent_path)
         with open(agent_path) as f:
             assert f.read() == "print('hello')"
-        # Cleanup
-        import shutil
+        shutil.rmtree(tmpdir)
+
+    def test_writes_bundle(self):
+        bundle = {
+            "files": {
+                "agent.py": "def design_architecture(c, cl): pass",
+                "helpers.py": "def foo(): pass",
+            },
+            "entry_point": "agent.py",
+        }
+        tmpdir = _write_agent_code(bundle)
+        assert os.path.exists(os.path.join(tmpdir, "agent", "agent.py"))
+        assert os.path.exists(os.path.join(tmpdir, "agent", "helpers.py"))
+        with open(os.path.join(tmpdir, "agent", "helpers.py")) as f:
+            assert f.read() == "def foo(): pass"
         shutil.rmtree(tmpdir)
 
 

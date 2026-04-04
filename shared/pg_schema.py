@@ -93,6 +93,22 @@ CREATE INDEX IF NOT EXISTS idx_cc_experiment ON code_components(experiment_id);
 CREATE INDEX IF NOT EXISTS idx_cc_component ON code_components(component);
 """
 
+AGENT_CODE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS agent_submissions (
+    id SERIAL PRIMARY KEY,
+    hotkey TEXT NOT NULL,
+    miner_uid INTEGER NOT NULL DEFAULT -1,
+    code_hash TEXT NOT NULL,
+    entry_point TEXT NOT NULL DEFAULT 'agent.py',
+    r2_key TEXT NOT NULL,
+    round_submitted INTEGER NOT NULL DEFAULT -1,
+    timestamp DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    UNIQUE(hotkey)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_hotkey ON agent_submissions(hotkey);
+CREATE INDEX IF NOT EXISTS idx_agent_hash ON agent_submissions(code_hash);
+"""
+
 ACCESS_LOG_SCHEMA = """
 CREATE TABLE IF NOT EXISTS miner_access_log (
     id SERIAL PRIMARY KEY,

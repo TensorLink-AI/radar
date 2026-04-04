@@ -111,16 +111,25 @@ def _build_agent_env_vars(allowed_urls: str = "") -> dict[str, str]:
     return env_vars
 
 
-def _write_agent_code(agent_code: str) -> str:
+def _write_agent_code(agent_code: dict | str) -> str:
     """Write miner's agent code to a temp dir for volume-mounting.
 
-    Returns the temp directory path containing agent/agent.py.
+    Accepts either a bundle dict (``{"files": {"agent.py": "..."}, ...}``)
+    or a single string (written as ``agent.py``).
+
+    Returns the temp directory path containing agent/*.py.
     """
     tmpdir = tempfile.mkdtemp(prefix="radar_agent_")
     agent_dir = os.path.join(tmpdir, "agent")
     os.makedirs(agent_dir, exist_ok=True)
-    with open(os.path.join(agent_dir, "agent.py"), "w") as f:
-        f.write(agent_code)
+
+    if isinstance(agent_code, dict) and "files" in agent_code:
+        for filename, code in agent_code["files"].items():
+            with open(os.path.join(agent_dir, filename), "w") as f:
+                f.write(code)
+    else:
+        with open(os.path.join(agent_dir, "agent.py"), "w") as f:
+            f.write(str(agent_code))
     return tmpdir
 
 
@@ -137,31 +146,25 @@ def _inject_allowed_urls_into_challenge(
 
 
 async def launch_agent_pod(
-    image_url: str,
+    image_url: str = "",
     mode: Optional[str] = None,
     mem_limit: str = "8192Mi",
-    miner_hosted_url: Optional[str] = None,
-    agent_code: Optional[str] = None,
+    agent_code: dict | str = "",
     allowed_urls: str = "",
 ):
     """
-    Launch a miner's agent pod via affinetes.
+    Launch a sandboxed agent pod via affinetes.
 
-    When *agent_code* is provided the pod uses the official agent image
-    and the miner's .py code is volume-mounted into /workspace/agent/.
-    This is the secure path — the miner never controls the image.
-
-    When *agent_code* is ``None`` the legacy path is used (miner's own
-    Docker image).  This will be removed once all miners migrate to
-    code-only submissions.
+    Uses the official agent image (subnet-owner controlled).  The miner's
+    .py files are volume-mounted into /workspace/agent/.  A URL allowlist
+    restricts which endpoints the agent can reach.
 
     Args:
-        image_url: Docker image (official agent image, or legacy miner image).
-        mode: "docker", "basilica", or "url".
+        image_url: Override official image (testing only).
+        mode: "docker" or "basilica".
         mem_limit: Memory limit for the container.
-        miner_hosted_url: Connect to miner-hosted pod (future mode).
-        agent_code: Miner's agent .py source code. When set, uses
-            official image + code injection.
+        agent_code: Bundle dict (``{"files": {...}, "entry_point": "..."}``),
+            or a single code string.
         allowed_urls: Comma-separated URL prefixes the agent may access.
 
     Returns: environment object with process_challenge() and cleanup()
@@ -169,44 +172,28 @@ async def launch_agent_pod(
     if mode is None:
         mode = get_mode()
 
-    if miner_hosted_url:
-        logger.info("Connecting to miner-hosted agent at %s", miner_hosted_url)
-        return _af().load_env(
-            mode="url",
-            base_url=miner_hosted_url,
-        )
+    from config import Config
+    official_image = image_url or Config.OFFICIAL_AGENT_IMAGE
 
-    if agent_code is not None:
-        # ── Secure path: official image + miner code injection ───
-        from config import Config
-        official_image = image_url or Config.OFFICIAL_AGENT_IMAGE
+    tmpdir = _write_agent_code(agent_code)
+    env_vars = _build_agent_env_vars(allowed_urls)
 
-        tmpdir = _write_agent_code(agent_code)
-        env_vars = _build_agent_env_vars(allowed_urls)
+    # Tell the harness which file is the entry point
+    if isinstance(agent_code, dict):
+        entry = agent_code.get("entry_point", "agent.py")
+        env_vars["AGENT_MODULE"] = f"/workspace/agent/{entry}"
 
-        logger.info(
-            "Launching sandboxed agent pod: image=%s mode=%s allowed_urls=%d prefixes",
-            official_image, mode, len(allowed_urls.split(",")) if allowed_urls else 0,
-        )
-        return _af().load_env(
-            image=official_image,
-            mode=mode,
-            env_vars=env_vars,
-            mem_limit=mem_limit,
-            cleanup=True,
-            volumes={f"{tmpdir}/agent": "/workspace/agent"},
-        )
-
-    # ── Legacy path: miner's own Docker image (no URL gating) ────
-    logger.warning(
-        "Launching LEGACY agent pod (miner-controlled image): %s", image_url,
+    logger.info(
+        "Launching sandboxed agent pod: image=%s mode=%s allowed_urls=%d prefixes",
+        official_image, mode, len(allowed_urls.split(",")) if allowed_urls else 0,
     )
     return _af().load_env(
-        image=image_url,
+        image=official_image,
         mode=mode,
-        env_vars=_build_env_vars(),
+        env_vars=env_vars,
         mem_limit=mem_limit,
         cleanup=True,
+        volumes={f"{tmpdir}/agent": "/workspace/agent"},
     )
 
 

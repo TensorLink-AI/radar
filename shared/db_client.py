@@ -134,6 +134,10 @@ class DatabaseClient:
         """GET diff for an experiment vs its parent."""
         return await self._get(f"/experiments/{index}/diff")
 
+    async def get_agent_code(self, hotkey: str) -> Optional[dict]:
+        """GET a miner's agent code bundle from the DB server."""
+        return await self._get(f"/agent_code/{hotkey}")
+
     async def close(self):
         """Close the underlying HTTP client."""
         if self._client and not self._client.is_closed:

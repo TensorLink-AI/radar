@@ -96,6 +96,7 @@ async def auth_middleware(request: Request, call_next):
         or path.startswith("/challenge")
         or path.startswith("/frontier")
         or path.startswith("/provenance")
+        or path.startswith("/agent_code")
     )
 
     if needs_auth and _metagraph:
@@ -207,3 +208,18 @@ async def proxy_experiments(request: Request, path: str):
 @app.api_route("/provenance/{path:path}", methods=["GET", "POST"])
 async def proxy_provenance(request: Request, path: str):
     return await _proxy_request(request, f"/provenance/{path}")
+
+
+@app.post("/agent_code")
+async def proxy_submit_agent_code(request: Request):
+    return await _proxy_request(request, "/agent_code")
+
+
+@app.get("/agent_code/{hotkey}")
+async def proxy_get_agent_code(request: Request, hotkey: str):
+    return await _proxy_request(request, f"/agent_code/{hotkey}")
+
+
+@app.get("/agent_code/{hotkey}/meta")
+async def proxy_get_agent_code_meta(request: Request, hotkey: str):
+    return await _proxy_request(request, f"/agent_code/{hotkey}/meta")

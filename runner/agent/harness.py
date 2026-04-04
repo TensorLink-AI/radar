@@ -136,6 +136,11 @@ def main():
         print(json.dumps({"error": f"Agent module not found: {agent_path}"}))
         sys.exit(1)
 
+    # Add agent dir to sys.path so inter-file imports work
+    agent_dir = os.path.dirname(agent_path)
+    if agent_dir not in sys.path:
+        sys.path.insert(0, agent_dir)
+
     try:
         agent_mod = _load_agent(agent_path)
     except Exception as e:

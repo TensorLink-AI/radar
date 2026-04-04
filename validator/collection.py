@@ -1,9 +1,9 @@
 """Phase A: run miner agents and collect architecture proposals.
 
-Validators launch the OFFICIAL agent image with miner code injected,
-send challenges, collect proposals.  Work-split across validators —
-each runs a subset.  Proposals uploaded to R2 so all validators see
-all submissions.
+Validators fetch miner agent code from the DB server, inject it into
+the OFFICIAL agent image, send challenges, collect proposals.
+Work-split across validators — each runs a subset.
+Proposals uploaded to R2 so all validators see all submissions.
 
 Agent stderr (reasoning trace) is captured and stored alongside proposals.
 """
@@ -17,12 +17,14 @@ import logging
 from typing import Optional
 
 from config import Config
+from shared.agent_code import compute_code_hash, validate_bundle
 from shared.artifacts import generate_scratchpad_urls
-from shared.commitment import ImageCommitment, pull_and_verify_image
+from shared.commitment import ImageCommitment
+from shared.db_client import DatabaseClient
 from shared.protocol import Proposal
 from shared.url_gate import parse_allowed_urls
 from validator.pod_manager import (
-    get_mode, launch_agent_pod, pre_validate_agent_code, run_agent_on_pod,
+    launch_agent_pod, pre_validate_agent_code, run_agent_on_pod,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,43 +59,61 @@ def _build_allowed_urls(challenge_json: str) -> str:
     from the challenge (validator proxy, desearch proxy).
     """
     prefixes: list[str] = parse_allowed_urls(Config.AGENT_ALLOWED_URLS)
-
-    # Add validator-provided URLs from the challenge
     try:
         data = json.loads(challenge_json)
         for key in ("db_url", "desearch_url"):
             url = data.get(key, "")
             if url:
-                # Allow the base URL (e.g. "http://localhost:8080/")
                 base = url.rstrip("/") + "/"
                 if base not in prefixes:
                     prefixes.append(base)
     except (json.JSONDecodeError, TypeError):
         pass
-
     return ",".join(prefixes)
 
 
-def _fetch_agent_code(commitment: ImageCommitment, r2) -> Optional[str]:
-    """Retrieve the miner's agent code from R2 or commitment.
+async def _fetch_agent_bundle(
+    db_client: DatabaseClient,
+    commitment: ImageCommitment,
+) -> Optional[dict]:
+    """Fetch a miner's agent code bundle from the DB server.
 
-    Miners commit their agent code to R2 at:
-        agents/{hotkey}/agent.py
-
-    Falls back to pulling the miner's Docker image (legacy path) if
-    no agent code is available.
-
-    Returns agent code string, or None if unavailable.
+    Verifies the code_hash against the on-chain commitment.
+    Returns the validated bundle dict or None.
     """
     if not commitment.hotkey:
         return None
-    try:
-        data = r2.download_json(f"agents/{commitment.hotkey}/agent.json")
-        if data and "code" in data:
-            return data["code"]
-    except Exception:
-        pass
-    return None
+
+    bundle = await db_client.get_agent_code(commitment.hotkey)
+    if not bundle or "files" not in bundle:
+        logger.warning(
+            "No agent code found for %s (uid=%d)",
+            commitment.hotkey[:16], commitment.miner_uid,
+        )
+        return None
+
+    # Validate bundle structure
+    ok, err = validate_bundle(bundle)
+    if not ok:
+        logger.warning(
+            "UID %d agent bundle validation failed: %s",
+            commitment.miner_uid, err,
+        )
+        return None
+
+    # Verify code hash matches on-chain commitment
+    if commitment.code_hash:
+        actual_hash = compute_code_hash(bundle["files"])
+        if actual_hash != commitment.code_hash:
+            logger.warning(
+                "UID %d code hash mismatch: on-chain=%s actual=%s",
+                commitment.miner_uid,
+                commitment.code_hash[:24],
+                actual_hash[:24],
+            )
+            return None
+
+    return bundle
 
 
 async def _run_single_agent(
@@ -103,46 +123,25 @@ async def _run_single_agent(
     r2,
     round_id: int,
     allowed_urls: str,
+    bundle: dict,
 ) -> tuple[Optional[Proposal], str]:
     """Run a single miner agent and return (proposal, agent_log) or (None, "")."""
-    # Try to get miner's agent code for sandboxed execution
-    agent_code = _fetch_agent_code(commitment, r2)
-
     miner_challenge_json = _attach_scratchpad_urls(
         challenge_json, r2, commitment.hotkey,
     )
 
-    if agent_code is not None:
-        # ── Secure path: official image + miner code injection ───
-        ok, err = pre_validate_agent_code(agent_code)
-        if not ok:
-            logger.warning("UID %d: agent code validation failed: %s", uid, err)
-            return None, ""
-
-        agent_env = await launch_agent_pod(
-            image_url=Config.OFFICIAL_AGENT_IMAGE,
-            mem_limit="8192Mi",
-            agent_code=agent_code,
-            allowed_urls=allowed_urls,
-        )
-    else:
-        # ── Legacy path: miner's Docker image (will be deprecated) ─
-        if not commitment.image_url:
-            return None, ""
-        if not pull_and_verify_image(commitment):
-            logger.warning("UID %d: image verification failed", uid)
-            return None, ""
-
-        agent_env = await launch_agent_pod(
-            image_url=commitment.image_url,
-            mem_limit="8192Mi",
-        )
+    agent_env = await launch_agent_pod(
+        image_url=Config.OFFICIAL_AGENT_IMAGE,
+        mem_limit="8192Mi",
+        agent_code=bundle,
+        allowed_urls=allowed_urls,
+    )
 
     try:
         result = await run_agent_on_pod(
             agent_env, miner_challenge_json,
             timeout=Config.AGENT_TIMEOUT,
-            allowed_urls=allowed_urls if agent_code is not None else "",
+            allowed_urls=allowed_urls,
         )
         if result and isinstance(result, dict) and "code" in result:
             proposal = Proposal(
@@ -180,15 +179,17 @@ async def run_and_collect_agents(
     validator_uids: list[int],
     commitments: dict[int, ImageCommitment],
     get_my_assignments_fn,
+    db_client: Optional[DatabaseClient] = None,
 ) -> tuple[dict[int, Proposal], dict[int, str]]:
     """Phase A: run assigned miner agents, upload proposals to R2, read all.
 
     1. Work-split: get_my_assignments() for which agents this validator runs
     2. For each assigned miner:
-       a. Fetch agent code from R2 (or fall back to Docker image)
-       b. launch_agent_pod() with official image + code injection
-       c. run_agent_on_pod() with challenge JSON + URL allowlist
-       d. Upload proposal + agent_log to R2: round_{id}/proposals/{uid}.json
+       a. Fetch agent code bundle from DB server
+       b. Verify code_hash against on-chain commitment
+       c. launch_agent_pod() with official image + code injection
+       d. run_agent_on_pod() with challenge JSON + URL allowlist
+       e. Upload proposal + agent_log to R2: round_{id}/proposals/{uid}.json
     3. Wait for other validators to upload
     4. Read all proposals from R2
     5. Dedup by code hash
@@ -202,16 +203,34 @@ async def run_and_collect_agents(
     # Build URL allowlist once for all agents this round
     allowed_urls = _build_allowed_urls(challenge_json)
 
-    # Run my assigned agents
-    proposals: dict[int, Proposal] = {}
-    agent_logs: dict[int, str] = {}
+    # Build DB client if not provided
+    if db_client is None:
+        db_client = DatabaseClient(Config.DB_API_URL, wallet)
+
+    # Pre-fetch all agent bundles for my assigned miners
+    bundles: dict[int, dict] = {}
     for uid in my_agent_uids:
         if uid not in commitments:
             continue
         commitment = commitments[uid]
         try:
+            bundle = await _fetch_agent_bundle(db_client, commitment)
+            if bundle:
+                bundles[uid] = bundle
+        except Exception as e:
+            logger.error("UID %d failed to fetch agent code: %s", uid, e)
+
+    # Run my assigned agents
+    proposals: dict[int, Proposal] = {}
+    agent_logs: dict[int, str] = {}
+    for uid in my_agent_uids:
+        if uid not in bundles:
+            continue
+        commitment = commitments[uid]
+        try:
             proposal, agent_log = await _run_single_agent(
-                uid, commitment, challenge_json, r2, round_id, allowed_urls,
+                uid, commitment, challenge_json, r2, round_id,
+                allowed_urls, bundles[uid],
             )
             if proposal:
                 proposals[uid] = proposal
@@ -223,7 +242,7 @@ async def run_and_collect_agents(
         "Ran %d agents, got %d proposals", len(my_agent_uids), len(proposals),
     )
 
-    # Poll R2 for other validators' proposals (replaces fixed sleep)
+    # Poll R2 for other validators' proposals
     expected_from_others = {
         uid for uid in all_uids
         if uid not in proposals and uid in commitments
@@ -260,7 +279,6 @@ async def run_and_collect_agents(
                 int(deadline - _time.monotonic()),
             )
     else:
-        # Single validator or no expected proposals — just try once
         for uid in all_uids:
             if uid in proposals:
                 continue
@@ -286,14 +304,18 @@ async def run_and_collect_agents(
     ]
     if missing_uids:
         logger.info(
-            "R2 sync missed %d proposals — running agents locally: %s",
+            "R2 sync missed %d proposals — fetching code + running locally: %s",
             len(missing_uids), missing_uids,
         )
         for uid in missing_uids:
             commitment = commitments[uid]
             try:
+                bundle = await _fetch_agent_bundle(db_client, commitment)
+                if not bundle:
+                    continue
                 proposal, agent_log = await _run_single_agent(
-                    uid, commitment, challenge_json, r2, round_id, allowed_urls,
+                    uid, commitment, challenge_json, r2, round_id,
+                    allowed_urls, bundle,
                 )
                 if proposal:
                     proposals[uid] = proposal
