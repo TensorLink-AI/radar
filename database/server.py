@@ -39,6 +39,14 @@ _rate_window: dict[str, list[float]] = defaultdict(list)
 _rate_lock = threading.Lock()
 _rate_limit: int = 60  # requests per minute per validator
 
+# IP-based rate limiter for unauthenticated / pre-auth flood protection
+_ip_rate_window: dict[str, list[float]] = defaultdict(list)
+_ip_rate_lock = threading.Lock()
+_IP_RATE_LIMIT: int = 120  # max requests per minute per IP (pre-auth)
+
+# Maximum request body size (5 MB) — reject oversized payloads early
+_MAX_BODY_BYTES: int = 5 * 1024 * 1024
+
 # Current challenge and frontier (set by database neuron)
 _current_challenge = None
 _current_frontier = None
@@ -118,6 +126,18 @@ def _check_rate_limit(hotkey: str) -> bool:
         return True
 
 
+def _check_ip_rate_limit(ip: str) -> bool:
+    """Pre-auth IP-based rate limit to mitigate unauthenticated floods."""
+    with _ip_rate_lock:
+        now = time.time()
+        window = _ip_rate_window[ip]
+        _ip_rate_window[ip] = [t for t in window if now - t < 60]
+        if len(_ip_rate_window[ip]) >= _IP_RATE_LIMIT:
+            return False
+        _ip_rate_window[ip].append(now)
+        return True
+
+
 class SearchRequest(BaseModel):
     query: str
 
@@ -145,7 +165,12 @@ class UpdateFrontierRequest(BaseModel):
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Epistula auth on protected routes."""
+    """Epistula auth on protected routes with IP-level flood protection."""
+    # ── IP-level rate limit (pre-auth, blocks unauthenticated floods) ──
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_ip_rate_limit(client_ip):
+        return JSONResponse(status_code=429, content={"error": "Too many requests"})
+
     path = request.url.path
     needs_auth = (
         path.startswith("/experiments")
@@ -157,7 +182,19 @@ async def auth_middleware(request: Request, call_next):
         or path.startswith("/llm")
     )
     if needs_auth and _auth_verify and _metagraph:
+        # ── Reject oversized bodies before reading fully ──
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > _MAX_BODY_BYTES:
+            return JSONResponse(
+                status_code=413, content={"error": "Request body too large"},
+            )
+
         body = await request.body()
+        if len(body) > _MAX_BODY_BYTES:
+            return JSONResponse(
+                status_code=413, content={"error": "Request body too large"},
+            )
+
         from shared.auth import verify_request
         ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
         if not ok:

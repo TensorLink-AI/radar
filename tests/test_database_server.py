@@ -15,6 +15,8 @@ from fastapi.testclient import TestClient
 from shared.database import DataElement
 from database.server import (
     app, set_db, set_challenge, set_frontier,
+    _ip_rate_window, _ip_rate_lock, _IP_RATE_LIMIT,
+    _check_ip_rate_limit,
 )
 
 
@@ -251,3 +253,20 @@ def test_record_context():
         "round_id": 1, "experiment_id": 0, "context_type": "frontier",
     })
     assert r.status_code == 200
+
+
+def test_ip_rate_limit():
+    """IP-based rate limiter blocks after threshold."""
+    test_ip = "10.99.99.99"
+    # Clear any state
+    with _ip_rate_lock:
+        _ip_rate_window.pop(test_ip, None)
+
+    for _ in range(_IP_RATE_LIMIT):
+        assert _check_ip_rate_limit(test_ip) is True
+    # Next request should be blocked
+    assert _check_ip_rate_limit(test_ip) is False
+
+    # Clean up
+    with _ip_rate_lock:
+        _ip_rate_window.pop(test_ip, None)
