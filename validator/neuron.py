@@ -145,7 +145,6 @@ class Validator:
             db_api_url=Config.DB_API_URL,
             wallet=self.wallet,
             metagraph=self.metagraph,
-            rate_limit=Config.PROXY_RATE_LIMIT,
         )
 
         logger.info(

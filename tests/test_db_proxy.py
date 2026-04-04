@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from validator.db_proxy import (
     app, set_config, set_metagraph, rotate_agent_token, get_agent_token,
     get_ready_trainers, clear_ready_trainers, _trainer_ready,
+    _check_rate_limit, _rate_window, _rate_lock,
 )
 
 
@@ -19,7 +20,7 @@ def _setup_proxy():
         db_api_url="http://fake-db:8090",
         wallet=None,
         metagraph=None,
-        rate_limit=100,
+        rate_limits={"db": 100, "desearch": 100, "llm": 100, "agent_code": 100},
     )
 
 
@@ -54,9 +55,39 @@ def test_proxy_no_db_url():
         db_api_url="",
         wallet=None,
         metagraph=None,
-        rate_limit=100,
+        rate_limits={"db": 100, "desearch": 100, "llm": 100, "agent_code": 100},
     )
     client = TestClient(app, raise_server_exceptions=False)
     r = client.get("/experiments/recent", headers=_auth_headers())
     # Should get 503 because db_api_url is empty
     assert r.status_code == 503
+
+
+def test_per_category_rate_limits():
+    """Each route category has an independent rate-limit bucket."""
+    # Set tight limits: 2 for db, 2 for llm
+    set_metagraph(None)
+    rotate_agent_token()
+    set_config(
+        db_api_url="http://fake-db:8090",
+        wallet=None,
+        metagraph=None,
+        rate_limits={"db": 2, "llm": 2, "desearch": 2, "agent_code": 2},
+    )
+    identity = "test-miner-99"
+    # Clear any existing state
+    with _rate_lock:
+        _rate_window.clear()
+
+    # Exhaust the "db" bucket
+    assert _check_rate_limit(identity, "db") is True
+    assert _check_rate_limit(identity, "db") is True
+    assert _check_rate_limit(identity, "db") is False  # blocked
+
+    # "llm" bucket should still be available
+    assert _check_rate_limit(identity, "llm") is True
+    assert _check_rate_limit(identity, "llm") is True
+    assert _check_rate_limit(identity, "llm") is False  # blocked
+
+    # "desearch" still independent
+    assert _check_rate_limit(identity, "desearch") is True

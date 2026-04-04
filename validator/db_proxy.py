@@ -75,19 +75,46 @@ _wallet = None
 _metagraph = None
 _client: Optional[httpx.AsyncClient] = None
 
-# Rate limiter: hotkey -> list of timestamps
+# Per-route-category rate limits (req/min per miner per category).
+# Each category gets its own independent bucket so heavy DB reads
+# don't starve LLM or search budgets.
+_CATEGORY_LIMITS: dict[str, int] = {
+    "db": 30,       # /experiments, /challenge, /frontier, /provenance
+    "desearch": 10, # /desearch
+    "llm": 15,      # /llm
+    "agent_code": 5,  # /agent_code
+}
+_DEFAULT_LIMIT: int = 20  # fallback for uncategorised routes
+
+# Rate limiter: "category:identity" -> list of timestamps
 _rate_window: dict[str, list[float]] = defaultdict(list)
 _rate_lock = threading.Lock()
-_rate_limit: int = 20
 
 
-def set_config(db_api_url: str, wallet, metagraph, rate_limit: int = 20):
-    """Configure the proxy at startup."""
-    global _db_api_url, _wallet, _metagraph, _rate_limit
+def _route_category(path: str) -> str:
+    """Map a request path to its rate-limit category."""
+    if path.startswith("/desearch"):
+        return "desearch"
+    if path.startswith("/llm"):
+        return "llm"
+    if path.startswith("/agent_code"):
+        return "agent_code"
+    # /experiments, /challenge, /frontier, /provenance all share "db"
+    return "db"
+
+
+def set_config(db_api_url: str, wallet, metagraph, rate_limits: dict[str, int] | None = None):
+    """Configure the proxy at startup.
+
+    ``rate_limits`` overrides per-category limits, e.g.
+    ``{"db": 40, "llm": 20}``.
+    """
+    global _db_api_url, _wallet, _metagraph
     _db_api_url = db_api_url.rstrip("/")
     _wallet = wallet
     _metagraph = metagraph
-    _rate_limit = rate_limit
+    if rate_limits:
+        _CATEGORY_LIMITS.update(rate_limits)
 
 
 def set_metagraph(metagraph):
@@ -103,14 +130,17 @@ async def _get_client() -> httpx.AsyncClient:
     return _client
 
 
-def _check_rate_limit(hotkey: str) -> bool:
+def _check_rate_limit(identity: str, category: str) -> bool:
+    """Check per-category rate limit for a given identity (hotkey or UID)."""
+    limit = _CATEGORY_LIMITS.get(category, _DEFAULT_LIMIT)
+    key = f"{category}:{identity}"
     with _rate_lock:
         now = time.time()
-        window = _rate_window[hotkey]
-        _rate_window[hotkey] = [t for t in window if now - t < 60]
-        if len(_rate_window[hotkey]) >= _rate_limit:
+        window = _rate_window[key]
+        _rate_window[key] = [t for t in window if now - t < 60]
+        if len(_rate_window[key]) >= limit:
             return False
-        _rate_window[hotkey].append(now)
+        _rate_window[key].append(now)
         return True
 
 
@@ -146,13 +176,17 @@ async def auth_middleware(request: Request, call_next):
     # Check if route needs Epistula-only auth
     needs_epistula = any(path.startswith(p) for p in _EPISTULA_ONLY_PREFIXES)
 
+    category = _route_category(path)
+
     if needs_agent_auth:
         # Agent token is the primary auth for pod requests
         if _verify_agent_token(request):
             # Rate-limit by miner UID (or shared "agent" key as fallback)
             rate_key = request.headers.get("X-Miner-UID", "agent-shared")
-            if not _check_rate_limit(f"agent:{rate_key}"):
-                return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+            if not _check_rate_limit(f"agent:{rate_key}", category):
+                return JSONResponse(status_code=429, content={
+                    "error": f"Rate limit exceeded for {category}",
+                })
             response = await call_next(request)
             return response
         # Fall back to Epistula for backward compat (miner neuron calls)
@@ -162,8 +196,10 @@ async def auth_middleware(request: Request, call_next):
             ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
             if ok:
                 request.state.miner_hotkey = hotkey
-                if not _check_rate_limit(hotkey):
-                    return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+                if not _check_rate_limit(hotkey, category):
+                    return JSONResponse(status_code=429, content={
+                        "error": f"Rate limit exceeded for {category}",
+                    })
                 response = await call_next(request)
                 return response
         return JSONResponse(status_code=403, content={"error": "Invalid agent token or signature"})
@@ -175,8 +211,10 @@ async def auth_middleware(request: Request, call_next):
         if not ok:
             return JSONResponse(status_code=403, content={"error": err})
         request.state.miner_hotkey = hotkey
-        if not _check_rate_limit(hotkey):
-            return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+        if not _check_rate_limit(hotkey, category):
+            return JSONResponse(status_code=429, content={
+                "error": f"Rate limit exceeded for {category}",
+            })
 
     response = await call_next(request)
     return response
