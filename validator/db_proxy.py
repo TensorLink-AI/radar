@@ -204,9 +204,6 @@ async def auth_middleware(request: Request, call_next):
 
     return JSONResponse(status_code=403, content={"error": "Invalid agent token or signature"})
 
-    response = await call_next(request)
-    return response
-
 
 async def _proxy_request(request: Request, path: str) -> Response:
     """Forward a request to the database server, signed with validator wallet."""

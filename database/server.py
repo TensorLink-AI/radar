@@ -8,7 +8,6 @@ Auth: Epistula verify, caller must be a validator.
 from __future__ import annotations
 
 import logging
-import re
 import threading
 import time
 from collections import defaultdict
@@ -18,7 +17,6 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from shared.access_logger import _extract_experiment_ids
 from shared.pg_access_logger import PgAccessLogger
 
 app = FastAPI(title="RADAR Experiment DB (Centralized)")
@@ -31,7 +29,6 @@ _r2 = None  # R2AuditLog (for agent code storage)
 _pool = None  # asyncpg pool (for agent_submissions table)
 
 # Auth middleware reference
-_auth_verify = None
 _metagraph = None
 
 # Rate limiter: hotkey -> list of timestamps
@@ -80,10 +77,9 @@ def set_pool(pool):
     _pool = pool
 
 
-def set_auth(metagraph, verify_fn=None):
-    global _auth_verify, _metagraph
+def set_auth(metagraph):
+    global _metagraph
     _metagraph = metagraph
-    _auth_verify = verify_fn
 
 
 def set_rate_limit(limit: int):

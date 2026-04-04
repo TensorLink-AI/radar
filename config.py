@@ -136,6 +136,6 @@ class Config:
     # ── Database Auth ─────────────────────────────────────────
     DB_VALI_RATE_LIMIT: int = int(os.getenv("RADAR_DB_VALI_RATE_LIMIT", "60"))
     # Shared subnet API key — lightweight gate before Epistula verification.
-    # Subnet owner generates once, distributes to validators + miners.
+    # Subnet owner generates once, distributes to validators for reverse proxy auth.
     # Empty string = disabled (open access, Epistula-only).
     DB_API_KEY: str = os.getenv("RADAR_DB_API_KEY", "")
