@@ -121,13 +121,19 @@ def main():
     allowed_prefixes = parse_allowed_urls(allowed_raw)
 
     # Always allow the validator proxy and scratchpad URLs passed in the challenge
-    for key in ("db_url", "desearch_url", "scratchpad_get_url", "scratchpad_put_url"):
+    for key in ("db_url", "desearch_url", "llm_url", "scratchpad_get_url", "scratchpad_put_url"):
         url = challenge.get(key, "")
         if url:
             # Allow the full URL as-is (presigned URLs are unique per request)
             allowed_prefixes.append(url)
 
-    client = GatedClient(allowed_prefixes)
+    # Inject agent token as default header so all proxy requests are authenticated
+    default_headers = {}
+    agent_token = challenge.get("agent_token", "")
+    if agent_token:
+        default_headers["X-Agent-Token"] = agent_token
+
+    client = GatedClient(allowed_prefixes, default_headers=default_headers)
     log(f"GatedClient initialised with {len(allowed_prefixes)} allowed prefixes")
 
     # 3. Load miner's agent module

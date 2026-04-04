@@ -6,20 +6,26 @@ import pytest
 from fastapi.testclient import TestClient
 
 from validator.db_proxy import (
-    app, set_config, set_metagraph,
+    app, set_config, set_metagraph, rotate_agent_token, get_agent_token,
     get_ready_trainers, clear_ready_trainers, _trainer_ready,
 )
 
 
 def _setup_proxy():
-    """Configure proxy with a fake upstream and no auth."""
+    """Configure proxy with a fake upstream, no Epistula auth, and a valid agent token."""
     set_metagraph(None)
+    rotate_agent_token()
     set_config(
         db_api_url="http://fake-db:8090",
         wallet=None,
         metagraph=None,
         rate_limit=100,
     )
+
+
+def _auth_headers() -> dict[str, str]:
+    """Return headers with a valid agent token."""
+    return {"X-Agent-Token": get_agent_token()}
 
 
 def test_health():
@@ -43,6 +49,7 @@ def test_ready_trainers_tracking():
 def test_proxy_no_db_url():
     """Without a DB API URL configured, proxy returns 503."""
     set_metagraph(None)
+    rotate_agent_token()
     set_config(
         db_api_url="",
         wallet=None,
@@ -50,6 +57,6 @@ def test_proxy_no_db_url():
         rate_limit=100,
     )
     client = TestClient(app, raise_server_exceptions=False)
-    r = client.get("/experiments/recent")
+    r = client.get("/experiments/recent", headers=_auth_headers())
     # Should get 503 because db_api_url is empty
     assert r.status_code == 503

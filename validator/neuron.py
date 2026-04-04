@@ -40,7 +40,7 @@ from validator.coordinator import (
 )
 from validator.db_proxy import (
     app as proxy_app, set_config as set_proxy_config, set_metagraph,
-    set_hotkey_map,
+    set_hotkey_map, rotate_agent_token,
 )
 from validator.evaluator import evaluate_all_checkpoints
 from validator.pod_manager import pre_validate_code
@@ -145,6 +145,25 @@ class Validator:
             set_proxy(self.desearch_proxy)
             register_routes(proxy_app)
 
+        # LLM proxy (Chutes AI) — mounted on proxy app
+        self.llm_proxy = None
+        if Config.LLM_ENABLED:
+            from validator.llm_proxy import LLMProxy
+            from validator.llm_proxy import set_proxy as set_llm_proxy
+            from validator.llm_proxy import register_routes as register_llm_routes
+            allowed_models = [
+                m.strip() for m in Config.CHUTES_ALLOWED_MODELS.split(",")
+                if m.strip()
+            ]
+            self.llm_proxy = LLMProxy(
+                chutes_url=Config.CHUTES_API_URL,
+                chutes_api_key=Config.CHUTES_API_KEY,
+                allowed_models=allowed_models,
+                max_queries=Config.LLM_MAX_QUERIES,
+            )
+            set_llm_proxy(self.llm_proxy)
+            register_llm_routes(proxy_app)
+
         # Configure proxy
         set_proxy_config(
             db_api_url=Config.DB_API_URL,
@@ -239,6 +258,12 @@ class Validator:
         challenge.desearch_url = (
             f"http://localhost:{self.proxy_port}/desearch" if self.desearch_proxy else ""
         )
+        challenge.llm_url = (
+            f"http://localhost:{self.proxy_port}/llm" if self.llm_proxy else ""
+        )
+
+        # Rotate agent token for this round — agents use it to auth proxy requests
+        challenge.agent_token = rotate_agent_token()
 
         logger.info(
             "Round %d: size bucket [%d, %d], frontier points in range: %d",

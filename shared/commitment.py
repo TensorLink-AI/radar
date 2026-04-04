@@ -116,8 +116,8 @@ class ImageCommitment:
 
     @property
     def is_valid(self) -> bool:
-        """Basic validation: code_hash (or legacy image_url) and listener_url present."""
-        return bool(self.code_hash or self.image_url) and bool(self.listener_url)
+        """Basic validation: code_hash and listener_url present."""
+        return bool(self.code_hash) and bool(self.listener_url)
 
 
 def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, ImageCommitment]:
@@ -184,7 +184,7 @@ def _read_all_commitments(
             continue
         try:
             c = ImageCommitment.from_json(raw_text, miner_uid=uid, hotkey=hotkey)
-            if c.code_hash or c.image_url:
+            if c.code_hash:
                 commitments[uid] = c
         except Exception as e:
             logger.debug("Bad commitment JSON for UID %d: %s", uid, e)
@@ -215,7 +215,7 @@ def _read_per_uid_commitments(
                 raw = decode_metadata(metadata)
                 if raw:
                     c = ImageCommitment.from_json(raw, miner_uid=uid, hotkey=hotkey)
-                    if c.code_hash or c.image_url:
+                    if c.code_hash:
                         commitments[uid] = c
             except Exception as e:
                 logger.debug("No commitment for UID %d: %s", uid, e)

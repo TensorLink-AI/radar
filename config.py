@@ -30,6 +30,18 @@ class Config:
     # Enable desearch proxy (set to "true" to enable)
     DESEARCH_ENABLED: bool = os.getenv("RADAR_DESEARCH_ENABLED", "false").lower() == "true"
 
+    # ── LLM Proxy (Chutes AI) ────────────────────────────────────────
+    # Chutes AI inference endpoint
+    CHUTES_API_URL: str = os.getenv("RADAR_CHUTES_API_URL", "https://chutes-api.com/v1")
+    # Chutes AI API key (subnet owner provides)
+    CHUTES_API_KEY: str = os.getenv("RADAR_CHUTES_API_KEY", "")
+    # Comma-separated list of allowed model names (empty = all)
+    CHUTES_ALLOWED_MODELS: str = os.getenv("RADAR_CHUTES_ALLOWED_MODELS", "")
+    # Max LLM queries per miner per tempo
+    LLM_MAX_QUERIES: int = int(os.getenv("RADAR_LLM_MAX_QUERIES", "50"))
+    # Enable LLM proxy (set to "true" to enable)
+    LLM_ENABLED: bool = os.getenv("RADAR_LLM_ENABLED", "false").lower() == "true"
+
     # ── Official Training Image ──────────────────────────────────────
     OFFICIAL_TRAINING_IMAGE: str = os.getenv("OFFICIAL_TRAINING_IMAGE", "ghcr.io/tensorlink-ai/radar/radar-runner:latest")
     OFFICIAL_TRAINING_IMAGE_DIGEST: str = os.getenv("OFFICIAL_TRAINING_IMAGE_DIGEST", "")

@@ -61,7 +61,7 @@ def _build_allowed_urls(challenge_json: str) -> str:
     prefixes: list[str] = parse_allowed_urls(Config.AGENT_ALLOWED_URLS)
     try:
         data = json.loads(challenge_json)
-        for key in ("db_url", "desearch_url"):
+        for key in ("db_url", "desearch_url", "llm_url"):
             url = data.get(key, "")
             if url:
                 base = url.rstrip("/") + "/"

@@ -92,9 +92,20 @@ class GatedClient:
     make HTTP calls.
     """
 
-    def __init__(self, allowed_prefixes: list[str], timeout: int = 30):
+    def __init__(
+        self,
+        allowed_prefixes: list[str],
+        default_headers: dict[str, str] | None = None,
+        timeout: int = 30,
+    ):
         self._allowed = allowed_prefixes
+        self._default_headers = default_headers or {}
         self._timeout = timeout
+
+    def _apply_headers(self, req) -> None:
+        """Apply default headers to a urllib Request."""
+        for k, v in self._default_headers.items():
+            req.add_header(k, v)
 
     def _check(self, url: str) -> None:
         if not check_url(url, self._allowed):
@@ -110,6 +121,7 @@ class GatedClient:
         self._check(url)
         import urllib.request
         req = urllib.request.Request(url, method="GET")
+        self._apply_headers(req)
         with urllib.request.urlopen(req, timeout=timeout or self._timeout) as resp:
             return resp.read()
 
@@ -125,6 +137,7 @@ class GatedClient:
             data = data.encode()
         req = urllib.request.Request(url, data=data, method="POST")
         req.add_header("Content-Type", "application/json")
+        self._apply_headers(req)
         with urllib.request.urlopen(req, timeout=timeout or self._timeout) as resp:
             return resp.read()
 
@@ -139,5 +152,6 @@ class GatedClient:
         import urllib.request
         req = urllib.request.Request(url, data=data, method="PUT")
         req.add_header("Content-Type", content_type)
+        self._apply_headers(req)
         with urllib.request.urlopen(req, timeout=timeout or self._timeout) as resp:
             return resp.status
