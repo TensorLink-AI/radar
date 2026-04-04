@@ -78,10 +78,10 @@ _client: Optional[httpx.AsyncClient] = None
 # Rate limiter: hotkey -> list of timestamps
 _rate_window: dict[str, list[float]] = defaultdict(list)
 _rate_lock = threading.Lock()
-_rate_limit: int = 10
+_rate_limit: int = 20
 
 
-def set_config(db_api_url: str, wallet, metagraph, rate_limit: int = 10):
+def set_config(db_api_url: str, wallet, metagraph, rate_limit: int = 20):
     """Configure the proxy at startup."""
     global _db_api_url, _wallet, _metagraph, _rate_limit
     _db_api_url = db_api_url.rstrip("/")
@@ -149,9 +149,10 @@ async def auth_middleware(request: Request, call_next):
     if needs_agent_auth:
         # Agent token is the primary auth for pod requests
         if _verify_agent_token(request):
-            # Rate-limit by token (all agents share one token per round,
-            # but individual rate limiting is done at the route level via
-            # X-Miner-UID header where applicable)
+            # Rate-limit by miner UID (or shared "agent" key as fallback)
+            rate_key = request.headers.get("X-Miner-UID", "agent-shared")
+            if not _check_rate_limit(f"agent:{rate_key}"):
+                return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
             response = await call_next(request)
             return response
         # Fall back to Epistula for backward compat (miner neuron calls)
