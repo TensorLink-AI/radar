@@ -272,12 +272,13 @@ class Validator:
         }
         set_hotkey_map(hotkey_map)
 
-        challenge.db_url = f"http://localhost:{self.db_port}"
+        base_url = Config.DB_API_URL or f"http://localhost:{self.db_port}"
+        challenge.db_url = base_url
         challenge.desearch_url = (
-            f"http://localhost:{self.db_port}/desearch" if self.desearch_proxy else ""
+            f"{base_url}/desearch" if self.desearch_proxy else ""
         )
         challenge.llm_url = (
-            f"http://localhost:{self.db_port}/llm" if self.llm_proxy else ""
+            f"{base_url}/llm" if self.llm_proxy else ""
         )
 
         # Set challenge on DB server for miners to query

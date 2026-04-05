@@ -70,5 +70,9 @@ class Config:
     EMA_ALPHA: float = float(os.getenv("RADAR_EMA_ALPHA", "0.3"))
     SOFTMAX_TEMPERATURE: float = float(os.getenv("RADAR_SOFTMAX_TEMP", "0.1"))
 
+    # ── External URLs (for miner agents on remote pods) ────────
+    DB_API_URL: str = os.getenv("RADAR_DB_API_URL", "")
+    VALIDATOR_EXTERNAL_URL: str = os.getenv("RADAR_VALIDATOR_EXTERNAL_URL", "")
+
     # ── Query API ────────────────────────────────────────────────
     QUERY_RATE_LIMIT: int = int(os.getenv("RADAR_QUERY_RATE_LIMIT", "10"))
