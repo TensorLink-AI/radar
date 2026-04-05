@@ -107,7 +107,7 @@ def _query_llm(client, challenge: dict, prompt: str, model: str = "") -> str:
         if available and not model:
             model = available[0]
         elif not model:
-            model = "deepseek-ai/DeepSeek-V3-0324"
+            model = "moonshotai/Kimi-K2.5-TEE"
 
         resp = client.post_json(
             f"{llm_url}/chat",
