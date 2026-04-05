@@ -137,6 +137,22 @@ class Validator:
             set_proxy(self.desearch_proxy)
             register_routes(db_app)
 
+        # LLM proxy
+        self.llm_proxy = None
+        if Config.LLM_ENABLED:
+            from validator.llm_proxy import LLMProxy
+            from validator.llm_proxy import set_proxy as set_llm_proxy
+            from validator.llm_proxy import register_routes as register_llm_routes
+            self.llm_proxy = LLMProxy(
+                provider=Config.LLM_PROVIDER,
+                model=Config.LLM_MODEL,
+                api_key=Config.LLM_API_KEY,
+                base_url=Config.LLM_BASE_URL,
+                max_requests=Config.LLM_MAX_REQUESTS,
+            )
+            set_llm_proxy(self.llm_proxy)
+            register_llm_routes(db_app)
+
         # Access logger — shares the same SQLite connection
         self.access_logger = AccessLogger(conn=self.db.conn)
         set_access_logger(self.access_logger)
@@ -256,9 +272,13 @@ class Validator:
         }
         set_hotkey_map(hotkey_map)
 
-        challenge.db_url = f"http://localhost:{self.db_port}"
+        base_url = Config.DB_API_URL or f"http://localhost:{self.db_port}"
+        challenge.db_url = base_url
         challenge.desearch_url = (
-            f"http://localhost:{self.db_port}/desearch" if self.desearch_proxy else ""
+            f"{base_url}/desearch" if self.desearch_proxy else ""
+        )
+        challenge.llm_url = (
+            f"{base_url}/llm" if self.llm_proxy else ""
         )
 
         # Set challenge on DB server for miners to query
@@ -603,6 +623,8 @@ def get_config() -> bt.Config:
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     config = get_config()
     validator = Validator(config)
     asyncio.run(validator.run())

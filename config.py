@@ -21,6 +21,12 @@ class Config:
 
     # ── LLM Configuration ──────────────────────────────────────────────
     LLM_MODEL_STRONG: str = os.getenv("RADAR_LLM_MODEL_STRONG", "o3")  # for planning
+    LLM_PROVIDER: str = os.getenv("RADAR_LLM_PROVIDER", "openai")
+    LLM_MODEL: str = os.getenv("RADAR_LLM_MODEL", "gpt-4.1")
+    LLM_BASE_URL: str = os.getenv("RADAR_LLM_BASE_URL", "") or os.getenv("RADAR_CHUTES_API_URL", "")
+    LLM_API_KEY: str = os.getenv("RADAR_LLM_API_KEY", "")
+    LLM_ENABLED: bool = os.getenv("RADAR_LLM_ENABLED", "false").lower() == "true"
+    LLM_MAX_REQUESTS: int = int(os.getenv("RADAR_LLM_MAX_REQUESTS", "50"))
 
     # ── Desearch Proxy ────────────────────────────────────────────────
     # SN22 Desearch endpoint URL
@@ -63,6 +69,10 @@ class Config:
     # ── Scoring ──────────────────────────────────────────────────
     EMA_ALPHA: float = float(os.getenv("RADAR_EMA_ALPHA", "0.3"))
     SOFTMAX_TEMPERATURE: float = float(os.getenv("RADAR_SOFTMAX_TEMP", "0.1"))
+
+    # ── External URLs (for miner agents on remote pods) ────────
+    DB_API_URL: str = os.getenv("RADAR_DB_API_URL", "")
+    VALIDATOR_EXTERNAL_URL: str = os.getenv("RADAR_VALIDATOR_EXTERNAL_URL", "")
 
     # ── Query API ────────────────────────────────────────────────
     QUERY_RATE_LIMIT: int = int(os.getenv("RADAR_QUERY_RATE_LIMIT", "10"))

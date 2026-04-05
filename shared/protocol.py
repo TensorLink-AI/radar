@@ -24,6 +24,7 @@ class Challenge:
     task: dict = field(default_factory=dict)
     db_url: str = ""
     desearch_url: str = ""
+    llm_url: str = ""
 
     # Pareto front filtered to this round's size bucket
     # Each entry: {code, metric, objectives} for frontier points in range
@@ -40,6 +41,7 @@ class Challenge:
             "task": self.task,
             "db_url": self.db_url,
             "desearch_url": self.desearch_url,
+            "llm_url": self.llm_url,
             "feasible_frontier": self.feasible_frontier,
         })
 
