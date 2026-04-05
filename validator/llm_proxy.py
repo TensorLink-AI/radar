@@ -85,6 +85,12 @@ class LLMProxy:
         self._query_counts: dict[int, list[float]] = defaultdict(list)
         self._client: Optional[httpx.AsyncClient] = None
 
+        # Circuit breaker: avoid hammering a dead upstream
+        self._consecutive_failures: int = 0
+        self._circuit_open_until: float = 0.0
+        self._CB_THRESHOLD = 3       # failures before opening circuit
+        self._CB_COOLDOWN = 60.0     # seconds to wait before retrying
+
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(timeout=60.0)
@@ -155,6 +161,15 @@ class LLMProxy:
             )
 
         self._validate_model(req.model)
+
+        # Circuit breaker: fail fast if upstream is known-broken
+        now = time.time()
+        if self._consecutive_failures >= self._CB_THRESHOLD and now < self._circuit_open_until:
+            raise HTTPException(
+                status_code=503,
+                detail="LLM upstream temporarily unavailable (circuit open)",
+            )
+
         self._record_query(miner_uid)
         remaining -= 1
 
@@ -180,11 +195,24 @@ class LLMProxy:
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPStatusError as e:
-            logger.warning("Chutes AI returned error: %s %s", e.response.status_code, e.response.text[:200])
+            self._consecutive_failures += 1
+            self._circuit_open_until = time.time() + self._CB_COOLDOWN
+            logger.warning(
+                "Chutes AI error: %s %s (failures: %d)",
+                e.response.status_code, e.response.text[:200],
+                self._consecutive_failures,
+            )
             raise HTTPException(status_code=502, detail="LLM upstream error")
         except (httpx.RequestError, httpx.TimeoutException) as e:
-            logger.warning("Chutes AI request failed: %s", e)
+            self._consecutive_failures += 1
+            self._circuit_open_until = time.time() + self._CB_COOLDOWN
+            logger.warning(
+                "Chutes AI request failed: %s (failures: %d)",
+                e, self._consecutive_failures,
+            )
             raise HTTPException(status_code=502, detail="LLM upstream unreachable")
+
+        self._consecutive_failures = 0
 
         # Extract response content from OpenAI-compatible format
         content = ""
