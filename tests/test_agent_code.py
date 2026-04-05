@@ -100,7 +100,19 @@ class TestValidateBundle:
         }
         ok, err = validate_bundle(bundle)
         assert not ok
-        assert "no paths" in err.lower() or "Invalid" in err
+        assert "path traversal" in err.lower() or "Invalid" in err
+
+    def test_subdirectory_files_allowed(self):
+        bundle = {
+            "files": {
+                "agent.py": "from core.llm import query\ndef design_architecture(c, cl): pass",
+                "core/__init__.py": "",
+                "core/llm.py": "def query(): pass",
+            },
+            "entry_point": "agent.py",
+        }
+        ok, err = validate_bundle(bundle)
+        assert ok, err
 
     def test_non_py_blocked(self):
         bundle = {
@@ -150,6 +162,23 @@ class TestBundleFromDirectory:
                 f.write("x = 1")
             with pytest.raises(ValueError, match="Entry point"):
                 bundle_from_directory(d)
+
+    def test_loads_subdirectory_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "agent.py"), "w") as f:
+                f.write("from core.llm import query\ndef design_architecture(c, cl): pass")
+            core_dir = os.path.join(d, "core")
+            os.makedirs(core_dir)
+            with open(os.path.join(core_dir, "__init__.py"), "w") as f:
+                f.write("")
+            with open(os.path.join(core_dir, "llm.py"), "w") as f:
+                f.write("def query(): pass")
+
+            bundle = bundle_from_directory(d)
+            assert "agent.py" in bundle["files"]
+            assert "core/__init__.py" in bundle["files"]
+            assert "core/llm.py" in bundle["files"]
+            assert bundle["entry_point"] == "agent.py"
 
 
 # ── JSON round-trip ──────────────────────────────────────────────
