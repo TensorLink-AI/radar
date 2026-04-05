@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from validator.llm_proxy import LLMProxy, ChatRequest, ChatMessage
+from validator.llm_proxy import LLMProxy, ChatRequest, ChatMessage, ChatResponse
 
 
 def _make_request(model="gpt-4", content="Hello"):
@@ -84,3 +84,14 @@ class TestChatRequest:
     def test_empty_messages(self):
         with pytest.raises(Exception):
             ChatRequest(model="gpt-4", messages=[])
+
+
+class TestChatResponse:
+    def test_none_content_coerced(self):
+        """Chutes AI can return null content — ensure ChatResponse handles it."""
+        resp = ChatResponse(model="gpt-4", content="", remaining_queries=5)
+        assert resp.content == ""
+
+    def test_normal_content(self):
+        resp = ChatResponse(model="gpt-4", content="hello", remaining_queries=3)
+        assert resp.content == "hello"
