@@ -231,8 +231,17 @@ class LLMProxy:
                 self._circuit_open_until = time.time() + self._CB_COOLDOWN
                 logger.warning(
                     "Chutes AI request failed: %s (failures: %d)",
-                    e, self._consecutive_failures,
+                    e or type(e).__name__, self._consecutive_failures,
                 )
+                if attempt < max_retries:
+                    wait = backoff * (2 ** attempt)
+                    wait = min(wait, 30.0)
+                    logger.info(
+                        "Chutes AI connection error, retrying in %.1fs (attempt %d/%d)",
+                        wait, attempt + 1, max_retries,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
                 raise HTTPException(status_code=502, detail="LLM upstream unreachable")
         else:
             # All retries exhausted (only reachable for 429s)

@@ -133,6 +133,11 @@ async def _get_client() -> httpx.AsyncClient:
     return _client
 
 
+# Longer timeout for LLM requests — the database server forwards to
+# Chutes AI with a 60 s timeout, so the proxy must wait at least that long.
+_LLM_TIMEOUT = httpx.Timeout(90.0, connect=10.0)
+
+
 def _check_rate_limit(identity: str, category: str) -> bool:
     """Check per-category rate limit for a given identity (hotkey or UID)."""
     max_req, window_secs = _CATEGORY_LIMITS.get(category, _DEFAULT_LIMIT)
@@ -238,14 +243,21 @@ async def _proxy_request(request: Request, path: str) -> Response:
     if query:
         target += f"?{query}"
 
+    # LLM requests need a longer timeout because the DB server
+    # forwards to Chutes AI (up to 60 s per attempt with retries).
+    timeout = _LLM_TIMEOUT if path.startswith("/llm") else None
+
     try:
         if request.method == "GET":
-            resp = await client.get(target, headers=headers)
+            resp = await client.get(target, headers=headers, timeout=timeout)
         elif request.method == "POST":
-            resp = await client.post(target, content=body, headers=headers)
+            resp = await client.post(
+                target, content=body, headers=headers, timeout=timeout,
+            )
         else:
             resp = await client.request(
                 request.method, target, content=body, headers=headers,
+                timeout=timeout,
             )
         return Response(
             content=resp.content,
@@ -253,7 +265,7 @@ async def _proxy_request(request: Request, path: str) -> Response:
             media_type=resp.headers.get("content-type", "application/json"),
         )
     except (httpx.RequestError, httpx.TimeoutException) as e:
-        logger.warning("Proxy request to %s failed: %s", target, e)
+        logger.warning("Proxy request to %s failed: %s", target, e or type(e).__name__)
         raise HTTPException(status_code=502, detail="Database server unreachable")
 
 
