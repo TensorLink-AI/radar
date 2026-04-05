@@ -176,6 +176,34 @@ class Validator:
             if uid < len(permits) and permits[uid]
         ]
 
+    def _proxy_base_url(self) -> str:
+        """Return the externally-reachable base URL for the validator proxy.
+
+        Uses VALIDATOR_EXTERNAL_URL if set, but replaces the port with the
+        actual proxy port when they differ — the proxy hosts routes like
+        ``/trainer/ready`` that don't exist on the database server.
+        """
+        from urllib.parse import urlparse, urlunparse
+
+        ext = Config.VALIDATOR_EXTERNAL_URL.rstrip("/") if Config.VALIDATOR_EXTERNAL_URL else ""
+        if not ext:
+            return f"http://localhost:{self.proxy_port}"
+
+        parsed = urlparse(ext)
+        ext_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if ext_port != self.proxy_port:
+            logger.warning(
+                "VALIDATOR_EXTERNAL_URL port %d differs from proxy port %d — "
+                "rewriting to use proxy port (the proxy hosts /trainer/ready)",
+                ext_port, self.proxy_port,
+            )
+            # Replace port in netloc
+            host = parsed.hostname or "localhost"
+            new_netloc = f"{host}:{self.proxy_port}"
+            parsed = parsed._replace(netloc=new_netloc)
+            return urlunparse(parsed).rstrip("/")
+        return ext
+
     def start_proxy_server(self):
         """Start the reverse proxy server in a background thread."""
         def _run():
@@ -234,11 +262,7 @@ class Validator:
 
         challenge.feasible_frontier = feasible_frontier
 
-        proxy_base = (
-            Config.VALIDATOR_EXTERNAL_URL.rstrip("/")
-            if Config.VALIDATOR_EXTERNAL_URL
-            else f"http://localhost:{self.proxy_port}"
-        )
+        proxy_base = self._proxy_base_url()
         challenge.db_url = proxy_base
         challenge.desearch_url = (
             f"{proxy_base}/desearch" if self.desearch_enabled else ""
@@ -297,6 +321,7 @@ class Validator:
         for uid, proposal in submissions.items():
             ok, reason = pre_validate_code(proposal.code)
             if not ok:
+                logger.warning("UID %d proposal rejected: %s", uid, reason)
                 continue
             filtered[uid] = proposal
 
