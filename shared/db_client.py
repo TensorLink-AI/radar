@@ -49,6 +49,13 @@ class DatabaseClient:
             )
             resp.raise_for_status()
             return resp.json()
+        except httpx.HTTPStatusError as e:
+            detail = e.response.text[:500] if e.response else ""
+            logger.warning(
+                "DatabaseClient POST %s failed (HTTP %d): %s",
+                path, e.response.status_code, detail,
+            )
+            return None
         except Exception as e:
             logger.warning("DatabaseClient POST %s failed: %s", path, e)
             return None
@@ -63,6 +70,13 @@ class DatabaseClient:
             )
             resp.raise_for_status()
             return resp.json()
+        except httpx.HTTPStatusError as e:
+            detail = e.response.text[:500] if e.response else ""
+            logger.warning(
+                "DatabaseClient GET %s failed (HTTP %d): %s",
+                path, e.response.status_code, detail,
+            )
+            return None
         except Exception as e:
             logger.warning("DatabaseClient GET %s failed: %s", path, e)
             return None

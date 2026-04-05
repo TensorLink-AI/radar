@@ -76,7 +76,10 @@ def validate_bundle(bundle: dict) -> tuple[bool, str]:
     except SyntaxError as e:
         return False, f"Syntax error in {entry}: {e}"
 
-    func_names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    func_names = {
+        n.name for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
     if "design_architecture" not in func_names:
         return False, f"Entry point {entry} missing design_architecture()"
 
@@ -91,8 +94,11 @@ def bundle_from_directory(directory: str, entry_point: str = "agent.py") -> dict
     """
     import os
 
+    _SKIP_DIRS = {"__pycache__", ".git", ".venv", "venv", "node_modules", ".tox"}
+
     files: dict[str, str] = {}
-    for root, _dirs, filenames in os.walk(directory):
+    for root, dirs, filenames in os.walk(directory):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
         for name in sorted(filenames):
             if not name.endswith(".py"):
                 continue

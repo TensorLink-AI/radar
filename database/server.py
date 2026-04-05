@@ -45,7 +45,7 @@ _IP_RATE_LIMIT: int = 120  # max requests per minute per IP (pre-auth)
 _MAX_BODY_BYTES: int = 5 * 1024 * 1024
 
 # Agent code limits
-_MAX_AGENT_FILES: int = 10          # max .py files per submission
+_MAX_AGENT_FILES: int = 25          # max .py files per submission
 _MAX_AGENT_FILE_BYTES: int = 50_000  # 50 KB per file
 
 # Nonce replay protection: track recently seen nonces
