@@ -76,7 +76,10 @@ def validate_bundle(bundle: dict) -> tuple[bool, str]:
     except SyntaxError as e:
         return False, f"Syntax error in {entry}: {e}"
 
-    func_names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    func_names = {
+        n.name for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
     if "design_architecture" not in func_names:
         return False, f"Entry point {entry} missing design_architecture()"
 
