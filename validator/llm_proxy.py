@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 # Chutes AI inference endpoint
-DEFAULT_CHUTES_URL = "https://chutes-api.com/v1"
+DEFAULT_CHUTES_URL = "https://llm.chutes.ai/v1"
 
 # Rate limit: max LLM queries per miner per tempo
 MAX_QUERIES_PER_TEMPO = 50
@@ -190,6 +190,18 @@ class LLMProxy:
         last_error: Exception | None = None
 
         for attempt in range(max_retries + 1):
+            # Check circuit breaker before each attempt (not just first call)
+            now = time.time()
+            if (
+                attempt > 0
+                and self._consecutive_failures >= self._CB_THRESHOLD
+                and now < self._circuit_open_until
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail="LLM upstream temporarily unavailable (circuit open)",
+                )
+
             try:
                 client = await self._get_client()
                 resp = await client.post(
@@ -227,21 +239,23 @@ class LLMProxy:
                 raise HTTPException(status_code=502, detail="LLM upstream error")
             except (httpx.RequestError, httpx.TimeoutException) as e:
                 last_error = e
-                self._consecutive_failures += 1
-                self._circuit_open_until = time.time() + self._CB_COOLDOWN
-                logger.warning(
-                    "Chutes AI request failed: %s (failures: %d)",
-                    e or type(e).__name__, self._consecutive_failures,
-                )
+                err_desc = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
                 if attempt < max_retries:
                     wait = backoff * (2 ** attempt)
                     wait = min(wait, 30.0)
                     logger.info(
-                        "Chutes AI connection error, retrying in %.1fs (attempt %d/%d)",
-                        wait, attempt + 1, max_retries,
+                        "Chutes AI connection error (%s), retrying in %.1fs (attempt %d/%d)",
+                        err_desc, wait, attempt + 1, max_retries,
                     )
                     await asyncio.sleep(wait)
                     continue
+                # All retries exhausted — record failure once per request
+                self._consecutive_failures += 1
+                self._circuit_open_until = time.time() + self._CB_COOLDOWN
+                logger.warning(
+                    "Chutes AI request failed: %s (failures: %d)",
+                    err_desc, self._consecutive_failures,
+                )
                 raise HTTPException(status_code=502, detail="LLM upstream unreachable")
         else:
             # All retries exhausted (only reachable for 429s)

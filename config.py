@@ -32,7 +32,7 @@ class Config:
 
     # ── LLM Proxy (Chutes AI) ────────────────────────────────────────
     # Chutes AI inference endpoint
-    CHUTES_API_URL: str = os.getenv("RADAR_CHUTES_API_URL", "https://chutes-api.com/v1")
+    CHUTES_API_URL: str = os.getenv("RADAR_CHUTES_API_URL", "https://llm.chutes.ai/v1")
     # Chutes AI API key (subnet owner provides)
     CHUTES_API_KEY: str = os.getenv("RADAR_CHUTES_API_KEY", "")
     # Comma-separated list of allowed model names (empty = all)
