@@ -21,6 +21,12 @@ class Config:
 
     # ── LLM Configuration ──────────────────────────────────────────────
     LLM_MODEL_STRONG: str = os.getenv("RADAR_LLM_MODEL_STRONG", "o3")  # for planning
+    LLM_PROVIDER: str = os.getenv("RADAR_LLM_PROVIDER", "openai")
+    LLM_MODEL: str = os.getenv("RADAR_LLM_MODEL", "gpt-4.1")
+    LLM_BASE_URL: str = os.getenv("RADAR_LLM_BASE_URL", "") or os.getenv("RADAR_CHUTES_API_URL", "")
+    LLM_API_KEY: str = os.getenv("RADAR_LLM_API_KEY", "")
+    LLM_ENABLED: bool = os.getenv("RADAR_LLM_ENABLED", "false").lower() == "true"
+    LLM_MAX_REQUESTS: int = int(os.getenv("RADAR_LLM_MAX_REQUESTS", "50"))
 
     # ── Desearch Proxy ────────────────────────────────────────────────
     # SN22 Desearch endpoint URL
