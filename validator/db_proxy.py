@@ -223,10 +223,14 @@ async def _proxy_request(request: Request, path: str) -> Response:
         headers["Content-Type"] = request.headers.get("content-type", "application/json")
 
     # Forward miner identity headers (used by LLM/desearch proxies on DB server)
+    # Agent pods don't know their UID, so inject a fallback for routes that
+    # require X-Miner-UID (e.g. /llm/chat rate limiting on the DB server).
     for fwd_header in ("X-Miner-UID", "X-Miner-Hotkey"):
         val = request.headers.get(fwd_header, "")
         if val:
             headers[fwd_header] = val
+    if "X-Miner-UID" not in headers:
+        headers["X-Miner-UID"] = "0"
 
     # Build target URL with query string
     target = f"{_db_api_url}{path}"
