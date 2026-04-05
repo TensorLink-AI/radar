@@ -251,7 +251,7 @@ class LLMProxy:
         choices = data.get("choices", [])
         if choices:
             msg = choices[0].get("message", {})
-            content = msg.get("content", "")
+            content = msg.get("content") or ""
 
         usage = data.get("usage", {})
         tokens = usage.get("total_tokens", 0)
