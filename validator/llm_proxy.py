@@ -216,27 +216,31 @@ class LLMProxy:
             except httpx.HTTPStatusError as e:
                 last_error = e
                 status = e.response.status_code
-                if status == 429 and attempt < max_retries:
-                    # Respect Retry-After header, else use exponential backoff
+                if status in (429, 502, 503) and attempt < max_retries:
+                    # Retryable: rate limit, bad gateway, service unavailable
                     retry_after = e.response.headers.get("Retry-After")
                     wait = float(retry_after) if retry_after else backoff * (2 ** attempt)
                     wait = min(wait, 30.0)
                     logger.info(
-                        "Chutes AI 429, retrying in %.1fs (attempt %d/%d)",
-                        wait, attempt + 1, max_retries,
+                        "Chutes AI %s, retrying in %.1fs (attempt %d/%d)",
+                        status, wait, attempt + 1, max_retries,
                     )
                     await asyncio.sleep(wait)
                     continue
                 # Non-retryable status or exhausted retries
                 self._consecutive_failures += 1
-                cooldown = self._CB_COOLDOWN * 2 if status == 429 else self._CB_COOLDOWN
+                cooldown = self._CB_COOLDOWN * 2 if status in (429, 503) else self._CB_COOLDOWN
                 self._circuit_open_until = time.time() + cooldown
+                detail = e.response.text[:200] if e.response.text else ""
                 logger.warning(
                     "Chutes AI error: %s %s (failures: %d)",
-                    status, e.response.text[:200],
+                    status, detail,
                     self._consecutive_failures,
                 )
-                raise HTTPException(status_code=502, detail="LLM upstream error")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"LLM upstream error: {status} {detail}".strip(),
+                )
             except (httpx.RequestError, httpx.TimeoutException) as e:
                 last_error = e
                 err_desc = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
@@ -258,14 +262,15 @@ class LLMProxy:
                 )
                 raise HTTPException(status_code=502, detail="LLM upstream unreachable")
         else:
-            # All retries exhausted (only reachable for 429s)
+            # All retries exhausted (reachable for 429/502/503)
             self._consecutive_failures += 1
             self._circuit_open_until = time.time() + self._CB_COOLDOWN * 2
+            status_code = last_error.response.status_code if isinstance(last_error, httpx.HTTPStatusError) else "?"
             logger.warning(
-                "Chutes AI 429 after %d retries (failures: %d)",
-                max_retries, self._consecutive_failures,
+                "Chutes AI %s after %d retries (failures: %d)",
+                status_code, max_retries, self._consecutive_failures,
             )
-            raise HTTPException(status_code=502, detail="LLM upstream rate limited")
+            raise HTTPException(status_code=502, detail=f"LLM upstream error ({status_code}) after retries")
 
         self._consecutive_failures = 0
 
