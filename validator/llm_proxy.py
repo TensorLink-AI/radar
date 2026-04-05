@@ -275,11 +275,13 @@ class LLMProxy:
         self._consecutive_failures = 0
 
         # Extract response content from OpenAI-compatible format
+        # Reasoning models (e.g. Kimi-K2.5) may return content=null with
+        # reasoning_content instead, so fall back to that.
         content = ""
         choices = data.get("choices", [])
         if choices:
             msg = choices[0].get("message", {})
-            content = msg.get("content") or ""
+            content = msg.get("content") or msg.get("reasoning_content") or ""
 
         usage = data.get("usage", {})
         tokens = usage.get("total_tokens", 0)
