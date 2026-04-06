@@ -268,43 +268,69 @@ async def _proxy_request(request: Request, path: str) -> Response:
     if is_stream_request:
         return await _proxy_stream(client, target, body, headers, timeout)
 
-    try:
-        if request.method == "GET":
-            resp = await client.get(target, headers=headers, timeout=timeout)
-        elif request.method == "POST":
-            resp = await client.post(target, content=body, headers=headers,
-                                     timeout=timeout)
-        else:
-            resp = await client.request(request.method, target, content=body,
-                                        headers=headers, timeout=timeout)
-        # For error responses, ensure the body is always valid JSON so
-        # downstream clients (GatedClient.get_json / post_json) can parse it.
-        if resp.status_code >= 400:
-            ct = resp.headers.get("content-type", "")
-            if "json" in ct:
-                return Response(
-                    content=resp.content,
-                    status_code=resp.status_code,
-                    media_type="application/json",
+    is_llm = path.startswith("/llm")
+    max_retries = 2 if is_llm else 0
+
+    for attempt in range(1 + max_retries):
+        try:
+            if request.method == "GET":
+                resp = await client.get(target, headers=headers, timeout=timeout)
+            elif request.method == "POST":
+                resp = await client.post(target, content=body, headers=headers,
+                                         timeout=timeout)
+            else:
+                resp = await client.request(request.method, target, content=body,
+                                            headers=headers, timeout=timeout)
+
+            # Retry transient upstream errors for LLM requests
+            if resp.status_code in (502, 503) and attempt < max_retries:
+                import asyncio as _aio
+                wait = 2.0 * (attempt + 1)
+                logger.warning(
+                    "Proxy %s returned %d — retry %.0fs (%d/%d)",
+                    target, resp.status_code, wait, attempt + 1, max_retries,
                 )
-            # Non-JSON error body — wrap it in a JSON envelope
-            import json as _json
-            body_text = resp.content.decode(errors="replace")[:500]
-            return JSONResponse(
+                await _aio.sleep(wait)
+                continue
+
+            # For error responses, ensure the body is always valid JSON so
+            # downstream clients (GatedClient.get_json / post_json) can parse it.
+            if resp.status_code >= 400:
+                ct = resp.headers.get("content-type", "")
+                if "json" in ct:
+                    return Response(
+                        content=resp.content,
+                        status_code=resp.status_code,
+                        media_type="application/json",
+                    )
+                # Non-JSON error body — wrap it in a JSON envelope
+                import json as _json
+                body_text = resp.content.decode(errors="replace")[:500]
+                return JSONResponse(
+                    status_code=resp.status_code,
+                    content={"error": body_text or "Unknown error"},
+                )
+            return Response(
+                content=resp.content,
                 status_code=resp.status_code,
-                content={"error": body_text or "Unknown error"},
+                media_type=resp.headers.get("content-type", "application/json"),
             )
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "application/json"),
-        )
-    except (httpx.RequestError, httpx.TimeoutException) as e:
-        logger.warning("Proxy request to %s failed: %s", target, e or type(e).__name__)
-        return JSONResponse(
-            status_code=502,
-            content={"error": "Database server unreachable"},
-        )
+        except (httpx.RequestError, httpx.TimeoutException) as e:
+            if attempt < max_retries:
+                import asyncio as _aio
+                wait = 2.0 * (attempt + 1)
+                logger.warning(
+                    "Proxy request to %s failed: %s — retry %.0fs (%d/%d)",
+                    target, e or type(e).__name__, wait,
+                    attempt + 1, max_retries,
+                )
+                await _aio.sleep(wait)
+                continue
+            logger.warning("Proxy request to %s failed: %s", target, e or type(e).__name__)
+            return JSONResponse(
+                status_code=502,
+                content={"error": "Database server unreachable"},
+            )
 
 
 async def _proxy_stream(
