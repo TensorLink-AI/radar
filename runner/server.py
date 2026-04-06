@@ -12,12 +12,29 @@ import logging
 import os
 import threading
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
-app = FastAPI(title="Radar Trainer")
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Preload metagraph at startup so /train doesn't block on first request."""
+    localnet = os.getenv("RADAR_LOCALNET", "").lower() in ("1", "true")
+    if not localnet:
+        logger.info("Preloading metagraph at startup...")
+        mg = await asyncio.to_thread(_load_metagraph)
+        if mg is not None:
+            logger.info("Metagraph preloaded (%d neurons)", mg.n)
+        else:
+            logger.warning("Metagraph preload failed — will retry on first request")
+    yield
+
+
+app = FastAPI(title="Radar Trainer", lifespan=_lifespan)
 
 # R2 client (initialized on first use, only for localnet fallback)
 _r2 = None
