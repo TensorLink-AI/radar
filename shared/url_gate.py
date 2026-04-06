@@ -97,10 +97,12 @@ class GatedClient:
         allowed_prefixes: list[str],
         default_headers: dict[str, str] | None = None,
         timeout: int = 30,
+        llm_timeout: int = 180,
     ):
         self._allowed = allowed_prefixes
         self._default_headers = default_headers or {}
         self._timeout = timeout
+        self._llm_timeout = llm_timeout
 
     def _apply_headers(self, req) -> None:
         """Apply default headers to a urllib Request."""
@@ -114,6 +116,14 @@ class GatedClient:
                 f"(allowed prefixes: {self._allowed})"
             )
 
+    def _effective_timeout(self, url: str, explicit: int | None) -> int:
+        """Return the timeout for a request — longer for LLM endpoints."""
+        if explicit is not None:
+            return explicit
+        if "/llm/" in url or url.rstrip("/").endswith("/llm"):
+            return self._llm_timeout
+        return self._timeout
+
     # ── Public API (what miner agents call) ──────────────────────────
 
     def get(self, url: str, timeout: int | None = None) -> bytes:
@@ -122,7 +132,7 @@ class GatedClient:
         import urllib.request
         req = urllib.request.Request(url, method="GET")
         self._apply_headers(req)
-        with urllib.request.urlopen(req, timeout=timeout or self._timeout) as resp:
+        with urllib.request.urlopen(req, timeout=self._effective_timeout(url, timeout)) as resp:
             return resp.read()
 
     def get_json(self, url: str, timeout: int | None = None) -> dict:
@@ -138,7 +148,7 @@ class GatedClient:
         req = urllib.request.Request(url, data=data, method="POST")
         req.add_header("Content-Type", "application/json")
         self._apply_headers(req)
-        with urllib.request.urlopen(req, timeout=timeout or self._timeout) as resp:
+        with urllib.request.urlopen(req, timeout=self._effective_timeout(url, timeout)) as resp:
             return resp.read()
 
     def post_json(self, url: str, payload: dict, timeout: int | None = None) -> dict:

@@ -13,6 +13,7 @@ Registers OpenAI-compatible endpoints on the database server's FastAPI app:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import AsyncIterator, Optional
 
@@ -22,6 +23,27 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from validator.llm_proxy import LLMProxy
 
 logger = logging.getLogger(__name__)
+
+
+async def _forward_with_disconnect(
+    request: Request, proxy: LLMProxy,
+    path: str, uid: int, payload: dict, hotkey: str,
+):
+    """Forward to Chutes AI, but cancel if the downstream client disconnects.
+
+    Prevents zombie Chutes requests from piling up when the agent's
+    shorter timeout fires before the Chutes call completes.
+    """
+    forward_task = asyncio.create_task(
+        proxy.forward(path, uid, payload, hotkey),
+    )
+    while not forward_task.done():
+        if await request.is_disconnected():
+            forward_task.cancel()
+            logger.info("Client disconnected, cancelled Chutes request [miner=%d path=%s]", uid, path)
+            raise HTTPException(status_code=499, detail="Client disconnected")
+        await asyncio.sleep(0.5)
+    return forward_task.result()
 
 _MAX_BODY_BYTES = 256 * 1024
 _proxy: Optional[LLMProxy] = None
@@ -46,21 +68,21 @@ def register_routes(app: FastAPI):
     async def llm_chat(request: Request):
         proxy = get_proxy()
         uid, hotkey, payload = await _parse_request(request)
-        result = await proxy.forward("chat/completions", uid, payload, hotkey)
+        result = await _forward_with_disconnect(request, proxy, "chat/completions", uid, payload, hotkey)
         return _to_response(result)
 
     @app.post("/llm/v1/completions")
     async def llm_completions(request: Request):
         proxy = get_proxy()
         uid, hotkey, payload = await _parse_request(request)
-        result = await proxy.forward("completions", uid, payload, hotkey)
+        result = await _forward_with_disconnect(request, proxy, "completions", uid, payload, hotkey)
         return _to_response(result)
 
     @app.post("/llm/v1/embeddings")
     async def llm_embeddings(request: Request):
         proxy = get_proxy()
         uid, hotkey, payload = await _parse_request(request)
-        result = await proxy.forward("embeddings", uid, payload, hotkey)
+        result = await _forward_with_disconnect(request, proxy, "embeddings", uid, payload, hotkey)
         return _to_response(result)
 
     @app.get("/llm/v1/models")
