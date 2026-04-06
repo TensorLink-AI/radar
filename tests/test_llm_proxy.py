@@ -3,16 +3,16 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from validator.llm_proxy import LLMProxy, ChatRequest, ChatMessage, ChatResponse
+from validator.llm_proxy import LLMProxy
 
 
-def _make_request(model="gpt-4", content="Hello"):
-    return ChatRequest(
-        model=model,
-        messages=[ChatMessage(role="user", content=content)],
-        temperature=0.7,
-        max_tokens=256,
-    )
+def _make_payload(model="gpt-4", content="Hello"):
+    return {
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": 0.7,
+        "max_tokens": 256,
+    }
 
 
 class TestLLMProxy:
@@ -49,7 +49,7 @@ class TestLLMProxy:
         proxy._record_query(5)
         from fastapi import HTTPException
         with pytest.raises(HTTPException) as exc_info:
-            await proxy.chat(5, _make_request())
+            await proxy.chat(5, _make_payload())
         assert exc_info.value.status_code == 429
 
     @pytest.mark.asyncio
@@ -57,7 +57,15 @@ class TestLLMProxy:
         proxy = LLMProxy(allowed_models=["gpt-4"], max_queries=10)
         from fastapi import HTTPException
         with pytest.raises(HTTPException) as exc_info:
-            await proxy.chat(0, _make_request(model="bad"))
+            await proxy.chat(0, _make_payload(model="bad"))
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_missing_model_rejected(self):
+        proxy = LLMProxy(max_queries=10)
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc_info:
+            await proxy.chat(0, {"messages": [{"role": "user", "content": "hi"}]})
         assert exc_info.value.status_code == 400
 
     def test_reset_limits(self):
@@ -67,31 +75,59 @@ class TestLLMProxy:
         proxy.reset_limits()
         assert proxy.remaining_queries(0) == 5
 
+    @pytest.mark.asyncio
+    async def test_blocked_fields_stripped(self):
+        """Blocked fields like 'stream' and 'api_key' should be removed."""
+        proxy = LLMProxy(max_queries=10, chutes_api_key="test-key")
+        payload = _make_payload()
+        payload["stream"] = True
+        payload["api_key"] = "evil-key"
 
-class TestChatRequest:
-    def test_valid(self):
-        req = _make_request()
-        assert req.model == "gpt-4"
-        assert len(req.messages) == 1
+        # Will fail at the HTTP call, but we can verify fields were stripped
+        # by checking the payload dict is mutated
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException):
+            await proxy.chat(0, payload)
 
-    def test_invalid_role(self):
-        with pytest.raises(Exception):
-            ChatRequest(
-                model="gpt-4",
-                messages=[ChatMessage(role="hacker", content="hi")],
-            )
+        assert "stream" not in payload
+        assert "api_key" not in payload
 
-    def test_empty_messages(self):
-        with pytest.raises(Exception):
-            ChatRequest(model="gpt-4", messages=[])
+    @pytest.mark.asyncio
+    async def test_max_tokens_capped(self):
+        """max_tokens above 16384 should be capped."""
+        proxy = LLMProxy(max_queries=10, chutes_api_key="test-key")
+        payload = _make_payload()
+        payload["max_tokens"] = 100000
 
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException):
+            await proxy.chat(0, payload)
 
-class TestChatResponse:
-    def test_none_content_coerced(self):
-        """Chutes AI can return null content — ensure ChatResponse handles it."""
-        resp = ChatResponse(model="gpt-4", content="", remaining_queries=5)
-        assert resp.content == ""
+        assert payload["max_tokens"] == 16384
 
-    def test_normal_content(self):
-        resp = ChatResponse(model="gpt-4", content="hello", remaining_queries=3)
-        assert resp.content == "hello"
+    @pytest.mark.asyncio
+    async def test_tool_calls_in_payload_accepted(self):
+        """Payload with tools should pass validation (fail at HTTP, not parse)."""
+        proxy = LLMProxy(max_queries=10, chutes_api_key="test-key")
+        payload = {
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "What's the weather?"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+        }
+
+        from fastapi import HTTPException
+        # Should fail at HTTP call, not at validation — tools pass through
+        with pytest.raises(HTTPException) as exc_info:
+            await proxy.chat(0, payload)
+        # Should be a connection error (502), not a validation error (400)
+        assert exc_info.value.status_code in (502, 503)
