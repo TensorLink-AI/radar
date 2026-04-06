@@ -62,6 +62,7 @@ class LLMProxy:
         max_queries: int = MAX_QUERIES_PER_TEMPO,
         tempo_seconds: int = TEMPO_DURATION_SECONDS,
         pool=None,
+        timeout: float = 120.0,
     ):
         self.chutes_url = chutes_url.rstrip("/")
         self.chutes_api_key = chutes_api_key
@@ -69,6 +70,7 @@ class LLMProxy:
         self.max_queries = max_queries
         self.tempo_seconds = tempo_seconds
         self.pool = pool  # asyncpg pool for query logging
+        self.timeout = timeout
 
         # miner_uid -> list of query timestamps in current window
         self._query_counts: dict[int, list[float]] = defaultdict(list)
@@ -82,7 +84,7 @@ class LLMProxy:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=60.0)
+            self._client = httpx.AsyncClient(timeout=self.timeout)
         return self._client
 
     def _prune_old_queries(self, miner_uid: int) -> int:
@@ -163,103 +165,102 @@ class LLMProxy:
         if payload.get("max_tokens", 0) > 16384:
             payload["max_tokens"] = 16384
 
+        # Context tag for log messages
+        ctx = f"miner={miner_uid} model={model}"
+
         # Circuit breaker: fail fast if upstream is known-broken
         now = time.time()
         if self._consecutive_failures >= self._CB_THRESHOLD and now < self._circuit_open_until:
-            raise HTTPException(
-                status_code=503,
-                detail="LLM upstream temporarily unavailable (circuit open)",
-            )
+            wait_s = self._circuit_open_until - now
+            logger.warning("Chutes AI circuit open [%s] (failures=%d, retry in %.0fs)",
+                           ctx, self._consecutive_failures, wait_s)
+            raise HTTPException(status_code=503, detail=(
+                f"LLM upstream unavailable ({self._consecutive_failures} "
+                f"failures, retry in {wait_s:.0f}s)"))
 
         self._record_query(miner_uid)
         remaining -= 1
-
         headers = {"Content-Type": "application/json"}
         if self.chutes_api_key:
             headers["Authorization"] = f"Bearer {self.chutes_api_key}"
 
-        max_retries = 3
-        backoff = 2.0
+        max_retries, backoff = 3, 2.0
         last_error: Exception | None = None
+        t0 = time.time()
 
         for attempt in range(max_retries + 1):
-            # Check circuit breaker before each retry
             now = time.time()
-            if (
-                attempt > 0
-                and self._consecutive_failures >= self._CB_THRESHOLD
-                and now < self._circuit_open_until
-            ):
-                raise HTTPException(
-                    status_code=503,
-                    detail="LLM upstream temporarily unavailable (circuit open)",
-                )
+            if (attempt > 0 and self._consecutive_failures >= self._CB_THRESHOLD
+                    and now < self._circuit_open_until):
+                logger.warning("Chutes AI circuit opened mid-retry [%s] %.1fs in",
+                               ctx, now - t0)
+                raise HTTPException(status_code=503, detail=(
+                    f"LLM upstream unavailable ({self._consecutive_failures} failures)"))
 
             try:
                 client = await self._get_client()
-                resp = await client.post(
-                    f"{self.chutes_url}/chat/completions",
-                    json=payload,
-                    headers=headers,
-                    timeout=60.0,
-                )
+                resp = await client.post(f"{self.chutes_url}/chat/completions",
+                                         json=payload, headers=headers,
+                                         timeout=self.timeout)
                 resp.raise_for_status()
                 data = resp.json()
-                break  # success
+                if attempt > 0:
+                    logger.info("Chutes AI OK on attempt %d [%s] (%.1fs)",
+                                attempt + 1, ctx, time.time() - t0)
+                break
             except httpx.HTTPStatusError as e:
                 last_error = e
                 status = e.response.status_code
+                body = e.response.text[:200] if e.response.text else ""
                 if status in (429, 502, 503) and attempt < max_retries:
-                    retry_after = e.response.headers.get("Retry-After")
-                    wait = float(retry_after) if retry_after else backoff * (2 ** attempt)
-                    wait = min(wait, 30.0)
-                    logger.info(
-                        "Chutes AI %s, retrying in %.1fs (attempt %d/%d)",
-                        status, wait, attempt + 1, max_retries,
-                    )
+                    ra = e.response.headers.get("Retry-After")
+                    wait = min(float(ra) if ra else backoff * (2 ** attempt), 30.0)
+                    logger.warning("Chutes AI HTTP %s [%s]: %s — retry in %.1fs (%d/%d)",
+                                   status, ctx, body, wait, attempt + 1, max_retries)
                     await asyncio.sleep(wait)
                     continue
                 self._consecutive_failures += 1
-                cooldown = self._CB_COOLDOWN * 2 if status in (429, 503) else self._CB_COOLDOWN
-                self._circuit_open_until = time.time() + cooldown
-                detail = e.response.text[:200] if e.response.text else ""
-                logger.warning(
-                    "Chutes AI error: %s %s (failures: %d)",
-                    status, detail, self._consecutive_failures,
-                )
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"LLM upstream error: {status} {detail}".strip(),
-                )
+                cd = self._CB_COOLDOWN * 2 if status in (429, 503) else self._CB_COOLDOWN
+                self._circuit_open_until = time.time() + cd
+                logger.error("Chutes AI HTTP %s [%s] after %.1fs: %s "
+                             "(failures=%d, circuit %.0fs)",
+                             status, ctx, time.time() - t0, body,
+                             self._consecutive_failures, cd)
+                raise HTTPException(status_code=502,
+                                    detail=f"LLM upstream error: HTTP {status} — {body}".strip())
             except (httpx.RequestError, httpx.TimeoutException) as e:
                 last_error = e
-                err_desc = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                etype = type(e).__name__
                 if attempt < max_retries:
-                    wait = backoff * (2 ** attempt)
-                    wait = min(wait, 30.0)
-                    logger.info(
-                        "Chutes AI connection error (%s), retrying in %.1fs (attempt %d/%d)",
-                        err_desc, wait, attempt + 1, max_retries,
-                    )
+                    wait = min(backoff * (2 ** attempt), 30.0)
+                    logger.warning("Chutes AI %s [%s] (timeout=%.0fs) — retry in %.1fs (%d/%d)",
+                                   etype, ctx, self.timeout, wait, attempt + 1, max_retries)
                     await asyncio.sleep(wait)
                     continue
                 self._consecutive_failures += 1
                 self._circuit_open_until = time.time() + self._CB_COOLDOWN
-                logger.warning(
-                    "Chutes AI request failed: %s (failures: %d)",
-                    err_desc, self._consecutive_failures,
-                )
-                raise HTTPException(status_code=502, detail="LLM upstream unreachable")
+                elapsed = time.time() - t0
+                logger.error("Chutes AI %s [%s] after %.1fs (timeout=%.0fs, "
+                             "failures=%d, circuit %.0fs)",
+                             etype, ctx, elapsed, self.timeout,
+                             self._consecutive_failures, self._CB_COOLDOWN)
+                raise HTTPException(status_code=502, detail=(
+                    f"LLM unreachable: {etype} after {max_retries + 1} attempts ({elapsed:.0f}s)"))
         else:
             self._consecutive_failures += 1
-            self._circuit_open_until = time.time() + self._CB_COOLDOWN * 2
-            status_code = last_error.response.status_code if isinstance(last_error, httpx.HTTPStatusError) else "?"
-            logger.warning(
-                "Chutes AI %s after %d retries (failures: %d)",
-                status_code, max_retries, self._consecutive_failures,
-            )
-            raise HTTPException(status_code=502, detail=f"LLM upstream error ({status_code}) after retries")
+            cd = self._CB_COOLDOWN * 2
+            self._circuit_open_until = time.time() + cd
+            elapsed = time.time() - t0
+            sc = last_error.response.status_code if isinstance(last_error, httpx.HTTPStatusError) else "?"
+            logger.error("Chutes AI exhausted retries [%s] (status=%s, %.1fs, "
+                         "failures=%d, circuit %.0fs)",
+                         ctx, sc, elapsed, self._consecutive_failures, cd)
+            raise HTTPException(status_code=502, detail=(
+                f"LLM upstream error (HTTP {sc}) after {max_retries + 1} attempts ({elapsed:.0f}s)"))
 
+        if self._consecutive_failures > 0:
+            logger.info("Chutes AI recovered [%s] after %d consecutive failures",
+                        ctx, self._consecutive_failures)
         self._consecutive_failures = 0
 
         # Extract summary for logging (best-effort)

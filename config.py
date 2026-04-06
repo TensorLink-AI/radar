@@ -41,6 +41,8 @@ class Config:
     LLM_MAX_QUERIES: int = int(os.getenv("RADAR_LLM_MAX_QUERIES", "50"))
     # Enable LLM proxy (set to "true" to enable)
     LLM_ENABLED: bool = os.getenv("RADAR_LLM_ENABLED", "false").lower() == "true"
+    # Timeout (seconds) for each Chutes AI request
+    CHUTES_TIMEOUT: float = float(os.getenv("RADAR_CHUTES_TIMEOUT", "120"))
 
     # ── Official Training Image ──────────────────────────────────────
     OFFICIAL_TRAINING_IMAGE: str = os.getenv("OFFICIAL_TRAINING_IMAGE", "ghcr.io/tensorlink-ai/radar/radar-runner:latest")

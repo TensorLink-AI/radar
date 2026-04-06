@@ -136,6 +136,7 @@ class DatabaseNeuron:
                 allowed_models=allowed_models,
                 max_queries=Config.LLM_MAX_QUERIES,
                 pool=self.pool,
+                timeout=Config.CHUTES_TIMEOUT,
             )
             set_llm_proxy(llm)
             register_llm_routes(app)
