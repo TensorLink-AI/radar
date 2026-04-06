@@ -249,6 +249,10 @@ class TrainingCoordinator:
             max_retries = 3
             for attempt in range(max_retries + 1):
                 try:
+                    # Re-sign on retries so the Epistula timestamp stays fresh
+                    if attempt > 0:
+                        headers = sign_request(self.wallet, payload)
+                        headers["Content-Type"] = "application/json"
                     resp = await client.post(
                         f"{url.rstrip('/')}/train",
                         content=payload,
