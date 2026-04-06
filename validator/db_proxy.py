@@ -191,6 +191,10 @@ async def auth_middleware(request: Request, call_next):
                 "error": f"Rate limit exceeded for {category}",
             })
         response = await call_next(request)
+        logger.info(
+            "Agent proxy: miner=%s %s %s -> %d",
+            rate_key, request.method, path, response.status_code,
+        )
         return response
 
     # Fall back to Epistula for backward compat
@@ -205,6 +209,10 @@ async def auth_middleware(request: Request, call_next):
                     "error": f"Rate limit exceeded for {category}",
                 })
             response = await call_next(request)
+            logger.info(
+                "Epistula proxy: hotkey=%s %s %s -> %d",
+                hotkey[:16], request.method, path, response.status_code,
+            )
             return response
 
     return JSONResponse(status_code=403, content={"error": "Invalid agent token or signature"})
@@ -237,7 +245,10 @@ def _build_target(path: str, request: Request) -> str:
 async def _proxy_request(request: Request, path: str) -> Response:
     """Forward a request to the database server, signed with validator wallet."""
     if not _db_api_url:
-        raise HTTPException(status_code=503, detail="DB API URL not configured")
+        return JSONResponse(
+            status_code=503,
+            content={"error": "DB API URL not configured"},
+        )
 
     client = await _get_client()
     body = await request.body()
@@ -266,6 +277,23 @@ async def _proxy_request(request: Request, path: str) -> Response:
         else:
             resp = await client.request(request.method, target, content=body,
                                         headers=headers, timeout=timeout)
+        # For error responses, ensure the body is always valid JSON so
+        # downstream clients (GatedClient.get_json / post_json) can parse it.
+        if resp.status_code >= 400:
+            ct = resp.headers.get("content-type", "")
+            if "json" in ct:
+                return Response(
+                    content=resp.content,
+                    status_code=resp.status_code,
+                    media_type="application/json",
+                )
+            # Non-JSON error body — wrap it in a JSON envelope
+            import json as _json
+            body_text = resp.content.decode(errors="replace")[:500]
+            return JSONResponse(
+                status_code=resp.status_code,
+                content={"error": body_text or "Unknown error"},
+            )
         return Response(
             content=resp.content,
             status_code=resp.status_code,
@@ -273,7 +301,10 @@ async def _proxy_request(request: Request, path: str) -> Response:
         )
     except (httpx.RequestError, httpx.TimeoutException) as e:
         logger.warning("Proxy request to %s failed: %s", target, e or type(e).__name__)
-        raise HTTPException(status_code=502, detail="Database server unreachable")
+        return JSONResponse(
+            status_code=502,
+            content={"error": "Database server unreachable"},
+        )
 
 
 async def _proxy_stream(
@@ -286,7 +317,10 @@ async def _proxy_stream(
         resp = await client.send(req, stream=True, timeout=timeout)
     except (httpx.RequestError, httpx.TimeoutException) as e:
         logger.warning("Proxy stream to %s failed: %s", target, e or type(e).__name__)
-        raise HTTPException(status_code=502, detail="Database server unreachable")
+        return JSONResponse(
+            status_code=502,
+            content={"error": "Database server unreachable"},
+        )
 
     if resp.status_code >= 400:
         error_body = (await resp.aread()).decode(errors="replace")
