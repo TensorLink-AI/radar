@@ -7,6 +7,7 @@ Auth: Epistula verify, caller must be a validator.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -270,6 +271,23 @@ async def auth_middleware(request: Request, call_next):
                 return JSONResponse(status_code=403, content={"error": "Validators only"})
 
     response = await call_next(request)
+
+    # Log successful authenticated requests to Postgres for audit
+    if _access_logger and needs_auth and response.status_code < 400:
+        miner_hotkey = request.headers.get("X-Miner-Hotkey", "")
+        miner_uid_str = request.headers.get("X-Miner-UID", "-1")
+        try:
+            miner_uid = int(miner_uid_str)
+        except ValueError:
+            miner_uid = -1
+        asyncio.create_task(_access_logger.log_access(
+            hotkey=miner_hotkey or "validator",
+            miner_uid=miner_uid,
+            endpoint=path,
+            experiment_ids=[],
+            method=request.method,
+        ))
+
     return response
 
 

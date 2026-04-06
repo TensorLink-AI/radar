@@ -191,6 +191,10 @@ async def auth_middleware(request: Request, call_next):
                 "error": f"Rate limit exceeded for {category}",
             })
         response = await call_next(request)
+        logger.info(
+            "Agent proxy: miner=%s %s %s -> %d",
+            rate_key, request.method, path, response.status_code,
+        )
         return response
 
     # Fall back to Epistula for backward compat
@@ -205,6 +209,10 @@ async def auth_middleware(request: Request, call_next):
                     "error": f"Rate limit exceeded for {category}",
                 })
             response = await call_next(request)
+            logger.info(
+                "Epistula proxy: hotkey=%s %s %s -> %d",
+                hotkey[:16], request.method, path, response.status_code,
+            )
             return response
 
     return JSONResponse(status_code=403, content={"error": "Invalid agent token or signature"})
