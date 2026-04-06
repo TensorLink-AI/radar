@@ -117,14 +117,16 @@ def main():
         sys.exit(1)
 
     # 2. Build GatedClient from allowed URLs in challenge + env
+    #    parse_allowed_urls normalises all entries to have a trailing "/",
+    #    so we only add URLs that aren't already covered by an existing prefix.
     allowed_raw = challenge.get("allowed_urls", os.environ.get("AGENT_ALLOWED_URLS", ""))
     allowed_prefixes = parse_allowed_urls(allowed_raw)
 
-    # Always allow the validator proxy and scratchpad URLs passed in the challenge
-    for key in ("db_url", "desearch_url", "llm_url", "scratchpad_get_url", "scratchpad_put_url"):
+    # Always allow scratchpad presigned URLs (unique per request, not covered
+    # by the validator-built prefix list).
+    for key in ("scratchpad_get_url", "scratchpad_put_url"):
         url = challenge.get(key, "")
-        if url:
-            # Allow the full URL as-is (presigned URLs are unique per request)
+        if url and not any(url.startswith(p) for p in allowed_prefixes):
             allowed_prefixes.append(url)
 
     # Inject agent token as default header so all proxy requests are authenticated
