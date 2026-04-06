@@ -171,6 +171,29 @@ class TestLLMProxy:
         assert payload["n"] == 2
 
     @pytest.mark.asyncio
+    async def test_timeout_opens_circuit_immediately(self):
+        """A single timeout should trip the circuit breaker."""
+        import httpx
+        proxy = LLMProxy(max_queries=10, chutes_api_key="test-key")
+
+        # Mock the client to raise TimeoutException
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.post = AsyncMock(side_effect=httpx.ReadTimeout("read timed out"))
+        proxy._client = mock_client
+
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc_info:
+            await proxy.forward("chat/completions", 0, _make_payload())
+        assert exc_info.value.status_code == 502
+
+        # Circuit should now be open — next call fails fast with 503
+        with pytest.raises(HTTPException) as exc_info:
+            await proxy.forward("chat/completions", 0, _make_payload())
+        assert exc_info.value.status_code == 503
+        assert "unavailable" in exc_info.value.detail.lower()
+
+    @pytest.mark.asyncio
     async def test_embeddings_path(self):
         """Embeddings endpoint should accept payload and fail at HTTP, not validation."""
         proxy = LLMProxy(max_queries=10, chutes_api_key="test-key")

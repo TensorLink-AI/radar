@@ -50,7 +50,16 @@ class LLMProxy:
         self.max_queries = max_queries
         self.tempo_seconds = tempo_seconds
         self.pool = pool
-        self.timeout = timeout
+        # Granular timeouts: LLM models can think for 60-120s before the
+        # first token, then stream for another 30-60s.  A flat timeout
+        # starves the read phase.  The `timeout` param sets the read
+        # timeout (default 300s); connect/write/pool are fixed shorter.
+        self.timeout = httpx.Timeout(
+            connect=30.0,
+            read=600.0,
+            write=60.0,
+            pool=60.0,
+        )
         self._query_counts: dict[int, list[float]] = defaultdict(list)
         self._client: Optional[httpx.AsyncClient] = None
         self._consecutive_failures: int = 0
@@ -93,9 +102,14 @@ class LLMProxy:
             raise HTTPException(status_code=503, detail=(
                 f"LLM unavailable ({self._consecutive_failures} failures, retry {wait_s:.0f}s)"))
 
-    def _open_circuit(self, double: bool = False):
+    def _open_circuit(self, double: bool = False, timeout: bool = False):
         self._consecutive_failures += 1
-        self._circuit_open_until = time.time() + self._CB_COOLDOWN * (2 if double else 1)
+        cooldown = self._CB_COOLDOWN * (2 if double else 1)
+        self._circuit_open_until = time.time() + cooldown
+        # Timeouts are strong evidence the upstream is down — trip the
+        # circuit breaker immediately instead of waiting for _CB_THRESHOLD.
+        if timeout and self._consecutive_failures < self._CB_THRESHOLD:
+            self._consecutive_failures = self._CB_THRESHOLD
 
     def _reset_circuit(self, ctx: str):
         if self._consecutive_failures > 0:
@@ -197,13 +211,30 @@ class LLMProxy:
                              status, ctx, time.time() - t0, body, self._consecutive_failures)
                 raise HTTPException(status_code=502,
                                     detail=f"LLM error: HTTP {status} — {body}".strip())
-            except (httpx.RequestError, httpx.TimeoutException) as e:
+            except httpx.TimeoutException as e:
+                last_error = e
+                # Timeouts are expensive (120s wasted). Only retry once,
+                # then open the circuit so subsequent calls fail fast.
+                is_timeout = True
+                if attempt < 1:  # at most 1 retry for timeouts
+                    wait = min(backoff * (2 ** attempt), 30.0)
+                    logger.warning("Chutes AI ReadTimeout [%s] (read=%.0fs) — retry %.1fs (%d/1)",
+                                   ctx, self.timeout.read, wait, attempt + 1)
+                    await asyncio.sleep(wait)
+                    continue
+                self._open_circuit(False, timeout=True)
+                elapsed = time.time() - t0
+                logger.error("Chutes AI ReadTimeout [%s] %.1fs — circuit OPEN (failures=%d)",
+                             ctx, elapsed, self._consecutive_failures)
+                raise HTTPException(status_code=502, detail=(
+                    f"LLM unreachable: ReadTimeout ({elapsed:.0f}s)"))
+            except httpx.RequestError as e:
                 last_error = e
                 etype = type(e).__name__
                 if attempt < max_retries:
                     wait = min(backoff * (2 ** attempt), 30.0)
-                    logger.warning("Chutes AI %s [%s] (timeout=%.0fs) — retry %.1fs (%d/%d)",
-                                   etype, ctx, self.timeout, wait, attempt + 1, max_retries)
+                    logger.warning("Chutes AI %s [%s] — retry %.1fs (%d/%d)",
+                                   etype, ctx, wait, attempt + 1, max_retries)
                     await asyncio.sleep(wait)
                     continue
                 self._open_circuit(False)
@@ -238,7 +269,8 @@ class LLMProxy:
             resp = await client.send(req, stream=True)
         except (httpx.RequestError, httpx.TimeoutException) as e:
             etype = type(e).__name__
-            self._open_circuit(False)
+            is_timeout = isinstance(e, httpx.TimeoutException)
+            self._open_circuit(False, timeout=is_timeout)
             logger.error("Chutes AI stream %s [%s] (failures=%d)",
                          etype, ctx, self._consecutive_failures)
             raise HTTPException(status_code=502,

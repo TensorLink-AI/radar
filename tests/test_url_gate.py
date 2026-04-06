@@ -98,6 +98,19 @@ class TestGatedClient:
         with pytest.raises(URLNotAllowedError):
             client.put("http://evil.com/upload", b"data")
 
+    def test_llm_timeout_longer(self):
+        client = GatedClient(["http://proxy.test/"], timeout=30, llm_timeout=180)
+        assert client._effective_timeout("http://proxy.test/experiments/recent", None) == 30
+        assert client._effective_timeout("http://proxy.test/llm/v1/chat/completions", None) == 180
+        assert client._effective_timeout("http://proxy.test/llm/models", None) == 180
+        # Explicit timeout overrides both
+        assert client._effective_timeout("http://proxy.test/llm/v1/chat/completions", 60) == 60
+
+    def test_llm_timeout_default(self):
+        client = GatedClient(["http://proxy.test/"])
+        assert client._effective_timeout("http://proxy.test/llm/chat", None) == 180
+        assert client._effective_timeout("http://proxy.test/other", None) == 30
+
 
 class _OKHandler(BaseHTTPRequestHandler):
     """Minimal handler that returns 200 with a JSON body."""
