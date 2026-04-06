@@ -49,7 +49,7 @@ class TestLLMProxy:
         proxy._record_query(5)
         from fastapi import HTTPException
         with pytest.raises(HTTPException) as exc_info:
-            await proxy.chat(5, _make_payload())
+            await proxy.forward("chat/completions", 5, _make_payload())
         assert exc_info.value.status_code == 429
 
     @pytest.mark.asyncio
@@ -57,7 +57,7 @@ class TestLLMProxy:
         proxy = LLMProxy(allowed_models=["gpt-4"], max_queries=10)
         from fastapi import HTTPException
         with pytest.raises(HTTPException) as exc_info:
-            await proxy.chat(0, _make_payload(model="bad"))
+            await proxy.forward("chat/completions", 0, _make_payload(model="bad"))
         assert exc_info.value.status_code == 400
 
     @pytest.mark.asyncio
@@ -65,7 +65,8 @@ class TestLLMProxy:
         proxy = LLMProxy(max_queries=10)
         from fastapi import HTTPException
         with pytest.raises(HTTPException) as exc_info:
-            await proxy.chat(0, {"messages": [{"role": "user", "content": "hi"}]})
+            await proxy.forward("chat/completions", 0,
+                                {"messages": [{"role": "user", "content": "hi"}]})
         assert exc_info.value.status_code == 400
 
     def test_reset_limits(self):
@@ -77,20 +78,32 @@ class TestLLMProxy:
 
     @pytest.mark.asyncio
     async def test_blocked_fields_stripped(self):
-        """Blocked fields like 'stream' and 'api_key' should be removed."""
+        """Blocked fields like 'api_key' and 'user' should be removed."""
+        proxy = LLMProxy(max_queries=10, chutes_api_key="test-key")
+        payload = _make_payload()
+        payload["api_key"] = "evil-key"
+        payload["user"] = "impersonate"
+
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException):
+            await proxy.forward("chat/completions", 0, payload)
+
+        assert "api_key" not in payload
+        assert "user" not in payload
+
+    @pytest.mark.asyncio
+    async def test_stream_field_preserved(self):
+        """stream: true should NOT be stripped — it's passed to upstream."""
         proxy = LLMProxy(max_queries=10, chutes_api_key="test-key")
         payload = _make_payload()
         payload["stream"] = True
-        payload["api_key"] = "evil-key"
 
-        # Will fail at the HTTP call, but we can verify fields were stripped
-        # by checking the payload dict is mutated
         from fastapi import HTTPException
         with pytest.raises(HTTPException):
-            await proxy.chat(0, payload)
+            await proxy.forward("chat/completions", 0, payload)
 
-        assert "stream" not in payload
-        assert "api_key" not in payload
+        # stream should still be in payload (not blocked)
+        assert payload.get("stream") is True
 
     @pytest.mark.asyncio
     async def test_max_tokens_capped(self):
@@ -101,7 +114,7 @@ class TestLLMProxy:
 
         from fastapi import HTTPException
         with pytest.raises(HTTPException):
-            await proxy.chat(0, payload)
+            await proxy.forward("chat/completions", 0, payload)
 
         assert payload["max_tokens"] == 16384
 
@@ -128,6 +141,53 @@ class TestLLMProxy:
         from fastapi import HTTPException
         # Should fail at HTTP call, not at validation — tools pass through
         with pytest.raises(HTTPException) as exc_info:
-            await proxy.chat(0, payload)
+            await proxy.forward("chat/completions", 0, payload)
         # Should be a connection error (502), not a validation error (400)
+        assert exc_info.value.status_code in (502, 503)
+
+    @pytest.mark.asyncio
+    async def test_openai_params_preserved(self):
+        """Extra OpenAI params (top_p, seed, response_format, etc.) pass through."""
+        proxy = LLMProxy(max_queries=10, chutes_api_key="test-key")
+        payload = _make_payload()
+        payload["top_p"] = 0.9
+        payload["frequency_penalty"] = 0.5
+        payload["presence_penalty"] = 0.3
+        payload["seed"] = 42
+        payload["response_format"] = {"type": "json_object"}
+        payload["stop"] = ["\n"]
+        payload["n"] = 2
+
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException):
+            await proxy.forward("chat/completions", 0, payload)
+
+        # All params should survive preparation
+        assert payload["top_p"] == 0.9
+        assert payload["frequency_penalty"] == 0.5
+        assert payload["seed"] == 42
+        assert payload["response_format"] == {"type": "json_object"}
+        assert payload["stop"] == ["\n"]
+        assert payload["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_embeddings_path(self):
+        """Embeddings endpoint should accept payload and fail at HTTP, not validation."""
+        proxy = LLMProxy(max_queries=10, chutes_api_key="test-key")
+        payload = {"model": "text-embedding-ada-002", "input": "hello world"}
+
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc_info:
+            await proxy.forward("embeddings", 0, payload)
+        assert exc_info.value.status_code in (502, 503)
+
+    @pytest.mark.asyncio
+    async def test_completions_path(self):
+        """Text completions endpoint should work."""
+        proxy = LLMProxy(max_queries=10, chutes_api_key="test-key")
+        payload = {"model": "gpt-3.5-turbo-instruct", "prompt": "Hello", "max_tokens": 50}
+
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc_info:
+            await proxy.forward("completions", 0, payload)
         assert exc_info.value.status_code in (502, 503)

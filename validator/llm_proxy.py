@@ -1,15 +1,14 @@
-"""LLM proxy — rate-limited proxy for miner agents to query Chutes AI.
+"""LLM proxy — full OpenAI-compatible passthrough to Chutes AI.
 
 Runs on the subnet owner's database server (NOT on validators).
 Validators forward /llm/* requests here. The Chutes API key never
 leaves the owner's machine.
 
-Passes through the full OpenAI-compatible request/response so agents
-can use tool calls, streaming, JSON mode, etc. Rate limiting and
-model validation happen before forwarding.
+Supports all OpenAI-compatible endpoints: chat completions, text
+completions, embeddings, and model listing — including SSE streaming.
+Rate limiting and model validation happen before forwarding.
 
 All queries are logged to Postgres (proxy_query_log table).
-Rate-limited to RADAR_LLM_MAX_QUERIES per miner per tempo.
 """
 
 from __future__ import annotations
@@ -18,41 +17,22 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 
-# Chutes AI inference endpoint
 DEFAULT_CHUTES_URL = "https://llm.chutes.ai/v1"
-
-# Rate limit: max LLM queries per miner per tempo
 MAX_QUERIES_PER_TEMPO = 50
-
-# Tempo duration in seconds (~72 min, matching desearch)
 TEMPO_DURATION_SECONDS = 360 * 12
-
-# Fields agents are NOT allowed to set (security / cost control)
-_BLOCKED_REQUEST_FIELDS = {"api_key", "user", "stream"}
-
-# Max request body size (256 KB) to prevent abuse
-_MAX_BODY_BYTES = 256 * 1024
+_BLOCKED_FIELDS = {"api_key", "user"}
+_MAX_TOKENS_CAP = 16384
 
 
 class LLMProxy:
-    """Rate-limited passthrough proxy for LLM inference via Chutes AI.
-
-    The subnet owner controls:
-      - Which models are available (allowed_models)
-      - The API key (chutes_api_key)
-      - Rate limits per miner per tempo
-
-    Passes through full OpenAI-compatible JSON so agents can use
-    tool_calls, response_format, etc.
-    """
+    """Rate-limited passthrough proxy for Chutes AI (OpenAI-compatible)."""
 
     def __init__(
         self,
@@ -69,18 +49,14 @@ class LLMProxy:
         self.allowed_models = allowed_models or []
         self.max_queries = max_queries
         self.tempo_seconds = tempo_seconds
-        self.pool = pool  # asyncpg pool for query logging
+        self.pool = pool
         self.timeout = timeout
-
-        # miner_uid -> list of query timestamps in current window
         self._query_counts: dict[int, list[float]] = defaultdict(list)
         self._client: Optional[httpx.AsyncClient] = None
-
-        # Circuit breaker: avoid hammering a dead upstream
         self._consecutive_failures: int = 0
         self._circuit_open_until: float = 0.0
-        self._CB_THRESHOLD = 3       # failures before opening circuit
-        self._CB_COOLDOWN = 60.0     # seconds to wait before retrying
+        self._CB_THRESHOLD = 3
+        self._CB_COOLDOWN = 60.0
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -88,191 +64,213 @@ class LLMProxy:
         return self._client
 
     def _prune_old_queries(self, miner_uid: int) -> int:
-        """Remove expired timestamps, return current count."""
         cutoff = time.time() - self.tempo_seconds
-        timestamps = self._query_counts[miner_uid]
-        self._query_counts[miner_uid] = [t for t in timestamps if t > cutoff]
+        ts = self._query_counts[miner_uid]
+        self._query_counts[miner_uid] = [t for t in ts if t > cutoff]
         return len(self._query_counts[miner_uid])
 
     def remaining_queries(self, miner_uid: int) -> int:
-        """How many queries this miner has left in the current tempo."""
-        used = self._prune_old_queries(miner_uid)
-        return max(0, self.max_queries - used)
+        return max(0, self.max_queries - self._prune_old_queries(miner_uid))
 
     def _record_query(self, miner_uid: int):
         self._query_counts[miner_uid].append(time.time())
 
     def _validate_model(self, model: str) -> None:
-        """Raise if model is not in the allowed list."""
         if not self.allowed_models:
-            return  # empty list = all models allowed
+            return
         if model not in self.allowed_models:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"Model {model!r} not allowed. "
-                    f"Allowed models: {self.allowed_models}"
-                ),
+                detail=f"Model {model!r} not allowed. Allowed: {self.allowed_models}",
             )
 
-    async def _log_query(
-        self, miner_uid: int, miner_hotkey: str,
-        model: str, query_text: str, content: str, tokens: int,
-    ):
-        """Log query to Postgres (best-effort, never raises)."""
+    def _check_circuit(self, ctx: str) -> None:
+        now = time.time()
+        if self._consecutive_failures >= self._CB_THRESHOLD and now < self._circuit_open_until:
+            wait_s = self._circuit_open_until - now
+            logger.warning("Chutes AI circuit open [%s] (failures=%d, %.0fs)",
+                           ctx, self._consecutive_failures, wait_s)
+            raise HTTPException(status_code=503, detail=(
+                f"LLM unavailable ({self._consecutive_failures} failures, retry {wait_s:.0f}s)"))
+
+    def _open_circuit(self, double: bool = False):
+        self._consecutive_failures += 1
+        self._circuit_open_until = time.time() + self._CB_COOLDOWN * (2 if double else 1)
+
+    def _reset_circuit(self, ctx: str):
+        if self._consecutive_failures > 0:
+            logger.info("Chutes AI recovered [%s] after %d failures",
+                        ctx, self._consecutive_failures)
+        self._consecutive_failures = 0
+
+    def auth_headers(self) -> dict[str, str]:
+        h: dict[str, str] = {}
+        if self.chutes_api_key:
+            h["Authorization"] = f"Bearer {self.chutes_api_key}"
+        return h
+
+    async def _log_query(self, uid: int, hotkey: str,
+                         model: str, query: str, content: str, tokens: int):
         if not self.pool:
             return
         try:
             await self.pool.execute(
-                """
-                INSERT INTO proxy_query_log
-                    (service, miner_uid, miner_hotkey, query_text, model,
-                     response_summary, tokens_used, timestamp)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, extract(epoch from now()))
-                """,
-                "llm", miner_uid, miner_hotkey, query_text[:500], model,
-                content[:200], tokens,
+                "INSERT INTO proxy_query_log "
+                "(service,miner_uid,miner_hotkey,query_text,model,"
+                "response_summary,tokens_used,timestamp) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,extract(epoch from now()))",
+                "llm", uid, hotkey, query[:500], model, content[:200], tokens,
             )
         except Exception as e:
             logger.debug("LLM query log failed: %s", e)
 
-    async def chat(
-        self, miner_uid: int, payload: dict, miner_hotkey: str = "",
-    ) -> dict:
-        """Forward an OpenAI-compatible chat request to Chutes AI.
-
-        Returns the full upstream JSON response with remaining_queries added.
-        Raises HTTPException(429) on rate limit, 400 on bad model.
-        """
+    def _prepare(self, miner_uid: int, payload: dict) -> tuple[str, int]:
+        """Validate, sanitise payload. Returns (model, remaining)."""
         remaining = self.remaining_queries(miner_uid)
         if remaining <= 0:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Rate limit exceeded. Max {self.max_queries} LLM queries per tempo.",
-            )
-
-        # Validate model
+            raise HTTPException(status_code=429,
+                                detail=f"Rate limit exceeded ({self.max_queries}/tempo).")
         model = payload.get("model", "")
         if not model:
             raise HTTPException(status_code=400, detail="Missing 'model' field")
         self._validate_model(model)
+        for f in _BLOCKED_FIELDS:
+            payload.pop(f, None)
+        if payload.get("max_tokens", 0) > _MAX_TOKENS_CAP:
+            payload["max_tokens"] = _MAX_TOKENS_CAP
+        return model, remaining
 
-        # Strip blocked fields
-        for field in _BLOCKED_REQUEST_FIELDS:
-            payload.pop(field, None)
-
-        # Enforce max_tokens cap
-        if payload.get("max_tokens", 0) > 16384:
-            payload["max_tokens"] = 16384
-
-        # Context tag for log messages
+    async def forward(
+        self, path: str, miner_uid: int, payload: dict, miner_hotkey: str = "",
+    ) -> dict | AsyncIterator[bytes]:
+        """Forward request to Chutes AI. Returns dict or SSE byte iterator."""
+        model, remaining = self._prepare(miner_uid, payload)
         ctx = f"miner={miner_uid} model={model}"
-
-        # Circuit breaker: fail fast if upstream is known-broken
-        now = time.time()
-        if self._consecutive_failures >= self._CB_THRESHOLD and now < self._circuit_open_until:
-            wait_s = self._circuit_open_until - now
-            logger.warning("Chutes AI circuit open [%s] (failures=%d, retry in %.0fs)",
-                           ctx, self._consecutive_failures, wait_s)
-            raise HTTPException(status_code=503, detail=(
-                f"LLM upstream unavailable ({self._consecutive_failures} "
-                f"failures, retry in {wait_s:.0f}s)"))
-
+        self._check_circuit(ctx)
         self._record_query(miner_uid)
         remaining -= 1
-        headers = {"Content-Type": "application/json"}
-        if self.chutes_api_key:
-            headers["Authorization"] = f"Bearer {self.chutes_api_key}"
 
-        max_retries, backoff = 3, 2.0
+        streaming = payload.get("stream", False)
+        headers = {"Content-Type": "application/json", **self.auth_headers()}
+        url = f"{self.chutes_url}/{path.lstrip('/')}"
+
+        if streaming:
+            return await self._forward_stream(
+                url, payload, headers, ctx, remaining, miner_uid, miner_hotkey, model)
+
+        return await self._forward_json(
+            url, payload, headers, ctx, remaining, miner_uid, miner_hotkey, model)
+
+    async def _forward_json(
+        self, url: str, payload: dict, headers: dict, ctx: str,
+        remaining: int, uid: int, hotkey: str, model: str,
+    ) -> dict:
+        max_retries, backoff, t0 = 3, 2.0, time.time()
         last_error: Exception | None = None
-        t0 = time.time()
 
         for attempt in range(max_retries + 1):
-            now = time.time()
-            if (attempt > 0 and self._consecutive_failures >= self._CB_THRESHOLD
-                    and now < self._circuit_open_until):
-                logger.warning("Chutes AI circuit opened mid-retry [%s] %.1fs in",
-                               ctx, now - t0)
-                raise HTTPException(status_code=503, detail=(
-                    f"LLM upstream unavailable ({self._consecutive_failures} failures)"))
-
+            if attempt > 0:
+                self._check_circuit(ctx)
             try:
                 client = await self._get_client()
-                resp = await client.post(f"{self.chutes_url}/chat/completions",
-                                         json=payload, headers=headers,
+                resp = await client.post(url, json=payload, headers=headers,
                                          timeout=self.timeout)
                 resp.raise_for_status()
                 data = resp.json()
                 if attempt > 0:
-                    logger.info("Chutes AI OK on attempt %d [%s] (%.1fs)",
+                    logger.info("Chutes AI OK attempt %d [%s] (%.1fs)",
                                 attempt + 1, ctx, time.time() - t0)
                 break
             except httpx.HTTPStatusError as e:
                 last_error = e
                 status = e.response.status_code
-                body = e.response.text[:200] if e.response.text else ""
+                body = (e.response.text or "")[:200]
                 if status in (429, 502, 503) and attempt < max_retries:
                     ra = e.response.headers.get("Retry-After")
                     wait = min(float(ra) if ra else backoff * (2 ** attempt), 30.0)
-                    logger.warning("Chutes AI HTTP %s [%s]: %s — retry in %.1fs (%d/%d)",
+                    logger.warning("Chutes AI HTTP %s [%s]: %s — retry %.1fs (%d/%d)",
                                    status, ctx, body, wait, attempt + 1, max_retries)
                     await asyncio.sleep(wait)
                     continue
-                self._consecutive_failures += 1
-                cd = self._CB_COOLDOWN * 2 if status in (429, 503) else self._CB_COOLDOWN
-                self._circuit_open_until = time.time() + cd
-                logger.error("Chutes AI HTTP %s [%s] after %.1fs: %s "
-                             "(failures=%d, circuit %.0fs)",
-                             status, ctx, time.time() - t0, body,
-                             self._consecutive_failures, cd)
+                self._open_circuit(status in (429, 503))
+                logger.error("Chutes AI HTTP %s [%s] %.1fs: %s (failures=%d)",
+                             status, ctx, time.time() - t0, body, self._consecutive_failures)
                 raise HTTPException(status_code=502,
-                                    detail=f"LLM upstream error: HTTP {status} — {body}".strip())
+                                    detail=f"LLM error: HTTP {status} — {body}".strip())
             except (httpx.RequestError, httpx.TimeoutException) as e:
                 last_error = e
                 etype = type(e).__name__
                 if attempt < max_retries:
                     wait = min(backoff * (2 ** attempt), 30.0)
-                    logger.warning("Chutes AI %s [%s] (timeout=%.0fs) — retry in %.1fs (%d/%d)",
+                    logger.warning("Chutes AI %s [%s] (timeout=%.0fs) — retry %.1fs (%d/%d)",
                                    etype, ctx, self.timeout, wait, attempt + 1, max_retries)
                     await asyncio.sleep(wait)
                     continue
-                self._consecutive_failures += 1
-                self._circuit_open_until = time.time() + self._CB_COOLDOWN
+                self._open_circuit(False)
                 elapsed = time.time() - t0
-                logger.error("Chutes AI %s [%s] after %.1fs (timeout=%.0fs, "
-                             "failures=%d, circuit %.0fs)",
-                             etype, ctx, elapsed, self.timeout,
-                             self._consecutive_failures, self._CB_COOLDOWN)
+                logger.error("Chutes AI %s [%s] %.1fs (failures=%d)",
+                             etype, ctx, elapsed, self._consecutive_failures)
                 raise HTTPException(status_code=502, detail=(
-                    f"LLM unreachable: {etype} after {max_retries + 1} attempts ({elapsed:.0f}s)"))
+                    f"LLM unreachable: {etype} ({elapsed:.0f}s)"))
         else:
-            self._consecutive_failures += 1
-            cd = self._CB_COOLDOWN * 2
-            self._circuit_open_until = time.time() + cd
+            self._open_circuit(True)
             elapsed = time.time() - t0
-            sc = last_error.response.status_code if isinstance(last_error, httpx.HTTPStatusError) else "?"
-            logger.error("Chutes AI exhausted retries [%s] (status=%s, %.1fs, "
-                         "failures=%d, circuit %.0fs)",
-                         ctx, sc, elapsed, self._consecutive_failures, cd)
-            raise HTTPException(status_code=502, detail=(
-                f"LLM upstream error (HTTP {sc}) after {max_retries + 1} attempts ({elapsed:.0f}s)"))
+            sc = last_error.response.status_code if isinstance(
+                last_error, httpx.HTTPStatusError) else "?"
+            logger.error("Chutes AI retries exhausted [%s] (status=%s, %.1fs)",
+                         ctx, sc, elapsed)
+            raise HTTPException(status_code=502,
+                                detail=f"LLM error (HTTP {sc}) after retries ({elapsed:.0f}s)")
 
-        if self._consecutive_failures > 0:
-            logger.info("Chutes AI recovered [%s] after %d consecutive failures",
-                        ctx, self._consecutive_failures)
-        self._consecutive_failures = 0
+        self._reset_circuit(ctx)
+        await self._log_from_response(uid, hotkey, model, payload, data)
+        data["remaining_queries"] = remaining
+        return data
 
-        # Extract summary for logging (best-effort)
-        content = ""
-        query_text = ""
-        tokens = 0
+    async def _forward_stream(
+        self, url: str, payload: dict, headers: dict, ctx: str,
+        remaining: int, uid: int, hotkey: str, model: str,
+    ) -> AsyncIterator[bytes]:
+        """SSE streaming passthrough (no retry mid-stream)."""
+        client = await self._get_client()
+        req = client.build_request("POST", url, json=payload, headers=headers)
         try:
-            messages = payload.get("messages", [])
-            if messages:
-                last_msg = messages[-1]
-                c = last_msg.get("content", "")
-                query_text = c[:500] if isinstance(c, str) else str(c)[:500]
+            resp = await client.send(req, stream=True)
+        except (httpx.RequestError, httpx.TimeoutException) as e:
+            etype = type(e).__name__
+            self._open_circuit(False)
+            logger.error("Chutes AI stream %s [%s] (failures=%d)",
+                         etype, ctx, self._consecutive_failures)
+            raise HTTPException(status_code=502,
+                                detail=f"LLM unreachable: {etype}")
+        if resp.status_code >= 400:
+            body = (await resp.aread()).decode(errors="replace")[:200]
+            await resp.aclose()
+            self._open_circuit(resp.status_code in (429, 503))
+            logger.error("Chutes AI stream HTTP %s [%s]: %s",
+                         resp.status_code, ctx, body)
+            raise HTTPException(status_code=502,
+                                detail=f"LLM error: HTTP {resp.status_code} — {body}")
+        self._reset_circuit(ctx)
+
+        async def generate() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await self._log_query(uid, hotkey, model, "", "(stream)", 0)
+
+        return generate()
+
+    async def _log_from_response(self, uid: int, hotkey: str,
+                                 model: str, payload: dict, data: dict):
+        query, content, tokens = "", "", 0
+        try:
+            msgs = payload.get("messages", [])
+            if msgs:
+                c = msgs[-1].get("content", "")
+                query = c[:500] if isinstance(c, str) else str(c)[:500]
             choices = data.get("choices", [])
             if choices:
                 msg = choices[0].get("message", {})
@@ -281,101 +279,12 @@ class LLMProxy:
                     content = str(content)
             tokens = data.get("usage", {}).get("total_tokens", 0)
         except Exception:
-            pass  # logging extraction should never fail the request
-
-        await self._log_query(miner_uid, miner_hotkey, model, query_text, content, tokens)
-
-        # Inject remaining quota into response for agent convenience
-        data["remaining_queries"] = remaining
-
-        return data
+            pass
+        await self._log_query(uid, hotkey, model, query, content, tokens)
 
     async def close(self):
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
     def reset_limits(self):
-        """Reset all rate limits."""
         self._query_counts.clear()
-
-
-# ── FastAPI routes ──────────────────────────────────────────────────────────
-
-_proxy: Optional[LLMProxy] = None
-
-
-def set_proxy(proxy: LLMProxy):
-    global _proxy
-    _proxy = proxy
-
-
-def get_proxy() -> LLMProxy:
-    if _proxy is None:
-        raise HTTPException(status_code=503, detail="LLM proxy not initialized")
-    return _proxy
-
-
-def register_routes(app: FastAPI):
-    """Register LLM proxy routes on the given FastAPI app."""
-
-    @app.post("/llm/chat")
-    async def llm_chat(request: Request):
-        """OpenAI-compatible chat completion. Requires X-Miner-UID header.
-
-        Accepts the full OpenAI request body (messages, tools, tool_choice,
-        response_format, etc.) and returns the full upstream response.
-        """
-        proxy = get_proxy()
-        miner_uid = _extract_miner_uid(request)
-        miner_hotkey = request.headers.get("X-Miner-Hotkey", "")
-
-        # Read raw JSON body (with size limit)
-        body = await request.body()
-        if len(body) > _MAX_BODY_BYTES:
-            raise HTTPException(status_code=413, detail="Request body too large")
-        try:
-            payload = await request.json()
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON body")
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
-
-        data = await proxy.chat(miner_uid, payload, miner_hotkey)
-        return JSONResponse(content=data)
-
-    @app.get("/llm/models")
-    def llm_models():
-        """List allowed models."""
-        proxy = get_proxy()
-        return {
-            "models": proxy.allowed_models,
-            "all_allowed": len(proxy.allowed_models) == 0,
-        }
-
-    @app.get("/llm/quota")
-    def llm_quota(request: Request):
-        """Check remaining LLM query quota for this miner."""
-        proxy = get_proxy()
-        miner_uid = _extract_miner_uid(request)
-        return {
-            "miner_uid": miner_uid,
-            "remaining_queries": proxy.remaining_queries(miner_uid),
-        }
-
-    @app.get("/llm/health")
-    def llm_health():
-        return {"status": "ok", "proxy_initialized": _proxy is not None}
-
-
-def _extract_miner_uid(request: Request) -> int:
-    """Extract miner UID from request header."""
-    uid_str = request.headers.get("X-Miner-UID", "")
-    if not uid_str:
-        raise HTTPException(status_code=400, detail="Missing X-Miner-UID header")
-    try:
-        uid = int(uid_str)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid X-Miner-UID header")
-    if uid < 0:
-        raise HTTPException(status_code=400, detail="Invalid miner UID")
-    return uid

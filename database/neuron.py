@@ -124,8 +124,8 @@ class DatabaseNeuron:
         # LLM proxy (Chutes AI)
         if Config.LLM_ENABLED:
             from validator.llm_proxy import LLMProxy
-            from validator.llm_proxy import set_proxy as set_llm_proxy
-            from validator.llm_proxy import register_routes as register_llm_routes
+            from validator.llm_routes import set_proxy as set_llm_proxy
+            from validator.llm_routes import register_routes as register_llm_routes
             allowed_models = [
                 m.strip() for m in Config.CHUTES_ALLOWED_MODELS.split(",")
                 if m.strip()
