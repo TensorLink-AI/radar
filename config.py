@@ -127,7 +127,7 @@ class Config:
     PG_SSL: str = os.getenv("RADAR_PG_SSL", "")
 
     # ── Database API ──────────────────────────────────────────
-    DB_API_URL: str = os.getenv("RADAR_DB_API_URL", "http://localhost:8090")
+    DB_API_URL: str = os.getenv("RADAR_DB_API_URL", "")
     DB_API_PORT: int = int(os.getenv("RADAR_DB_API_PORT", "8090"))
 
     # ── Miner Listener ───────────────────────────────────────

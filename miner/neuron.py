@@ -86,6 +86,9 @@ class Miner:
             return
 
         db_url = Config.DB_API_URL
+        if not db_url:
+            logger.error("RADAR_DB_API_URL not set — cannot submit agent code")
+            return
         from shared.db_client import DatabaseClient
         db = DatabaseClient(db_url=db_url, wallet=self.wallet)
         try:

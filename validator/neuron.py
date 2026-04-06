@@ -93,6 +93,11 @@ class Validator:
             self.task = next(iter(self.tasks.values()))
 
         # Database client — talks to centralized DB server
+        if not Config.DB_API_URL:
+            raise RuntimeError(
+                "RADAR_DB_API_URL is not set. Validators must point to the "
+                "centralized DB server (e.g. http://<db-host>:8090)."
+            )
         self.db_client = DatabaseClient(
             db_url=Config.DB_API_URL, wallet=self.wallet,
             api_key=Config.DB_API_KEY,
