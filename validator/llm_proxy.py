@@ -54,10 +54,9 @@ class LLMProxy:
         # first token, then stream for another 30-60s.  A flat timeout
         # starves the read phase.  The `timeout` param sets the read
         # timeout (default 300s); connect/write/pool are fixed shorter.
-        read_timeout = max(timeout, 180.0)
         self.timeout = httpx.Timeout(
             connect=30.0,
-            read=read_timeout,
+            read=600.0,
             write=60.0,
             pool=60.0,
         )
