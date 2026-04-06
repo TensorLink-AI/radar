@@ -252,15 +252,26 @@ async def run_agent_on_pod(
     for attempt in range(1 + max_retries):
         try:
             result = await env.process_challenge(**call_kwargs)
+            if attempt > 0:
+                logger.info(
+                    "Agent pod succeeded on attempt %d/%d",
+                    attempt + 1, 1 + max_retries,
+                )
             return result
         except Exception as e:
+            err_str = str(e)
+            is_502 = "502" in err_str
             if attempt < max_retries:
-                # Basilica pods can take ~5 min to spin up; use longer
-                # backoff to give the cluster time to recover.
-                wait = 15 * (attempt + 1)  # 15s, 30s
+                # Basilica deployments can take 30-60s to become fully
+                # responsive even after reporting "ready".  Use a longer
+                # base backoff (30s) so the next deployment has time to
+                # warm up.  Double on subsequent retries.
+                wait = 30 * (attempt + 1)  # 30s, 60s, 90s
                 logger.warning(
-                    "Agent pod attempt %d/%d failed: %s — retrying in %ds",
-                    attempt + 1, 1 + max_retries, e, wait,
+                    "Agent pod attempt %d/%d failed (%s): %s — retrying in %ds",
+                    attempt + 1, 1 + max_retries,
+                    "502 Bad Gateway" if is_502 else type(e).__name__,
+                    e, wait,
                 )
                 await asyncio.sleep(wait)
             else:
