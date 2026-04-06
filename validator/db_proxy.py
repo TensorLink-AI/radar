@@ -20,7 +20,7 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from shared.auth import sign_request
 
@@ -134,8 +134,8 @@ async def _get_client() -> httpx.AsyncClient:
 
 
 # Longer timeout for LLM requests — the database server forwards to
-# Chutes AI with a 60 s timeout, so the proxy must wait at least that long.
-_LLM_TIMEOUT = httpx.Timeout(90.0, connect=10.0)
+# Chutes AI with up to 120 s timeout + retries, so the proxy must wait longer.
+_LLM_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 
 
 def _check_rate_limit(identity: str, category: str) -> bool:
@@ -210,15 +210,8 @@ async def auth_middleware(request: Request, call_next):
     return JSONResponse(status_code=403, content={"error": "Invalid agent token or signature"})
 
 
-async def _proxy_request(request: Request, path: str) -> Response:
-    """Forward a request to the database server, signed with validator wallet."""
-    if not _db_api_url:
-        raise HTTPException(status_code=503, detail="DB API URL not configured")
-
-    client = await _get_client()
-    body = await request.body()
-
-    # Sign outgoing request with validator wallet
+def _build_proxy_headers(request: Request, body: bytes) -> dict:
+    """Build signed headers with forwarded miner identity."""
     headers = {}
     if _wallet:
         headers = sign_request(_wallet, body)
@@ -226,39 +219,53 @@ async def _proxy_request(request: Request, path: str) -> Response:
         headers["X-Radar-API-Key"] = _api_key
     if body:
         headers["Content-Type"] = request.headers.get("content-type", "application/json")
-
-    # Forward miner identity headers (used by LLM/desearch proxies on DB server)
-    # Agent pods don't know their UID, so inject a fallback for routes that
-    # require X-Miner-UID (e.g. /llm/chat rate limiting on the DB server).
-    for fwd_header in ("X-Miner-UID", "X-Miner-Hotkey"):
-        val = request.headers.get(fwd_header, "")
+    for fwd in ("X-Miner-UID", "X-Miner-Hotkey"):
+        val = request.headers.get(fwd, "")
         if val:
-            headers[fwd_header] = val
+            headers[fwd] = val
     if "X-Miner-UID" not in headers:
         headers["X-Miner-UID"] = "0"
+    return headers
 
-    # Build target URL with query string
+
+def _build_target(path: str, request: Request) -> str:
     target = f"{_db_api_url}{path}"
     query = str(request.url.query)
-    if query:
-        target += f"?{query}"
+    return f"{target}?{query}" if query else target
 
-    # LLM requests need a longer timeout because the DB server
-    # forwards to Chutes AI (up to 60 s per attempt with retries).
+
+async def _proxy_request(request: Request, path: str) -> Response:
+    """Forward a request to the database server, signed with validator wallet."""
+    if not _db_api_url:
+        raise HTTPException(status_code=503, detail="DB API URL not configured")
+
+    client = await _get_client()
+    body = await request.body()
+    headers = _build_proxy_headers(request, body)
+    target = _build_target(path, request)
     timeout = _LLM_TIMEOUT if path.startswith("/llm") else None
+
+    # Check if this is a streaming LLM request (agent sent stream: true)
+    is_stream_request = False
+    if path.startswith("/llm") and body:
+        try:
+            import json
+            is_stream_request = json.loads(body).get("stream", False)
+        except Exception:
+            pass
+
+    if is_stream_request:
+        return await _proxy_stream(client, target, body, headers, timeout)
 
     try:
         if request.method == "GET":
             resp = await client.get(target, headers=headers, timeout=timeout)
         elif request.method == "POST":
-            resp = await client.post(
-                target, content=body, headers=headers, timeout=timeout,
-            )
+            resp = await client.post(target, content=body, headers=headers,
+                                     timeout=timeout)
         else:
-            resp = await client.request(
-                request.method, target, content=body, headers=headers,
-                timeout=timeout,
-            )
+            resp = await client.request(request.method, target, content=body,
+                                        headers=headers, timeout=timeout)
         return Response(
             content=resp.content,
             status_code=resp.status_code,
@@ -267,6 +274,34 @@ async def _proxy_request(request: Request, path: str) -> Response:
     except (httpx.RequestError, httpx.TimeoutException) as e:
         logger.warning("Proxy request to %s failed: %s", target, e or type(e).__name__)
         raise HTTPException(status_code=502, detail="Database server unreachable")
+
+
+async def _proxy_stream(
+    client: httpx.AsyncClient, target: str, body: bytes,
+    headers: dict, timeout,
+) -> StreamingResponse:
+    """Stream an SSE response from the database server back to the caller."""
+    try:
+        req = client.build_request("POST", target, content=body, headers=headers)
+        resp = await client.send(req, stream=True, timeout=timeout)
+    except (httpx.RequestError, httpx.TimeoutException) as e:
+        logger.warning("Proxy stream to %s failed: %s", target, e or type(e).__name__)
+        raise HTTPException(status_code=502, detail="Database server unreachable")
+
+    if resp.status_code >= 400:
+        error_body = (await resp.aread()).decode(errors="replace")
+        await resp.aclose()
+        return Response(content=error_body, status_code=resp.status_code,
+                        media_type="application/json")
+
+    async def generate():
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            await resp.aclose()
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 @app.get("/health")
