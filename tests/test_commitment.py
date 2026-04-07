@@ -128,8 +128,8 @@ class TestReadMinerCommitments:
         assert result[1].miner_uid == 1
         assert result[1].hotkey == "hotkey_1"
 
-    def test_read_all_commitments_skips_validators(self):
-        """Commitments from validator UIDs should be skipped."""
+    def test_read_all_commitments_skips_unknown_uids(self):
+        """Commitments from UIDs not in the target set should be skipped."""
         subtensor = MagicMock()
         subtensor.get_all_commitments.return_value = {
             "hotkey_0": ImageCommitment(code_hash="sha256:abc", listener_url="y").to_json(),
@@ -137,7 +137,7 @@ class TestReadMinerCommitments:
         result = _read_all_commitments(
             subtensor, netuid=1,
             hotkey_to_uid={"hotkey_0": 0},
-            miner_uids={1, 2},  # UID 0 is not a miner
+            miner_uids={1, 2},  # UID 0 is not in the target set
         )
         assert len(result) == 0
 

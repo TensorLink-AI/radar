@@ -122,33 +122,30 @@ class ImageCommitment:
 
 def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, ImageCommitment]:
     """
-    Read image commitments from all miners in the metagraph.
+    Read image commitments from all neurons in the metagraph.
+
+    Any UID with a valid commitment (code_hash + listener_url) is included,
+    regardless of validator_permit. On small subnets, miners may have
+    validator_permit=true even though they run as miners.
 
     Priority: get_all_commitments (single RPC) → per-UID fallback.
 
-    Returns: {uid: ImageCommitment} for miners with valid commitments.
+    Returns: {uid: ImageCommitment} for neurons with valid commitments.
     """
     hotkeys = metagraph.hotkeys if metagraph.hotkeys is not None else []
 
-    # Build hotkey→uid map and miner UID set
+    # Build hotkey→uid map for ALL neurons
     hotkey_to_uid: dict[str, int] = {}
-    validator_permits = metagraph.validator_permit
-    miner_uids: set[int] = set()
+    all_uids: set[int] = set()
     for uid in range(metagraph.n):
         if uid < len(hotkeys) and hotkeys[uid]:
             hotkey_to_uid[hotkeys[uid]] = uid
-        is_validator = (
-            validator_permits is not None
-            and uid < len(validator_permits)
-            and validator_permits[uid]
-        )
-        if not is_validator:
-            miner_uids.add(uid)
-    logger.info("Checking %d miner UIDs for commitments", len(miner_uids))
+        all_uids.add(uid)
+    logger.info("Checking %d UIDs for commitments", len(all_uids))
 
     # Primary: get_all_commitments — single RPC call, SDK handles decoding
     commitments = _read_all_commitments(
-        subtensor, netuid, hotkey_to_uid, miner_uids,
+        subtensor, netuid, hotkey_to_uid, all_uids,
     )
     if commitments:
         logger.info("Found %d commitments via get_all_commitments", len(commitments))
@@ -156,7 +153,7 @@ def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, Image
 
     # Fallback: per-UID get_commitment (slower, but works if map query fails)
     commitments = _read_per_uid_commitments(
-        subtensor, netuid, hotkeys, sorted(miner_uids),
+        subtensor, netuid, hotkeys, sorted(all_uids),
     )
     if commitments:
         logger.info("Found %d commitments via per-UID fallback", len(commitments))
@@ -220,7 +217,14 @@ def _read_per_uid_commitments(
                 metadata = subtensor.get_commitment_metadata(
                     netuid=netuid, hotkey_ss58=hotkey,
                 )
-                if not metadata or not isinstance(metadata, dict):
+                if not metadata:
+                    logger.info("UID %d: no commitment on chain", uid)
+                    continue
+                if not isinstance(metadata, dict):
+                    logger.warning(
+                        "UID %d: commitment metadata is %s, not dict: %s",
+                        uid, type(metadata).__name__, str(metadata)[:120],
+                    )
                     continue
                 # Use SDK decoding — handles current on-chain byte tuple format
                 from bittensor.core.chain_data.utils import decode_metadata
