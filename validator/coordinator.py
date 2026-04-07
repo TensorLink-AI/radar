@@ -262,9 +262,10 @@ class TrainingCoordinator:
                     # Retry on transient server errors:
                     # - 502: Bad Gateway (trainer pod proxy up, server still starting)
                     # - 503: Service Unavailable (metagraph/auth not ready yet)
-                    # Do NOT retry 429 — means another validator already dispatched
-                    # this job (semaphore busy) or rate limit hit. The checkpoint
-                    # will appear in R2 from the other validator's dispatch.
+                    # Do NOT retry 429 — the trainer is already running this
+                    # job (from an earlier retry whose response was lost to a
+                    # proxy timeout).  Treat as "already running" so checkpoint
+                    # polling picks up the result from R2.
                     if resp.status_code in (502, 503) and attempt < max_retries:
                         wait = 10 * (attempt + 1)
                         logger.warning(
@@ -273,6 +274,26 @@ class TrainingCoordinator:
                         )
                         await asyncio.sleep(wait)
                         continue
+
+                    # 429 = trainer semaphore busy — job is already running
+                    # (likely from an earlier retry where the proxy returned
+                    # 502/503 but the trainer received and started the request).
+                    # Report as "already_running" so checkpoint polling still
+                    # collects the result.
+                    if resp.status_code == 429:
+                        logger.info(
+                            "Trainer UID %d already running job (HTTP 429) — "
+                            "checkpoint will be collected via R2 polling",
+                            job.trainer_uid,
+                        )
+                        return TrainingResult(
+                            round_id=job.round_id,
+                            arch_owner=job.arch_owner,
+                            trainer_uid=job.trainer_uid,
+                            dispatcher=self.my_uid,
+                            seed=challenge.seed,
+                            status="already_running",
+                        )
 
                     try:
                         data = resp.json()
