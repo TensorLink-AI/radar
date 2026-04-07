@@ -493,11 +493,20 @@ class TrainingCoordinator:
         # Fire TrainerRequest to all miners with listener_urls.
         # Re-sign per miner so the Epistula timestamp stays fresh —
         # stale timestamps (>30s) cause miners to reject with 403.
+        with_listener = {uid: c for uid, c in commitments.items() if c.listener_url}
+        without_listener = {uid: c for uid, c in commitments.items() if not c.listener_url}
+        if without_listener:
+            logger.warning(
+                "Skipping %d miners with no listener_url: %s",
+                len(without_listener), sorted(without_listener.keys()),
+            )
+        logger.info(
+            "Sending TrainerRequest to %d miners with listener_urls (round %d)",
+            len(with_listener), round_id,
+        )
         sent_uids: set[int] = set()
         async with httpx.AsyncClient(timeout=30) as client:
-            for uid, commitment in commitments.items():
-                if not commitment.listener_url:
-                    continue
+            for uid, commitment in with_listener.items():
                 try:
                     url = f"{commitment.listener_url.rstrip('/')}/prepare"
                     fresh_headers = sign_request(self.wallet, body)
