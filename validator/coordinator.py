@@ -489,10 +489,10 @@ class TrainingCoordinator:
             memory=Config.TRAINER_MEMORY,
         )
         body = req.to_json().encode()
-        headers = sign_request(self.wallet, body)
-        headers["Content-Type"] = "application/json"
 
-        # Fire TrainerRequest to all miners with listener_urls
+        # Fire TrainerRequest to all miners with listener_urls.
+        # Re-sign per miner so the Epistula timestamp stays fresh —
+        # stale timestamps (>30s) cause miners to reject with 403.
         sent_uids: set[int] = set()
         async with httpx.AsyncClient(timeout=30) as client:
             for uid, commitment in commitments.items():
@@ -500,8 +500,16 @@ class TrainingCoordinator:
                     continue
                 try:
                     url = f"{commitment.listener_url.rstrip('/')}/prepare"
-                    await client.post(url, content=body, headers=headers)
-                    sent_uids.add(uid)
+                    fresh_headers = sign_request(self.wallet, body)
+                    fresh_headers["Content-Type"] = "application/json"
+                    resp = await client.post(url, content=body, headers=fresh_headers)
+                    if resp.status_code < 400:
+                        sent_uids.add(uid)
+                    else:
+                        logger.warning(
+                            "TrainerRequest to UID %d rejected (HTTP %d): %s",
+                            uid, resp.status_code, resp.text[:200],
+                        )
                 except Exception as e:
                     logger.warning("Failed to send TrainerRequest to UID %d: %s", uid, e)
 
