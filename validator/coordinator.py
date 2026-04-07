@@ -165,9 +165,10 @@ class TrainingCoordinator:
         gift_eval_urls = gift_eval_urls or {}
         logger.info("Dispatching %d jobs to %d trainer endpoints", len(jobs), len(trainer_endpoints))
 
-        # Per-job timeout: time_budget + 120s buffer for startup/upload overhead
+        # Trainer returns 202 Accepted immediately; this timeout only
+        # covers auth + request parsing, not the full training run.
         time_budget = challenge.task.get("time_budget", 300)
-        job_timeout = time_budget + 120
+        job_timeout = 60
 
         # Build tasks for concurrent dispatch
         immediate_results: list[TrainingResult] = []
@@ -310,6 +311,22 @@ class TrainingCoordinator:
                             dispatcher=self.my_uid,
                             status="failed",
                             error=f"Non-JSON response (HTTP {resp.status_code}): {body_preview}",
+                        )
+
+                    # 202 Accepted = trainer acknowledged, training in background
+                    if resp.status_code == 202:
+                        logger.info(
+                            "Trainer UID %d accepted job (HTTP 202) — "
+                            "checkpoint will be collected via R2 polling",
+                            job.trainer_uid,
+                        )
+                        return TrainingResult(
+                            round_id=job.round_id,
+                            arch_owner=job.arch_owner,
+                            trainer_uid=job.trainer_uid,
+                            dispatcher=self.my_uid,
+                            seed=challenge.seed,
+                            status="accepted",
                         )
 
                     # Log HTTP errors with the response body for diagnostics
