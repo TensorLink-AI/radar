@@ -173,21 +173,33 @@ def _read_all_commitments(
     try:
         all_raw = subtensor.get_all_commitments(netuid=netuid)
     except Exception as e:
-        logger.debug("get_all_commitments failed: %s", e)
+        logger.warning("get_all_commitments RPC failed: %s", e)
         return commitments
 
+    miner_entries = 0
     for hotkey, raw_text in all_raw.items():
         uid = hotkey_to_uid.get(hotkey)
         if uid is None or uid not in miner_uids:
             continue
+        miner_entries += 1
         if not raw_text:
+            logger.warning("UID %d: commitment on chain is empty", uid)
             continue
         try:
             c = ImageCommitment.from_json(raw_text, miner_uid=uid, hotkey=hotkey)
             if c.code_hash:
                 commitments[uid] = c
+            else:
+                logger.warning(
+                    "UID %d: commitment has no code_hash (raw=%s)",
+                    uid, raw_text[:120],
+                )
         except Exception as e:
-            logger.debug("Bad commitment JSON for UID %d: %s", uid, e)
+            logger.warning("UID %d: bad commitment JSON: %s (raw=%s)", uid, e, raw_text[:120])
+    logger.info(
+        "get_all_commitments: %d total on chain, %d miner entries, %d valid",
+        len(all_raw), miner_entries, len(commitments),
+    )
     return commitments
 
 
@@ -211,14 +223,19 @@ def _read_per_uid_commitments(
                 if not metadata or not isinstance(metadata, dict):
                     continue
                 # Use SDK decoding — handles current on-chain byte tuple format
-                from bittensor.core.async_subtensor import decode_metadata
+                from bittensor.core.chain_data.utils import decode_metadata
                 raw = decode_metadata(metadata)
                 if raw:
                     c = ImageCommitment.from_json(raw, miner_uid=uid, hotkey=hotkey)
                     if c.code_hash:
                         commitments[uid] = c
+                    else:
+                        logger.warning(
+                            "UID %d: per-UID commitment has no code_hash (raw=%s)",
+                            uid, raw[:120],
+                        )
             except Exception as e:
-                logger.debug("No commitment for UID %d: %s", uid, e)
+                logger.warning("Per-UID commitment read failed for UID %d: %s", uid, e)
     finally:
         bt_logger.setLevel(prev_level)
     return commitments
