@@ -398,14 +398,23 @@ class Validator:
             gift_eval_urls=gift_eval_urls,
         )
         succeeded = sum(1 for r in my_results if r.status == "success")
-        failed = sum(1 for r in my_results if r.status != "success")
-        logger.info("Phase B dispatch: %d succeeded, %d failed", succeeded, failed)
+        already_running = sum(1 for r in my_results if r.status == "already_running")
+        failed = sum(1 for r in my_results if r.status not in ("success", "already_running"))
+        logger.info(
+            "Phase B dispatch: %d succeeded, %d already running, %d failed",
+            succeeded, already_running, failed,
+        )
         for r in my_results:
             if r.status == "success":
                 logger.info(
                     "  Job arch=%d trainer=%d: success (%.1fs, %d flops)",
                     r.arch_owner, r.trainer_uid,
                     r.training_time_seconds, r.flops_equivalent_size,
+                )
+            elif r.status == "already_running":
+                logger.info(
+                    "  Job arch=%d trainer=%d: already running (awaiting R2 checkpoint)",
+                    r.arch_owner, r.trainer_uid,
                 )
             else:
                 logger.warning(

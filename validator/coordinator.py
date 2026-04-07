@@ -262,9 +262,10 @@ class TrainingCoordinator:
                     # Retry on transient server errors:
                     # - 502: Bad Gateway (trainer pod proxy up, server still starting)
                     # - 503: Service Unavailable (metagraph/auth not ready yet)
-                    # Do NOT retry 429 — means another validator already dispatched
-                    # this job (semaphore busy) or rate limit hit. The checkpoint
-                    # will appear in R2 from the other validator's dispatch.
+                    # Do NOT retry 429 — the trainer is already running this
+                    # job (from an earlier retry whose response was lost to a
+                    # proxy timeout).  Treat as "already running" so checkpoint
+                    # polling picks up the result from R2.
                     if resp.status_code in (502, 503) and attempt < max_retries:
                         wait = 10 * (attempt + 1)
                         logger.warning(
@@ -273,6 +274,26 @@ class TrainingCoordinator:
                         )
                         await asyncio.sleep(wait)
                         continue
+
+                    # 429 = trainer semaphore busy — job is already running
+                    # (likely from an earlier retry where the proxy returned
+                    # 502/503 but the trainer received and started the request).
+                    # Report as "already_running" so checkpoint polling still
+                    # collects the result.
+                    if resp.status_code == 429:
+                        logger.info(
+                            "Trainer UID %d already running job (HTTP 429) — "
+                            "checkpoint will be collected via R2 polling",
+                            job.trainer_uid,
+                        )
+                        return TrainingResult(
+                            round_id=job.round_id,
+                            arch_owner=job.arch_owner,
+                            trainer_uid=job.trainer_uid,
+                            dispatcher=self.my_uid,
+                            seed=challenge.seed,
+                            status="already_running",
+                        )
 
                     try:
                         data = resp.json()
@@ -363,10 +384,14 @@ class TrainingCoordinator:
     ) -> dict[int, dict]:
         """Poll R2 for training_meta.json from each miner.
 
+        Uses direct key lookups (strongly consistent) instead of
+        list_objects (eventually consistent) to avoid missing recently
+        uploaded artifacts.
+
         Performs post-upload verification: checks that the meta's round_id
         and miner_hotkey match expectations, rejecting tampered artifacts.
         """
-        from shared.artifacts import list_round_artifacts, meta_key as mk_fn, verify_uploaded_artifacts
+        from shared.artifacts import meta_key as mk_fn, checkpoint_key as ck_fn
 
         results: dict[int, dict] = {}
         deadline = asyncio.get_event_loop().time() + timeout
@@ -374,11 +399,9 @@ class TrainingCoordinator:
         # Build uid→hotkey mapping
         hotkeys = self.metagraph.hotkeys if hasattr(self.metagraph, "hotkeys") else []
         uid_to_hotkey = {}
-        hotkey_to_uid = {}
         for uid in expected_miners:
             hk = hotkeys[uid] if uid < len(hotkeys) else f"uid_{uid}"
             uid_to_hotkey[uid] = hk
-            hotkey_to_uid[hk] = uid
 
         poll_count = 0
         while asyncio.get_event_loop().time() < deadline:
@@ -388,32 +411,45 @@ class TrainingCoordinator:
                 "Checkpoint poll #%d: %d/%d collected, %.0fs remaining (round %d)",
                 poll_count, len(results), len(expected_miners), remaining, round_id,
             )
-            # Use list_round_artifacts to find which miners have uploaded
-            available = list_round_artifacts(self.r2, round_id)
-            for hk in available:
-                uid = hotkey_to_uid.get(hk)
-                if uid is None or uid in results:
+            # Check each pending miner directly (strongly consistent)
+            for uid, hk in uid_to_hotkey.items():
+                if uid in results:
                     continue
                 try:
-                    # Verify artifact integrity before accepting
-                    ok, err = verify_uploaded_artifacts(self.r2, round_id, hk)
-                    if not ok:
+                    meta = self.r2.download_json(mk_fn(round_id, hk))
+                    if not meta:
+                        continue
+
+                    # Verify meta fields match expectations
+                    if meta.get("round_id") != round_id:
                         logger.warning(
-                            "Artifact verification failed for miner %s (UID %s) round %d: %s",
-                            hk[:16], uid, round_id, err,
+                            "Meta round_id mismatch for UID %d: expected %d, got %s",
+                            uid, round_id, meta.get("round_id"),
+                        )
+                        continue
+                    if meta.get("miner_hotkey") != hk:
+                        logger.warning(
+                            "Meta miner_hotkey mismatch for UID %d: expected %s, got %s",
+                            uid, hk[:16], str(meta.get("miner_hotkey"))[:16],
                         )
                         continue
 
-                    meta = self.r2.download_json(mk_fn(round_id, hk))
-                    if meta:
-                        meta["miner_uid"] = uid
-                        meta["miner_hotkey"] = hk
-                        results[uid] = meta
-                        logger.info(
-                            "Checkpoint received: UID %d status=%s flops=%d (round %d)",
-                            uid, meta.get("status", "?"),
-                            meta.get("flops_equivalent_size", 0), round_id,
+                    # Verify checkpoint file exists
+                    if not self.r2.key_exists(ck_fn(round_id, hk)):
+                        logger.debug(
+                            "Meta exists but checkpoint missing for UID %d (round %d)",
+                            uid, round_id,
                         )
+                        continue
+
+                    meta["miner_uid"] = uid
+                    meta["miner_hotkey"] = hk
+                    results[uid] = meta
+                    logger.info(
+                        "Checkpoint received: UID %d status=%s flops=%d (round %d)",
+                        uid, meta.get("status", "?"),
+                        meta.get("flops_equivalent_size", 0), round_id,
+                    )
                 except Exception as exc:
                     logger.warning("Error reading checkpoint for UID %s round %d: %s", uid, round_id, exc)
 
