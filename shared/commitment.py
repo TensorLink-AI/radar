@@ -220,7 +220,14 @@ def _read_per_uid_commitments(
                 metadata = subtensor.get_commitment_metadata(
                     netuid=netuid, hotkey_ss58=hotkey,
                 )
-                if not metadata or not isinstance(metadata, dict):
+                if not metadata:
+                    logger.info("UID %d: no commitment on chain", uid)
+                    continue
+                if not isinstance(metadata, dict):
+                    logger.warning(
+                        "UID %d: commitment metadata is %s, not dict: %s",
+                        uid, type(metadata).__name__, str(metadata)[:120],
+                    )
                     continue
                 # Use SDK decoding — handles current on-chain byte tuple format
                 from bittensor.core.chain_data.utils import decode_metadata
