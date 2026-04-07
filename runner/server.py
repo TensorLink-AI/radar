@@ -75,7 +75,12 @@ def _get_r2():
 
 @app.post("/train")
 async def train(request: Request):
-    """Execute a training job, routing to the appropriate task runner."""
+    """Accept a training job and run it in the background.
+
+    Returns 202 Accepted immediately so proxy timeouts don't kill the
+    upload pipeline.  Training + R2 upload happen in a background task;
+    the validator discovers results via R2 polling.
+    """
     if _train_semaphore.locked():
         return JSONResponse(status_code=429, content={"error": "Training job already in progress"})
 
@@ -128,12 +133,16 @@ async def train(request: Request):
             "error": f"Unknown task '{task_name}'. Supported: {sorted(_RUNNERS.keys())}",
         })
 
-    # 5. Download GIFT-Eval data if provided
-    gift_eval_urls = data.get("gift_eval_urls", {})
-    if gift_eval_urls:
-        _download_gift_eval_from_urls(gift_eval_urls)
+    # 5. Acquire semaphore synchronously to guarantee 429 on overlap,
+    #    then kick off training + upload in a background task so the
+    #    HTTP response isn't blocked by the full training duration.
+    #    The validator discovers results via R2 polling.
+    if not _train_semaphore.locked():
+        await _train_semaphore.acquire()
+    else:
+        # Race: another request acquired between the check and here
+        return JSONResponse(status_code=429, content={"error": "Training job already in progress"})
 
-    # 6. Execute training under semaphore
     training_config = {
         "seed": data.get("seed", 42),
         "round_id": data.get("round_id", 0),
@@ -143,22 +152,83 @@ async def train(request: Request):
         "time_budget": data.get("time_budget", 300),
     }
 
-    async with _train_semaphore:
-        runner_fn = _RUNNERS[task_name]
-        result = await asyncio.to_thread(runner_fn, architecture_code, training_config)
+    runner_fn = _RUNNERS[task_name]
+    upload_urls = data.get("upload_urls", {})
+    gift_eval_urls = data.get("gift_eval_urls", {})
 
+    asyncio.create_task(_train_and_upload(
+        runner_fn, architecture_code, training_config,
+        upload_urls, gift_eval_urls,
+    ))
+
+    logger.info(
+        "Training job accepted: round=%d miner=%s task=%s",
+        training_config["round_id"], training_config["miner_hotkey"], task_name,
+    )
+    return JSONResponse(
+        status_code=202,
+        content={"status": "accepted", "round_id": training_config["round_id"]},
+    )
+
+
+async def _train_and_upload(
+    runner_fn,
+    architecture_code: str,
+    training_config: dict,
+    upload_urls: dict,
+    gift_eval_urls: dict,
+):
+    """Background task: download data, train, upload artifacts, release semaphore."""
     round_id = training_config["round_id"]
     miner_hotkey = training_config["miner_hotkey"]
+    try:
+        # Download GIFT-Eval data if provided
+        if gift_eval_urls:
+            _download_gift_eval_from_urls(gift_eval_urls)
 
-    if result.get("status") in ("build_failed", "size_violation", "failed"):
-        return JSONResponse(content=result)
+        # Run training
+        result = await asyncio.to_thread(runner_fn, architecture_code, training_config)
 
-    # 7. Upload checkpoint to R2
-    upload_urls = data.get("upload_urls", {})
-    result = _upload_artifacts(
-        result, architecture_code, round_id, miner_hotkey, upload_urls,
+        if result.get("status") in ("build_failed", "size_violation", "failed"):
+            logger.warning(
+                "Training failed for round %d miner %s: %s — %s",
+                round_id, miner_hotkey, result.get("status"), result.get("error", ""),
+            )
+            # Upload a failure meta so the validator knows what happened
+            _upload_failure_meta(round_id, miner_hotkey, upload_urls, result)
+            return
+
+        # Upload artifacts to R2
+        _upload_artifacts(result, architecture_code, round_id, miner_hotkey, upload_urls)
+    except Exception as e:
+        logger.error("Background train+upload failed for round %d miner %s: %s", round_id, miner_hotkey, e)
+    finally:
+        _train_semaphore.release()
+        logger.info("Training semaphore released (round %d miner %s)", round_id, miner_hotkey)
+
+
+def _upload_failure_meta(
+    round_id: int, miner_hotkey: str, upload_urls: dict, result: dict,
+):
+    """Upload a training_meta.json for a failed run so the validator can see it."""
+    from shared.artifacts import TrainingMeta
+    meta = TrainingMeta(
+        round_id=round_id,
+        miner_hotkey=miner_hotkey,
+        status=result.get("status", "failed"),
+        error=result.get("error", ""),
+        flops_equivalent_size=result.get("flops_equivalent_size", 0),
+        training_time_seconds=result.get("training_time_seconds", 0),
     )
-    return JSONResponse(content=result)
+    if upload_urls.get("meta"):
+        try:
+            import httpx
+            body = json.dumps(meta.to_dict(), indent=2).encode()
+            resp = httpx.put(upload_urls["meta"], content=body, timeout=30)
+            resp.raise_for_status()
+            logger.info("Uploaded failure meta for round %d miner %s", round_id, miner_hotkey)
+        except Exception as e:
+            logger.error("Failed to upload failure meta: %s", e)
 
 
 def _upload_artifacts(
