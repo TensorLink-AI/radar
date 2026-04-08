@@ -870,7 +870,6 @@ if [ "$USE_TESTNET" = true ]; then
     export RADAR_SUBMISSION_WINDOW=${RADAR_SUBMISSION_WINDOW:-50}
     export RADAR_TRAINING_WINDOW=${RADAR_TRAINING_WINDOW:-150}
     export RADAR_EVAL_WINDOW=${RADAR_EVAL_WINDOW:-25}
-    export RADAR_TRAINING_TIMEOUT=${RADAR_TRAINING_TIMEOUT:-1800}
     export RADAR_AGENT_TIMEOUT=${RADAR_AGENT_TIMEOUT:-600}
     export RADAR_TIME_BUDGET=${RADAR_TIME_BUDGET:-300}
     # Skip the training-window block wait — in test mode, dispatch already finished
@@ -882,7 +881,6 @@ else
     export RADAR_SUBMISSION_WINDOW=${RADAR_SUBMISSION_WINDOW:-15}
     export RADAR_TRAINING_WINDOW=${RADAR_TRAINING_WINDOW:-40}
     export RADAR_EVAL_WINDOW=${RADAR_EVAL_WINDOW:-10}
-    export RADAR_TRAINING_TIMEOUT=${RADAR_TRAINING_TIMEOUT:-420}
     # Agent timeout: 120s for fast test iterations (default 600s — too long for localnet rounds)
     export RADAR_AGENT_TIMEOUT=${RADAR_AGENT_TIMEOUT:-120}
     # Trainer time_budget: 120s for fast test iterations (default 300s)
