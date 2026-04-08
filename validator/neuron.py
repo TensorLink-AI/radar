@@ -139,6 +139,8 @@ class Validator:
             try:
                 from shared.r2_audit import R2AuditLog
                 self.pretrain_r2 = R2AuditLog(bucket=Config.PRETRAIN_R2_BUCKET)
+                logger.info("Pretrain R2 client initialized for bucket=%s prefix=%s",
+                            Config.PRETRAIN_R2_BUCKET, Config.PRETRAIN_R2_PREFIX)
             except Exception as e:
                 logger.warning("Pretrain R2 unavailable: %s", e)
 
