@@ -241,11 +241,20 @@ class PretrainBenchmark:
         if self._manifest is not None:
             return self._manifest
         if self.r2 is None:
+            logger.warning("Pretrain R2 client is None, cannot load manifest")
             return {}
         key = f"{self.r2_prefix}/manifest.json"
+        logger.info("Loading pretrain manifest from bucket=%s key=%s", self.r2.bucket, key)
         manifest = self.r2.download_json(key)
         if manifest:
+            n_shards = len(manifest.get("shards", []))
+            logger.info("Pretrain manifest loaded: %d shards", n_shards)
             self._manifest = manifest
+        else:
+            logger.warning(
+                "Failed to load pretrain manifest from bucket=%s key=%s",
+                self.r2.bucket, key,
+            )
         return manifest or {}
 
     def get_shard_keys(self) -> list[str]:
