@@ -38,7 +38,7 @@ def get_dataloader(
     # Pretrain mode: streaming parquet shards
     if pretrain_shard_urls:
         try:
-            from shared.pretrain_data import pretrain_dataloader
+            from pretrain_loader import pretrain_dataloader
             shuffle_buf = int(os.environ.get("RADAR_PRETRAIN_SHUFFLE_BUFFER", "10000"))
             yield from pretrain_dataloader(
                 shard_urls=pretrain_shard_urls,

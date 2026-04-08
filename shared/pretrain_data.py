@@ -1,40 +1,24 @@
-"""Streaming shard-based pretrain dataloader for time-series forecasting.
+"""Generic shard-based pretrain infrastructure.
 
-Downloads parquet shards one at a time from presigned URLs (or R2 directly),
-extracts series, cuts context/target windows, and yields shuffled batches.
-Designed for ~1TB pretrain data that cannot fit in memory or on disk at once.
+Task-agnostic utilities for streaming large pretrain datasets from R2:
+  - ShuffleBuffer: fixed-capacity reservoir for approximate shuffling
+  - download_shard: HTTP download of a single shard into memory
+  - PretrainBenchmark: manifest loading, shard selection, presigned URL generation
 
-Architecture:
-  _iter_series()              → yields (values, freq) from parquet shards
-  _cut_windows_from_series()  → slides context+horizon windows, yields (x, y)
-  _ShuffleBuffer              → fixed-capacity reservoir for approximate shuffling
-  pretrain_dataloader()       → top-level generator yielding {"context", "target"} batches
+Task-specific logic (parsing shard contents, windowing, batching) lives
+in each task's runner directory, e.g. runner/timeseries_forecast/pretrain_loader.py.
 """
 
 from __future__ import annotations
 
-import io
 import logging
 import random
 from typing import Iterator
 
-import torch
-
 logger = logging.getLogger(__name__)
 
-# Same frequency → prediction-length mapping as gift_eval.py
-FREQ_TO_PRED_LEN: dict[str, int] = {
-    "H": 48, "T": 60, "D": 14, "W": 8, "M": 12, "Q": 8, "Y": 4,
-    "B": 14, "5T": 60, "10T": 60, "15T": 48, "30T": 48,
-}
 
-DEFAULT_PRED_LEN = 96
-DEFAULT_CONTEXT_LEN = 512
-DEFAULT_STRIDE = 64
-MAX_SERIES_LEN = 8192
-
-
-class _ShuffleBuffer:
+class ShuffleBuffer:
     """Fixed-capacity reservoir for approximate shuffling without full materialization.
 
     When full, adding a new item randomly evicts one (returned to caller).
@@ -66,166 +50,19 @@ class _ShuffleBuffer:
         return len(self._buf)
 
 
-def _download_shard(url: str) -> bytes:
+def download_shard(url: str, timeout: int = 120) -> bytes:
     """Download a shard from a presigned URL into memory."""
     import httpx
-    resp = httpx.get(url, timeout=120, follow_redirects=True)
+    resp = httpx.get(url, timeout=timeout, follow_redirects=True)
     resp.raise_for_status()
     return resp.content
 
 
-def _iter_series(
-    shard_urls: list[str],
-    seed: int = 42,
-) -> Iterator[tuple[list[float], str]]:
-    """Download shards one at a time, yield (values, freq) per series.
-
-    Each shard is a parquet file with at least a 'target' column (list[float])
-    and a 'freq' column (string). Shards are shuffled, then rows within each
-    shard are shuffled.
-    """
-    import pandas as pd
-
-    rng = random.Random(seed)
-    order = list(range(len(shard_urls)))
-    rng.shuffle(order)
-
-    for shard_idx in order:
-        url = shard_urls[shard_idx]
-        try:
-            raw = _download_shard(url)
-            df = pd.read_parquet(io.BytesIO(raw))
-        except Exception as e:
-            logger.warning("Failed to load shard %d: %s", shard_idx, e)
-            continue
-
-        if "target" not in df.columns:
-            logger.warning("Shard %d missing 'target' column, skipping", shard_idx)
-            continue
-
-        has_freq = "freq" in df.columns
-
-        # Shuffle rows within shard
-        indices = list(range(len(df)))
-        rng.shuffle(indices)
-
-        for row_idx in indices:
-            row = df.iloc[row_idx]
-            values = row["target"]
-            if not isinstance(values, list):
-                try:
-                    values = list(values)
-                except (TypeError, ValueError):
-                    continue
-
-            # Clamp to max length to avoid memory issues
-            if len(values) > MAX_SERIES_LEN:
-                values = values[:MAX_SERIES_LEN]
-
-            freq = str(row["freq"]) if has_freq else "H"
-            yield values, freq
-
-        del df, raw  # free memory before next shard
-
-
-def _cut_windows_from_series(
-    values: list[float],
-    freq: str,
-    context_len: int = DEFAULT_CONTEXT_LEN,
-    stride: int = DEFAULT_STRIDE,
-) -> Iterator[tuple[list[float], list[float]]]:
-    """Slide a (context_len + pred_len) window over a series.
-
-    Yields (context_window, target_window) pairs.
-    pred_len is determined from the frequency string.
-    """
-    pred_len = FREQ_TO_PRED_LEN.get(freq, DEFAULT_PRED_LEN)
-    window_len = context_len + pred_len
-    n = len(values)
-
-    if n < window_len:
-        return
-
-    # Slide with stride
-    for start in range(0, n - window_len + 1, stride):
-        ctx = values[start : start + context_len]
-        tgt = values[start + context_len : start + window_len]
-        yield ctx, tgt
-
-
-def pretrain_dataloader(
-    shard_urls: list[str],
-    batch_size: int = 64,
-    context_len: int = DEFAULT_CONTEXT_LEN,
-    stride: int = DEFAULT_STRIDE,
-    shuffle_buffer_size: int = 10_000,
-    seed: int = 42,
-) -> Iterator[dict[str, torch.Tensor]]:
-    """Streaming pretrain dataloader.
-
-    Downloads parquet shards one at a time, extracts series, cuts windows,
-    shuffles via a fixed-capacity buffer, and yields batches of
-    {"context": (B, context_len, 1), "target": (B, pred_len, 1)}.
-
-    Because different series have different prediction lengths (based on freq),
-    batches are grouped by pred_len so all items in a batch share the same
-    target shape.
-    """
-    buf = _ShuffleBuffer(capacity=shuffle_buffer_size, seed=seed)
-
-    # Accumulate windows by pred_len for batching
-    pending: dict[int, list[tuple[list[float], list[float]]]] = {}
-
-    def _flush_pending(pred_len: int) -> Iterator[dict[str, torch.Tensor]]:
-        """Yield full batches from pending[pred_len]."""
-        items = pending.get(pred_len, [])
-        while len(items) >= batch_size:
-            batch_items = items[:batch_size]
-            items = items[batch_size:]
-            ctx = torch.tensor(
-                [w[0] for w in batch_items], dtype=torch.float32,
-            ).unsqueeze(-1)  # (B, context_len, 1)
-            tgt = torch.tensor(
-                [w[1] for w in batch_items], dtype=torch.float32,
-            ).unsqueeze(-1)  # (B, pred_len, 1)
-            yield {"context": ctx, "target": tgt}
-        pending[pred_len] = items
-
-    def _process_window(window: tuple[list[float], list[float]]):
-        """Add window to pending, yield any full batches."""
-        pred_len = len(window[1])
-        if pred_len not in pending:
-            pending[pred_len] = []
-        pending[pred_len].append(window)
-        yield from _flush_pending(pred_len)
-
-    # Main loop: iterate shards → series → windows → shuffle buffer → batches
-    for values, freq in _iter_series(shard_urls, seed=seed):
-        for window in _cut_windows_from_series(values, freq, context_len, stride):
-            evicted = buf.add(window)
-            if evicted is not None:
-                yield from _process_window(evicted)
-
-    # Drain remaining items from shuffle buffer
-    for window in buf.drain():
-        yield from _process_window(window)
-
-    # Flush any remaining partial batches
-    for pred_len in list(pending.keys()):
-        items = pending[pred_len]
-        if items:
-            ctx = torch.tensor(
-                [w[0] for w in items], dtype=torch.float32,
-            ).unsqueeze(-1)
-            tgt = torch.tensor(
-                [w[1] for w in items], dtype=torch.float32,
-            ).unsqueeze(-1)
-            yield {"context": ctx, "target": tgt}
-            pending[pred_len] = []
-
-
 class PretrainBenchmark:
-    """Manages pretrain data: R2 manifest, presigned URL generation."""
+    """Manages pretrain data: R2 manifest, shard selection, presigned URL generation.
+
+    Task-agnostic — just knows about shard files listed in a manifest.json.
+    """
 
     def __init__(
         self,
@@ -262,9 +99,9 @@ class PretrainBenchmark:
         manifest = self._load_manifest()
         shards = manifest.get("shards", [])
         return [
-            f"{self.r2_prefix}/{s['filename']}"
+            s["s3_key"]
             for s in shards
-            if "filename" in s
+            if "s3_key" in s
         ]
 
     def select_shards(self, seed: int, n: int) -> list[str]:

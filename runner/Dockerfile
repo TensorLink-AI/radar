@@ -28,6 +28,7 @@ COPY timeseries_forecast/harness.py /workspace/runner/timeseries_forecast/harnes
 COPY timeseries_forecast/prepare.py /workspace/runner/timeseries_forecast/prepare.py
 COPY timeseries_forecast/evaluate.py /workspace/runner/timeseries_forecast/evaluate.py
 COPY timeseries_forecast/flops.py /workspace/runner/timeseries_forecast/flops.py
+COPY timeseries_forecast/pretrain_loader.py /workspace/runner/timeseries_forecast/pretrain_loader.py
 
 # Also place ts-forecasting files at /workspace for direct imports
 # (frozen harness.py and prepare.py expect to be importable as top-level modules)
@@ -35,6 +36,7 @@ COPY timeseries_forecast/harness.py /workspace/harness.py
 COPY timeseries_forecast/prepare.py /workspace/prepare.py
 COPY timeseries_forecast/evaluate.py /workspace/evaluate.py
 COPY timeseries_forecast/flops.py /workspace/flops.py
+COPY timeseries_forecast/pretrain_loader.py /workspace/pretrain_loader.py
 
 # Frozen copies (read-only reference)
 RUN mkdir -p /workspace/frozen

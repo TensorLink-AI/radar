@@ -29,6 +29,7 @@ COPY harness.py /workspace/harness.py
 COPY prepare.py /workspace/prepare.py
 COPY evaluate.py /workspace/evaluate.py
 COPY flops.py /workspace/flops.py
+COPY pretrain_loader.py /workspace/pretrain_loader.py
 COPY server.py /workspace/server.py
 
 # Shared modules (needed by server.py for R2 upload)
