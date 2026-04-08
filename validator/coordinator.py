@@ -174,7 +174,7 @@ class TrainingCoordinator:
 
         # Build tasks for concurrent dispatch
         immediate_results: list[TrainingResult] = []
-        dispatch_tasks: list[tuple[Job, str, bytes, dict]] = []
+        dispatch_tasks: list[tuple[Job, str, bytes]] = []
 
         for job in jobs:
             proposal = submissions.get(job.arch_owner)
@@ -241,23 +241,21 @@ class TrainingCoordinator:
                 dispatch_payload["pretrain_shard_urls"] = pretrain_shard_urls
             payload = json.dumps(dispatch_payload).encode()
 
-            headers = sign_request(self.wallet, payload)
-            headers["Content-Type"] = "application/json"
-            dispatch_tasks.append((job, trainer_url, payload, headers))
+            dispatch_tasks.append((job, trainer_url, payload))
 
         if not dispatch_tasks:
             return immediate_results
 
         async def _dispatch_one(
-            client: httpx.AsyncClient, job: Job, url: str, payload: bytes, headers: dict,
+            client: httpx.AsyncClient, job: Job, url: str, payload: bytes,
         ) -> TrainingResult:
             max_retries = 3
             for attempt in range(max_retries + 1):
                 try:
-                    # Re-sign on retries so the Epistula timestamp stays fresh
-                    if attempt > 0:
-                        headers = sign_request(self.wallet, payload)
-                        headers["Content-Type"] = "application/json"
+                    # Sign fresh every attempt so the Epistula timestamp
+                    # is always within the 30s tolerance window.
+                    headers = sign_request(self.wallet, payload)
+                    headers["Content-Type"] = "application/json"
                     resp = await client.post(
                         f"{url.rstrip('/')}/train",
                         content=payload,
@@ -265,13 +263,14 @@ class TrainingCoordinator:
                     )
 
                     # Retry on transient server errors:
+                    # - 403: Timestamp stale (clock skew or slow dispatch)
                     # - 502: Bad Gateway (trainer pod proxy up, server still starting)
                     # - 503: Service Unavailable (metagraph/auth not ready yet)
                     # Do NOT retry 429 — the trainer is already running this
                     # job (from an earlier retry whose response was lost to a
                     # proxy timeout).  Treat as "already running" so checkpoint
                     # polling picks up the result from R2.
-                    if resp.status_code in (502, 503) and attempt < max_retries:
+                    if resp.status_code in (403, 502, 503) and attempt < max_retries:
                         wait = 10 * (attempt + 1)
                         logger.warning(
                             "Trainer UID %d returned HTTP %d, retrying in %ds (attempt %d/%d)",
@@ -390,8 +389,8 @@ class TrainingCoordinator:
 
         async with httpx.AsyncClient(timeout=job_timeout) as client:
             coros = [
-                _dispatch_one(client, job, url, payload, headers)
-                for job, url, payload, headers in dispatch_tasks
+                _dispatch_one(client, job, url, payload)
+                for job, url, payload in dispatch_tasks
             ]
             dispatch_results = await asyncio.gather(*coros)
 
