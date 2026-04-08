@@ -202,6 +202,13 @@ async def _train_and_upload(
         _upload_artifacts(result, architecture_code, round_id, miner_hotkey, upload_urls)
     except Exception as e:
         logger.error("Background train+upload failed for round %d miner %s: %s", round_id, miner_hotkey, e)
+        try:
+            _upload_failure_meta(round_id, miner_hotkey, upload_urls, {
+                "status": "failed",
+                "error": f"Unhandled exception: {e}",
+            })
+        except Exception:
+            logger.error("Failed to upload failure meta for round %d miner %s", round_id, miner_hotkey)
     finally:
         _train_semaphore.release()
         logger.info("Training semaphore released (round %d miner %s)", round_id, miner_hotkey)
