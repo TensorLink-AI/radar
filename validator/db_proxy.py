@@ -272,6 +272,9 @@ async def _proxy_request(request: Request, path: str) -> Response:
     max_retries = 2 if is_llm else 0
 
     for attempt in range(1 + max_retries):
+        # Re-sign on retries so the Epistula timestamp stays fresh
+        if attempt > 0:
+            headers = _build_proxy_headers(request, body)
         try:
             if request.method == "GET":
                 resp = await client.get(target, headers=headers, timeout=timeout)
@@ -325,7 +328,7 @@ async def _proxy_request(request: Request, path: str) -> Response:
                     attempt + 1, max_retries,
                 )
                 await _aio.sleep(wait)
-                continue
+                continue  # headers re-signed at top of loop
             logger.warning("Proxy request to %s failed: %s", target, e or type(e).__name__)
             return JSONResponse(
                 status_code=502,

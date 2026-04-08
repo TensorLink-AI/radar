@@ -91,3 +91,66 @@ def test_per_category_rate_limits():
 
     # "desearch" still independent
     assert _check_rate_limit(identity, "desearch") is True
+
+
+@pytest.mark.asyncio
+async def test_proxy_resigns_on_retry():
+    """Headers are re-signed on retry so Epistula timestamps stay fresh."""
+    import httpx
+    from unittest.mock import call
+
+    _setup_proxy()
+
+    sign_call_count = 0
+
+    def mock_sign(wallet, body):
+        nonlocal sign_call_count
+        sign_call_count += 1
+        return {
+            "X-Epistula-Signed-By": "hk0",
+            "X-Epistula-Timestamp": str(1000 + sign_call_count),
+            "X-Epistula-Nonce": f"nonce-{sign_call_count}",
+            "X-Epistula-Signature": "sig",
+        }
+
+    # Mock wallet so _build_proxy_headers calls sign_request
+    mock_wallet = MagicMock()
+
+    # Upstream returns 503 then 200
+    resp_503 = MagicMock()
+    resp_503.status_code = 503
+    resp_503.headers = {"content-type": "application/json"}
+    resp_503.content = b'{"error": "not ready"}'
+
+    resp_200 = MagicMock()
+    resp_200.status_code = 200
+    resp_200.headers = {"content-type": "application/json"}
+    resp_200.content = b'{"result": "ok"}'
+
+    mock_client = AsyncMock()
+    mock_client.is_closed = False
+    mock_client.post = AsyncMock(side_effect=[resp_503, resp_200])
+
+    from validator import db_proxy
+
+    with patch.object(db_proxy, "_wallet", mock_wallet), \
+         patch.object(db_proxy, "_client", mock_client), \
+         patch("validator.db_proxy.sign_request", side_effect=mock_sign), \
+         patch("asyncio.sleep", new_callable=AsyncMock):
+
+        # Simulate an LLM POST (max_retries=2 for LLM)
+        from starlette.testclient import TestClient
+        from httpx import ASGITransport, AsyncClient
+
+        token = get_agent_token()
+        transport = ASGITransport(app=app)  # type: ignore[arg-type]
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/llm/v1/chat/completions",
+                json={"model": "test", "messages": []},
+                headers={"X-Agent-Token": token, "X-Miner-UID": "1"},
+            )
+
+    assert resp.status_code == 200
+    # sign_request called once for initial headers + once for the retry
+    assert sign_call_count >= 2, f"Expected >=2 sign calls, got {sign_call_count}"
