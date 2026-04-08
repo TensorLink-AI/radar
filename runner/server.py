@@ -183,6 +183,10 @@ async def _train_and_upload(
     """Background task: download data, train, upload artifacts, release semaphore."""
     round_id = training_config["round_id"]
     miner_hotkey = training_config["miner_hotkey"]
+    logger.info(
+        "Starting train+upload: round=%d miner=%s upload_url_keys=%s",
+        round_id, miner_hotkey, sorted(upload_urls.keys()) if upload_urls else "(none)",
+    )
     try:
         # Download GIFT-Eval data if provided (still needed for validation)
         if gift_eval_urls:
@@ -196,7 +200,13 @@ async def _train_and_upload(
             os.environ.pop("RADAR_PRETRAIN_SHARD_URLS", None)
 
         # Run training
+        t0 = time.time()
         result = await asyncio.to_thread(runner_fn, architecture_code, training_config)
+        elapsed = time.time() - t0
+        logger.info(
+            "Training complete: round=%d miner=%s status=%s elapsed=%.1fs",
+            round_id, miner_hotkey, result.get("status", "?"), elapsed,
+        )
 
         if result.get("status") in ("build_failed", "size_violation", "failed"):
             logger.warning(
@@ -210,7 +220,10 @@ async def _train_and_upload(
         # Upload artifacts to R2
         _upload_artifacts(result, architecture_code, round_id, miner_hotkey, upload_urls)
     except Exception as e:
-        logger.error("Background train+upload failed for round %d miner %s: %s", round_id, miner_hotkey, e)
+        logger.error(
+            "Background train+upload failed for round %d miner %s: %s",
+            round_id, miner_hotkey, e, exc_info=True,
+        )
         try:
             _upload_failure_meta(round_id, miner_hotkey, upload_urls, {
                 "status": "failed",
