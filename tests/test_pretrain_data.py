@@ -209,7 +209,7 @@ def test_pretrain_benchmark_select_shards_deterministic():
         def download_json(self, key):
             return {
                 "shards": [
-                    {"filename": f"shard_{i:05d}.parquet"}
+                    {"s3_key": f"datasets/radar/v1/shard_{i:05d}.parquet", "shard_id": f"{i:05d}"}
                     for i in range(284)
                 ],
             }
@@ -236,7 +236,7 @@ def test_pretrain_benchmark_generate_urls():
         def download_json(self, key):
             return {
                 "shards": [
-                    {"filename": f"shard_{i:05d}.parquet"}
+                    {"s3_key": f"datasets/radar/v1/shard_{i:05d}.parquet", "shard_id": f"{i:05d}"}
                     for i in range(10)
                 ],
             }

@@ -99,9 +99,9 @@ class PretrainBenchmark:
         manifest = self._load_manifest()
         shards = manifest.get("shards", [])
         return [
-            f"{self.r2_prefix}/{s['filename']}"
+            s["s3_key"]
             for s in shards
-            if "filename" in s
+            if "s3_key" in s
         ]
 
     def select_shards(self, seed: int, n: int) -> list[str]:
