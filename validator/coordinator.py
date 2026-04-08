@@ -472,7 +472,23 @@ class TrainingCoordinator:
                         )
                         continue
 
-                    # Verify checkpoint file exists
+                    # Failure statuses: collect the meta without requiring a checkpoint.
+                    # The trainer only uploads training_meta.json for failures
+                    # (no checkpoint is produced). Downstream scoring handles these
+                    # via penalties / size gate rejection.
+                    _FAILURE_STATUSES = ("build_failed", "size_violation", "failed", "timeout")
+                    meta_status = meta.get("status", "")
+                    if meta_status in _FAILURE_STATUSES:
+                        meta["miner_uid"] = uid
+                        meta["miner_hotkey"] = hk
+                        results[uid] = meta
+                        logger.info(
+                            "Training failure collected: UID %d status=%s error=%s (round %d)",
+                            uid, meta_status, meta.get("error", ""), round_id,
+                        )
+                        continue
+
+                    # Verify checkpoint file exists (only for success status)
                     ck = ck_fn(round_id, hk)
                     if not self.r2.key_exists(ck):
                         logger.info(

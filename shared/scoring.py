@@ -126,7 +126,7 @@ def compute_penalties(
         status = meta.get("status", "")
         if status == "attestation_failed":
             penalties[uid] = min(1.0, penalties.get(uid, 0.0) + 1.0)
-        elif status in ("failed", "timeout", "build_failed"):
+        elif status in ("failed", "timeout", "build_failed", "size_violation"):
             penalties[uid] = min(1.0, penalties.get(uid, 0.0) + 0.5)
 
         if uid in eval_results:
