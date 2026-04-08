@@ -160,13 +160,17 @@ Each round targets one bucket deterministically from the block hash. FLOPs measu
 
 ## Round Timing
 
-| Phase | Blocks | Duration |
-|-------|--------|----------|
-| Submission (A) | 50 | ~10 min |
-| Training (B) | 150 | ~30 min |
-| Evaluation (C) | 25 | ~5 min |
-| Fallback/Scoring | 50 | ~10 min |
-| **Total** | **275** | **~55 min** |
+Two layers of timing control each phase:
+- **Block windows** (on-chain): define WHEN phases start/end. All validators agree via consensus block height (~12s/block). These are rigid boundaries.
+- **Second timeouts** (operational): define HOW LONG work within a phase may take. Soft guardrails that must fit inside their phase's block window.
+
+| Phase | Block Window | Duration | Operational Timeout | Controls |
+|-------|-------------|----------|--------------------|----|
+| Submission (A) | 50 blocks | ~10 min | `AGENT_TIMEOUT` (600s) | Agent pod execution |
+| Training (B) | 150 blocks | ~30 min | *(none — trainers must finish within window)* | — |
+| Evaluation (C) | 25 blocks | ~5 min | `EVAL_WINDOW_BLOCKS × 12` (300s) | R2 checkpoint polling |
+| Fallback/Scoring | 50 blocks | ~10 min | `FALLBACK_WINDOW_BLOCKS × 12` (600s) | Re-dispatch polling |
+| **Total** | **275** | **~55 min** | | |
 
 ## R2 Bucket Path Convention
 

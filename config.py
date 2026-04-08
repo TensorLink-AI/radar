@@ -59,17 +59,46 @@ class Config:
     R2_BUCKET: str = os.getenv("R2_BUCKET", "")
     R2_PRESIGNED_TTL: int = int(os.getenv("RADAR_PRESIGNED_TTL", "5400"))
 
-    # ── Round Timing (blocks, ~12s/block) ────────────────────────
+    # ── Round Timing ───────────────────────────────────────────────
+    #
+    # Two layers of timing control each phase:
+    #
+    #   BLOCK WINDOWS (on-chain)   – define WHEN phases start/end.
+    #       All validators agree via consensus block height (~12s/block).
+    #       These are rigid boundaries that keep validators in sync.
+    #
+    #   SECOND TIMEOUTS (operational) – define HOW LONG work within a
+    #       phase is allowed to take. These are soft guardrails that
+    #       prevent indefinite waits for pods, HTTP calls, or R2 polling.
+    #       Must fit inside their phase's block window.
+    #
+    # Phase A (Submission):  SUBMISSION_WINDOW_BLOCKS × 12s = outer boundary
+    #                        AGENT_TIMEOUT               = inner timeout for agent execution
+    # Phase B (Training):    TRAINING_WINDOW_BLOCKS × 12s = outer boundary
+    #                        (no separate timeout — trainers must finish within the window)
+    # Phase C (Evaluation):  EVAL_WINDOW_BLOCKS × 12s     = outer boundary AND polling timeout
+    # Fallback:              FALLBACK_WINDOW_BLOCKS × 12s  = outer boundary AND polling timeout
+    #
+    # Example with defaults:
+    #   Phase A: 50 blocks (600s) with AGENT_TIMEOUT=600s  → agent gets full window
+    #   Phase B: 150 blocks (1800s)                        → trainers get ~30 min
+    #   Phase C: 25 blocks (300s)                          → checkpoint polling for ~5 min
+    #   Fallback: 50 blocks (600s)                         → re-dispatch polling for ~10 min
+    #   Total: 275 blocks (~55 min)
+
+    # Block windows (on-chain phase boundaries, ~12s per block)
     ROUND_INTERVAL_BLOCKS: int = int(os.getenv("RADAR_ROUND_INTERVAL", "275"))
     SUBMISSION_WINDOW_BLOCKS: int = int(os.getenv("RADAR_SUBMISSION_WINDOW", "50"))
     TRAINING_WINDOW_BLOCKS: int = int(os.getenv("RADAR_TRAINING_WINDOW", "150"))
     EVAL_WINDOW_BLOCKS: int = int(os.getenv("RADAR_EVAL_WINDOW", "25"))
-    SKIP_TRAINING_WAIT: bool = os.getenv("RADAR_SKIP_TRAINING_WAIT", "false").lower() == "true"
-    SIZE_GATE_TOLERANCE: float = float(os.getenv("RADAR_SIZE_GATE_TOLERANCE", "0.10"))
     FALLBACK_ENABLED: bool = os.getenv("RADAR_FALLBACK_ENABLED", "false").lower() == "true"
     FALLBACK_WINDOW_BLOCKS: int = int(os.getenv("RADAR_FALLBACK_WINDOW", "50"))
 
+    SKIP_TRAINING_WAIT: bool = os.getenv("RADAR_SKIP_TRAINING_WAIT", "false").lower() == "true"
+    SIZE_GATE_TOLERANCE: float = float(os.getenv("RADAR_SIZE_GATE_TOLERANCE", "0.10"))
+
     # ── Agent (Phase A) ──────────────────────────────────────────
+    # AGENT_TIMEOUT must fit within SUBMISSION_WINDOW_BLOCKS × 12s.
     AGENT_TIMEOUT: int = int(os.getenv("RADAR_AGENT_TIMEOUT", "600"))
     AGENT_POD_RETRIES: int = int(os.getenv("RADAR_AGENT_POD_RETRIES", "3"))
 
@@ -81,9 +110,6 @@ class Config:
     # Comma-separated URL prefixes that agent pods are allowed to reach.
     # The validator proxy and presigned R2 URLs are added automatically.
     AGENT_ALLOWED_URLS: str = os.getenv("RADAR_AGENT_ALLOWED_URLS", "")
-
-    # ── Training Dispatch ────────────────────────────────────────
-    TRAINING_TIMEOUT: int = int(os.getenv("RADAR_TRAINING_TIMEOUT", "1800"))
 
     # ── Warm-Standby Trainer ────────────────────────────────────
     TRAINER_PREPARE_TIMEOUT: int = int(os.getenv("RADAR_TRAINER_PREPARE_TIMEOUT", "600"))
