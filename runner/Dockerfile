@@ -11,7 +11,7 @@ RUN pip3 install --no-cache-dir \
 
 RUN pip3 install --no-cache-dir \
     bittensor cryptography sentencepiece \
-    fastapi uvicorn httpx boto3 safetensors pyarrow
+    fastapi uvicorn httpx boto3 safetensors pyarrow pandas
 
 # ── Generic harness ───────────────────────────────────────────────
 RUN mkdir -p /workspace/runner
@@ -49,6 +49,8 @@ RUN mkdir -p /workspace/shared
 COPY shared_auth.py /workspace/shared/auth.py
 COPY shared_artifacts.py /workspace/shared/artifacts.py
 COPY shared_r2_audit.py /workspace/shared/r2_audit.py
+COPY shared_pretrain_data.py /workspace/shared/pretrain_data.py
+COPY shared_gift_eval.py /workspace/shared/gift_eval.py
 RUN touch /workspace/shared/__init__.py
 
 # Lock down frozen files
