@@ -483,15 +483,16 @@ class Validator:
         # ── RELEASE TRAINERS ─────────────────────────────────
         if self.coordinator:
             collected_uids = set(training_metas.keys())
-            await self.coordinator.release_trainers(
-                challenge.round_id, commitments, collected_uids,
-            )
             all_prepared = set(dynamic_endpoints.keys())
             timed_out = all_prepared - collected_uids
             if timed_out:
-                await self.coordinator.release_trainers(
-                    challenge.round_id, commitments, timed_out,
+                logger.info(
+                    "Timed-out trainers (no checkpoint): %s", sorted(timed_out),
                 )
+            all_release_uids = all_prepared | collected_uids
+            await self.coordinator.release_trainers(
+                challenge.round_id, commitments, all_release_uids,
+            )
 
         # Fallback for missing validators
         missing_trainers = [uid for uid in filtered if uid not in training_metas]

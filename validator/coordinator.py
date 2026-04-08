@@ -423,6 +423,13 @@ class TrainingCoordinator:
             hk = hotkeys[uid] if uid < len(hotkeys) else f"uid_{uid}"
             uid_to_hotkey[uid] = hk
 
+        # Log expected R2 keys for debugging
+        for uid, hk in uid_to_hotkey.items():
+            logger.info(
+                "Expecting R2 meta key for UID %d: %s",
+                uid, mk_fn(round_id, hk),
+            )
+
         poll_count = 0
         while asyncio.get_event_loop().time() < deadline:
             poll_count += 1
@@ -435,10 +442,21 @@ class TrainingCoordinator:
             for uid, hk in uid_to_hotkey.items():
                 if uid in results:
                     continue
+                mk = mk_fn(round_id, hk)
                 try:
-                    meta = self.r2.download_json(mk_fn(round_id, hk))
+                    meta = self.r2.download_json(mk)
                     if not meta:
+                        if poll_count == 1:
+                            logger.info(
+                                "UID %d: meta not found at %s (will keep polling)",
+                                uid, mk,
+                            )
                         continue
+
+                    logger.info(
+                        "UID %d: meta found at %s — status=%s",
+                        uid, mk, meta.get("status", "?"),
+                    )
 
                     # Verify meta fields match expectations
                     if meta.get("round_id") != round_id:
@@ -455,10 +473,11 @@ class TrainingCoordinator:
                         continue
 
                     # Verify checkpoint file exists
-                    if not self.r2.key_exists(ck_fn(round_id, hk)):
-                        logger.debug(
-                            "Meta exists but checkpoint missing for UID %d (round %d)",
-                            uid, round_id,
+                    ck = ck_fn(round_id, hk)
+                    if not self.r2.key_exists(ck):
+                        logger.info(
+                            "Meta exists but checkpoint missing for UID %d at %s (round %d)",
+                            uid, ck, round_id,
                         )
                         continue
 
@@ -478,10 +497,22 @@ class TrainingCoordinator:
                 break
             await asyncio.sleep(30)
         else:
-            logger.warning(
-                "Checkpoint collection timed out: %d/%d collected after %ds (round %d)",
-                len(results), len(expected_miners), timeout, round_id,
-            )
+            # On timeout, check what actually exists in R2 for this round
+            round_prefix = f"round_{round_id}/"
+            try:
+                existing_keys = self.r2.list_keys(round_prefix)
+                logger.warning(
+                    "Checkpoint collection timed out: %d/%d collected after %ds (round %d). "
+                    "R2 keys under %s: %s",
+                    len(results), len(expected_miners), timeout, round_id,
+                    round_prefix, existing_keys[:20] if existing_keys else "(none)",
+                )
+            except Exception:
+                logger.warning(
+                    "Checkpoint collection timed out: %d/%d collected after %ds (round %d). "
+                    "R2 list_keys also failed — check R2 connectivity",
+                    len(results), len(expected_miners), timeout, round_id,
+                )
 
         return results
 
