@@ -154,6 +154,7 @@ class TrainingCoordinator:
         trainer_endpoints: dict[int, str],
         commitments: dict[int, "ImageCommitment"] | None = None,
         gift_eval_urls: dict[str, str] | None = None,
+        pretrain_shard_urls: list[str] | None = None,
     ) -> list[TrainingResult]:
         """POST to trainer endpoints with Epistula-signed payload.
 
@@ -163,6 +164,7 @@ class TrainingCoordinator:
         """
         commitments = commitments or {}
         gift_eval_urls = gift_eval_urls or {}
+        pretrain_shard_urls = pretrain_shard_urls or []
         logger.info("Dispatching %d jobs to %d trainer endpoints", len(jobs), len(trainer_endpoints))
 
         # Trainer returns 202 Accepted immediately; this timeout only
@@ -235,6 +237,8 @@ class TrainingCoordinator:
             }
             if gift_eval_urls:
                 dispatch_payload["gift_eval_urls"] = gift_eval_urls
+            if pretrain_shard_urls:
+                dispatch_payload["pretrain_shard_urls"] = pretrain_shard_urls
             payload = json.dumps(dispatch_payload).encode()
 
             headers = sign_request(self.wallet, payload)

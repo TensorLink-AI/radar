@@ -114,12 +114,18 @@ class Config:
     # ── Query API ────────────────────────────────────────────────
     QUERY_RATE_LIMIT: int = int(os.getenv("RADAR_QUERY_RATE_LIMIT", "10"))
 
-    # ── GIFT-Eval Benchmark Data ─────────────────────────────────
+    # ── GIFT-Eval Benchmark Data (Phase C evaluation) ──────────────
     GIFT_EVAL_R2_BUCKET: str = os.getenv("RADAR_GIFT_EVAL_BUCKET", "gift-eval-benchmark")
     GIFT_EVAL_R2_PREFIX: str = os.getenv("RADAR_GIFT_EVAL_PREFIX", "gift-eval-full")
     GIFT_EVAL_CACHE_DIR: str = os.getenv("RADAR_GIFT_EVAL_CACHE", "/tmp/radar_gift_eval")
     GIFT_EVAL_DATASETS_PER_ROUND: int = int(os.getenv("RADAR_GIFT_EVAL_DATASETS", "0"))  # 0 = all datasets
     GIFT_EVAL_MAX_SERIES_PER_DATASET: int = int(os.getenv("RADAR_GIFT_EVAL_MAX_SERIES", "500"))
+
+    # ── Pretrain Data (Phase B training) ─────────────────────────
+    PRETRAIN_R2_BUCKET: str = os.getenv("RADAR_PRETRAIN_BUCKET", "gift-eval-pretrain")
+    PRETRAIN_R2_PREFIX: str = os.getenv("RADAR_PRETRAIN_PREFIX", "datasets/radar/v1")
+    PRETRAIN_SHARDS_PER_ROUND: int = int(os.getenv("RADAR_PRETRAIN_SHARDS", "8"))
+    PRETRAIN_SHUFFLE_BUFFER: int = int(os.getenv("RADAR_PRETRAIN_SHUFFLE_BUFFER", "10000"))
 
     # ── Postgres ──────────────────────────────────────────────
     PG_DSN: str = os.getenv("RADAR_PG_DSN", "postgresql://radar:radar@localhost:5432/radar")

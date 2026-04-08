@@ -133,6 +133,15 @@ class Validator:
             except Exception as e:
                 logger.warning("GIFT-Eval R2 unavailable: %s", e)
 
+        # Pretrain R2 client (separate bucket for training data)
+        self.pretrain_r2 = None
+        if self.r2 and Config.PRETRAIN_R2_BUCKET:
+            try:
+                from shared.r2_audit import R2AuditLog
+                self.pretrain_r2 = R2AuditLog(bucket=Config.PRETRAIN_R2_BUCKET)
+            except Exception as e:
+                logger.warning("Pretrain R2 unavailable: %s", e)
+
         # Training coordinator
         my_uid = self._my_uid()
         if self.r2:
@@ -379,7 +388,7 @@ class Validator:
                 "or trainer pods failed to deploy. Training will fail for all jobs."
             )
 
-        # Generate presigned GET URLs for GIFT-Eval data
+        # Generate presigned GET URLs for GIFT-Eval data (evaluation)
         gift_eval_urls = {}
         if self.gift_r2:
             try:
@@ -392,10 +401,28 @@ class Validator:
             except Exception as e:
                 logger.warning("Failed to generate GIFT-Eval presigned URLs: %s", e)
 
+        # Generate presigned GET URLs for pretrain shards (training)
+        pretrain_shard_urls: list[str] = []
+        if self.pretrain_r2:
+            try:
+                from shared.pretrain_data import PretrainBenchmark
+                pretrain = PretrainBenchmark(
+                    r2=self.pretrain_r2,
+                    r2_prefix=Config.PRETRAIN_R2_PREFIX,
+                )
+                shard_keys = pretrain.select_shards(
+                    seed=challenge.seed,
+                    n=Config.PRETRAIN_SHARDS_PER_ROUND,
+                )
+                pretrain_shard_urls = pretrain.generate_presigned_shard_urls(shard_keys)
+            except Exception as e:
+                logger.warning("Failed to generate pretrain shard URLs: %s", e)
+
         my_results = await self.coordinator.dispatch_jobs(
             my_jobs, challenge, filtered, trainer_endpoints,
             commitments=commitments,
             gift_eval_urls=gift_eval_urls,
+            pretrain_shard_urls=pretrain_shard_urls,
         )
         _OK_STATUSES = ("success", "accepted", "already_running")
         succeeded = sum(1 for r in my_results if r.status == "success")

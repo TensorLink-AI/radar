@@ -43,10 +43,23 @@ class TSForecastingRunner:
         ).to(device)
 
     def get_dataloader(self, batch_size: int) -> Iterator:
+        import json
         import os
         from prepare import get_dataloader
         data_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "")
-        return get_dataloader(batch_size=batch_size, data_dir=data_dir if data_dir else None)
+        # Pretrain shard URLs passed via env var (JSON list of presigned URLs)
+        pretrain_urls_raw = os.environ.get("RADAR_PRETRAIN_SHARD_URLS", "")
+        pretrain_shard_urls = None
+        if pretrain_urls_raw:
+            try:
+                pretrain_shard_urls = json.loads(pretrain_urls_raw)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return get_dataloader(
+            batch_size=batch_size,
+            data_dir=data_dir if data_dir else None,
+            pretrain_shard_urls=pretrain_shard_urls,
+        )
 
     def default_loss(self, predictions: Any, targets: Any) -> Any:
         """Quantile loss (pinball) — the ts_forecasting default."""
