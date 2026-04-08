@@ -335,6 +335,8 @@ TRAINER_IMAGE="${GHCR_REPO}/radar-runner:latest"
 cp shared/auth.py runner/shared_auth.py
 cp shared/artifacts.py runner/shared_artifacts.py
 cp shared/r2_audit.py runner/shared_r2_audit.py
+cp shared/pretrain_data.py runner/shared_pretrain_data.py
+cp shared/gift_eval.py runner/shared_gift_eval.py
 
 TRAINER_LOG="${LOG_DIR}/trainer_build.log"
 if ! docker build -t radar-runner:latest -f runner/Dockerfile runner/ > "$TRAINER_LOG" 2>&1; then
@@ -343,17 +345,19 @@ if ! docker build -t radar-runner:latest -f runner/Dockerfile runner/ > "$TRAINE
     cp shared/auth.py runner/timeseries_forecast/auth.py
     cp shared/artifacts.py runner/timeseries_forecast/artifacts.py
     cp shared/r2_audit.py runner/timeseries_forecast/r2_audit.py
+    cp shared/pretrain_data.py runner/timeseries_forecast/pretrain_data.py
+    cp shared/gift_eval.py runner/timeseries_forecast/gift_eval.py
     if ! docker build -t radar-runner:latest runner/timeseries_forecast/ >> "$TRAINER_LOG" 2>&1; then
-        rm -f runner/timeseries_forecast/auth.py runner/timeseries_forecast/artifacts.py runner/timeseries_forecast/r2_audit.py
+        rm -f runner/timeseries_forecast/auth.py runner/timeseries_forecast/artifacts.py runner/timeseries_forecast/r2_audit.py runner/timeseries_forecast/pretrain_data.py runner/timeseries_forecast/gift_eval.py
         echo "  Trainer build log: $TRAINER_LOG"
         tail -20 "$TRAINER_LOG"
         fail "Trainer Docker build failed — see log above"
     fi
-    rm -f runner/timeseries_forecast/auth.py runner/timeseries_forecast/artifacts.py runner/timeseries_forecast/r2_audit.py
+    rm -f runner/timeseries_forecast/auth.py runner/timeseries_forecast/artifacts.py runner/timeseries_forecast/r2_audit.py runner/timeseries_forecast/pretrain_data.py runner/timeseries_forecast/gift_eval.py
 fi
 
 # Clean up copied files
-rm -f runner/shared_auth.py runner/shared_artifacts.py runner/shared_r2_audit.py
+rm -f runner/shared_auth.py runner/shared_artifacts.py runner/shared_r2_audit.py runner/shared_pretrain_data.py runner/shared_gift_eval.py
 
 docker tag radar-runner:latest "$TRAINER_IMAGE"
 if ! docker push "$TRAINER_IMAGE" > /dev/null 2>&1; then

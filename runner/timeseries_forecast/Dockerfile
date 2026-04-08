@@ -11,7 +11,7 @@ RUN pip3 install --no-cache-dir \
 
 RUN pip3 install --no-cache-dir \
     bittensor cryptography sentencepiece \
-    fastapi uvicorn httpx boto3 safetensors pyarrow
+    fastapi uvicorn httpx boto3 safetensors pyarrow pandas
 
 # Frozen code (harness, auth, prepare, evaluate, flops, server)
 COPY harness.py /workspace/frozen/harness.py
@@ -36,6 +36,8 @@ RUN mkdir -p /workspace/shared
 COPY auth.py /workspace/shared/auth.py
 COPY artifacts.py /workspace/shared/artifacts.py
 COPY r2_audit.py /workspace/shared/r2_audit.py
+COPY pretrain_data.py /workspace/shared/pretrain_data.py
+COPY gift_eval.py /workspace/shared/gift_eval.py
 RUN touch /workspace/shared/__init__.py
 
 # Actor for affinetes

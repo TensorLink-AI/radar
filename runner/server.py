@@ -155,10 +155,11 @@ async def train(request: Request):
     runner_fn = _RUNNERS[task_name]
     upload_urls = data.get("upload_urls", {})
     gift_eval_urls = data.get("gift_eval_urls", {})
+    pretrain_shard_urls = data.get("pretrain_shard_urls", [])
 
     asyncio.create_task(_train_and_upload(
         runner_fn, architecture_code, training_config,
-        upload_urls, gift_eval_urls,
+        upload_urls, gift_eval_urls, pretrain_shard_urls,
     ))
 
     logger.info(
@@ -177,14 +178,22 @@ async def _train_and_upload(
     training_config: dict,
     upload_urls: dict,
     gift_eval_urls: dict,
+    pretrain_shard_urls: list[str] | None = None,
 ):
     """Background task: download data, train, upload artifacts, release semaphore."""
     round_id = training_config["round_id"]
     miner_hotkey = training_config["miner_hotkey"]
     try:
-        # Download GIFT-Eval data if provided
+        # Download GIFT-Eval data if provided (still needed for validation)
         if gift_eval_urls:
             _download_gift_eval_from_urls(gift_eval_urls)
+
+        # Pass pretrain shard URLs via env var for the training harness
+        if pretrain_shard_urls:
+            os.environ["RADAR_PRETRAIN_SHARD_URLS"] = json.dumps(pretrain_shard_urls)
+            logger.info("Set %d pretrain shard URLs for training", len(pretrain_shard_urls))
+        else:
+            os.environ.pop("RADAR_PRETRAIN_SHARD_URLS", None)
 
         # Run training
         result = await asyncio.to_thread(runner_fn, architecture_code, training_config)

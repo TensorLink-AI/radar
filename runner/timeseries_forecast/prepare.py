@@ -1,8 +1,12 @@
 """
 Frozen data preparation and evaluation for time-series forecasting.
 
-Dual-mode: GIFT-Eval (real benchmark data from Arrow files) or random
-(placeholder for testing). Mode controlled by RADAR_EVAL_DATA env var.
+Three training data modes:
+  - pretrain: Streaming parquet shards from presigned URLs (production)
+  - gift_eval: GIFT-Eval Arrow benchmark data (legacy/fallback)
+  - random: Random data (placeholder for testing)
+
+Evaluation always uses GIFT-Eval Arrow data or random fallback.
 """
 
 import math
@@ -25,8 +29,28 @@ def get_dataloader(
     seed: int = 42,
     data_dir: str | None = None,
     dataset_names: list[str] | None = None,
+    pretrain_shard_urls: list[str] | None = None,
 ):
-    """Yield training batches. GIFT-Eval mode loads from Arrow cache."""
+    """Yield training batches.
+
+    Priority: pretrain shards (if URLs provided) → GIFT-Eval Arrow → random.
+    """
+    # Pretrain mode: streaming parquet shards
+    if pretrain_shard_urls:
+        try:
+            from shared.pretrain_data import pretrain_dataloader
+            shuffle_buf = int(os.environ.get("RADAR_PRETRAIN_SHUFFLE_BUFFER", "10000"))
+            yield from pretrain_dataloader(
+                shard_urls=pretrain_shard_urls,
+                batch_size=batch_size,
+                context_len=CONTEXT_LEN,
+                shuffle_buffer_size=shuffle_buf,
+                seed=seed,
+            )
+            return
+        except ImportError:
+            pass  # fall through to gift_eval / random
+
     if EVAL_DATA_MODE == "random" or data_dir is None:
         yield from _random_dataloader(batch_size)
         return
