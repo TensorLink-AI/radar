@@ -191,6 +191,12 @@ def _gift_eval_validate(
                 targets = batch["target"].to(device)
                 predictions = model(context)
 
+                # Truncate predictions to match dataset prediction length
+                # (model outputs PREDICTION_LEN=96, dataset may need fewer)
+                target_pred_len = targets.shape[1]
+                if predictions.shape[1] > target_pred_len:
+                    predictions = predictions[:, :target_pred_len, :, :]
+
                 sample_crps = _crps_from_quantiles(predictions, targets, quantiles_t)
                 sample_naive = _naive_crps(targets).to(device)
 
@@ -227,9 +233,13 @@ def _gift_eval_validate(
     if not per_dataset:
         return _random_validate(model, 10, batch_size)
 
-    agg_crps = sum(all_crps) / len(all_crps)
-    agg_ncrps = math.exp(sum(all_ncrps_logs) / len(all_ncrps_logs)) if all_ncrps_logs else float("inf")
-    agg_mase = sum(all_mase) / len(all_mase)
+    # NaN-safe aggregation — skip datasets that produced NaN
+    valid_crps = [v for v in all_crps if not math.isnan(v)]
+    valid_mase = [v for v in all_mase if not math.isnan(v)]
+    valid_logs = [v for v in all_ncrps_logs if not math.isnan(v)]
+    agg_crps = sum(valid_crps) / len(valid_crps) if valid_crps else float("inf")
+    agg_ncrps = math.exp(sum(valid_logs) / len(valid_logs)) if valid_logs else float("inf")
+    agg_mase = sum(valid_mase) / len(valid_mase) if valid_mase else float("inf")
 
     return {
         "crps": agg_crps,

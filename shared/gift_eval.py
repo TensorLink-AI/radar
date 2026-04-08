@@ -88,6 +88,15 @@ FREQ_TO_PRED_LEN = {
 }
 
 
+def _has_nan(values: list) -> bool:
+    """Check if a list of numeric values contains NaN or None."""
+    import math
+    for v in values:
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return True
+    return False
+
+
 def select_datasets(eval_split_seed: int, n: int) -> list[str]:
     """Deterministic selection of N datasets for a round. 0 = all."""
     if n <= 0 or n >= len(GIFT_EVAL_DATASETS):
@@ -234,6 +243,12 @@ def load_dataset(
 
         context = values[-(context_len + pred_len):-pred_len]
         target = values[-pred_len:]
+
+        # Skip series with NaN/None — datasets like "car_parts_with_missing"
+        # have missing values that poison CRPS computation
+        if _has_nan(context) or _has_nan(target):
+            continue
+
         samples.append({
             "context": context,
             "target": target,

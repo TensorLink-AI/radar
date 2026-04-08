@@ -129,6 +129,70 @@ def test_gift_eval_short_series_skipped():
         assert len(samples) == 1
 
 
+def test_gift_eval_nan_series_skipped():
+    """Series with NaN values are filtered out during loading."""
+    from shared.gift_eval import load_dataset
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # context=values[92:604], target=values[604:700]
+        clean = [float(x) for x in range(700)]
+        nan_in_target = list(clean)
+        nan_in_target[650] = float("nan")          # index 650 is in target window
+        nan_in_context = list(clean)
+        nan_in_context[300] = float("nan")          # index 300 is in context window
+        series_data = [
+            clean,              # clean
+            nan_in_target,      # NaN in target region
+            nan_in_context,     # NaN in context region
+            clean,              # clean
+        ]
+        _create_mock_arrow_file(tmpdir, "test_nan", series_data)
+
+        samples = load_dataset(
+            "test_nan", context_len=512, prediction_len=96,
+            cache_dir=tmpdir,
+        )
+        # Only the 2 clean series should survive
+        assert len(samples) == 2
+        # Verify no NaN in returned data
+        import math
+        for s in samples:
+            assert not any(math.isnan(v) for v in s["context"])
+            assert not any(math.isnan(v) for v in s["target"])
+
+
+def test_gift_eval_freq_override_pred_len():
+    """Frequency metadata overrides prediction_len in loaded samples."""
+    import pyarrow as pa
+    from shared.gift_eval import load_dataset
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ds_dir = os.path.join(tmpdir, "test_freq")
+        os.makedirs(ds_dir, exist_ok=True)
+        arrow_path = os.path.join(ds_dir, "data-00000-of-00001.arrow")
+
+        # Create Arrow file with freq="H" metadata → pred_len should become 48
+        series_data = [list(range(700))]
+        arrays = [pa.array(s) for s in series_data]
+        import numpy as np
+        offsets = np.cumsum([0] + [len(s) for s in series_data])
+        target_col = pa.ListArray.from_arrays(offsets.tolist(), pa.concat_arrays(arrays))
+
+        schema = pa.schema([("target", target_col.type)],
+                           metadata={b"freq": b"H"})
+        table = pa.table({"target": target_col}, schema=schema)
+        with pa.ipc.new_file(arrow_path, table.schema) as writer:
+            writer.write_table(table)
+
+        samples = load_dataset(
+            "test_freq", context_len=512, prediction_len=96,
+            cache_dir=tmpdir,
+        )
+        assert len(samples) == 1
+        assert samples[0]["prediction_len"] == 48
+        assert len(samples[0]["target"]) == 48
+
+
 def test_gift_eval_batches_univariate():
     """get_eval_batches yields (B, T, 1) and (B, P, 1) tensors."""
     from shared.gift_eval import load_dataset, get_eval_batches
@@ -202,6 +266,53 @@ def test_univariate_model_output_shape():
 
 
 # ── Fallback mode ──
+
+
+def test_gift_eval_validate_truncates_predictions():
+    """Evaluation truncates model predictions to match dataset target length."""
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast"))
+    from prepare import _gift_eval_validate, CONTEXT_LEN, PREDICTION_LEN, QUANTILES
+    import pyarrow as pa
+    import numpy as np
+    import torch.nn as nn
+
+    # Create a dataset with freq="H" → pred_len=48
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ds_dir = os.path.join(tmpdir, "test_trunc")
+        os.makedirs(ds_dir, exist_ok=True)
+        arrow_path = os.path.join(ds_dir, "data-00000-of-00001.arrow")
+
+        series_data = [list(range(700)) for _ in range(5)]
+        arrays = [pa.array(s) for s in series_data]
+        offsets = np.cumsum([0] + [len(s) for s in series_data])
+        target_col = pa.ListArray.from_arrays(offsets.tolist(), pa.concat_arrays(arrays))
+        schema = pa.schema([("target", target_col.type)],
+                           metadata={b"freq": b"H"})
+        table = pa.table({"target": target_col}, schema=schema)
+        with pa.ipc.new_file(arrow_path, table.schema) as writer:
+            writer.write_table(table)
+
+        # Model that always outputs (B, 96, 1, 9) — i.e. PREDICTION_LEN=96
+        class FixedModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(CONTEXT_LEN, PREDICTION_LEN * len(QUANTILES))
+
+            def forward(self, x):
+                B = x.shape[0]
+                out = self.fc(x.mean(dim=2))
+                return out.view(B, PREDICTION_LEN, 1, len(QUANTILES))
+
+        model = FixedModel()
+        result = _gift_eval_validate(
+            model, ["test_trunc"], batch_size=5, seed=42, data_dir=tmpdir,
+        )
+        # Should succeed (not crash) and produce finite CRPS
+        assert "crps" in result
+        assert result["crps"] < float("inf")
+        import math
+        assert not math.isnan(result["crps"])
 
 
 def test_gift_eval_fallback_random():
