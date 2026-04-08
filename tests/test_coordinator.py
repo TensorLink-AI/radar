@@ -187,5 +187,47 @@ async def test_dispatch_resigns_on_retry():
 
     assert len(results) == 1
     assert results[0].status == "success"
-    # sign_request called once for initial headers + once for the retry
+    # sign_request called fresh every attempt (initial + retry)
     assert sign_call_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_dispatch_retries_on_403():
+    """403 (stale timestamp) triggers retry with fresh signature."""
+    coordinator = TrainingCoordinator(
+        wallet=MagicMock(), metagraph=MagicMock(hotkeys=["hk0", "hk1"]),
+        r2=MagicMock(), my_uid=10,
+    )
+    jobs = [Job(arch_owner=0, trainer_uid=1, dispatcher=10, round_id=1)]
+    challenge = MagicMock(seed=42, round_id=1, min_flops_equivalent=0,
+                          max_flops_equivalent=1000000, task={"time_budget": 300})
+    submissions = {0: Proposal(code="code_a")}
+    endpoints = {1: "http://trainer:8080"}
+
+    resp_403 = MagicMock()
+    resp_403.status_code = 403
+    resp_403.json.return_value = {"error": "Timestamp too old or too far in future"}
+    resp_403.text = '{"error": "Timestamp too old or too far in future"}'
+    resp_202 = MagicMock()
+    resp_202.status_code = 202
+    resp_202.json.return_value = {"status": "accepted"}
+
+    mock_post = AsyncMock(side_effect=[resp_403, resp_202])
+
+    with patch("httpx.AsyncClient") as mock_client, \
+         patch("shared.artifacts.generate_upload_urls", return_value={"checkpoint": "http://fake/ckpt"}), \
+         patch("validator.coordinator.sign_request", return_value={"X-Epistula-Signed-By": "hk0"}), \
+         patch("asyncio.sleep", new_callable=AsyncMock):
+        mock_client.return_value.__aenter__ = AsyncMock(return_value=MagicMock(
+            post=mock_post,
+        ))
+        mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        results = await coordinator.dispatch_jobs(
+            jobs, challenge, submissions, endpoints,
+        )
+
+    assert len(results) == 1
+    assert results[0].status == "accepted"
+    # POST called twice: first attempt (403) + retry (202)
+    assert mock_post.call_count == 2
