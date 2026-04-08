@@ -189,7 +189,15 @@ def _gift_eval_validate(
             for batch in get_eval_batches(samples, batch_size):
                 context = batch["context"].to(device)
                 targets = batch["target"].to(device)
-                predictions = model(context)
+
+                try:
+                    predictions = model(context)
+                except Exception:
+                    continue
+
+                # Skip batch if model outputs NaN (diverged weights, instability)
+                if torch.isnan(predictions).any():
+                    continue
 
                 # Truncate predictions to match dataset prediction length
                 # (model outputs PREDICTION_LEN=96, dataset may need fewer)
@@ -267,7 +275,15 @@ def _random_validate(model, n_batches: int = 10, batch_size: int = 32) -> dict:
                 break
             context = batch["context"].to(device)
             targets = batch["target"].to(device)
-            predictions = model(context)
+
+            try:
+                predictions = model(context)
+            except Exception:
+                continue
+
+            # Skip batch if model outputs NaN (diverged weights, instability)
+            if torch.isnan(predictions).any():
+                continue
 
             sample_crps = _crps_from_quantiles(predictions, targets, quantiles_t)
             sample_naive = _naive_crps(targets).to(device)

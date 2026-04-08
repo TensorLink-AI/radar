@@ -315,6 +315,45 @@ def test_gift_eval_validate_truncates_predictions():
         assert not math.isnan(result["crps"])
 
 
+def test_gift_eval_nan_model_output_skipped():
+    """Evaluation handles models that output NaN (diverged weights)."""
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast"))
+    from prepare import _random_validate, CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES
+    import math
+    import torch.nn as nn
+
+    class NaNModel(nn.Module):
+        """Model that always outputs NaN (simulates diverged training)."""
+        def __init__(self):
+            super().__init__()
+            self.dummy = nn.Linear(1, 1)  # need a parameter for device detection
+
+        def forward(self, x):
+            B = x.shape[0]
+            return torch.full(
+                (B, PREDICTION_LEN, NUM_VARIATES, len(QUANTILES)), float("nan")
+            )
+
+    model = NaNModel()
+    result = _random_validate(model, n_batches=2, batch_size=4)
+    # Should NOT return NaN — NaN batches are skipped, result is inf
+    assert not math.isnan(result["crps"])
+
+
+def test_evaluator_env_has_cache_default():
+    """Evaluator subprocess env uses correct GIFT_EVAL_CACHE default."""
+    # Verify the evaluator code uses /tmp/radar_gift_eval as default
+    # (not empty string, which would cause subprocess to miss cached data)
+    import ast
+    eval_path = os.path.join(
+        os.path.dirname(__file__), "..", "validator", "evaluator.py"
+    )
+    with open(eval_path) as f:
+        source = f.read()
+    assert "/tmp/radar_gift_eval" in source
+
+
 def test_gift_eval_fallback_random():
     """RADAR_EVAL_DATA=random still works via _random_validate."""
     import sys

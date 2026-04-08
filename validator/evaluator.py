@@ -136,7 +136,9 @@ def evaluate_checkpoint(
             "PATH": os.environ.get("PATH", "/usr/bin:/usr/local/bin"),
             "HOME": tmpdir,
             "PYTHONPATH": f"{runner_path_abs}:{shared_path_abs}",
-            "RADAR_GIFT_EVAL_CACHE": os.environ.get("RADAR_GIFT_EVAL_CACHE", ""),
+            "RADAR_GIFT_EVAL_CACHE": os.environ.get(
+                "RADAR_GIFT_EVAL_CACHE", "/tmp/radar_gift_eval"
+            ),
             "RADAR_EVAL_DATA": os.environ.get("RADAR_EVAL_DATA", "gift_eval"),
         }
         # Do NOT forward R2 credentials, wallet keys, or BASILICA tokens
