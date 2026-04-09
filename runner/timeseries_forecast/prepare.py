@@ -191,6 +191,23 @@ def _gift_eval_validate(
                 targets = batch["target"].to(device)
                 predictions = model(context)
 
+                # Truncate predictions to match dataset prediction length
+                # (model outputs PREDICTION_LEN=96, dataset may need fewer)
+                target_pred_len = targets.shape[1]
+                if predictions.shape[1] > target_pred_len:
+                    predictions = predictions[:, :target_pred_len, :, :]
+
+                # Mask: keep samples where neither predictions nor targets have NaN
+                valid = (
+                    ~torch.isnan(predictions).flatten(1).any(dim=1)
+                    & ~torch.isnan(targets).flatten(1).any(dim=1)
+                )
+                if not valid.any():
+                    continue
+
+                predictions = predictions[valid]
+                targets = targets[valid]
+
                 sample_crps = _crps_from_quantiles(predictions, targets, quantiles_t)
                 sample_naive = _naive_crps(targets).to(device)
 
@@ -259,6 +276,14 @@ def _random_validate(model, n_batches: int = 10, batch_size: int = 32) -> dict:
             targets = batch["target"].to(device)
             predictions = model(context)
 
+            # Mask: keep samples where predictions are not NaN
+            valid = ~torch.isnan(predictions).flatten(1).any(dim=1)
+            if not valid.any():
+                continue
+
+            predictions = predictions[valid]
+            targets = targets[valid]
+
             sample_crps = _crps_from_quantiles(predictions, targets, quantiles_t)
             sample_naive = _naive_crps(targets).to(device)
 
@@ -275,7 +300,18 @@ def _random_validate(model, n_batches: int = 10, batch_size: int = 32) -> dict:
             total_mase += mase
 
     count = max(i, 1)
-    avg_crps = total_crps / max(total_samples, 1)
+
+    # No valid samples → model is fully broken, score as failure
+    if total_samples == 0:
+        return {
+            "crps": float("inf"),
+            "ncrps": float("inf"),
+            "mase": float("inf"),
+            "n_batches": count,
+            "n_samples": 0,
+        }
+
+    avg_crps = total_crps / total_samples
 
     if all_log_ratios:
         all_logs = torch.cat(all_log_ratios)
