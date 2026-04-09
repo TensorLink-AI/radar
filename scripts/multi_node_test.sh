@@ -710,12 +710,14 @@ class _Replicas:
 
 
 class _Metadata:
-    def __init__(self, image, image_tag, state, replicas, uptime_seconds=10):
+    def __init__(self, image, image_tag, state, replicas, uptime_seconds=10,
+                 image_digest=""):
         self.image = image
         self.image_tag = image_tag
         self.state = state
         self.replicas = replicas
         self.uptime_seconds = uptime_seconds
+        self.image_digest = image_digest
 
 
 class _Deployment:
@@ -765,6 +767,7 @@ class BasilicaClient:
             image_tag=info.get("image_tag", "latest"),
             state="running",
             replicas=_Replicas(ready=1, desired=1),
+            image_digest=os.environ.get("OFFICIAL_TRAINING_IMAGE_DIGEST", ""),
         )
 MOCKEOF
 

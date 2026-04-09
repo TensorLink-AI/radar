@@ -259,7 +259,9 @@ class Miner:
                 deployment.name, trainer_url,
             )
 
-            # Enroll for public metadata so validators can verify the pod
+            # Enroll for public metadata so validators can verify the pod.
+            # This is REQUIRED — validators call get_public_deployment_metadata
+            # and will reject the pod if enrollment is missing.
             try:
                 await loop.run_in_executor(
                     None,
@@ -269,7 +271,17 @@ class Miner:
                 )
                 logger.info("Public metadata enrolled for %s", deployment.name)
             except Exception as e:
-                logger.warning("Failed to enroll public metadata for %s: %s", deployment.name, e)
+                logger.error(
+                    "Failed to enroll public metadata for %s: %s — "
+                    "validators will reject this pod", deployment.name, e,
+                )
+                # Clean up the un-attestable pod
+                try:
+                    client.delete_deployment(deployment.name)
+                except Exception:
+                    pass
+                self.active_deployments.pop(request.round_id, None)
+                return
 
             # POST signed TrainerReady back to requesting validator
             await self._post_trainer_ready(
