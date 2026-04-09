@@ -419,8 +419,12 @@ async def add_experiment(req: AddExperimentRequest):
     """Validator writes a DataElement after Phase C."""
     d = _require_db()
     from shared.database import DataElement
-    element = DataElement.from_dict(req.data)
-    idx = await d.add(element)
+    try:
+        element = DataElement.from_dict(req.data)
+        idx = await d.add(element)
+    except Exception as e:
+        logger.error("add_experiment failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"DB insert failed: {e}")
     return {"index": idx}
 
 

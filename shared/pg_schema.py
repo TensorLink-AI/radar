@@ -1,6 +1,7 @@
 """Postgres schema DDL and row conversion helpers for PgExperimentStore."""
 
 import difflib
+import json
 from typing import Optional
 
 from shared.database import DataElement
@@ -173,7 +174,12 @@ def row_to_element(row) -> DataElement:
 
 
 def element_to_params(element: DataElement, next_id: int) -> tuple:
-    """Convert a DataElement to a positional tuple for INSERT ($1..$20)."""
+    """Convert a DataElement to a positional tuple for INSERT ($1..$20).
+
+    JSONB columns (loss_curve, generated_samples, objectives) are explicitly
+    serialised with ``json.dumps`` so asyncpg sends a valid JSON string
+    regardless of statement-cache or connection-pooler settings.
+    """
     round_id = element.round_id if element.round_id >= 0 else None
     return (
         next_id,
@@ -189,10 +195,10 @@ def element_to_params(element: DataElement, next_id: int) -> tuple:
         element.score,
         element.miner_uid,
         element.miner_hotkey,
-        element.loss_curve,
+        json.dumps(element.loss_curve),
         element.manifest_sha256,
-        element.generated_samples,
-        element.objectives,
+        json.dumps(element.generated_samples),
+        json.dumps(element.objectives),
         element.timestamp,
         round_id,
         element.task,
