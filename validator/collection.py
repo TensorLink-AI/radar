@@ -162,14 +162,18 @@ async def _run_single_agent(
             return proposal, agent_log
         else:
             error_msg = ""
+            result_keys = ""
             if isinstance(result, dict):
                 error_msg = result.get("error", "")
                 stderr = result.get("stderr", "")
                 if stderr:
                     error_msg = f"{error_msg} | stderr: {stderr[:500]}"
+                result_keys = ", ".join(result.keys())
             logger.warning(
-                "UID %d agent returned no proposal: %s",
-                uid, error_msg or repr(result),
+                "UID %d proposal rejected (no code returned): %s | "
+                "result_type=%s result_keys=[%s]",
+                uid, error_msg or repr(result)[:200],
+                type(result).__name__, result_keys,
             )
     finally:
         try:
@@ -335,18 +339,25 @@ async def run_and_collect_agents(
                 logger.error("UID %d agent failed (fallback): %s", uid, e)
 
     # Dedup by code hash
-    seen_hashes: set[str] = set()
+    seen_hashes: dict[str, int] = {}  # hash -> first uid that claimed it
     deduped: dict[int, Proposal] = {}
     deduped_logs: dict[int, str] = {}
     for uid, p in sorted(proposals.items()):
         h = hashlib.sha256(p.code.strip().encode()).hexdigest()
         if h not in seen_hashes:
-            seen_hashes.add(h)
+            seen_hashes[h] = uid
             deduped[uid] = p
             deduped_logs[uid] = agent_logs.get(uid, "")
+        else:
+            logger.warning(
+                "UID %d proposal rejected (duplicate): code hash %s "
+                "already submitted by UID %d | name=%r code_len=%d",
+                uid, h[:16], seen_hashes[h], p.name[:80], len(p.code),
+            )
 
+    dup_count = len(proposals) - len(deduped)
     logger.info(
-        "Phase A complete: %d total proposals, %d after dedup",
-        len(proposals), len(deduped),
+        "Phase A complete: %d total proposals, %d after dedup (%d duplicates removed)",
+        len(proposals), len(deduped), dup_count,
     )
     return deduped, deduped_logs
