@@ -315,8 +315,8 @@ def test_gift_eval_validate_truncates_predictions():
         assert not math.isnan(result["crps"])
 
 
-def test_gift_eval_nan_model_output_propagates():
-    """NaN model output propagates to metrics (not silently dropped)."""
+def test_gift_eval_all_nan_model_propagates():
+    """Model that outputs ALL NaN produces NaN metrics."""
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast"))
     from prepare import _random_validate, CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES
@@ -324,10 +324,9 @@ def test_gift_eval_nan_model_output_propagates():
     import torch.nn as nn
 
     class NaNModel(nn.Module):
-        """Model that always outputs NaN (simulates diverged training)."""
         def __init__(self):
             super().__init__()
-            self.dummy = nn.Linear(1, 1)  # need a parameter for device detection
+            self.dummy = nn.Linear(1, 1)
 
         def forward(self, x):
             B = x.shape[0]
@@ -337,8 +336,36 @@ def test_gift_eval_nan_model_output_propagates():
 
     model = NaNModel()
     result = _random_validate(model, n_batches=2, batch_size=4)
-    # NaN model output should produce NaN metrics — not be hidden
+    # All-NaN model → no valid samples → NaN propagates
     assert math.isnan(result["crps"])
+
+
+def test_gift_eval_partial_nan_masked():
+    """Partial NaN in model output: valid samples still scored."""
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast"))
+    from prepare import _random_validate, CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES
+    import math
+    import torch.nn as nn
+
+    class PartialNaNModel(nn.Module):
+        """First sample in each batch is NaN, rest are valid."""
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(CONTEXT_LEN, PREDICTION_LEN * NUM_VARIATES * len(QUANTILES))
+
+        def forward(self, x):
+            B = x.shape[0]
+            out = self.fc(x.mean(dim=2))
+            out = out.view(B, PREDICTION_LEN, NUM_VARIATES, len(QUANTILES))
+            out[0] = float("nan")  # poison first sample only
+            return out
+
+    model = PartialNaNModel()
+    result = _random_validate(model, n_batches=2, batch_size=4)
+    # Partial NaN → masked out, valid samples produce finite CRPS
+    assert not math.isnan(result["crps"])
+    assert result["crps"] < float("inf")
 
 
 def test_evaluator_env_has_cache_default():
