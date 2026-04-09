@@ -337,11 +337,19 @@ class Validator:
         for uid, proposal in submissions.items():
             ok, reason = pre_validate_code(proposal.code)
             if not ok:
-                logger.warning("UID %d proposal rejected: %s", uid, reason)
+                logger.warning(
+                    "UID %d proposal rejected (pre_validate_code): %s | "
+                    "name=%r code_len=%d",
+                    uid, reason, proposal.name[:80], len(proposal.code),
+                )
                 continue
             filtered[uid] = proposal
 
-        logger.info("Phase A: %d proposals, %d after filter", len(submissions), len(filtered))
+        rejected_count = len(submissions) - len(filtered)
+        logger.info(
+            "Phase A: %d proposals, %d after filter (%d rejected)",
+            len(submissions), len(filtered), rejected_count,
+        )
 
         if not filtered:
             logger.info("No valid submissions this round")

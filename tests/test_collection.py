@@ -147,5 +147,5 @@ async def test_run_single_agent_logs_error_result(caplog):
 
     assert proposal is None
     assert agent_log == ""
-    assert "UID 0 agent returned no proposal" in caplog.text
+    assert "UID 0 proposal rejected (no code returned)" in caplog.text
     assert "SyntaxError" in caplog.text

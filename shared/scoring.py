@@ -7,12 +7,15 @@ identical scores from identical checkpoints.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from shared.pareto import ParetoFront
     from shared.task import Objective
+
+logger = logging.getLogger(__name__)
 
 
 def passes_size_gate(metrics: dict, challenge) -> bool:
@@ -55,8 +58,20 @@ def score_round(
     for uid, metrics in eval_results.items():
         if not metrics.get("passed_size_gate", False):
             scores[uid] = 0.0
+            logger.info(
+                "UID %d scored 0: failed size gate "
+                "(flops=%d, allowed=[%d, %d], error=%s)",
+                uid, metrics.get("flops_equivalent_size", 0),
+                challenge.min_flops_equivalent,
+                challenge.max_flops_equivalent,
+                metrics.get("error", ""),
+            )
         elif metrics.get("crps") is None or not math.isfinite(metrics.get("crps", float("inf"))):
             scores[uid] = 0.0
+            logger.info(
+                "UID %d scored 0: invalid CRPS=%s error=%s",
+                uid, metrics.get("crps"), metrics.get("error", ""),
+            )
         else:
             feasible[uid] = metrics
 
