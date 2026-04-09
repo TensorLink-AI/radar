@@ -39,12 +39,14 @@ async def prov_store():
 async def _add_exp(pool, id, code="", hotkey="", round_id=None, metric=None,
                    success=True, task="ts", miner_uid=-1):
     from shared.pg_schema import INSERT_SQL
+    import json
     import time
     await pool.execute(
         INSERT_SQL,
         id, "", code, "", "", metric, success, "",
         None, 0, 0.0, miner_uid, hotkey,
-        [], "", [], {}, time.time(), round_id, task,
+        json.dumps([]), "", json.dumps([]), json.dumps({}),
+        time.time(), round_id, task,
     )
 
 
