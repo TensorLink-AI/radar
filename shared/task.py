@@ -70,6 +70,7 @@ class TaskSpec:
     runner_dir: str = ""
     docker_memory: str = "8Gi"
     docker_cpus: str = "2"
+    task_params: dict = field(default_factory=dict)
 
     @property
     def primary_objective(self) -> Optional[Objective]:
@@ -128,6 +129,7 @@ class TaskSpec:
             "runner_dir": self.runner_dir,
             "docker_memory": self.docker_memory,
             "docker_cpus": self.docker_cpus,
+            "task_params": self.task_params,
         }
 
     @classmethod
@@ -151,6 +153,7 @@ class TaskSpec:
             runner_dir=d.get("runner_dir", ""),
             docker_memory=d.get("docker_memory", "8Gi"),
             docker_cpus=d.get("docker_cpus", "2"),
+            task_params=d.get("task_params", {}),
         )
 
     @classmethod
@@ -233,6 +236,12 @@ def ml_training_task() -> TaskSpec:
         runner_dir="runner/timeseries_forecast",
         docker_memory="8Gi",
         docker_cpus="2",
+        task_params={
+            "context_len": 512,
+            "prediction_len": 96,
+            "num_variates": 1,
+            "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+        },
     )
 
 
