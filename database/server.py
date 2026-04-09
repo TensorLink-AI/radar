@@ -432,7 +432,8 @@ async def add_experiment(req: AddExperimentRequest):
 async def update_frontier(req: UpdateFrontierRequest):
     """Validator pushes frontier data."""
     global _current_frontier
-    _current_frontier = req.frontier
+    from shared.pg_schema import _sanitize_for_json
+    _current_frontier = _sanitize_for_json(req.frontier)
     return {"status": "ok"}
 
 
