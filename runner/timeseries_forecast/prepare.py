@@ -301,12 +301,12 @@ def _random_validate(model, n_batches: int = 10, batch_size: int = 32) -> dict:
 
     count = max(i, 1)
 
-    # No valid samples → model is fully broken, propagate NaN
+    # No valid samples → model is fully broken, score as failure
     if total_samples == 0:
         return {
-            "crps": float("nan"),
-            "ncrps": float("nan"),
-            "mase": float("nan"),
+            "crps": float("inf"),
+            "ncrps": float("inf"),
+            "mase": float("inf"),
             "n_batches": count,
             "n_samples": 0,
         }

@@ -315,8 +315,8 @@ def test_gift_eval_validate_truncates_predictions():
         assert not math.isnan(result["crps"])
 
 
-def test_gift_eval_all_nan_model_propagates():
-    """Model that outputs ALL NaN produces NaN metrics."""
+def test_gift_eval_all_nan_model_returns_inf():
+    """Model that outputs ALL NaN scores as failure (inf), not nan."""
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast"))
     from prepare import _random_validate, CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES
@@ -336,8 +336,10 @@ def test_gift_eval_all_nan_model_propagates():
 
     model = NaNModel()
     result = _random_validate(model, n_batches=2, batch_size=4)
-    # All-NaN model → no valid samples → NaN propagates
-    assert math.isnan(result["crps"])
+    # All-NaN model → no valid samples → inf (not nan, which breaks weights)
+    assert not math.isnan(result["crps"])
+    assert result["crps"] == float("inf")
+    assert result["n_samples"] == 0
 
 
 def test_gift_eval_partial_nan_masked():
