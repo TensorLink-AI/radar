@@ -639,14 +639,24 @@ class TrainingCoordinator:
             for uid, ready_msg in ready.items():
                 if uid in result:
                     continue
+                # Require instance_name — miners must deploy on Basilica
+                # so validators can verify the pod image and endpoint.
+                if not ready_msg.instance_name:
+                    logger.warning(
+                        "UID %d TrainerReady rejected: missing instance_name "
+                        "(attestation required)", uid,
+                    )
+                    continue
                 # Verify the pod via Basilica public metadata
-                if ready_msg.instance_name:
-                    ok, reason = await verify_miner_pod(ready_msg.instance_name)
-                    if not ok:
-                        logger.warning(
-                            "UID %d TrainerReady failed verification: %s", uid, reason,
-                        )
-                        continue
+                ok, reason = await verify_miner_pod(
+                    ready_msg.instance_name,
+                    trainer_url=ready_msg.trainer_url,
+                )
+                if not ok:
+                    logger.warning(
+                        "UID %d TrainerReady failed verification: %s", uid, reason,
+                    )
+                    continue
                 result[uid] = ready_msg.trainer_url
                 logger.info("UID %d trainer ready at %s", uid, ready_msg.trainer_url)
 

@@ -152,20 +152,20 @@ class TestVerifyMinerPod:
             assert "No ready replicas" in reason
 
     @pytest.mark.asyncio
-    async def test_no_expected_image_configured(self):
-        """No expected image configured -> passes gracefully."""
+    async def test_no_expected_image_configured_fails(self):
+        """No expected image configured -> fails (strict mode)."""
         with patch("config.Config.OFFICIAL_TRAINING_IMAGE", ""):
             ok, reason = await verify_miner_pod("my-pod", expected_image="")
-            assert ok
-            assert "no expected image" in reason
+            assert not ok
+            assert "No expected image configured" in reason
 
     @pytest.mark.asyncio
-    async def test_basilica_sdk_not_installed(self):
-        """basilica SDK missing -> passes with warning."""
+    async def test_basilica_sdk_not_installed_fails(self):
+        """basilica SDK missing -> fails (attestation is mandatory)."""
         with patch.dict(sys.modules, {"basilica": None}):
             ok, reason = await verify_miner_pod("my-pod")
-            assert ok
-            assert "basilica not available" in reason
+            assert not ok
+            assert "basilica SDK not installed" in reason
 
     @pytest.mark.asyncio
     async def test_api_exception(self):
@@ -178,13 +178,11 @@ class TestVerifyMinerPod:
             assert "connection refused" in reason
 
     @pytest.mark.asyncio
-    async def test_empty_instance_name(self):
-        """Empty instance_name -> still calls API (caller handles skip)."""
-        fake_mod, _ = _patch_basilica(side_effect=RuntimeError("invalid instance name"))
-        with patch.dict(sys.modules, {"basilica": fake_mod}):
-            ok, reason = await verify_miner_pod("")
-            assert not ok
-            assert "Attestation failed" in reason
+    async def test_empty_instance_name_rejected(self):
+        """Empty instance_name -> rejected immediately (attestation required)."""
+        ok, reason = await verify_miner_pod("")
+        assert not ok
+        assert "Missing instance_name" in reason
 
     @pytest.mark.asyncio
     async def test_image_without_tag_only_compares_image(self):
@@ -206,6 +204,60 @@ class TestVerifyMinerPod:
         with patch.dict(sys.modules, {"basilica": fake_mod}):
             ok, reason = await verify_miner_pod("my-pod")
             assert ok
+
+    @pytest.mark.asyncio
+    async def test_url_mismatch_rejected(self):
+        """Miner-claimed URL doesn't match Basilica metadata -> fails."""
+        meta = _make_meta()
+        meta.url = "https://real-pod.basilica.cloud"
+        fake_mod, _ = _patch_basilica(meta=meta)
+        with patch.dict(sys.modules, {"basilica": fake_mod}):
+            ok, reason = await verify_miner_pod(
+                "my-pod", trainer_url="https://evil-redirect.example.com",
+            )
+            assert not ok
+            assert "URL mismatch" in reason
+            assert "evil-redirect" in reason
+
+    @pytest.mark.asyncio
+    async def test_url_match_passes(self):
+        """Miner-claimed URL matches Basilica metadata -> passes."""
+        meta = _make_meta()
+        meta.url = "https://real-pod.basilica.cloud"
+        fake_mod, _ = _patch_basilica(meta=meta)
+        with patch.dict(sys.modules, {"basilica": fake_mod}):
+            ok, reason = await verify_miner_pod(
+                "my-pod", trainer_url="https://real-pod.basilica.cloud",
+            )
+            assert ok
+            assert reason == "ok"
+
+    @pytest.mark.asyncio
+    async def test_url_trailing_slash_normalised(self):
+        """Trailing slash difference should not cause mismatch."""
+        meta = _make_meta()
+        meta.url = "https://pod.basilica.cloud/"
+        fake_mod, _ = _patch_basilica(meta=meta)
+        with patch.dict(sys.modules, {"basilica": fake_mod}):
+            ok, reason = await verify_miner_pod(
+                "my-pod", trainer_url="https://pod.basilica.cloud",
+            )
+            assert ok
+
+    @pytest.mark.asyncio
+    async def test_url_check_skipped_when_meta_has_no_url(self):
+        """If Basilica metadata has no url field, skip URL check."""
+        meta = _make_meta()
+        # Configure spec so getattr returns None for url/endpoint
+        meta.url = None
+        meta.endpoint = None
+        fake_mod, _ = _patch_basilica(meta=meta)
+        with patch.dict(sys.modules, {"basilica": fake_mod}):
+            ok, reason = await verify_miner_pod(
+                "my-pod", trainer_url="https://anything.example.com",
+            )
+            assert ok
+            assert reason == "ok"
 
 
 class TestNormaliseAgentCode:

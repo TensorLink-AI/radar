@@ -296,23 +296,32 @@ def _parse_image_ref(image_ref: str) -> tuple[str, str]:
 async def verify_miner_pod(
     instance_name: str,
     expected_image: str = "",
+    trainer_url: str = "",
 ) -> tuple[bool, str]:
     """Check Basilica public metadata to verify a trainer pod.
 
+    Attestation is MANDATORY — miners must deploy on Basilica so
+    validators can verify the image, pod state, and endpoint URL.
+
     Args:
-        instance_name: Basilica deployment instance name.
+        instance_name: Basilica deployment instance name (required).
         expected_image: Expected image reference (e.g. 'ghcr.io/org/repo:tag').
             Defaults to Config.OFFICIAL_TRAINING_IMAGE.
+        trainer_url: The trainer URL the miner claimed. If Basilica metadata
+            includes a URL, it must match this value.
 
     Returns:
         (ok, reason) tuple.
     """
+    if not instance_name:
+        return False, "Missing instance_name (attestation required)"
+
     try:
         from config import Config
         if not expected_image:
             expected_image = Config.OFFICIAL_TRAINING_IMAGE
         if not expected_image:
-            return True, "ok (no expected image configured)"
+            return False, "No expected image configured — cannot verify pod"
 
         # Lazy import basilica SDK
         from basilica import BasilicaClient
@@ -340,9 +349,20 @@ async def verify_miner_pod(
         if isinstance(ready_count, int) and ready_count < 1 and state_lower == "running":
             return False, f"No ready replicas: {ready_count}"
 
+        # Verify trainer_url matches Basilica-reported URL (if available).
+        # This prevents miners from claiming a Basilica instance_name but
+        # routing training traffic to a different (unverified) endpoint.
+        meta_url = getattr(meta, "url", None) or getattr(meta, "endpoint", None)
+        if trainer_url and meta_url:
+            if trainer_url.rstrip("/") != str(meta_url).rstrip("/"):
+                return False, (
+                    f"URL mismatch: miner claimed {trainer_url}, "
+                    f"Basilica reports {meta_url}"
+                )
+
         return True, "ok"
     except ImportError:
-        logger.warning("basilica SDK not installed, skipping attestation check")
-        return True, "ok (basilica not available)"
+        logger.warning("basilica SDK not installed — attestation cannot proceed")
+        return False, "basilica SDK not installed (attestation required)"
     except Exception as e:
         return False, f"Attestation failed: {e}"
