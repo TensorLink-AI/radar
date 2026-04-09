@@ -131,6 +131,7 @@ class TrainingCoordinator:
         self.r2 = r2
         self.my_uid = my_uid
         self._fallback_uids: dict[int, set[int]] = {}  # round_id → UIDs using proxy
+        self._verified_pods: dict[int, dict[int, str]] = {}  # round_id → {uid: instance_name}
 
     def compute_my_jobs(
         self,
@@ -158,14 +159,33 @@ class TrainingCoordinator:
     ) -> list[TrainingResult]:
         """POST to trainer endpoints with Epistula-signed payload.
 
-        Dispatches concurrently. Attestation is already verified in
-        prepare_trainers() when TrainerReady arrives; fallback proxy
-        is trusted subnet-owner infrastructure.
+        Re-verifies pod attestation before dispatch to close the
+        TOCTOU gap between prepare_trainers() and actual dispatch.
+        Fallback proxy is trusted subnet-owner infrastructure.
         """
+        from validator.pod_manager import verify_miner_pod
+
         commitments = commitments or {}
         gift_eval_urls = gift_eval_urls or {}
         pretrain_shard_urls = pretrain_shard_urls or []
         logger.info("Dispatching %d jobs to %d trainer endpoints", len(jobs), len(trainer_endpoints))
+
+        # Re-verify pods before dispatching training data.
+        # This closes the TOCTOU gap: a miner could swap the pod
+        # between prepare_trainers() and now.
+        round_id = challenge.round_id
+        verified = self._verified_pods.get(round_id, {})
+        fallback_uids = self._fallback_uids.get(round_id, set())
+        for uid, instance_name in list(verified.items()):
+            if uid in fallback_uids:
+                continue
+            ok, reason = await verify_miner_pod(instance_name)
+            if not ok:
+                logger.warning(
+                    "UID %d pod re-verification failed before dispatch: %s — "
+                    "removing from trainer_endpoints", uid, reason,
+                )
+                trainer_endpoints.pop(uid, None)
 
         # Trainer returns 202 Accepted immediately; this timeout only
         # covers auth + request parsing, not the full training run.
@@ -633,6 +653,10 @@ class TrainingCoordinator:
         # Poll for TrainerReady responses
         deadline = asyncio.get_event_loop().time() + Config.TRAINER_PREPARE_TIMEOUT
         result: dict[int, str] = {}
+        verified_instances: dict[int, str] = {}
+
+        # Build uid→hotkey map for ownership verification
+        hotkeys = self.metagraph.hotkeys if hasattr(self.metagraph, "hotkeys") else []
 
         while asyncio.get_event_loop().time() < deadline:
             ready = get_ready_trainers(round_id)
@@ -648,9 +672,11 @@ class TrainingCoordinator:
                     )
                     continue
                 # Verify the pod via Basilica public metadata
+                miner_hk = hotkeys[uid] if uid < len(hotkeys) else ""
                 ok, reason = await verify_miner_pod(
                     ready_msg.instance_name,
-                    trainer_url=ready_msg.trainer_url,
+                    miner_hotkey=miner_hk,
+                    round_id=round_id,
                 )
                 if not ok:
                     logger.warning(
@@ -658,6 +684,7 @@ class TrainingCoordinator:
                     )
                     continue
                 result[uid] = ready_msg.trainer_url
+                verified_instances[uid] = ready_msg.instance_name
                 logger.info("UID %d trainer ready at %s", uid, ready_msg.trainer_url)
 
             if len(result) >= len(sent_uids):
@@ -678,6 +705,7 @@ class TrainingCoordinator:
                 )
 
         self._fallback_uids[round_id] = fallback_uids
+        self._verified_pods[round_id] = verified_instances
 
         logger.info(
             "prepare_trainers complete: %d ready, %d fallback, %d no response (round %d)",
@@ -729,3 +757,4 @@ class TrainingCoordinator:
         logger.info("Released %d trainers (round %d)", released, round_id)
         clear_ready_trainers(round_id)
         self._fallback_uids.pop(round_id, None)
+        self._verified_pods.pop(round_id, None)

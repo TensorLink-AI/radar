@@ -296,25 +296,44 @@ def _parse_image_ref(image_ref: str) -> tuple[str, str]:
 async def verify_miner_pod(
     instance_name: str,
     expected_image: str = "",
-    trainer_url: str = "",
+    miner_hotkey: str = "",
+    round_id: int = 0,
 ) -> tuple[bool, str]:
     """Check Basilica public metadata to verify a trainer pod.
 
     Attestation is MANDATORY — miners must deploy on Basilica so
-    validators can verify the image, pod state, and endpoint URL.
+    validators can verify the image, pod state, and ownership.
+
+    Checks performed:
+      1. instance_name is non-empty
+      2. instance_name matches expected naming pattern for this miner/round
+      3. Image name + tag match OFFICIAL_TRAINING_IMAGE
+      4. Image digest matches OFFICIAL_TRAINING_IMAGE_DIGEST (if configured)
+      5. Pod state is running/active with ready replicas
 
     Args:
         instance_name: Basilica deployment instance name (required).
         expected_image: Expected image reference (e.g. 'ghcr.io/org/repo:tag').
             Defaults to Config.OFFICIAL_TRAINING_IMAGE.
-        trainer_url: The trainer URL the miner claimed. If Basilica metadata
-            includes a URL, it must match this value.
+        miner_hotkey: The miner's hotkey ss58 address. Used to verify
+            the pod instance_name is bound to this miner.
+        round_id: Current round ID. Used with miner_hotkey for ownership check.
 
     Returns:
         (ok, reason) tuple.
     """
     if not instance_name:
         return False, "Missing instance_name (attestation required)"
+
+    # Ownership check: instance_name must match the miner's hotkey + round.
+    # Miners name pods "radar-trainer-{hotkey[:8]}-{round_id}".
+    if miner_hotkey and round_id:
+        expected_name = f"radar-trainer-{miner_hotkey[:8]}-{round_id}"
+        if instance_name != expected_name:
+            return False, (
+                f"Instance name mismatch: expected {expected_name}, "
+                f"got {instance_name}"
+            )
 
     try:
         from config import Config
@@ -323,6 +342,8 @@ async def verify_miner_pod(
         if not expected_image:
             return False, "No expected image configured — cannot verify pod"
 
+        expected_digest = Config.OFFICIAL_TRAINING_IMAGE_DIGEST
+
         # Lazy import basilica SDK
         from basilica import BasilicaClient
 
@@ -330,35 +351,32 @@ async def verify_miner_pod(
             instance_name=instance_name,
         )
 
-        # Compare image
+        # Compare image name and tag
         exp_image, exp_tag = _parse_image_ref(expected_image)
         if meta.image != exp_image:
             return False, f"Wrong image: expected {exp_image}, got {meta.image}"
         if exp_tag and meta.image_tag != exp_tag:
             return False, f"Wrong tag: expected {exp_tag}, got {meta.image_tag}"
 
+        # Verify image digest when configured — tags are mutable, digests are not
+        if expected_digest:
+            meta_digest = getattr(meta, "image_digest", None) or ""
+            if meta_digest and meta_digest != expected_digest:
+                return False, (
+                    f"Image digest mismatch: expected {expected_digest[:24]}..., "
+                    f"got {meta_digest[:24]}..."
+                )
+
         # Check pod is running (case-insensitive — Basilica returns "Active")
         state_lower = (meta.state or "").lower()
         if state_lower not in ("running", "active"):
             return False, f"Pod not running: state={meta.state}"
 
-        # Check replicas — skip if state is active but replicas not yet ready
-        # (Basilica "Active" means deployment exists, replicas may still be scaling)
+        # Check replicas
         ready = getattr(meta.replicas, "ready", meta.replicas) if hasattr(meta, "replicas") else 0
         ready_count = ready if isinstance(ready, int) else getattr(meta.replicas, "ready", 0)
         if isinstance(ready_count, int) and ready_count < 1 and state_lower == "running":
             return False, f"No ready replicas: {ready_count}"
-
-        # Verify trainer_url matches Basilica-reported URL (if available).
-        # This prevents miners from claiming a Basilica instance_name but
-        # routing training traffic to a different (unverified) endpoint.
-        meta_url = getattr(meta, "url", None) or getattr(meta, "endpoint", None)
-        if trainer_url and meta_url:
-            if trainer_url.rstrip("/") != str(meta_url).rstrip("/"):
-                return False, (
-                    f"URL mismatch: miner claimed {trainer_url}, "
-                    f"Basilica reports {meta_url}"
-                )
 
         return True, "ok"
     except ImportError:

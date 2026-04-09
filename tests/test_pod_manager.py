@@ -205,59 +205,100 @@ class TestVerifyMinerPod:
             ok, reason = await verify_miner_pod("my-pod")
             assert ok
 
+    # ── Ownership check tests ─────────────────────────────────────
+
     @pytest.mark.asyncio
-    async def test_url_mismatch_rejected(self):
-        """Miner-claimed URL doesn't match Basilica metadata -> fails."""
+    async def test_ownership_check_correct_name(self):
+        """instance_name matching hotkey+round passes ownership check."""
+        hotkey = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        name = f"radar-trainer-{hotkey[:8]}-42"
         meta = _make_meta()
-        meta.url = "https://real-pod.basilica.cloud"
         fake_mod, _ = _patch_basilica(meta=meta)
         with patch.dict(sys.modules, {"basilica": fake_mod}):
             ok, reason = await verify_miner_pod(
-                "my-pod", trainer_url="https://evil-redirect.example.com",
+                name, miner_hotkey=hotkey, round_id=42,
             )
+            assert ok
+            assert reason == "ok"
+
+    @pytest.mark.asyncio
+    async def test_ownership_check_wrong_hotkey(self):
+        """instance_name with different hotkey prefix -> rejected."""
+        real_hotkey = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        spoofed_name = "radar-trainer-XXXXXXXX-42"
+        ok, reason = await verify_miner_pod(
+            spoofed_name, miner_hotkey=real_hotkey, round_id=42,
+        )
+        assert not ok
+        assert "Instance name mismatch" in reason
+
+    @pytest.mark.asyncio
+    async def test_ownership_check_wrong_round(self):
+        """instance_name with different round -> rejected."""
+        hotkey = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        wrong_round_name = f"radar-trainer-{hotkey[:8]}-99"
+        ok, reason = await verify_miner_pod(
+            wrong_round_name, miner_hotkey=hotkey, round_id=42,
+        )
+        assert not ok
+        assert "Instance name mismatch" in reason
+
+    @pytest.mark.asyncio
+    async def test_ownership_check_skipped_without_hotkey(self):
+        """Without miner_hotkey, ownership check is skipped."""
+        meta = _make_meta()
+        fake_mod, _ = _patch_basilica(meta=meta)
+        with patch.dict(sys.modules, {"basilica": fake_mod}):
+            ok, reason = await verify_miner_pod("any-name")
+            assert ok
+
+    # ── Image digest tests ────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_digest_match_passes(self):
+        """Matching image digest -> passes."""
+        meta = _make_meta()
+        meta.image_digest = "sha256:abc123"
+        fake_mod, _ = _patch_basilica(meta=meta)
+        with patch.dict(sys.modules, {"basilica": fake_mod}), \
+             patch("config.Config.OFFICIAL_TRAINING_IMAGE_DIGEST", "sha256:abc123"):
+            ok, reason = await verify_miner_pod("my-pod")
+            assert ok
+            assert reason == "ok"
+
+    @pytest.mark.asyncio
+    async def test_digest_mismatch_rejected(self):
+        """Different image digest -> rejected."""
+        meta = _make_meta()
+        meta.image_digest = "sha256:evil999"
+        fake_mod, _ = _patch_basilica(meta=meta)
+        with patch.dict(sys.modules, {"basilica": fake_mod}), \
+             patch("config.Config.OFFICIAL_TRAINING_IMAGE_DIGEST", "sha256:abc123"):
+            ok, reason = await verify_miner_pod("my-pod")
             assert not ok
-            assert "URL mismatch" in reason
-            assert "evil-redirect" in reason
+            assert "Image digest mismatch" in reason
 
     @pytest.mark.asyncio
-    async def test_url_match_passes(self):
-        """Miner-claimed URL matches Basilica metadata -> passes."""
+    async def test_digest_check_skipped_when_not_configured(self):
+        """No expected digest configured -> skip check, still pass."""
         meta = _make_meta()
-        meta.url = "https://real-pod.basilica.cloud"
+        meta.image_digest = "sha256:anything"
         fake_mod, _ = _patch_basilica(meta=meta)
-        with patch.dict(sys.modules, {"basilica": fake_mod}):
-            ok, reason = await verify_miner_pod(
-                "my-pod", trainer_url="https://real-pod.basilica.cloud",
-            )
-            assert ok
-            assert reason == "ok"
-
-    @pytest.mark.asyncio
-    async def test_url_trailing_slash_normalised(self):
-        """Trailing slash difference should not cause mismatch."""
-        meta = _make_meta()
-        meta.url = "https://pod.basilica.cloud/"
-        fake_mod, _ = _patch_basilica(meta=meta)
-        with patch.dict(sys.modules, {"basilica": fake_mod}):
-            ok, reason = await verify_miner_pod(
-                "my-pod", trainer_url="https://pod.basilica.cloud",
-            )
+        with patch.dict(sys.modules, {"basilica": fake_mod}), \
+             patch("config.Config.OFFICIAL_TRAINING_IMAGE_DIGEST", ""):
+            ok, reason = await verify_miner_pod("my-pod")
             assert ok
 
     @pytest.mark.asyncio
-    async def test_url_check_skipped_when_meta_has_no_url(self):
-        """If Basilica metadata has no url field, skip URL check."""
+    async def test_digest_check_skipped_when_meta_has_no_digest(self):
+        """Basilica doesn't report digest -> skip check, still pass."""
         meta = _make_meta()
-        # Configure spec so getattr returns None for url/endpoint
-        meta.url = None
-        meta.endpoint = None
+        meta.image_digest = None
         fake_mod, _ = _patch_basilica(meta=meta)
-        with patch.dict(sys.modules, {"basilica": fake_mod}):
-            ok, reason = await verify_miner_pod(
-                "my-pod", trainer_url="https://anything.example.com",
-            )
+        with patch.dict(sys.modules, {"basilica": fake_mod}), \
+             patch("config.Config.OFFICIAL_TRAINING_IMAGE_DIGEST", "sha256:abc"):
+            ok, reason = await verify_miner_pod("my-pod")
             assert ok
-            assert reason == "ok"
 
 
 class TestNormaliseAgentCode:
