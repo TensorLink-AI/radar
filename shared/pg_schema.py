@@ -2,6 +2,7 @@
 
 import difflib
 import json
+import math
 from typing import Optional
 
 from shared.database import DataElement
@@ -173,12 +174,35 @@ def row_to_element(row) -> DataElement:
     )
 
 
+def _sanitize_for_json(obj):
+    """Replace float inf/nan with None so json.dumps produces valid JSON.
+
+    PostgreSQL's JSONB parser rejects JavaScript-style ``Infinity`` and
+    ``NaN`` tokens that Python's ``json.dumps`` emits by default.
+    """
+    if isinstance(obj, float):
+        if math.isinf(obj) or math.isnan(obj):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
+
+
+def _jsonb(value) -> str:
+    """Serialize a value to a valid JSON string for JSONB columns."""
+    return json.dumps(_sanitize_for_json(value))
+
+
 def element_to_params(element: DataElement, next_id: int) -> tuple:
     """Convert a DataElement to a positional tuple for INSERT ($1..$20).
 
     JSONB columns (loss_curve, generated_samples, objectives) are explicitly
     serialised with ``json.dumps`` so asyncpg sends a valid JSON string
-    regardless of statement-cache or connection-pooler settings.
+    regardless of statement-cache or connection-pooler settings.  Float
+    ``inf``/``nan`` are replaced with ``null`` to keep PostgreSQL happy.
     """
     round_id = element.round_id if element.round_id >= 0 else None
     return (
@@ -195,10 +219,10 @@ def element_to_params(element: DataElement, next_id: int) -> tuple:
         element.score,
         element.miner_uid,
         element.miner_hotkey,
-        json.dumps(element.loss_curve),
+        _jsonb(element.loss_curve),
         element.manifest_sha256,
-        json.dumps(element.generated_samples),
-        json.dumps(element.objectives),
+        _jsonb(element.generated_samples),
+        _jsonb(element.objectives),
         element.timestamp,
         round_id,
         element.task,
