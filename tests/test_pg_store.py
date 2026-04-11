@@ -16,10 +16,9 @@ skip_no_pg = pytest.mark.skipif(not PG_DSN, reason="TEST_PG_DSN not set")
 @pytest.fixture
 async def store():
     """Create a PgExperimentStore with a clean schema for each test."""
-    import asyncpg
-    from shared.pg_store import PgExperimentStore
+    from shared.pg_store import PgExperimentStore, create_pg_pool
 
-    pool = await asyncpg.create_pool(PG_DSN, min_size=1, max_size=3)
+    pool = await create_pg_pool(PG_DSN, min_size=1, max_size=3)
     # Clean tables before each test
     async with pool.acquire() as conn:
         await conn.execute("DROP TABLE IF EXISTS code_components CASCADE")
@@ -151,6 +150,38 @@ async def test_get_pareto_elements(store):
     await store.add(DataElement(name="d", success=True, metric=0.3))
     elems = await store.get_pareto_elements()
     assert len(elems) == 2
+
+
+@skip_no_pg
+@pytest.mark.asyncio
+async def test_jsonb_columns_decoded(store):
+    """JSONB columns must come back as Python dicts/lists, not strings.
+
+    Regression guard: without a JSON codec, asyncpg returns JSONB as ``str``,
+    which breaks ``DataElement.to_api_dict`` (``objectives.items()``) and any
+    code calling ``.get(...)`` on ``objectives``.
+    """
+    await store.add(DataElement(
+        name="e",
+        success=True,
+        metric=0.1,
+        objectives={"crps": 0.1, "flops_equivalent_size": 1_000_000},
+        loss_curve=[1.0, 0.5, 0.25],
+        generated_samples=[[1, 2], [3, 4]],
+    ))
+    elems = await store.get_pareto_elements()
+    assert len(elems) == 1
+    e = elems[0]
+    assert isinstance(e.objectives, dict)
+    assert e.objectives["crps"] == 0.1
+    assert e.objectives["flops_equivalent_size"] == 1_000_000
+    assert isinstance(e.loss_curve, list)
+    assert e.loss_curve == [1.0, 0.5, 0.25]
+    assert isinstance(e.generated_samples, list)
+    # to_api_dict must not raise — this was the Phase C 500
+    d = e.to_api_dict()
+    assert d["results"]["crps"] == 0.1
+    assert d["results"]["flops_equivalent_size"] == 1_000_000
 
 
 @skip_no_pg

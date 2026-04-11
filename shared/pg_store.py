@@ -4,6 +4,7 @@ Drop-in async replacement for SQLiteExperimentStore.
 All methods are async, backed by asyncpg connection pool.
 """
 
+import json
 import logging
 import re
 import time
@@ -19,6 +20,45 @@ from shared.pg_schema import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _register_json_codecs(conn: asyncpg.Connection) -> None:
+    """Register JSON/JSONB codecs so asyncpg returns Python dicts/lists.
+
+    Without this, asyncpg returns JSONB columns as raw strings, which breaks
+    ``row_to_element`` (objectives/loss_curve/generated_samples end up as
+    ``str`` instead of ``dict``/``list``) and causes ``to_api_dict`` to raise
+    ``AttributeError: 'str' object has no attribute 'items'``.
+    """
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+    await conn.set_type_codec(
+        "json",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+
+
+async def create_pg_pool(dsn: str, **kwargs) -> asyncpg.Pool:
+    """Create an asyncpg pool with JSON/JSONB codecs pre-registered.
+
+    All radar components should use this helper instead of
+    ``asyncpg.create_pool`` directly so JSONB columns are decoded to Python
+    objects consistently.
+    """
+    user_init = kwargs.pop("init", None)
+
+    async def _init(conn: asyncpg.Connection) -> None:
+        await _register_json_codecs(conn)
+        if user_init is not None:
+            await user_init(conn)
+
+    return await asyncpg.create_pool(dsn, init=_init, **kwargs)
 
 
 class PgExperimentStore:

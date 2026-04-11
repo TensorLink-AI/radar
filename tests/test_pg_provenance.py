@@ -16,11 +16,10 @@ skip_no_pg = pytest.mark.skipif(not PG_DSN, reason="TEST_PG_DSN not set")
 @pytest.fixture
 async def prov_store():
     """Create store + provenance with clean schema."""
-    import asyncpg
-    from shared.pg_store import PgExperimentStore
+    from shared.pg_store import PgExperimentStore, create_pg_pool
     from shared.pg_access_logger import PgAccessLogger
 
-    pool = await asyncpg.create_pool(PG_DSN, min_size=1, max_size=3)
+    pool = await create_pg_pool(PG_DSN, min_size=1, max_size=3)
     async with pool.acquire() as conn:
         await conn.execute("DROP TABLE IF EXISTS code_components CASCADE")
         await conn.execute("DROP TABLE IF EXISTS round_context CASCADE")
