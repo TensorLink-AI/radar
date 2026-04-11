@@ -149,7 +149,12 @@ CREATE INDEX IF NOT EXISTS idx_access_hotkey_round
 
 
 def row_to_element(row) -> DataElement:
-    """Convert an asyncpg Record to a DataElement. JSONB auto-deserialized."""
+    """Convert an asyncpg Record to a DataElement.
+
+    JSONB columns (objectives, loss_curve, generated_samples) are decoded to
+    Python objects via the codec registered in ``shared.pg_store.create_pg_pool``.
+    Pools that do not register that codec will return JSONB as ``str``.
+    """
     return DataElement(
         index=row["id"],
         name=row["name"],

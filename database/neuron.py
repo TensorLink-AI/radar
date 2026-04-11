@@ -11,7 +11,6 @@ import argparse
 import asyncio
 import logging
 
-import asyncpg
 import bittensor as bt
 import uvicorn
 
@@ -23,7 +22,7 @@ from database.server import (
 )
 from shared.pareto import ParetoFront
 from shared.pg_access_logger import PgAccessLogger
-from shared.pg_store import PgExperimentStore
+from shared.pg_store import PgExperimentStore, create_pg_pool
 from shared.task import load_enabled_tasks
 
 logger = logging.getLogger(__name__)
@@ -83,7 +82,7 @@ class DatabaseNeuron:
         if Config.PG_SSL or "supabase" in pg_dsn:
             pool_kwargs["statement_cache_size"] = 0
 
-        self.pool = await asyncpg.create_pool(pg_dsn, **pool_kwargs)
+        self.pool = await create_pg_pool(pg_dsn, **pool_kwargs)
         self.store = PgExperimentStore(self.pool)
         await self.store.init_schema()
 
