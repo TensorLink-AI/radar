@@ -316,8 +316,12 @@ def get_frontier():
 async def get_pareto(request: Request, task: str = ""):
     d = _require_db()
     kw = {"task": task} if task else {}
-    elements = await d.get_pareto_elements(**kw)
-    return [e.to_api_dict() for e in elements]
+    try:
+        elements = await d.get_pareto_elements(**kw)
+        return [e.to_api_dict() for e in elements]
+    except Exception:
+        logger.exception("GET /experiments/pareto failed (task=%r)", task)
+        raise
 
 
 @app.get("/experiments/recent")

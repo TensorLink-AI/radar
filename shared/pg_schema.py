@@ -148,12 +148,37 @@ CREATE INDEX IF NOT EXISTS idx_access_hotkey_round
 """
 
 
+def _decode_jsonb(value, default):
+    """Coerce a JSONB column value to a Python dict/list.
+
+    asyncpg returns JSONB as a Python object only when a codec is registered
+    on the connection (see ``shared.pg_store.create_pg_pool``). In
+    environments where codec registration is skipped or silently fails
+    (some managed Postgres poolers), JSONB is returned as ``str`` instead.
+    This helper parses strings so downstream consumers always see a native
+    container, which is critical for ``DataElement.to_api_dict`` and any
+    ``.get(...)`` / ``.items()`` calls on ``objectives``.
+    """
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError):
+            return default
+    return default
+
+
 def row_to_element(row) -> DataElement:
     """Convert an asyncpg Record to a DataElement.
 
-    JSONB columns (objectives, loss_curve, generated_samples) are decoded to
-    Python objects via the codec registered in ``shared.pg_store.create_pg_pool``.
-    Pools that do not register that codec will return JSONB as ``str``.
+    JSONB columns (objectives, loss_curve, generated_samples) are decoded via
+    ``_decode_jsonb`` so callers always get dict/list regardless of whether
+    the asyncpg connection has a JSONB codec registered.
     """
     return DataElement(
         index=row["id"],
@@ -169,10 +194,10 @@ def row_to_element(row) -> DataElement:
         score=row["score"],
         miner_uid=row["miner_uid"],
         miner_hotkey=row["miner_hotkey"],
-        loss_curve=row["loss_curve"],
+        loss_curve=_decode_jsonb(row["loss_curve"], []),
         manifest_sha256=row["manifest_sha256"],
-        generated_samples=row["generated_samples"],
-        objectives=row["objectives"],
+        generated_samples=_decode_jsonb(row["generated_samples"], []),
+        objectives=_decode_jsonb(row["objectives"], {}),
         timestamp=row["timestamp"],
         task=row["task"],
         round_id=row["round_id"] if row["round_id"] is not None else -1,
