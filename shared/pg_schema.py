@@ -27,10 +27,14 @@ CREATE TABLE IF NOT EXISTS experiments (
     generated_samples JSONB NOT NULL DEFAULT '[]',
     objectives JSONB NOT NULL DEFAULT '{}',
     timestamp DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    round_id INTEGER,
+    round_id BIGINT,
     task TEXT NOT NULL DEFAULT '',
     search_vector tsvector
 );
+-- Migration: round_id is derived from ``seed_int % 2**32`` in
+-- ``shared.challenge.generate_challenge`` and can exceed INT32's 2.1B max.
+-- Widen existing deployments to BIGINT; no-op if already BIGINT.
+ALTER TABLE experiments ALTER COLUMN round_id TYPE BIGINT;
 """
 
 SCHEMA_INDEX_DDL = """
@@ -77,11 +81,12 @@ END $$;
 PROVENANCE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS round_context (
     id SERIAL PRIMARY KEY,
-    round_id INTEGER NOT NULL,
+    round_id BIGINT NOT NULL,
     experiment_id INTEGER NOT NULL,
     context_type TEXT NOT NULL,
     timestamp DOUBLE PRECISION NOT NULL
 );
+ALTER TABLE round_context ALTER COLUMN round_id TYPE BIGINT;
 CREATE INDEX IF NOT EXISTS idx_rc_round ON round_context(round_id);
 CREATE INDEX IF NOT EXISTS idx_rc_experiment ON round_context(experiment_id);
 
@@ -106,8 +111,9 @@ CREATE TABLE IF NOT EXISTS proxy_query_log (
     response_summary TEXT NOT NULL DEFAULT '',
     tokens_used INTEGER NOT NULL DEFAULT 0,
     timestamp DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    round_id INTEGER NOT NULL DEFAULT -1
+    round_id BIGINT NOT NULL DEFAULT -1
 );
+ALTER TABLE proxy_query_log ALTER COLUMN round_id TYPE BIGINT;
 CREATE INDEX IF NOT EXISTS idx_pql_service ON proxy_query_log(service);
 CREATE INDEX IF NOT EXISTS idx_pql_miner ON proxy_query_log(miner_hotkey);
 CREATE INDEX IF NOT EXISTS idx_pql_round ON proxy_query_log(round_id);
@@ -122,10 +128,11 @@ CREATE TABLE IF NOT EXISTS agent_submissions (
     code_hash TEXT NOT NULL,
     entry_point TEXT NOT NULL DEFAULT 'agent.py',
     r2_key TEXT NOT NULL,
-    round_submitted INTEGER NOT NULL DEFAULT -1,
+    round_submitted BIGINT NOT NULL DEFAULT -1,
     timestamp DOUBLE PRECISION NOT NULL DEFAULT 0.0,
     UNIQUE(hotkey)
 );
+ALTER TABLE agent_submissions ALTER COLUMN round_submitted TYPE BIGINT;
 CREATE INDEX IF NOT EXISTS idx_agent_hotkey ON agent_submissions(hotkey);
 CREATE INDEX IF NOT EXISTS idx_agent_hash ON agent_submissions(code_hash);
 """
@@ -139,8 +146,9 @@ CREATE TABLE IF NOT EXISTS miner_access_log (
     method TEXT NOT NULL DEFAULT 'GET',
     experiment_ids JSONB NOT NULL DEFAULT '[]',
     timestamp DOUBLE PRECISION NOT NULL,
-    round_id INTEGER NOT NULL DEFAULT -1
+    round_id BIGINT NOT NULL DEFAULT -1
 );
+ALTER TABLE miner_access_log ALTER COLUMN round_id TYPE BIGINT;
 CREATE INDEX IF NOT EXISTS idx_access_hotkey ON miner_access_log(hotkey);
 CREATE INDEX IF NOT EXISTS idx_access_round ON miner_access_log(round_id);
 CREATE INDEX IF NOT EXISTS idx_access_hotkey_round
