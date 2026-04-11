@@ -47,7 +47,29 @@ class DataElement:
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
     def to_api_dict(self) -> dict:
-        """JSON shape exposed to miners via the DB API."""
+        """JSON shape exposed to miners via the DB API.
+
+        Defensive against ``objectives`` / ``loss_curve`` arriving as JSON
+        strings — this happens when a DataElement is built from a row whose
+        JSONB columns weren't decoded by asyncpg (pools without a codec). The
+        handler must never raise on well-formed DB rows.
+        """
+        objectives = self.objectives
+        if isinstance(objectives, str):
+            try:
+                objectives = json.loads(objectives)
+            except (ValueError, TypeError):
+                objectives = {}
+        if not isinstance(objectives, dict):
+            objectives = {}
+        loss_curve = self.loss_curve
+        if isinstance(loss_curve, str):
+            try:
+                loss_curve = json.loads(loss_curve)
+            except (ValueError, TypeError):
+                loss_curve = []
+        if not isinstance(loss_curve, list):
+            loss_curve = []
         return {
             "index": self.index,
             "timestamp": self.timestamp,
@@ -62,8 +84,8 @@ class DataElement:
             "results": {
                 "success": self.success,
                 "metric": self.metric,
-                **{k: v for k, v in self.objectives.items()},
-                "loss_curve": self.loss_curve,
+                **{k: v for k, v in objectives.items()},
+                "loss_curve": loss_curve,
             },
             "analysis": self.analysis,
             "score": self.score,

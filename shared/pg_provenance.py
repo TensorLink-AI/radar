@@ -290,6 +290,7 @@ class PgProvenanceQuery:
         return dict(row)
 
     async def _get_accessed_ids(self, hotkey: str, round_id: int) -> set[int]:
+        import json as _json
         try:
             rows = await self.pool.fetch(
                 "SELECT experiment_ids FROM miner_access_log "
@@ -301,6 +302,12 @@ class PgProvenanceQuery:
         ids: set[int] = set()
         for row in rows:
             exp_ids = row["experiment_ids"]
+            # Pools without a JSONB codec return this as a string.
+            if isinstance(exp_ids, str):
+                try:
+                    exp_ids = _json.loads(exp_ids)
+                except (ValueError, TypeError):
+                    exp_ids = None
             if isinstance(exp_ids, list):
                 ids.update(exp_ids)
         return ids
