@@ -234,6 +234,23 @@ def _sanitize_for_json(obj):
     return obj
 
 
+def _finite_or(value, default):
+    """Replace NaN/Inf floats with ``default``.
+
+    Postgres ``DOUBLE PRECISION`` will happily store NaN and +/-Inf, but
+    those values then poison API responses (``json.dumps`` emits the
+    non-standard ``NaN``/``Infinity`` tokens that strict parsers reject)
+    and misbehave in ``ORDER BY metric`` queries (NaN sorts greater than
+    every real number). The evaluator explicitly emits ``float('inf')``
+    for CRPS on eval failure, so sanitise at the write boundary.
+    """
+    if value is None:
+        return default
+    if isinstance(value, float) and (math.isinf(value) or math.isnan(value)):
+        return default
+    return value
+
+
 def _jsonb(value) -> str:
     """Serialize a value to a valid JSON string for JSONB columns."""
     return json.dumps(_sanitize_for_json(value))
@@ -254,12 +271,12 @@ def element_to_params(element: DataElement, next_id: int) -> tuple:
         element.code,
         element.motivation,
         element.trace,
-        element.metric,
+        _finite_or(element.metric, None),
         element.success,
         element.analysis,
         element.parent,
         element.generation,
-        element.score,
+        _finite_or(element.score, 0.0),
         element.miner_uid,
         element.miner_hotkey,
         _jsonb(element.loss_curve),
