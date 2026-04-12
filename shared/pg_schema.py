@@ -186,6 +186,23 @@ def _decode_jsonb(value, default):
     return default
 
 
+def _finite_or(value, default):
+    """Replace NaN/Inf floats with ``default``.
+
+    Postgres ``DOUBLE PRECISION`` stores NaN and +/-Inf without complaint,
+    but those values poison downstream JSON serialisation (``json.dumps``
+    emits the non-standard ``NaN``/``Infinity`` tokens that strict parsers
+    reject) and misbehave in ``ORDER BY`` queries (NaN sorts greater than
+    every real number).  Applied on both READ (``row_to_element``) and
+    WRITE (``element_to_params``) to cover legacy rows already in the DB.
+    """
+    if value is None:
+        return default
+    if isinstance(value, float) and (math.isinf(value) or math.isnan(value)):
+        return default
+    return value
+
+
 def row_to_element(row) -> DataElement:
     """Convert an asyncpg Record to a DataElement.
 
@@ -199,12 +216,12 @@ def row_to_element(row) -> DataElement:
         code=row["code"],
         motivation=row["motivation"],
         trace=row["trace"],
-        metric=row["metric"],
+        metric=_finite_or(row["metric"], None),
         success=bool(row["success"]),
         analysis=row["analysis"],
         parent=row["parent_index"],
         generation=row["generation"],
-        score=row["score"],
+        score=_finite_or(row["score"], 0.0),
         miner_uid=row["miner_uid"],
         miner_hotkey=row["miner_hotkey"],
         loss_curve=_decode_jsonb(row["loss_curve"], []),
@@ -232,23 +249,6 @@ def _sanitize_for_json(obj):
     if isinstance(obj, list):
         return [_sanitize_for_json(v) for v in obj]
     return obj
-
-
-def _finite_or(value, default):
-    """Replace NaN/Inf floats with ``default``.
-
-    Postgres ``DOUBLE PRECISION`` will happily store NaN and +/-Inf, but
-    those values then poison API responses (``json.dumps`` emits the
-    non-standard ``NaN``/``Infinity`` tokens that strict parsers reject)
-    and misbehave in ``ORDER BY metric`` queries (NaN sorts greater than
-    every real number). The evaluator explicitly emits ``float('inf')``
-    for CRPS on eval failure, so sanitise at the write boundary.
-    """
-    if value is None:
-        return default
-    if isinstance(value, float) and (math.isinf(value) or math.isnan(value)):
-        return default
-    return value
 
 
 def _jsonb(value) -> str:

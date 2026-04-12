@@ -16,7 +16,7 @@ import asyncpg
 from shared.database import DataElement
 from shared.pg_schema import (
     SCHEMA_TABLE_DDL, SCHEMA_INDEX_DDL, FTS_FUNCTION_DDL, FTS_TRIGGER_DDL,
-    INSERT_SQL, row_to_element, element_to_params, compute_diff,
+    INSERT_SQL, row_to_element, element_to_params, compute_diff, _finite_or,
 )
 
 logger = logging.getLogger(__name__)
@@ -279,8 +279,10 @@ class PgExperimentStore:
         return {
             "total": total, "successful": successful,
             "failed": total - successful,
-            "best_metric": mrow["best"], "worst_metric": mrow["worst"],
-            "mean_metric": mrow["mean"], "max_generation": max_gen,
+            "best_metric": _finite_or(mrow["best"], None),
+            "worst_metric": _finite_or(mrow["worst"], None),
+            "mean_metric": _finite_or(mrow["mean"], None),
+            "max_generation": max_gen,
         }
 
     # ── Task discovery ──────────────────────────────────
