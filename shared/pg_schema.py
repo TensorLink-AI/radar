@@ -40,8 +40,13 @@ ALTER TABLE experiments ALTER COLUMN round_id TYPE BIGINT;
 SCHEMA_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_success ON experiments(success);
 CREATE INDEX IF NOT EXISTS idx_metric ON experiments(metric) WHERE metric IS NOT NULL;
+-- Drop legacy INT4-cast version of idx_flops if it exists; the CAST target
+-- is widened to BIGINT below so miner-reported flops values > 2^31 don't
+-- break INSERTs. The DROP is required because CREATE INDEX IF NOT EXISTS
+-- won't update the indexed expression of an existing index.
+DROP INDEX IF EXISTS idx_flops;
 CREATE INDEX IF NOT EXISTS idx_flops ON experiments(
-    CAST((objectives->>'flops_equivalent_size') AS INTEGER)
+    CAST((objectives->>'flops_equivalent_size') AS BIGINT)
 ) WHERE success = TRUE;
 CREATE INDEX IF NOT EXISTS idx_round ON experiments(round_id);
 CREATE INDEX IF NOT EXISTS idx_miner ON experiments(miner_uid);

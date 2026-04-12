@@ -51,8 +51,10 @@ def generate_challenge(block_hash: str, base_task: dict) -> Challenge:
 
     bucket = rng.choice(SIZE_BUCKETS)
     round_id = seed_int % (2**32)
-    eval_split_seed = rng.randint(0, 2**31)
-    seed = rng.randint(0, 2**31)
+    # randint is inclusive on both ends; cap at 2**31 - 1 so seeds stay in
+    # signed int32 range for any downstream consumer that narrows them.
+    eval_split_seed = rng.randint(0, 2**31 - 1)
+    seed = rng.randint(0, 2**31 - 1)
 
     # Allow env var override for testing — forces a specific size range
     min_override = os.getenv("RADAR_MIN_FLOPS")

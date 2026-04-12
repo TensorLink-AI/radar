@@ -241,7 +241,7 @@ class PgExperimentStore:
         row = await self.pool.fetchval(
             "SELECT COUNT(*) FROM experiments "
             "WHERE success = TRUE AND metric IS NOT NULL "
-            "AND CAST((objectives->>'flops_equivalent_size') AS INTEGER) "
+            "AND CAST((objectives->>'flops_equivalent_size') AS BIGINT) "
             f"BETWEEN $1 AND $2{tc}",
             min_flops, max_flops, *tp,
         )
@@ -254,7 +254,7 @@ class PgExperimentStore:
         rows = await self.pool.fetch(
             "SELECT * FROM experiments "
             "WHERE success = TRUE AND metric IS NOT NULL "
-            "AND CAST((objectives->>'flops_equivalent_size') AS INTEGER) "
+            "AND CAST((objectives->>'flops_equivalent_size') AS BIGINT) "
             f"BETWEEN $1 AND $2{tc}",
             min_flops, max_flops, *tp,
         )
