@@ -248,6 +248,8 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
     model.train()
     step = 0
     optim_step = 0
+    nan_streak = 0
+    _MAX_NAN_STREAK = 50
     for batch in runner.get_dataloader(batch_size=cfg["batch_size"]):
         if time.time() - start > time_budget:
             break
@@ -283,6 +285,17 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
             predictions = model(inputs)
             loss = loss_fn(predictions, targets) / cfg["grad_accum_steps"]
+
+        # Skip backward when loss is non-finite (gradient explosion / bad loss fn)
+        if not torch.isfinite(loss):
+            optimizer.zero_grad(set_to_none=True)
+            nan_streak += 1
+            if nan_streak >= _MAX_NAN_STREAK:
+                logger.warning("Stopping: %d consecutive non-finite losses (model diverged)", nan_streak)
+                break
+            step += 1
+            continue
+        nan_streak = 0
 
         loss.backward()
         if (step + 1) % cfg["grad_accum_steps"] == 0:

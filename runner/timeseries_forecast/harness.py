@@ -308,6 +308,8 @@ def main():
     optim_step = 0
     running_loss = 0.0
     loss_curve: list[float] = []
+    nan_streak = 0
+    _MAX_NAN_STREAK = 50
     start = time.time()
 
     gift_cache = os.environ.get("RADAR_GIFT_EVAL_CACHE", "")
@@ -356,6 +358,17 @@ def main():
             predictions = model(context)
             loss = loss_fn(predictions, targets, QUANTILES)
             loss = loss / grad_accum
+
+        # Skip backward when loss is non-finite (gradient explosion / bad loss fn)
+        if not torch.isfinite(loss):
+            optimizer.zero_grad(set_to_none=True)
+            nan_streak += 1
+            if nan_streak >= _MAX_NAN_STREAK:
+                print(f"WARNING: stopping — {nan_streak} consecutive non-finite losses (model diverged)", file=sys.stderr)
+                break
+            step += 1
+            continue
+        nan_streak = 0
 
         loss.backward()
 
