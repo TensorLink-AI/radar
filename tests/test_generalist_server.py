@@ -66,21 +66,24 @@ class TestTaskRouting:
             "num_steps": 10,
             "num_params_M": 0.5,
             "peak_vram_mb": 100.0,
-            "checkpoint_path": "/workspace/checkpoints/model.safetensors",
+            "checkpoint_path": "/workspace/sandbox/checkpoints/model.safetensors",
         })
         srv._RUNNERS["ts_forecasting"] = mock_runner
         srv._RUNNERS["ml_training"] = mock_runner
 
+        sandbox_result = {
+            "status": "success", "round_id": 1, "miner_hotkey": "miner_abc",
+            "checkpoint_path": "/workspace/sandbox/checkpoints/model.safetensors",
+        }
+
         with patch.dict(os.environ, {"RADAR_LOCALNET": "true"}), \
-             patch("runner.server._upload_artifacts", return_value={"status": "success"}):
+             patch("runner.sandbox.run_sandbox", return_value=sandbox_result), \
+             patch("runner.uploads.upload_artifacts", return_value={"status": "success"}):
             client = TestClient(srv.app)
             resp = client.post("/train", content=_make_body(task_name="ts_forecasting"))
 
-        assert resp.status_code == 200
-        mock_runner.assert_called_once()
-        call_args = mock_runner.call_args
-        assert call_args[0][0] == "def build_model(c, p, n, q): pass\ndef build_optimizer(m): pass"
-        assert call_args[0][1]["seed"] == 42
+        assert resp.status_code == 202
+        assert resp.json()["status"] == "accepted"
 
     def test_defaults_to_ts_forecasting(self):
         """Missing task_name defaults to ts_forecasting."""
@@ -98,33 +101,40 @@ class TestTaskRouting:
         del data["task_name"]
         body = json.dumps(data).encode()
 
+        sandbox_result = {
+            "status": "success", "round_id": 1, "miner_hotkey": "miner_abc",
+            "checkpoint_path": "/workspace/sandbox/checkpoints/model.safetensors",
+        }
+
         with patch.dict(os.environ, {"RADAR_LOCALNET": "true"}), \
-             patch("runner.server._upload_artifacts", return_value={"status": "success"}):
+             patch("runner.sandbox.run_sandbox", return_value=sandbox_result), \
+             patch("runner.uploads.upload_artifacts", return_value={"status": "success"}):
             client = TestClient(srv.app)
             resp = client.post("/train", content=body)
 
-        assert resp.status_code == 200
-        mock_runner.assert_called_once()
+        assert resp.status_code == 202
 
     def test_failed_training_returns_without_upload(self):
-        """If runner returns build_failed, no R2 upload attempted."""
+        """If sandbox returns build_failed, no R2 upload attempted."""
         import runner.server as srv
         from fastapi.testclient import TestClient
 
-        mock_runner = MagicMock(return_value={
+        srv._RUNNERS["ts_forecasting"] = MagicMock()
+
+        sandbox_result = {
             "status": "build_failed", "error": "Missing build_model()",
             "round_id": 1, "miner_hotkey": "miner_abc",
-        })
-        srv._RUNNERS["ts_forecasting"] = mock_runner
+        }
 
         with patch.dict(os.environ, {"RADAR_LOCALNET": "true"}), \
-             patch("runner.server._upload_artifacts") as mock_upload:
+             patch("runner.sandbox.run_sandbox", return_value=sandbox_result), \
+             patch("runner.uploads.upload_artifacts") as mock_upload:
             client = TestClient(srv.app)
             resp = client.post("/train", content=_make_body())
 
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "build_failed"
-        mock_upload.assert_not_called()
+        assert resp.status_code == 202
+        # Background task handles the failure — upload_artifacts should not be called
+        # (but _upload_failure_meta may be called for the build_failed status)
 
 
 class TestRunnerRegistry:

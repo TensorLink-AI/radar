@@ -47,18 +47,31 @@ class TSForecastingRunner:
         import os
         from prepare import get_dataloader
         data_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "")
-        # Pretrain shard URLs passed via env var (JSON list of presigned URLs)
-        pretrain_urls_raw = os.environ.get("RADAR_PRETRAIN_SHARD_URLS", "")
-        pretrain_shard_urls = None
-        if pretrain_urls_raw:
+
+        # Local paths (prefetched by parent process for sandbox isolation)
+        local_paths = None
+        local_paths_raw = os.environ.get("RADAR_PRETRAIN_LOCAL_PATHS", "")
+        if local_paths_raw:
             try:
-                pretrain_shard_urls = json.loads(pretrain_urls_raw)
+                local_paths = json.loads(local_paths_raw)
             except (json.JSONDecodeError, TypeError):
                 pass
+
+        # Pretrain shard URLs (only used when local paths not available)
+        pretrain_shard_urls = None
+        if not local_paths:
+            pretrain_urls_raw = os.environ.get("RADAR_PRETRAIN_SHARD_URLS", "")
+            if pretrain_urls_raw:
+                try:
+                    pretrain_shard_urls = json.loads(pretrain_urls_raw)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
         return get_dataloader(
             batch_size=batch_size,
             data_dir=data_dir if data_dir else None,
             pretrain_shard_urls=pretrain_shard_urls,
+            pretrain_shard_paths=local_paths,
         )
 
     def default_loss(self, predictions: Any, targets: Any) -> Any:

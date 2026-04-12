@@ -67,18 +67,20 @@ class TestFailClosed:
         import runner.server as srv
         from fastapi.testclient import TestClient
 
-        mock_runner = MagicMock(return_value={
+        srv._RUNNERS["ts_forecasting"] = MagicMock()
+
+        sandbox_result = {
             "status": "success", "round_id": 1, "miner_hotkey": "miner_abc",
-            "checkpoint_path": "/tmp/ckpt",
-        })
-        srv._RUNNERS["ts_forecasting"] = mock_runner
+            "checkpoint_path": "/workspace/sandbox/checkpoints/model.safetensors",
+        }
 
         with patch.dict(os.environ, {"RADAR_LOCALNET": "true"}), \
-             patch("runner.server._upload_artifacts", return_value={"status": "success"}):
+             patch("runner.sandbox.run_sandbox", return_value=sandbox_result), \
+             patch("runner.uploads.upload_artifacts", return_value={"status": "success"}):
             client = TestClient(srv.app)
             resp = client.post("/train", content=_make_body())
 
-        assert resp.status_code == 200
+        assert resp.status_code == 202
 
     def test_rejects_invalid_auth(self):
         """Bad Epistula headers should return 403."""
@@ -112,7 +114,7 @@ class TestRateLimiting:
         srv._RUNNERS["ts_forecasting"] = mock_runner
 
         with patch.dict(os.environ, {"RADAR_LOCALNET": "true"}), \
-             patch("runner.server._upload_artifacts", return_value={"status": "success"}):
+             patch("runner.uploads.upload_artifacts", return_value={"status": "success"}):
             client = TestClient(srv.app)
             # First request — will get past rate limit
             resp1 = client.post("/train", content=_make_body())

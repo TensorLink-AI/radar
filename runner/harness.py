@@ -148,8 +148,9 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
         )
 
     # 7. Save checkpoint
-    checkpoint_path = "/workspace/checkpoints/model.safetensors"
-    os.makedirs("/workspace/checkpoints", exist_ok=True)
+    checkpoint_dir = os.environ.get("CHECKPOINT_DIR", "/workspace/checkpoints")
+    checkpoint_path = os.path.join(checkpoint_dir, "model.safetensors")
+    os.makedirs(checkpoint_dir, exist_ok=True)
     from safetensors.torch import save_file
     save_file(model.state_dict(), checkpoint_path)
 
