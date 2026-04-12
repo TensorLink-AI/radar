@@ -147,3 +147,37 @@ def test_evaluate_prints_ncrps():
     with open(eval_path) as f:
         source = f.read()
     assert "ncrps:" in source
+
+
+def test_validate_filters_inf_predictions():
+    """Validation must filter inf predictions, not just NaN.
+
+    Models that output inf values should have those samples dropped
+    rather than contaminating the entire CRPS average with inf.
+    """
+    source = _read_source()
+    # Must use isfinite (catches both NaN and inf) instead of just isnan
+    assert "isfinite" in source, \
+        "validate must use torch.isfinite to filter both NaN and inf predictions"
+    # Must NOT rely solely on isnan for the prediction validity mask
+    fn_src = _get_function_source("_random_validate")
+    assert "isnan" not in fn_src, \
+        "_random_validate should use isfinite, not isnan, to catch inf predictions"
+    fn_src2 = _get_function_source("_gift_eval_validate")
+    assert "isnan" not in fn_src2, \
+        "_gift_eval_validate should use isfinite, not isnan, to catch inf predictions"
+
+
+def test_validate_filters_inf_crps_samples():
+    """Per-sample CRPS values that are inf must be dropped before accumulating.
+
+    Even with finite predictions, numerical overflow can produce inf CRPS
+    in edge cases (e.g., very large float32 values near overflow boundary).
+    """
+    source = _read_source()
+    fn_src = _get_function_source("_random_validate")
+    assert "isfinite(sample_crps)" in fn_src, \
+        "_random_validate must filter non-finite CRPS values"
+    fn_src2 = _get_function_source("_gift_eval_validate")
+    assert "isfinite(sample_crps)" in fn_src2, \
+        "_gift_eval_validate must filter non-finite CRPS values"

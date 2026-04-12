@@ -197,10 +197,10 @@ def _gift_eval_validate(
                 if predictions.shape[1] > target_pred_len:
                     predictions = predictions[:, :target_pred_len, :, :]
 
-                # Mask: keep samples where neither predictions nor targets have NaN
+                # Mask: keep samples where predictions and targets are finite (no NaN/inf)
                 valid = (
-                    ~torch.isnan(predictions).flatten(1).any(dim=1)
-                    & ~torch.isnan(targets).flatten(1).any(dim=1)
+                    torch.isfinite(predictions).flatten(1).all(dim=1)
+                    & torch.isfinite(targets).flatten(1).all(dim=1)
                 )
                 if not valid.any():
                     continue
@@ -210,6 +210,15 @@ def _gift_eval_validate(
 
                 sample_crps = _crps_from_quantiles(predictions, targets, quantiles_t)
                 sample_naive = _naive_crps(targets).to(device)
+
+                # Drop samples with non-finite CRPS (overflow from large preds)
+                finite_mask = torch.isfinite(sample_crps)
+                if not finite_mask.any():
+                    continue
+                sample_crps = sample_crps[finite_mask]
+                sample_naive = sample_naive[finite_mask]
+                predictions = predictions[finite_mask]
+                targets = targets[finite_mask]
 
                 ratio = sample_crps / sample_naive.clamp(min=1e-8)
                 ds_log_ratios.append(torch.log(ratio.clamp(min=1e-8)))
@@ -276,8 +285,8 @@ def _random_validate(model, n_batches: int = 10, batch_size: int = 32) -> dict:
             targets = batch["target"].to(device)
             predictions = model(context)
 
-            # Mask: keep samples where predictions are not NaN
-            valid = ~torch.isnan(predictions).flatten(1).any(dim=1)
+            # Mask: keep samples where predictions are finite (no NaN/inf)
+            valid = torch.isfinite(predictions).flatten(1).all(dim=1)
             if not valid.any():
                 continue
 
@@ -286,6 +295,15 @@ def _random_validate(model, n_batches: int = 10, batch_size: int = 32) -> dict:
 
             sample_crps = _crps_from_quantiles(predictions, targets, quantiles_t)
             sample_naive = _naive_crps(targets).to(device)
+
+            # Drop samples with non-finite CRPS (overflow from large preds)
+            finite_mask = torch.isfinite(sample_crps)
+            if not finite_mask.any():
+                continue
+            sample_crps = sample_crps[finite_mask]
+            sample_naive = sample_naive[finite_mask]
+            predictions = predictions[finite_mask]
+            targets = targets[finite_mask]
 
             ratio = sample_crps / sample_naive.clamp(min=1e-8)
             all_log_ratios.append(torch.log(ratio.clamp(min=1e-8)))

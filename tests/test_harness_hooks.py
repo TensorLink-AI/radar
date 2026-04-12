@@ -137,3 +137,33 @@ def test_init_weights_no_change_is_ok():
     good_init_weights(model)
     params_after = sum(p.numel() for p in model.parameters())
     assert params_after == params_before
+
+
+# ── Non-finite loss skip (source-level) ──────────────────────────
+
+def test_harness_skips_nonfinite_loss():
+    """Training loop must skip backward when loss is non-finite.
+
+    Gradient explosion can produce inf/nan loss. Calling backward()
+    on non-finite loss corrupts model weights, leading to inf CRPS
+    at eval time. Both harnesses must check for this.
+    """
+    import ast
+
+    # Check standalone ts_forecasting harness
+    harness_path = os.path.join(
+        os.path.dirname(__file__), "..", "runner", "timeseries_forecast", "harness.py"
+    )
+    with open(harness_path) as f:
+        source = f.read()
+    assert "torch.isfinite(loss)" in source, \
+        "ts_forecasting harness must check loss is finite before backward"
+
+    # Check generic harness
+    generic_path = os.path.join(
+        os.path.dirname(__file__), "..", "runner", "harness.py"
+    )
+    with open(generic_path) as f:
+        source = f.read()
+    assert "torch.isfinite(loss)" in source, \
+        "generic harness must check loss is finite before backward"
