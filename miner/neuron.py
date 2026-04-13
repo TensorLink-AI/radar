@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 
 import bittensor as bt
 import httpx
@@ -58,8 +59,13 @@ class Miner:
         self.listener_port = int(getattr(config, "listener_port", Config.MINER_LISTENER_PORT))
         self.external_ip = getattr(config, "external_ip", "") or "0.0.0.0"
 
-        # Active Basilica deployments: round_id → deployment object
-        self.active_deployments: dict[int, object] = {}
+        # Active Basilica deployments: round_id → (deployment_object, created_at)
+        self.active_deployments: dict[int, tuple[object, float]] = {}
+
+        # Max age (seconds) before a deployment is considered stale and reaped.
+        # Full round is ~55 min; TTL is ~25-40 min. Use 1h as the reaper cutoff
+        # so we don't interfere with pods that are still legitimately training.
+        self._stale_age: int = int(os.getenv("RADAR_STALE_DEPLOY_SECS", "3600"))
 
         # Validator db_urls to notify when deployment completes: round_id → [urls]
         self._pending_notify: dict[int, list[str]] = {}
@@ -163,20 +169,24 @@ class Miner:
             request.memory, request.time_budget,
         )
 
+        # Tear down stale deployments from previous rounds before allocating
+        await self._reap_stale_deployments()
+
         # Deduplicate — only one deployment per round, but notify all validators
-        existing = self.active_deployments.get(request.round_id)
-        if existing and existing != "pending":
+        entry = self.active_deployments.get(request.round_id)
+        if entry and entry != "pending":
+            deployment, _ts = entry
             # Pod already deployed — just POST TrainerReady to this validator
             logger.info(
                 "Already deployed for round %d, notifying validator at %s",
                 request.round_id, request.validator_db_url,
             )
             await self._post_trainer_ready(
-                request.round_id, existing.url, existing.name,
+                request.round_id, deployment.url, deployment.name,
                 request.validator_db_url,
             )
             return
-        if existing == "pending":
+        if entry == "pending":
             # Deployment in progress — queue this validator for notification when ready
             logger.info(
                 "Deployment in progress for round %d, queuing notification for %s",
@@ -277,7 +287,7 @@ class Miner:
                 request.validator_db_url,
             )
 
-            self.active_deployments[request.round_id] = deployment
+            self.active_deployments[request.round_id] = (deployment, time.time())
 
             # Notify any validators that arrived while deployment was pending
             pending_urls = self._pending_notify.pop(request.round_id, [])
@@ -306,13 +316,41 @@ class Miner:
 
     async def handle_release(self, round_id: int):
         """Tear down the Basilica pod for a completed round."""
-        deployment = self.active_deployments.pop(round_id, None)
-        if deployment and deployment != "pending":
+        entry = self.active_deployments.pop(round_id, None)
+        if entry and entry != "pending":
+            deployment, _ts = entry
             try:
                 deployment.delete()
                 logger.info("Released trainer for round %d (deployment=%s)", round_id, deployment.name)
             except Exception as e:
                 logger.debug("Teardown failed: %s (TTL will clean up)", e)
+
+    async def _reap_stale_deployments(self):
+        """Delete deployments older than ``_stale_age`` seconds.
+
+        Called before each new deploy and in the heartbeat loop so stale pods
+        from missed /release signals don't accumulate and waste GPU quota.
+        """
+        now = time.time()
+        stale_rounds = [
+            rid for rid, entry in self.active_deployments.items()
+            if entry != "pending" and now - entry[1] > self._stale_age
+        ]
+        for rid in stale_rounds:
+            entry = self.active_deployments.pop(rid)
+            deployment, created = entry
+            age_min = (now - created) / 60
+            try:
+                deployment.delete()
+                logger.info(
+                    "Reaped stale deployment for round %d (%s, %.0f min old)",
+                    rid, deployment.name, age_min,
+                )
+            except Exception as e:
+                logger.debug(
+                    "Stale reap failed for round %d: %s (TTL will clean up)",
+                    rid, e,
+                )
 
     def _setup_listener_routes(self):
         """Register listener endpoints on the FastAPI app."""
@@ -395,6 +433,7 @@ class Miner:
             await asyncio.sleep(300)
             try:
                 self.metagraph = self.subtensor.metagraph(self.netuid)
+                await self._reap_stale_deployments()
                 logger.info(
                     "Heartbeat: metagraph synced (%d neurons). "
                     "Active deployments: %d. Listening on port %d.",
