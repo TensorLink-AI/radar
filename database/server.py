@@ -486,7 +486,11 @@ async def get_component_experiments(component: str):
 @app.get("/provenance/component_stats")
 async def get_component_stats():
     prov = _require_provenance()
-    return await prov.get_component_stats()
+    try:
+        return await prov.get_component_stats()
+    except Exception:
+        logger.exception("GET /provenance/component_stats failed")
+        raise HTTPException(status_code=500, detail="Component stats query failed")
 
 
 @app.get("/provenance/dead_ends")

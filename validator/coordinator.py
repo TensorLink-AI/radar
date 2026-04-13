@@ -264,13 +264,14 @@ class TrainingCoordinator:
 
                     # Retry on transient server errors:
                     # - 403: Timestamp stale (clock skew or slow dispatch)
+                    # - 500: Internal Server Error (transient Basilica platform error)
                     # - 502: Bad Gateway (trainer pod proxy up, server still starting)
                     # - 503: Service Unavailable (metagraph/auth not ready yet)
                     # Do NOT retry 429 — the trainer is already running this
                     # job (from an earlier retry whose response was lost to a
                     # proxy timeout).  Treat as "already running" so checkpoint
                     # polling picks up the result from R2.
-                    if resp.status_code in (403, 502, 503) and attempt < max_retries:
+                    if resp.status_code in (403, 500, 502, 503) and attempt < max_retries:
                         wait = 10 * (attempt + 1)
                         logger.warning(
                             "Trainer UID %d returned HTTP %d, retrying in %ds (attempt %d/%d)",

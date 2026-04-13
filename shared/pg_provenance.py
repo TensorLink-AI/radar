@@ -5,6 +5,7 @@ backed by asyncpg connection pool.
 """
 
 import logging
+import math
 import time
 from typing import Optional
 
@@ -15,6 +16,15 @@ from shared.pg_schema import PROVENANCE_SCHEMA
 from shared.provenance import compute_similarity
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_float(v):
+    """Replace inf/nan floats with None for JSON compliance."""
+    if v is None:
+        return None
+    if isinstance(v, float) and (math.isinf(v) or math.isnan(v)):
+        return None
+    return v
 
 
 class PgProvenanceQuery:
@@ -200,11 +210,13 @@ class PgProvenanceQuery:
             "FROM code_components c "
             "JOIN experiments e ON c.experiment_id = e.id "
             "WHERE e.success = TRUE AND e.metric IS NOT NULL "
+            "AND e.metric != 'NaN'::double precision "
             "GROUP BY c.component ORDER BY count DESC",
         )
         return [
             {"component": r["component"], "count": r["count"],
-             "avg_metric": r["avg_metric"], "best_metric": r["best_metric"]}
+             "avg_metric": _safe_float(r["avg_metric"]),
+             "best_metric": _safe_float(r["best_metric"])}
             for r in rows
         ]
 
@@ -262,7 +274,7 @@ class PgProvenanceQuery:
         return {
             "experiments": [
                 {"id": r["id"], "name": r["name"], "miner_uid": r["miner_uid"],
-                 "metric": r["metric"], "success": bool(r["success"])}
+                 "metric": _safe_float(r["metric"]), "success": bool(r["success"])}
                 for r in experiments
             ],
             "components": [
