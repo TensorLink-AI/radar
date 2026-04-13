@@ -82,7 +82,10 @@ async def train(request: Request):
     the validator discovers results via R2 polling.
     """
     if _train_semaphore.locked():
-        return JSONResponse(status_code=429, content={"error": "Training job already in progress"})
+        return JSONResponse(status_code=429, content={
+            "error": "Training job already in progress",
+            "reason": "already_running",
+        })
 
     body = await request.body()
 
@@ -105,15 +108,16 @@ async def train(request: Request):
             logger.error("Auth verification failed: %s", e)
             return JSONResponse(status_code=403, content={"error": "Auth verification error"})
 
-    # 2. Per-hotkey rate limit
+    # 2. Per-hotkey rate limit (check only — timestamp recorded after semaphore)
     with _hotkey_lock:
         last = _hotkey_last_request.get(sender, 0.0)
         if time.time() - last < HOTKEY_COOLDOWN_SECONDS:
             remaining = HOTKEY_COOLDOWN_SECONDS - (time.time() - last)
             return JSONResponse(status_code=429, content={
                 "error": f"Rate limited. Retry in {remaining:.0f}s",
+                "reason": "rate_limited",
+                "retry_after": int(remaining) + 1,
             })
-        _hotkey_last_request[sender] = time.time()
 
     # 3. Parse request
     try:
@@ -126,7 +130,13 @@ async def train(request: Request):
         return JSONResponse(status_code=400, content={"error": "Missing architecture code"})
 
     # 4. Route to task runner
-    _register_runners()
+    try:
+        _register_runners()
+    except Exception as e:
+        logger.error("Failed to register task runners: %s", e)
+        return JSONResponse(status_code=500, content={
+            "error": f"Runner initialization failed: {e}",
+        })
     task_name = data.get("task_name", "ts_forecasting")
     if task_name not in _RUNNERS:
         return JSONResponse(status_code=400, content={
@@ -141,7 +151,15 @@ async def train(request: Request):
         await _train_semaphore.acquire()
     else:
         # Race: another request acquired between the check and here
-        return JSONResponse(status_code=429, content={"error": "Training job already in progress"})
+        return JSONResponse(status_code=429, content={
+            "error": "Training job already in progress",
+            "reason": "already_running",
+        })
+
+    # Record rate-limit timestamp AFTER semaphore acquired — if the
+    # request fails before this point, retries won't be rate-limited.
+    with _hotkey_lock:
+        _hotkey_last_request[sender] = time.time()
 
     training_config = {
         "seed": data.get("seed", 42),

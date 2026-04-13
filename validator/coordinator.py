@@ -267,25 +267,38 @@ class TrainingCoordinator:
                     # - 500: Internal Server Error (transient Basilica platform error)
                     # - 502: Bad Gateway (trainer pod proxy up, server still starting)
                     # - 503: Service Unavailable (metagraph/auth not ready yet)
-                    # Do NOT retry 429 — the trainer is already running this
-                    # job (from an earlier retry whose response was lost to a
-                    # proxy timeout).  Treat as "already running" so checkpoint
-                    # polling picks up the result from R2.
+                    # 429 is handled separately below — rate-limited 429s are
+                    # retried, while already-running 429s go to R2 polling.
                     if resp.status_code in (403, 500, 502, 503) and attempt < max_retries:
                         wait = 10 * (attempt + 1)
+                        body_preview = resp.text[:300] if resp.text else "(empty)"
                         logger.warning(
-                            "Trainer UID %d returned HTTP %d, retrying in %ds (attempt %d/%d)",
-                            job.trainer_uid, resp.status_code, wait, attempt + 1, max_retries,
+                            "Trainer UID %d returned HTTP %d: %s — retrying in %ds (attempt %d/%d)",
+                            job.trainer_uid, resp.status_code, body_preview,
+                            wait, attempt + 1, max_retries,
                         )
                         await asyncio.sleep(wait)
                         continue
 
-                    # 429 = trainer semaphore busy — job is already running
-                    # (likely from an earlier retry where the proxy returned
-                    # 502/503 but the trainer received and started the request).
-                    # Report as "already_running" so checkpoint polling still
-                    # collects the result.
+                    # 429 from trainer — check reason to decide retry vs accept.
+                    # "already_running" = semaphore busy, job IS running → poll R2.
+                    # "rate_limited"    = per-hotkey cooldown, no job running → retry.
                     if resp.status_code == 429:
+                        try:
+                            reason_data = resp.json()
+                        except (json.JSONDecodeError, ValueError):
+                            reason_data = {}
+                        reason = reason_data.get("reason", "already_running")
+
+                        if reason == "rate_limited" and attempt < max_retries:
+                            retry_after = int(reason_data.get("retry_after", 30))
+                            logger.warning(
+                                "Trainer UID %d rate-limited (HTTP 429), retrying in %ds (attempt %d/%d)",
+                                job.trainer_uid, retry_after, attempt + 1, max_retries,
+                            )
+                            await asyncio.sleep(retry_after)
+                            continue
+
                         logger.info(
                             "Trainer UID %d already running job (HTTP 429) — "
                             "checkpoint will be collected via R2 polling",
