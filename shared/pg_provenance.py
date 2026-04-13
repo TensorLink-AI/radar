@@ -274,7 +274,7 @@ class PgProvenanceQuery:
         return {
             "experiments": [
                 {"id": r["id"], "name": r["name"], "miner_uid": r["miner_uid"],
-                 "metric": r["metric"], "success": bool(r["success"])}
+                 "metric": _safe_float(r["metric"]), "success": bool(r["success"])}
                 for r in experiments
             ],
             "components": [
