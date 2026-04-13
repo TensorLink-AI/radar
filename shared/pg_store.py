@@ -355,7 +355,8 @@ class PgExperimentStore:
             )
             result.append({
                 "root_index": root["id"], "root_name": root["name"],
-                "num_descendants": row["cnt"], "best_metric": row["best"],
+                "num_descendants": row["cnt"],
+                "best_metric": _finite_or(row["best"], None),
                 "latest_index": row["latest"],
                 "max_generation": row["max_gen"] or 0,
             })

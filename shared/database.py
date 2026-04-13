@@ -6,6 +6,7 @@ analysis, motivation, parent index, and more.
 """
 
 import json
+import math
 import re
 import time
 from collections import Counter
@@ -70,6 +71,18 @@ class DataElement:
                 loss_curve = []
         if not isinstance(loss_curve, list):
             loss_curve = []
+
+        def _safe(v):
+            """Replace inf/nan floats with None for JSON compliance."""
+            if isinstance(v, float) and (math.isinf(v) or math.isnan(v)):
+                return None
+            return v
+
+        metric = _safe(self.metric)
+        score = _safe(self.score)
+        safe_obj = {k: _safe(v) for k, v in objectives.items()}
+        safe_lc = [_safe(v) for v in loss_curve]
+
         return {
             "index": self.index,
             "timestamp": self.timestamp,
@@ -83,12 +96,12 @@ class DataElement:
             "motivation": self.motivation,
             "results": {
                 "success": self.success,
-                "metric": self.metric,
-                **{k: v for k, v in objectives.items()},
-                "loss_curve": loss_curve,
+                "metric": metric,
+                **safe_obj,
+                "loss_curve": safe_lc,
             },
             "analysis": self.analysis,
-            "score": self.score,
+            "score": score,
             "round_id": self.round_id,
         }
 
