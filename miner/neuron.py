@@ -62,11 +62,6 @@ class Miner:
         # Active Basilica deployments: round_id → (deployment_object, created_at)
         self.active_deployments: dict[int, tuple[object, float]] = {}
 
-        # Max age (seconds) before a deployment is considered stale and reaped.
-        # Full round is ~55 min; TTL is ~25-40 min. Use 1h as the reaper cutoff
-        # so we don't interfere with pods that are still legitimately training.
-        self._stale_age: int = int(os.getenv("RADAR_STALE_DEPLOY_SECS", "3600"))
-
         # Validator db_urls to notify when deployment completes: round_id → [urls]
         self._pending_notify: dict[int, list[str]] = {}
 
@@ -169,8 +164,8 @@ class Miner:
             request.memory, request.time_budget,
         )
 
-        # Tear down stale deployments from previous rounds before allocating
-        await self._reap_stale_deployments()
+        # Tear down all deployments from prior rounds — this round supersedes them
+        await self._teardown_prior_rounds(request.round_id)
 
         # Deduplicate — only one deployment per round, but notify all validators
         entry = self.active_deployments.get(request.round_id)
@@ -325,16 +320,45 @@ class Miner:
             except Exception as e:
                 logger.debug("Teardown failed: %s (TTL will clean up)", e)
 
-    async def _reap_stale_deployments(self):
-        """Delete deployments older than ``_stale_age`` seconds.
+    async def _teardown_prior_rounds(self, current_round_id: int):
+        """Delete all deployments from rounds before ``current_round_id``.
 
-        Called before each new deploy and in the heartbeat loop so stale pods
-        from missed /release signals don't accumulate and waste GPU quota.
+        Called at the start of handle_prepare so stale pods from earlier
+        rounds are torn down immediately when a new round begins.
         """
+        old_rounds = [
+            rid for rid in self.active_deployments
+            if rid != current_round_id
+        ]
+        for rid in old_rounds:
+            entry = self.active_deployments.pop(rid)
+            if entry == "pending":
+                continue
+            deployment, _created = entry
+            try:
+                deployment.delete()
+                logger.info(
+                    "Tore down prior-round deployment: round %d (%s)",
+                    rid, deployment.name,
+                )
+            except Exception as e:
+                logger.debug(
+                    "Prior-round teardown failed for round %d: %s (TTL will clean up)",
+                    rid, e,
+                )
+
+    async def _reap_stale_deployments(self):
+        """Safety-net: delete any deployment older than one full round interval.
+
+        Handles the case where no new round arrives (e.g. miner goes idle)
+        but a pod is still lingering. Threshold is derived from
+        ``Config.ROUND_INTERVAL_BLOCKS`` so it adapts to subnet config changes.
+        """
+        stale_age = Config.ROUND_INTERVAL_BLOCKS * 12  # blocks → seconds
         now = time.time()
         stale_rounds = [
             rid for rid, entry in self.active_deployments.items()
-            if entry != "pending" and now - entry[1] > self._stale_age
+            if entry != "pending" and now - entry[1] > stale_age
         ]
         for rid in stale_rounds:
             entry = self.active_deployments.pop(rid)
