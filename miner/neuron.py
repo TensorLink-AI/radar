@@ -170,7 +170,7 @@ class Miner:
         # Deduplicate — only one deployment per round, but notify all validators
         entry = self.active_deployments.get(request.round_id)
         if entry and entry != "pending":
-            deployment, _ts = entry
+            deployment, _ts, _ttl = entry
             # Pod already deployed — just POST TrainerReady to this validator
             logger.info(
                 "Already deployed for round %d, notifying validator at %s",
