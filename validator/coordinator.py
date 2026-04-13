@@ -271,9 +271,11 @@ class TrainingCoordinator:
                     # retried, while already-running 429s go to R2 polling.
                     if resp.status_code in (403, 500, 502, 503) and attempt < max_retries:
                         wait = 10 * (attempt + 1)
+                        body_preview = resp.text[:300] if resp.text else "(empty)"
                         logger.warning(
-                            "Trainer UID %d returned HTTP %d, retrying in %ds (attempt %d/%d)",
-                            job.trainer_uid, resp.status_code, wait, attempt + 1, max_retries,
+                            "Trainer UID %d returned HTTP %d: %s — retrying in %ds (attempt %d/%d)",
+                            job.trainer_uid, resp.status_code, body_preview,
+                            wait, attempt + 1, max_retries,
                         )
                         await asyncio.sleep(wait)
                         continue
