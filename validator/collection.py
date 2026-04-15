@@ -192,6 +192,45 @@ async def _run_single_agent(
     return None, ""
 
 
+async def _run_agents_concurrently(
+    *,
+    uids: list[int],
+    commitments: dict[int, ImageCommitment],
+    bundles: dict[int, dict],
+    challenge_json: str,
+    r2,
+    round_id: int,
+    allowed_urls: str,
+    concurrency: int,
+) -> dict[int, tuple[Optional[Proposal], str]]:
+    """Run multiple agents concurrently with a bounded semaphore.
+
+    Returns {uid: (proposal_or_None, agent_log)}. Per-agent exceptions
+    are logged and produce (None, "") so one bad agent never aborts the
+    batch.
+    """
+    sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+    async def _bounded(uid: int) -> tuple[int, Optional[Proposal], str]:
+        async with sem:
+            try:
+                proposal, agent_log = await _run_single_agent(
+                    uid, commitments[uid], challenge_json, r2, round_id,
+                    allowed_urls, bundles[uid],
+                )
+                return uid, proposal, agent_log
+            except Exception as e:
+                logger.error("UID %d agent failed: %s", uid, e)
+                return uid, None, ""
+
+    logger.info(
+        "Running %d agents concurrently (cap=%d)",
+        len(uids), max(1, int(concurrency)),
+    )
+    raw = await asyncio.gather(*[_bounded(uid) for uid in uids])
+    return {uid: (proposal, log) for uid, proposal, log in raw}
+
+
 async def run_and_collect_agents(
     wallet,
     metagraph,
@@ -231,36 +270,42 @@ async def run_and_collect_agents(
     if db_client is None:
         db_client = DatabaseClient(Config.DB_API_URL, wallet)
 
-    # Pre-fetch all agent bundles for my assigned miners
-    bundles: dict[int, dict] = {}
-    for uid in my_agent_uids:
-        if uid not in commitments:
-            continue
-        commitment = commitments[uid]
+    # Pre-fetch all agent bundles for my assigned miners (concurrently).
+    async def _prefetch(uid: int) -> tuple[int, Optional[dict]]:
         try:
-            bundle = await _fetch_agent_bundle(db_client, commitment)
-            if bundle:
-                bundles[uid] = bundle
+            b = await _fetch_agent_bundle(db_client, commitments[uid])
+            return uid, b
         except Exception as e:
             logger.error("UID %d failed to fetch agent code: %s", uid, e)
+            return uid, None
 
-    # Run my assigned agents
+    fetch_uids = [uid for uid in my_agent_uids if uid in commitments]
+    fetched = await asyncio.gather(*[_prefetch(uid) for uid in fetch_uids])
+    bundles: dict[int, dict] = {uid: b for uid, b in fetched if b}
+
+    # Run my assigned agents concurrently (one task per agent, capped by a
+    # semaphore). Each agent has its own pod on a separate Basilica node,
+    # so no local resource contention; the cap throttles orchestration /
+    # R2 fan-out and prevents one slow agent from serialising the round.
     proposals: dict[int, Proposal] = {}
     agent_logs: dict[int, str] = {}
-    for uid in my_agent_uids:
-        if uid not in bundles:
-            continue
-        commitment = commitments[uid]
-        try:
-            proposal, agent_log = await _run_single_agent(
-                uid, commitment, challenge_json, r2, round_id,
-                allowed_urls, bundles[uid],
-            )
+
+    runnable_uids = [uid for uid in my_agent_uids if uid in bundles]
+    if runnable_uids:
+        results = await _run_agents_concurrently(
+            uids=runnable_uids,
+            commitments=commitments,
+            bundles=bundles,
+            challenge_json=challenge_json,
+            r2=r2,
+            round_id=round_id,
+            allowed_urls=allowed_urls,
+            concurrency=Config.AGENT_CONCURRENCY,
+        )
+        for uid, (proposal, agent_log) in results.items():
             if proposal:
                 proposals[uid] = proposal
                 agent_logs[uid] = agent_log
-        except Exception as e:
-            logger.error("UID %d agent failed: %s", uid, e)
 
     logger.info(
         "Ran %d agents, got %d proposals", len(my_agent_uids), len(proposals),
@@ -331,21 +376,33 @@ async def run_and_collect_agents(
             "R2 sync missed %d proposals — fetching code + running locally: %s",
             len(missing_uids), missing_uids,
         )
-        for uid in missing_uids:
-            commitment = commitments[uid]
+        # Fetch all fallback bundles concurrently
+        async def _fetch(uid: int) -> tuple[int, Optional[dict]]:
             try:
-                bundle = await _fetch_agent_bundle(db_client, commitment)
-                if not bundle:
-                    continue
-                proposal, agent_log = await _run_single_agent(
-                    uid, commitment, challenge_json, r2, round_id,
-                    allowed_urls, bundle,
-                )
+                b = await _fetch_agent_bundle(db_client, commitments[uid])
+                return uid, b
+            except Exception as e:
+                logger.error("UID %d failed to fetch agent code (fallback): %s", uid, e)
+                return uid, None
+
+        fetched = await asyncio.gather(*[_fetch(uid) for uid in missing_uids])
+        fallback_bundles = {uid: b for uid, b in fetched if b}
+
+        if fallback_bundles:
+            results = await _run_agents_concurrently(
+                uids=list(fallback_bundles.keys()),
+                commitments=commitments,
+                bundles=fallback_bundles,
+                challenge_json=challenge_json,
+                r2=r2,
+                round_id=round_id,
+                allowed_urls=allowed_urls,
+                concurrency=Config.AGENT_CONCURRENCY,
+            )
+            for uid, (proposal, agent_log) in results.items():
                 if proposal:
                     proposals[uid] = proposal
                     agent_logs[uid] = agent_log
-            except Exception as e:
-                logger.error("UID %d agent failed (fallback): %s", uid, e)
 
     # Dedup by code hash
     seen_hashes: dict[str, int] = {}  # hash -> first uid that claimed it

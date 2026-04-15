@@ -116,6 +116,13 @@ class Config:
     AGENT_TIMEOUT: int = int(os.getenv("RADAR_AGENT_TIMEOUT", "600"))
     AGENT_POD_RETRIES: int = int(os.getenv("RADAR_AGENT_POD_RETRIES", "3"))
 
+    # Max number of agent pods this validator runs concurrently in Phase A.
+    # Each pod is on a separate Basilica node so there's no local resource
+    # contention; the cap exists to avoid overwhelming the orchestration
+    # layer / R2 with many simultaneous starts. Set to 1 for the old
+    # sequential behavior.
+    AGENT_CONCURRENCY: int = int(os.getenv("RADAR_AGENT_CONCURRENCY", "8"))
+
     # Official agent image (subnet-owner controlled, locked down)
     OFFICIAL_AGENT_IMAGE: str = os.getenv(
         "RADAR_OFFICIAL_AGENT_IMAGE",
