@@ -29,6 +29,12 @@ class Challenge:
     # Per-round ephemeral token for authenticating agent pod → proxy requests
     agent_token: str = ""
 
+    # Phase A wall-clock budget (seconds) for the agent pod. The agent is
+    # expected to return a proposal within this window; the validator will
+    # kill the pod if it runs longer. Independent of task["time_budget"],
+    # which is the *trainer's* training-loop budget in Phase B.
+    agent_seconds: int = 600
+
     # Pareto front filtered to this round's size bucket
     # Each entry: {code, metric, objectives} for frontier points in range
     feasible_frontier: list = field(default_factory=list)
@@ -51,6 +57,7 @@ class Challenge:
             "desearch_url": self.desearch_url,
             "llm_url": self.llm_url,
             "agent_token": self.agent_token,
+            "agent_seconds": self.agent_seconds,
             "feasible_frontier": self.feasible_frontier,
             "scratchpad_get_url": self.scratchpad_get_url,
             "scratchpad_put_url": self.scratchpad_put_url,

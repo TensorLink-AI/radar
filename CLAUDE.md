@@ -160,17 +160,24 @@ Each round targets one bucket deterministically from the block hash. FLOPs measu
 
 ## Round Timing
 
-Two layers of timing control each phase:
-- **Block windows** (on-chain): define WHEN phases start/end. All validators agree via consensus block height (~12s/block). These are rigid boundaries.
-- **Second timeouts** (operational): define HOW LONG work within a phase may take. Soft guardrails that must fit inside their phase's block window.
+Three layers of timing, intentionally separated:
 
-| Phase | Block Window | Duration | Operational Timeout | Controls |
-|-------|-------------|----------|--------------------|----|
-| Submission (A) | 50 blocks | ~10 min | `AGENT_TIMEOUT` (600s) | Agent pod execution |
-| Training (B) | 150 blocks | ~30 min | *(none — trainers must finish within window)* | — |
-| Evaluation (C) | 25 blocks | ~5 min | `EVAL_WINDOW_BLOCKS × 12` (300s) | R2 checkpoint polling |
-| Fallback/Scoring | 50 blocks | ~10 min | `FALLBACK_WINDOW_BLOCKS × 12` (600s) | Re-dispatch polling |
-| **Total** | **275** | **~55 min** | | |
+1. **Block windows** (on-chain, validator-global): define WHEN phases start/end. Consensus-driven via block height (~12s/block). Rigid boundaries. Env: `RADAR_SUBMISSION_WINDOW`, `RADAR_TRAINING_WINDOW`, `RADAR_EVAL_WINDOW`, `RADAR_FALLBACK_WINDOW`.
+2. **Validator operational timeouts** (seconds, validator-global): HTTP / R2 polling guardrails. E.g. `TRAINER_PREPARE_TIMEOUT`.
+3. **Per-task second budgets** (seconds, set in `tasks/<task>/<task>.yaml`): different tasks can demand different amounts of work per phase.
+   - `agent_seconds` → Phase A wall-clock for the **agent pod** (0/unset = inherit `Config.AGENT_TIMEOUT`)
+   - `time_budget` → Phase B wall-clock for the **trainer's training loop**
+   - `kill_timeout` → Phase B hard subprocess kill (outer safety net)
+
+| Phase | Block Window | Per-task budget | Global default | Controls |
+|-------|-------------|-----------------|----------------|----------|
+| Submission (A) | 50 blocks (~10 min) | `agent_seconds` | `AGENT_TIMEOUT` (600s) | Agent pod wall-clock |
+| Training (B)   | 150 blocks (~30 min) | `time_budget` / `kill_timeout` | 300s / 600s | Trainer training loop + kill |
+| Evaluation (C) | 25 blocks (~5 min) | — | `EVAL_WINDOW_BLOCKS × 12` (300s) | R2 checkpoint polling |
+| Fallback/Scoring | 50 blocks (~10 min) | — | `FALLBACK_WINDOW_BLOCKS × 12` (600s) | Re-dispatch polling |
+| **Total** | **275 (~55 min)** | | | |
+
+Note: `RADAR_TIME_BUDGET` used to silently override every task's `time_budget`; it has been removed. Edit the per-task YAML instead.
 
 ## R2 Bucket Path Convention
 

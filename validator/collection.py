@@ -130,6 +130,15 @@ async def _run_single_agent(
         challenge_json, r2, commitment.hotkey,
     )
 
+    # Per-round agent budget comes from the challenge (populated from the
+    # task YAML's agent_seconds, falling back to Config.AGENT_TIMEOUT).
+    try:
+        agent_timeout = int(json.loads(miner_challenge_json).get(
+            "agent_seconds", Config.AGENT_TIMEOUT,
+        ))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        agent_timeout = Config.AGENT_TIMEOUT
+
     agent_env = await launch_agent_pod(
         image_url=Config.OFFICIAL_AGENT_IMAGE,
         mem_limit="8192Mi",
@@ -140,7 +149,7 @@ async def _run_single_agent(
     try:
         result = await run_agent_on_pod(
             agent_env, miner_challenge_json,
-            timeout=Config.AGENT_TIMEOUT,
+            timeout=agent_timeout,
             allowed_urls=allowed_urls,
         )
         if result and isinstance(result, dict) and "code" in result:

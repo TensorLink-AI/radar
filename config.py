@@ -61,29 +61,41 @@ class Config:
 
     # ── Round Timing ───────────────────────────────────────────────
     #
-    # Two layers of timing control each phase:
+    # Timing is controlled at three distinct layers. Read this carefully —
+    # the names have historically been confusing.
     #
-    #   BLOCK WINDOWS (on-chain)   – define WHEN phases start/end.
-    #       All validators agree via consensus block height (~12s/block).
-    #       These are rigid boundaries that keep validators in sync.
+    #   (1) BLOCK WINDOWS (on-chain, ~12s/block)
+    #       Rigid phase boundaries agreed via consensus block height.
+    #       Validator-global. Env vars below (RADAR_*_WINDOW).
     #
-    #   SECOND TIMEOUTS (operational) – define HOW LONG work within a
-    #       phase is allowed to take. These are soft guardrails that
-    #       prevent indefinite waits for pods, HTTP calls, or R2 polling.
-    #       Must fit inside their phase's block window.
+    #   (2) VALIDATOR OPERATIONAL TIMEOUTS (seconds, validator-side)
+    #       Soft guardrails on HTTP calls / R2 polling. Validator-global.
+    #       e.g. TRAINER_PREPARE_TIMEOUT (wait for TrainerReady).
     #
-    # Phase A (Submission):  SUBMISSION_WINDOW_BLOCKS × 12s = outer boundary
-    #                        AGENT_TIMEOUT               = inner timeout for agent execution
-    # Phase B (Training):    TRAINING_WINDOW_BLOCKS × 12s = outer boundary
-    #                        (no separate timeout — trainers must finish within the window)
-    # Phase C (Evaluation):  EVAL_WINDOW_BLOCKS × 12s     = outer boundary AND polling timeout
-    # Fallback:              FALLBACK_WINDOW_BLOCKS × 12s  = outer boundary AND polling timeout
+    #   (3) PER-TASK SECOND BUDGETS (seconds, set in task YAML)
+    #       Declared in tasks/<task>/<task>.yaml, so different tasks can
+    #       demand different amounts of work:
+    #
+    #         agent_seconds : Phase A — agent pod wall-clock.
+    #                         0/unset ⇒ inherit Config.AGENT_TIMEOUT.
+    #         time_budget   : Phase B — trainer *training-loop* wall-clock
+    #                         (how long the harness runs training).
+    #         kill_timeout  : Phase B — hard subprocess kill for trainer
+    #                         run/eval commands. Always >= time_budget.
+    #
+    # Per phase:
+    #   Phase A (Submission):  SUBMISSION_WINDOW_BLOCKS × 12s = outer boundary
+    #                          task.agent_seconds (or AGENT_TIMEOUT)  = inner agent cap
+    #   Phase B (Training):    TRAINING_WINDOW_BLOCKS × 12s = outer boundary
+    #                          task.time_budget             = inner trainer-loop cap
+    #   Phase C (Evaluation):  EVAL_WINDOW_BLOCKS × 12s     = outer boundary AND R2 polling timeout
+    #   Fallback:              FALLBACK_WINDOW_BLOCKS × 12s = outer boundary AND polling timeout
     #
     # Example with defaults:
-    #   Phase A: 50 blocks (600s) with AGENT_TIMEOUT=600s  → agent gets full window
-    #   Phase B: 150 blocks (1800s)                        → trainers get ~30 min
-    #   Phase C: 25 blocks (300s)                          → checkpoint polling for ~5 min
-    #   Fallback: 50 blocks (600s)                         → re-dispatch polling for ~10 min
+    #   Phase A: 50 blocks (600s), agent_seconds=600s     → agent gets ~full window
+    #   Phase B: 150 blocks (1800s), time_budget=300s     → training loop 5 min of 30 min window
+    #   Phase C: 25 blocks (300s)                         → checkpoint polling for ~5 min
+    #   Fallback: 50 blocks (600s)                        → re-dispatch polling for ~10 min
     #   Total: 275 blocks (~55 min)
 
     # Block windows (on-chain phase boundaries, ~12s per block)
@@ -98,7 +110,9 @@ class Config:
     SIZE_GATE_TOLERANCE: float = float(os.getenv("RADAR_SIZE_GATE_TOLERANCE", "0.10"))
 
     # ── Agent (Phase A) ──────────────────────────────────────────
-    # AGENT_TIMEOUT must fit within SUBMISSION_WINDOW_BLOCKS × 12s.
+    # Default agent pod wall-clock (seconds). Per-task overrides come from
+    # `agent_seconds` in the task YAML; this is the fallback when a task
+    # doesn't set one. Must fit within SUBMISSION_WINDOW_BLOCKS × 12s.
     AGENT_TIMEOUT: int = int(os.getenv("RADAR_AGENT_TIMEOUT", "600"))
     AGENT_POD_RETRIES: int = int(os.getenv("RADAR_AGENT_POD_RETRIES", "3"))
 
