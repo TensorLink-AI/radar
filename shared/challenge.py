@@ -38,11 +38,19 @@ def select_task(block_hash: str, task_names: list[str]) -> str:
     return rng.choice(sorted(task_names))
 
 
-def generate_challenge(block_hash: str, base_task: dict) -> Challenge:
+def generate_challenge(
+    block_hash: str,
+    base_task: dict,
+    default_agent_seconds: int = 600,
+) -> Challenge:
     """Generate a deterministic challenge from block hash.
 
     Picks a random size bucket, derives round_id, eval_split_seed, and seed.
     All validators with the same block_hash produce the same challenge.
+
+    The agent's Phase A wall-clock budget is resolved in priority order:
+      1. base_task["agent_seconds"] if > 0 (per-task override from YAML)
+      2. default_agent_seconds (validator-side global, e.g. Config.AGENT_TIMEOUT)
 
     Override bucket with RADAR_MIN_FLOPS / RADAR_MAX_FLOPS env vars (testing).
     """
@@ -62,6 +70,11 @@ def generate_challenge(block_hash: str, base_task: dict) -> Challenge:
     if min_override and max_override:
         bucket = (int(min_override), int(max_override))
 
+    # Agent wall-clock budget: per-task override from YAML wins; otherwise
+    # use the caller-supplied default (typically Config.AGENT_TIMEOUT).
+    task_agent_seconds = int(base_task.get("agent_seconds") or 0)
+    agent_seconds = task_agent_seconds if task_agent_seconds > 0 else int(default_agent_seconds)
+
     return Challenge(
         challenge_id=f"round_{round_id}",
         seed=seed,
@@ -70,6 +83,7 @@ def generate_challenge(block_hash: str, base_task: dict) -> Challenge:
         max_flops_equivalent=bucket[1],
         eval_split_seed=eval_split_seed,
         round_id=round_id,
+        agent_seconds=agent_seconds,
     )
 
 

@@ -165,7 +165,12 @@ class TrainingCoordinator:
         commitments = commitments or {}
         gift_eval_urls = gift_eval_urls or {}
         pretrain_shard_urls = pretrain_shard_urls or []
-        logger.info("Dispatching %d jobs to %d trainer endpoints", len(jobs), len(trainer_endpoints))
+        # Each job is sent to exactly one trainer (1:1 arch→trainer).
+        # `trainer_endpoints` is the available pool, not the fan-out.
+        logger.info(
+            "Dispatching %d jobs across %d available trainers (1 trainer per job)",
+            len(jobs), len(trainer_endpoints),
+        )
 
         # Trainer returns 202 Accepted immediately; this timeout only
         # covers auth + request parsing, not the full training run.

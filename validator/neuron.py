@@ -256,7 +256,11 @@ class Validator:
         # Select task for this round (deterministic from block hash)
         task_name = select_task(block_hash, list(self.tasks.keys()))
         round_task = self.tasks[task_name]
-        challenge = generate_challenge(block_hash, round_task.to_dict())
+        challenge = generate_challenge(
+            block_hash,
+            round_task.to_dict(),
+            default_agent_seconds=Config.AGENT_TIMEOUT,
+        )
 
         # Fetch feasible frontier from centralized DB
         pareto_elements = await self.db_client.get_pareto_elements(task=task_name)
