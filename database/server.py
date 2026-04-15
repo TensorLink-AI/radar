@@ -98,6 +98,16 @@ def set_frontier(frontier_data):
     _current_frontier = frontier_data
 
 
+def get_current_challenge():
+    """Accessor for the active challenge (used by the dashboard)."""
+    return _current_challenge
+
+
+def get_current_frontier():
+    """Accessor for the current frontier (used by the dashboard)."""
+    return _current_frontier
+
+
 def set_access_logger(al: PgAccessLogger):
     global _access_logger
     _access_logger = al

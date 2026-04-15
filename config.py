@@ -204,3 +204,14 @@ class Config:
     # Subnet owner generates once, distributes to validators for reverse proxy auth.
     # Empty string = disabled (open access, Epistula-only).
     DB_API_KEY: str = os.getenv("RADAR_DB_API_KEY", "")
+
+    # ── Dashboard (read-only web UI for inspecting experiments) ───────
+    DASHBOARD_ENABLED: bool = os.getenv("RADAR_DASHBOARD_ENABLED", "false").lower() == "true"
+    # Shared key used to log into the dashboard. Empty = dashboard refuses
+    # every request (fail-closed) even if ENABLED is true.
+    DASHBOARD_KEY: str = os.getenv("RADAR_DASHBOARD_KEY", "")
+    # Session cookie TTL in seconds (default 8h)
+    DASHBOARD_SESSION_TTL: int = int(os.getenv("RADAR_DASHBOARD_SESSION_TTL", "28800"))
+    # Max bytes of a log file streamed inline before falling back to presigned URL
+    DASHBOARD_MAX_LOG_BYTES: int = int(os.getenv("RADAR_DASHBOARD_MAX_LOG_BYTES", "10485760"))
+    DASHBOARD_PAGE_SIZE: int = int(os.getenv("RADAR_DASHBOARD_PAGE_SIZE", "50"))

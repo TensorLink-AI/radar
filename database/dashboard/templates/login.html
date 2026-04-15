@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Radar Dashboard — Login</title>
+    <link rel="stylesheet" href="/dashboard/static/dashboard.css">
+</head>
+<body class="login">
+<div class="login-card">
+    <h1>Radar Dashboard</h1>
+    <p class="muted">Read-only access to the experiment database.</p>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    <form method="post" action="/dashboard/login">
+        <input type="hidden" name="next" value="{{ next }}">
+        <label>
+            Access key
+            <input type="password" name="key" autofocus required>
+        </label>
+        <button type="submit">Sign in</button>
+    </form>
+</div>
+</body>
+</html>

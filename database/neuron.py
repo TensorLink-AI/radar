@@ -19,6 +19,7 @@ from database.server import (
     app, set_db, set_auth, set_challenge, set_frontier,
     set_access_logger, set_hotkey_map, set_rate_limit,
     set_r2, set_pool,
+    get_current_challenge, get_current_frontier,
 )
 from shared.pareto import ParetoFront
 from shared.pg_access_logger import PgAccessLogger
@@ -143,6 +144,21 @@ class DatabaseNeuron:
                 "LLM proxy enabled (Chutes: %s, models: %s)",
                 Config.CHUTES_API_URL, allowed_models or "all",
             )
+
+        # Read-only web dashboard (subnet-owner operator UI)
+        if Config.DASHBOARD_ENABLED:
+            try:
+                from database.dashboard import mount_dashboard
+                mount_dashboard(
+                    app,
+                    store=self.store,
+                    pool=self.pool,
+                    r2=self.r2,
+                    get_challenge=get_current_challenge,
+                    get_frontier=get_current_frontier,
+                )
+            except Exception as e:
+                logger.warning("Dashboard mount failed: %s", e)
 
         logger.info("Database initialized, schemas created")
 
