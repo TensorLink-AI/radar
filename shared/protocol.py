@@ -112,6 +112,11 @@ class TrainerRequest:
     min_gpu_memory_gb: int = 16
     memory: str = "16Gi"
 
+    # How long (seconds) until Phase B dispatch arrives after pod creation.
+    # Miners use this to set a pod TTL that survives the full Phase A window.
+    # Default 600s matches the default SUBMISSION_WINDOW of 50 blocks × 12s.
+    submission_window_seconds: int = 600
+
     def to_json(self) -> str:
         return json.dumps({
             "round_id": self.round_id,
@@ -124,6 +129,7 @@ class TrainerRequest:
             "gpu_count": self.gpu_count,
             "min_gpu_memory_gb": self.min_gpu_memory_gb,
             "memory": self.memory,
+            "submission_window_seconds": self.submission_window_seconds,
         })
 
     @classmethod

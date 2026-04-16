@@ -202,9 +202,12 @@ class Miner:
             logger.error("basilica SDK not installed — cannot deploy trainer pod")
             return
 
-        # TTL = allocation wait + training time + upload buffer
-        # Pod auto-deletes after this even if release signal is missed
-        ttl = 900 + int(request.time_budget) + 300  # 15 min alloc + training + 5 min upload
+        # TTL = Phase A window (wait for dispatch) + training + upload buffer
+        # The pod is created at Phase A start but dispatch doesn't arrive
+        # until Phase B, so the TTL must cover the full submission window.
+        # Pod auto-deletes after this even if release signal is missed.
+        submission_wait = int(getattr(request, "submission_window_seconds", 0) or 600)
+        ttl = submission_wait + int(request.time_budget) + 600  # window + training + 10 min buffer
         deploy_timeout = 900  # 15 min max wait for GPU allocation
         hotkey = self.wallet.hotkey.ss58_address
         deploy_name = f"radar-trainer-{hotkey[:8]}-{request.round_id}"

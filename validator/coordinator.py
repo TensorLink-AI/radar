@@ -609,6 +609,7 @@ class TrainingCoordinator:
             gpu_count=Config.TRAINER_GPU_COUNT,
             min_gpu_memory_gb=Config.TRAINER_MIN_GPU_MEMORY_GB,
             memory=Config.TRAINER_MEMORY,
+            submission_window_seconds=Config.SUBMISSION_WINDOW_BLOCKS * 12,
         )
         body = req.to_json().encode()
 

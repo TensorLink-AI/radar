@@ -1,6 +1,6 @@
 """Tests for shared.protocol — round-trip serialization."""
 
-from shared.protocol import Challenge, Proposal
+from shared.protocol import Challenge, Proposal, TrainerRequest
 
 
 def test_challenge_round_trip():
@@ -95,3 +95,30 @@ def test_challenge_empty_frontier():
     json_str = c.to_json()
     c2 = Challenge.from_json(json_str)
     assert c2.feasible_frontier == []
+
+
+def test_trainer_request_round_trip():
+    """TrainerRequest serializes submission_window_seconds."""
+    req = TrainerRequest(
+        round_id=42,
+        time_budget=1500,
+        submission_window_seconds=1800,
+        validator_db_url="http://vali:8080",
+    )
+    json_str = req.to_json()
+    req2 = TrainerRequest.from_json(json_str)
+    assert req2.submission_window_seconds == 1800
+    assert req2.time_budget == 1500
+
+
+def test_trainer_request_backward_compat():
+    """Old TrainerRequests without submission_window_seconds still parse."""
+    import json
+    old_json = json.dumps({
+        "round_id": 42,
+        "time_budget": 300,
+        "validator_db_url": "http://vali:8080",
+    })
+    req = TrainerRequest.from_json(old_json)
+    assert req.round_id == 42
+    assert req.submission_window_seconds == 600  # default fallback
