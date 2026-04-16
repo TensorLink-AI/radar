@@ -474,11 +474,26 @@ class Validator:
             )
 
         # ── Checkpoint collection ─────────────────────────────
-        training_metas = await self.coordinator.wait_for_checkpoints(
-            challenge.round_id,
-            expected_miners=list(filtered.keys()),
-            timeout=Config.EVAL_WINDOW_BLOCKS * 12,
-        )
+        # Only poll for miners whose training was actually dispatched.
+        # Miners whose dispatch failed (no endpoint, connection error, etc.)
+        # will never upload checkpoints — polling for them wastes the full
+        # timeout window.
+        dispatched_miners = [
+            r.arch_owner for r in my_results if r.status in _OK_STATUSES
+        ]
+        if not dispatched_miners:
+            logger.warning(
+                "No training jobs were dispatched successfully — "
+                "skipping checkpoint polling (round %d)",
+                challenge.round_id,
+            )
+            training_metas: dict[int, dict] = {}
+        else:
+            training_metas = await self.coordinator.wait_for_checkpoints(
+                challenge.round_id,
+                expected_miners=dispatched_miners,
+                timeout=Config.EVAL_WINDOW_BLOCKS * 12,
+            )
 
         logger.info(
             "Checkpoint collection: %d/%d miners have training metas",
@@ -739,16 +754,17 @@ class Validator:
             nonzero_weights = {
                 uid: f"{w:.4f}" for uid, w in zip(uids, weights) if w > 0
             }
-            if nonzero_weights:
-                logger.info(
-                    "Setting weights for %d UIDs (%d nonzero): %s",
-                    len(uids), len(nonzero_weights), nonzero_weights,
-                )
-            else:
+            if not nonzero_weights:
                 logger.warning(
-                    "Setting all-zero weights for %d UIDs (no miner scored this round)",
+                    "All weights are zero for %d UIDs — skipping set_weights "
+                    "(no miner scored this round)",
                     len(uids),
                 )
+                return
+            logger.info(
+                "Setting weights for %d UIDs (%d nonzero): %s",
+                len(uids), len(nonzero_weights), nonzero_weights,
+            )
             self.subtensor.set_weights(
                 netuid=self.netuid, wallet=self.wallet,
                 uids=uids, weights=weights,
