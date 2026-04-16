@@ -80,11 +80,15 @@ _client: Optional[httpx.AsyncClient] = None
 # Each category gets its own independent bucket so heavy DB reads
 # don't starve LLM or search budgets.
 # Round duration is ~55 min; round-scoped limits use 3600s (1 hour).
-_CATEGORY_LIMITS: dict[str, tuple[int, int]] = {
-    "db":         (5, 60),      #  5 req / min
-    "desearch":   (10, 3600),   # 10 req / round
-    "llm":        (30, 3600),   # 30 req / round
-}
+def _build_default_category_limits() -> dict[str, tuple[int, int]]:
+    from config import Config
+    return {
+        "db":         (Config.DB_VALI_RATE_LIMIT, 60),
+        "desearch":   (Config.DESEARCH_MAX_QUERIES, 3600),
+        "llm":        (Config.LLM_MAX_QUERIES, 3600),
+    }
+
+_CATEGORY_LIMITS: dict[str, tuple[int, int]] = {}
 _DEFAULT_LIMIT: tuple[int, int] = (5, 60)
 
 # Rate limiter: "category:identity" -> list of timestamps
@@ -116,6 +120,8 @@ def set_config(
     _wallet = wallet
     _metagraph = metagraph
     _api_key = api_key
+    if not _CATEGORY_LIMITS:
+        _CATEGORY_LIMITS.update(_build_default_category_limits())
     if rate_limits:
         _CATEGORY_LIMITS.update(rate_limits)
 
