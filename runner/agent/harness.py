@@ -134,6 +134,9 @@ def main():
     agent_token = challenge.get("agent_token", "")
     if agent_token:
         default_headers["X-Agent-Token"] = agent_token
+    miner_uid = challenge.get("miner_uid")
+    if miner_uid is not None:
+        default_headers["X-Miner-UID"] = str(miner_uid)
 
     client = GatedClient(allowed_prefixes, default_headers=default_headers)
     log(f"GatedClient initialised with {len(allowed_prefixes)} allowed prefixes")

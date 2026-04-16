@@ -129,6 +129,14 @@ async def _run_single_agent(
     miner_challenge_json = _attach_scratchpad_urls(
         challenge_json, r2, commitment.hotkey,
     )
+    # Inject miner identity so agent pod requests get per-miner rate buckets
+    try:
+        _data = json.loads(miner_challenge_json)
+        _data["miner_uid"] = uid
+        _data["miner_hotkey"] = commitment.hotkey
+        miner_challenge_json = json.dumps(_data)
+    except (json.JSONDecodeError, TypeError):
+        pass
 
     # Per-round agent budget comes from the challenge (populated from the
     # task YAML's agent_seconds, falling back to Config.AGENT_TIMEOUT).
