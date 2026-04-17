@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import AsyncIterator, Optional
 
 import httpx
@@ -50,14 +50,14 @@ class LLMProxy:
         self.max_queries = max_queries
         self.tempo_seconds = tempo_seconds
         self.pool = pool
-        # Timeout budget per attempt: 60s read covers most reasoning
-        # models.  The circuit breaker trips on the first timeout so
-        # subsequent calls fail instantly instead of burning budget.
+        # Short connect means if Chutes is unreachable we know within
+        # 5s and return 503 to the miner. Long read accommodates slow
+        # reasoning models (Kimi-K2.5-TEE can legitimately take 60-90s).
         self.timeout = httpx.Timeout(
-            connect=10.0,
-            read=60.0,
-            write=30.0,
-            pool=30.0,
+            connect=5.0,
+            read=120.0,
+            write=15.0,
+            pool=10.0,
         )
         self._query_counts: dict[int, list[float]] = defaultdict(list)
         self._client: Optional[httpx.AsyncClient] = None
@@ -65,10 +65,18 @@ class LLMProxy:
         self._circuit_open_until: float = 0.0
         self._CB_THRESHOLD = 3
         self._CB_COOLDOWN = 60.0
+        self._recent_latencies: deque = deque(maxlen=50)
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=self.timeout)
+            self._client = httpx.AsyncClient(
+                timeout=self.timeout,
+                limits=httpx.Limits(
+                    max_connections=50,
+                    max_keepalive_connections=20,
+                    keepalive_expiry=30.0,
+                ),
+            )
         return self._client
 
     def _prune_old_queries(self, miner_uid: int) -> int:
@@ -95,11 +103,14 @@ class LLMProxy:
     def _check_circuit(self, ctx: str) -> None:
         now = time.time()
         if self._consecutive_failures >= self._CB_THRESHOLD and now < self._circuit_open_until:
-            wait_s = self._circuit_open_until - now
-            logger.warning("Chutes AI circuit open [%s] (failures=%d, %.0fs)",
-                           ctx, self._consecutive_failures, wait_s)
-            raise HTTPException(status_code=503, detail=(
-                f"LLM unavailable ({self._consecutive_failures} failures, retry {wait_s:.0f}s)"))
+            retry_after = int(self._circuit_open_until - now) + 1
+            logger.warning("Chutes AI circuit OPEN [%s] — rejecting for %ds (failures=%d)",
+                           ctx, retry_after, self._consecutive_failures)
+            raise HTTPException(
+                status_code=503,
+                detail=f"LLM unavailable: circuit breaker open ({retry_after}s remaining)",
+                headers={"Retry-After": str(retry_after)},
+            )
 
     def _open_circuit(self, double: bool = False, timeout: bool = False):
         self._consecutive_failures += 1
@@ -190,9 +201,15 @@ class LLMProxy:
                                          timeout=self.timeout)
                 resp.raise_for_status()
                 data = resp.json()
+                chutes_latency = time.time() - t0
+                self._recent_latencies.append((time.time(), chutes_latency))
+                tokens = data.get("usage", {}).get("total_tokens", 0)
                 if attempt > 0:
-                    logger.info("Chutes AI OK attempt %d [%s] (%.1fs)",
-                                attempt + 1, ctx, time.time() - t0)
+                    logger.info("Chutes AI OK attempt %d [%s] %.1fs tokens=%d model=%s",
+                                attempt + 1, ctx, chutes_latency, tokens, model)
+                else:
+                    logger.info("Chutes AI OK [%s] %.1fs tokens=%d model=%s",
+                                ctx, chutes_latency, tokens, model)
                 break
             except httpx.HTTPStatusError as e:
                 last_error = e
