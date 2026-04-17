@@ -108,13 +108,13 @@ class TestGatedClient:
 
     def test_llm_timeout_default(self):
         client = GatedClient(["http://proxy.test/"])
-        assert client._effective_timeout("http://proxy.test/llm/chat", None) == 90
-        assert client._effective_timeout("http://proxy.test/other", None) == 15
+        assert client._effective_timeout("http://proxy.test/llm/chat", None) == 30
+        assert client._effective_timeout("http://proxy.test/other", None) == 10
 
     def test_max_retries_default(self):
         client = GatedClient(["http://proxy.test/"])
-        assert client._max_retries == 2
-        assert client._retries_for_url("http://proxy.test/experiments") == 2
+        assert client._max_retries == 1
+        assert client._retries_for_url("http://proxy.test/experiments") == 1
         assert client._retries_for_url("http://proxy.test/llm/chat") == 0
 
 

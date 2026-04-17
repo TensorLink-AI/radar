@@ -64,7 +64,7 @@ def scratchpad_key(miner_hotkey: str) -> str:
 def generate_scratchpad_urls(
     r2: "R2AuditLog",
     miner_hotkey: str,
-    ttl: int = 900,
+    ttl: int = 1800,
     max_size_bytes: int = 10 * 1024 * 1024,
 ) -> tuple[str, str]:
     """Generate presigned GET and PUT URLs for a miner's scratchpad.
