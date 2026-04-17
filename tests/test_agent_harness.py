@@ -53,6 +53,14 @@ class TestBuildAgentEnvVars:
     def test_includes_allowed_urls(self):
         env = _build_agent_env_vars("http://a.com,http://b.com")
         assert env["AGENT_ALLOWED_URLS"] == "http://a.com,http://b.com"
+        # The entrypoint programs iptables from RADAR_ALLOWED_URLS before the
+        # harness runs, so the same allowlist must be exposed under that name.
+        assert env["RADAR_ALLOWED_URLS"] == "http://a.com,http://b.com"
+
+    def test_no_allowed_urls_when_empty(self):
+        env = _build_agent_env_vars("")
+        assert "AGENT_ALLOWED_URLS" not in env
+        assert "RADAR_ALLOWED_URLS" not in env
 
     def test_no_basilica_token(self):
         with patch.dict(os.environ, {"BASILICA_API_TOKEN": "secret"}):
