@@ -275,7 +275,7 @@ class TrainingCoordinator:
                     # 429 is handled separately below — rate-limited 429s are
                     # retried, while already-running 429s go to R2 polling.
                     if resp.status_code in (403, 500, 502, 503) and attempt < max_retries:
-                        wait = 10 * (attempt + 1)
+                        wait = 5 * (attempt + 1)
                         body_preview = resp.text[:300] if resp.text else "(empty)"
                         logger.warning(
                             "Trainer UID %d returned HTTP %d: %s — retrying in %ds (attempt %d/%d)",
@@ -383,7 +383,7 @@ class TrainingCoordinator:
                     )
                 except Exception as e:
                     if attempt < max_retries:
-                        wait = 5 * (attempt + 1)
+                        wait = 3 * (attempt + 1)
                         logger.warning(
                             "Dispatch to trainer UID %d failed (%s), retrying in %ds",
                             job.trainer_uid, e, wait,
@@ -689,11 +689,23 @@ class TrainingCoordinator:
 
         self._fallback_uids[round_id] = fallback_uids
 
+        total_miners = len(sent_uids)
+        real_count = len(result) - len(fallback_uids)
+        fallback_count = len(fallback_uids)
+        no_response = total_miners - len(result)
+        fallback_pct = (fallback_count / total_miners * 100) if total_miners else 0
+
         logger.info(
-            "prepare_trainers complete: %d ready, %d fallback, %d no response (round %d)",
-            len(result) - len(fallback_uids), len(fallback_uids),
-            len(sent_uids) - len(result), round_id,
+            "prepare_trainers complete: %d ready, %d fallback (%.0f%%), "
+            "%d no response (round %d)",
+            real_count, fallback_count, fallback_pct, no_response, round_id,
         )
+        if fallback_pct > 50:
+            logger.warning(
+                "FALLBACK_RATE_HIGH: %.0f%% of miners (%d/%d) using fallback "
+                "template (round %d) — agents may not be learning",
+                fallback_pct, fallback_count, total_miners, round_id,
+            )
         return result
 
     async def release_trainers(

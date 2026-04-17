@@ -64,6 +64,8 @@ def load_scratchpad(challenge: dict, client: GatedClient,
 def save_scratchpad(challenge: dict, client: GatedClient,
                     local_dir: str = "/tmp/scratchpad") -> bool:
     """Upload the miner's scratchpad via presigned PUT."""
+    import time as _time
+
     url = challenge.get("scratchpad_put_url", "")
     if not url:
         return False
@@ -86,10 +88,29 @@ def save_scratchpad(challenge: dict, client: GatedClient,
 
         with open(archive_path, "rb") as f:
             data = f.read()
-        client.put(url, data, content_type="application/gzip")
+
+        last_err = None
+        for attempt in range(3):
+            try:
+                client.put(url, data, content_type="application/gzip")
+                os.remove(archive_path)
+                log(f"Saved scratchpad ({size_mb:.1f}MB)")
+                return True
+            except Exception as e:
+                last_err = e
+                status = getattr(e, "code", None) or getattr(e, "status", None)
+                # 403 means presigned URL expired — retrying won't help
+                if status == 403:
+                    log(f"Scratchpad save got HTTP 403 (presigned URL expired)")
+                    break
+                if attempt < 2:
+                    wait = 2 ** attempt
+                    log(f"Scratchpad save attempt {attempt + 1} failed: {e} — retry in {wait}s")
+                    _time.sleep(wait)
+
         os.remove(archive_path)
-        log(f"Saved scratchpad ({size_mb:.1f}MB)")
-        return True
+        log(f"Scratchpad save failed after retries: {last_err}")
+        return False
     except Exception as e:
         log(f"Scratchpad save failed: {e}")
         return False

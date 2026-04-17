@@ -139,9 +139,10 @@ async def _get_client() -> httpx.AsyncClient:
     return _client
 
 
-# Longer timeout for LLM requests — the database server forwards to
-# Chutes AI with up to 120 s timeout + retries, so the proxy must wait longer.
-_LLM_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
+# LLM timeout: Chutes AI can take ~120s for reasoning models.
+# Must be shorter than GatedClient's llm_timeout (120s) to avoid
+# the proxy doing work after the agent-side caller has given up.
+_LLM_TIMEOUT = httpx.Timeout(130.0, connect=10.0)
 
 
 def _check_rate_limit(identity: str, category: str) -> bool:
@@ -275,9 +276,24 @@ async def _proxy_request(request: Request, path: str) -> Response:
         return await _proxy_stream(client, target, body, headers, timeout)
 
     is_llm = path.startswith("/llm")
-    max_retries = 2 if is_llm else 0
+    max_retries = 1 if is_llm else 0
+    # Hard cap on total time spent retrying — prevents cascading timeouts
+    # from eating the agent's entire budget.
+    retry_budget = 150.0 if is_llm else 35.0
+    t0 = time.time()
 
     for attempt in range(1 + max_retries):
+        elapsed = time.time() - t0
+        if attempt > 0 and elapsed > retry_budget:
+            logger.warning(
+                "Proxy retry budget exhausted (%.0fs/%.0fs) for %s",
+                elapsed, retry_budget, target,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"error": "Retry budget exhausted"},
+            )
+
         # Re-sign on retries so the Epistula timestamp stays fresh
         if attempt > 0:
             headers = _build_proxy_headers(request, body)

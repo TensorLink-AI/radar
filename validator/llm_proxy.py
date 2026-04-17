@@ -51,14 +51,14 @@ class LLMProxy:
         self.tempo_seconds = tempo_seconds
         self.pool = pool
         # Granular timeouts: LLM models can think for 60-120s before the
-        # first token, then stream for another 30-60s.  A flat timeout
-        # starves the read phase.  The `timeout` param sets the read
-        # timeout (default 300s); connect/write/pool are fixed shorter.
+        # first token, then stream for another 30-60s.  Keep read timeout
+        # under the db_proxy's _LLM_TIMEOUT (130s) so this layer fails
+        # before the proxy gives up and the agent's connection is already dead.
         self.timeout = httpx.Timeout(
-            connect=30.0,
-            read=600.0,
-            write=60.0,
-            pool=60.0,
+            connect=10.0,
+            read=120.0,
+            write=30.0,
+            pool=30.0,
         )
         self._query_counts: dict[int, list[float]] = defaultdict(list)
         self._client: Optional[httpx.AsyncClient] = None
