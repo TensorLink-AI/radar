@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
+import time
+import urllib.error
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -96,13 +99,15 @@ class GatedClient:
         self,
         allowed_prefixes: list[str],
         default_headers: dict[str, str] | None = None,
-        timeout: int = 30,
-        llm_timeout: int = 180,
+        timeout: int = 15,
+        llm_timeout: int = 90,
+        max_retries: int = 2,
     ):
         self._allowed = allowed_prefixes
         self._default_headers = default_headers or {}
         self._timeout = timeout
         self._llm_timeout = llm_timeout
+        self._max_retries = max_retries
 
     def _apply_headers(self, req) -> None:
         """Apply default headers to a urllib Request."""
@@ -124,6 +129,53 @@ class GatedClient:
             return self._llm_timeout
         return self._timeout
 
+    def _retries_for_url(self, url: str) -> int:
+        """LLM requests are too expensive to retry — fail fast."""
+        if "/llm/" in url or url.rstrip("/").endswith("/llm"):
+            return 0
+        return self._max_retries
+
+    def _do_request(self, req, url: str, timeout: int) -> tuple[bytes, int]:
+        """Execute a urllib request with retries for transient failures.
+
+        Returns (body_bytes, http_status_code).
+        Connection errors and timeouts are retried with exponential backoff.
+        HTTP 5xx errors are retried. HTTP 4xx errors are raised immediately.
+        """
+        import urllib.request
+
+        max_retries = self._retries_for_url(url)
+        last_err: BaseException | None = None
+
+        for attempt in range(1 + max_retries):
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.read(), resp.status
+            except urllib.error.HTTPError as e:
+                if e.code in (502, 503, 504) and attempt < max_retries:
+                    wait = min(2 ** attempt, 4)
+                    logger.warning(
+                        "HTTP %s %s returned %d (attempt %d/%d) — retry in %ds",
+                        req.method, url[:80], e.code,
+                        attempt + 1, 1 + max_retries, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
+            except (urllib.error.URLError, socket.timeout, OSError) as e:
+                last_err = e
+                if attempt < max_retries:
+                    wait = min(2 ** attempt, 4)
+                    logger.warning(
+                        "HTTP %s %s failed (attempt %d/%d): %s — retry in %ds",
+                        req.method, url[:80],
+                        attempt + 1, 1 + max_retries, e, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+
+        raise last_err  # type: ignore[misc]
+
     # ── Public API (what miner agents call) ──────────────────────────
 
     def get(self, url: str, timeout: int | None = None) -> bytes:
@@ -132,8 +184,8 @@ class GatedClient:
         import urllib.request
         req = urllib.request.Request(url, method="GET")
         self._apply_headers(req)
-        with urllib.request.urlopen(req, timeout=self._effective_timeout(url, timeout)) as resp:
-            return resp.read()
+        body, _ = self._do_request(req, url, self._effective_timeout(url, timeout))
+        return body
 
     def get_json(self, url: str, timeout: int | None = None) -> dict:
         """HTTP GET, returns parsed JSON."""
@@ -148,8 +200,8 @@ class GatedClient:
         req = urllib.request.Request(url, data=data, method="POST")
         req.add_header("Content-Type", "application/json")
         self._apply_headers(req)
-        with urllib.request.urlopen(req, timeout=self._effective_timeout(url, timeout)) as resp:
-            return resp.read()
+        body, _ = self._do_request(req, url, self._effective_timeout(url, timeout))
+        return body
 
     def post_json(self, url: str, payload: dict, timeout: int | None = None) -> dict:
         """HTTP POST with JSON body, returns parsed JSON."""
@@ -163,5 +215,5 @@ class GatedClient:
         req = urllib.request.Request(url, data=data, method="PUT")
         req.add_header("Content-Type", content_type)
         self._apply_headers(req)
-        with urllib.request.urlopen(req, timeout=timeout or self._timeout) as resp:
-            return resp.status
+        _, status = self._do_request(req, url, timeout or self._timeout)
+        return status

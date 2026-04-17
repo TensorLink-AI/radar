@@ -99,17 +99,23 @@ class TestGatedClient:
             client.put("http://evil.com/upload", b"data")
 
     def test_llm_timeout_longer(self):
-        client = GatedClient(["http://proxy.test/"], timeout=30, llm_timeout=180)
-        assert client._effective_timeout("http://proxy.test/experiments/recent", None) == 30
-        assert client._effective_timeout("http://proxy.test/llm/v1/chat/completions", None) == 180
-        assert client._effective_timeout("http://proxy.test/llm/models", None) == 180
+        client = GatedClient(["http://proxy.test/"], timeout=15, llm_timeout=90)
+        assert client._effective_timeout("http://proxy.test/experiments/recent", None) == 15
+        assert client._effective_timeout("http://proxy.test/llm/v1/chat/completions", None) == 90
+        assert client._effective_timeout("http://proxy.test/llm/models", None) == 90
         # Explicit timeout overrides both
         assert client._effective_timeout("http://proxy.test/llm/v1/chat/completions", 60) == 60
 
     def test_llm_timeout_default(self):
         client = GatedClient(["http://proxy.test/"])
-        assert client._effective_timeout("http://proxy.test/llm/chat", None) == 180
-        assert client._effective_timeout("http://proxy.test/other", None) == 30
+        assert client._effective_timeout("http://proxy.test/llm/chat", None) == 90
+        assert client._effective_timeout("http://proxy.test/other", None) == 15
+
+    def test_max_retries_default(self):
+        client = GatedClient(["http://proxy.test/"])
+        assert client._max_retries == 2
+        assert client._retries_for_url("http://proxy.test/experiments") == 2
+        assert client._retries_for_url("http://proxy.test/llm/chat") == 0
 
 
 class _OKHandler(BaseHTTPRequestHandler):
