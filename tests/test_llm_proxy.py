@@ -194,6 +194,62 @@ class TestLLMProxy:
         assert "unavailable" in exc_info.value.detail.lower()
 
     @pytest.mark.asyncio
+    async def test_circuit_open_returns_retry_after(self):
+        """When the circuit is open, 503 responses should carry Retry-After."""
+        import httpx
+        proxy = LLMProxy(max_queries=10, chutes_api_key="test-key")
+
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.post = AsyncMock(side_effect=httpx.ReadTimeout("read timed out"))
+        proxy._client = mock_client
+
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException):
+            await proxy.forward("chat/completions", 0, _make_payload())
+
+        # Circuit is now open; next call should return 503 with Retry-After.
+        with pytest.raises(HTTPException) as exc_info:
+            await proxy.forward("chat/completions", 0, _make_payload())
+        assert exc_info.value.status_code == 503
+        headers = exc_info.value.headers or {}
+        assert "Retry-After" in headers
+        assert int(headers["Retry-After"]) > 0
+
+    @pytest.mark.asyncio
+    async def test_connect_timeout_is_short(self):
+        """Ensure proxy fails fast when upstream is unreachable."""
+        import time
+        proxy = LLMProxy(
+            chutes_url="http://192.0.2.1:1",  # TEST-NET-1, blackholed
+            chutes_api_key="test-key",
+            max_queries=10,
+        )
+        from fastapi import HTTPException
+        t0 = time.monotonic()
+        with pytest.raises(HTTPException):
+            await proxy.forward("chat/completions", 0, _make_payload())
+        elapsed = time.monotonic() - t0
+        # Should fail within ~connect timeout (5s) + 1 retry + small overhead,
+        # definitely not 70+ seconds
+        assert elapsed < 20, f"connect not capped: {elapsed:.1f}s"
+
+    def test_timeout_values(self):
+        """Connect timeout is short; read timeout accommodates slow models."""
+        proxy = LLMProxy()
+        assert proxy.timeout.connect == 5.0
+        assert proxy.timeout.read == 120.0
+        assert proxy.timeout.pool == 10.0
+
+    def test_recent_latencies_deque_bounded(self):
+        """Latency deque should be capped at 50 entries."""
+        proxy = LLMProxy()
+        assert proxy._recent_latencies.maxlen == 50
+        for i in range(100):
+            proxy._recent_latencies.append((float(i), 1.0))
+        assert len(proxy._recent_latencies) == 50
+
+    @pytest.mark.asyncio
     async def test_embeddings_path(self):
         """Embeddings endpoint should accept payload and fail at HTTP, not validation."""
         proxy = LLMProxy(max_queries=10, chutes_api_key="test-key")
