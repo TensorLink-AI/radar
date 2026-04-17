@@ -179,3 +179,55 @@ class TestGatedClientLive:
         # Blocked
         with pytest.raises(URLNotAllowedError):
             client.get("http://evil.com/steal")
+
+
+# ── Connect-timeout enforcement ────────────────────────────────────
+
+@pytest.mark.slow
+def test_connect_timeout_is_bounded():
+    """Connecting to a blackholed IP should fail within ~timeout seconds,
+    not ~75s (Linux tcp_syn_retries default)."""
+    import time
+
+    # 192.0.2.1 is TEST-NET-1 (RFC 5737) — reserved, never routed.
+    # Hitting it reliably triggers the TCP connect-timeout path.
+    client = GatedClient(
+        allowed_prefixes=["http://192.0.2.1/"],
+        timeout=3,
+        max_retries=0,
+    )
+    t0 = time.monotonic()
+    try:
+        client.get("http://192.0.2.1/anything", timeout=3)
+    except Exception:
+        pass
+    elapsed = time.monotonic() - t0
+    # Allow generous slack for scheduling, but far less than 75s default.
+    assert elapsed < 15, (
+        f"connect timeout not enforced: took {elapsed:.1f}s "
+        f"(expected < 15s with timeout=3)"
+    )
+
+
+def test_default_timeout_restored_after_call():
+    """_do_request must restore socket.getdefaulttimeout after each call."""
+    import socket
+
+    original = socket.getdefaulttimeout()
+    sentinel = 42.0
+    socket.setdefaulttimeout(sentinel)
+    try:
+        client = GatedClient(
+            allowed_prefixes=["http://192.0.2.1/"],
+            timeout=1,
+            max_retries=0,
+        )
+        try:
+            client.get("http://192.0.2.1/", timeout=1)
+        except Exception:
+            pass
+        assert socket.getdefaulttimeout() == sentinel, (
+            f"Expected {sentinel}, got {socket.getdefaulttimeout()}"
+        )
+    finally:
+        socket.setdefaulttimeout(original)

@@ -141,6 +141,15 @@ class GatedClient:
         Returns (body_bytes, http_status_code).
         Connection errors and timeouts are retried with exponential backoff.
         HTTP 5xx errors are retried. HTTP 4xx errors are raised immediately.
+
+        Note on timeouts: urllib.request.urlopen's `timeout=` parameter only
+        bounds the READ phase once the TCP connection is established — it
+        does NOT cap the connect phase. Without socket.setdefaulttimeout,
+        an unreachable or slow-to-accept server costs ~75-127s per attempt
+        (Linux tcp_syn_retries default), which wrecks agent time budgets.
+        We set the socket default for the duration of each attempt and
+        restore the previous value in `finally` so we don't clobber any
+        caller that set their own default.
         """
         import urllib.request
 
@@ -149,6 +158,8 @@ class GatedClient:
 
         # Note: max_retries=N means N+1 total attempts (1 initial + N retries).
         for attempt in range(1 + max_retries):
+            prev_default = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(timeout)
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     return resp.read(), resp.status
@@ -174,6 +185,8 @@ class GatedClient:
                     )
                     time.sleep(wait)
                     continue
+            finally:
+                socket.setdefaulttimeout(prev_default)
 
         raise last_err  # type: ignore[misc]
 
