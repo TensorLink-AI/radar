@@ -69,50 +69,57 @@ def save_scratchpad(challenge: dict, client: GatedClient,
     url = challenge.get("scratchpad_put_url", "")
     if not url:
         return False
+    archive_path: str | None = None
     try:
         fd, archive_path = tempfile.mkstemp(suffix=".tar.gz", prefix="scratchpad_")
         os.close(fd)
-        with tarfile.open(archive_path, "w:gz") as tar:
-            for root, _dirs, files in os.walk(local_dir):
-                for f in files:
-                    full = os.path.join(root, f)
-                    arcname = os.path.relpath(full, local_dir)
-                    tar.add(full, arcname=arcname)
+        try:
+            with tarfile.open(archive_path, "w:gz") as tar:
+                for root, _dirs, files in os.walk(local_dir):
+                    for f in files:
+                        full = os.path.join(root, f)
+                        arcname = os.path.relpath(full, local_dir)
+                        tar.add(full, arcname=arcname)
 
-        max_mb = challenge.get("scratchpad_max_mb", 10)
-        size_mb = os.path.getsize(archive_path) / (1024 * 1024)
-        if size_mb > max_mb:
-            log(f"Scratchpad too large ({size_mb:.1f}MB > {max_mb}MB). Not saving.")
-            os.remove(archive_path)
+            max_mb = challenge.get("scratchpad_max_mb", 10)
+            size_mb = os.path.getsize(archive_path) / (1024 * 1024)
+            if size_mb > max_mb:
+                log(f"Scratchpad too large ({size_mb:.1f}MB > {max_mb}MB). Not saving.")
+                return False
+
+            with open(archive_path, "rb") as f:
+                data = f.read()
+
+            last_err = None
+            for attempt in range(3):
+                try:
+                    client.put(url, data, content_type="application/gzip")
+                    log(f"Saved scratchpad ({size_mb:.1f}MB)")
+                    return True
+                except Exception as e:
+                    last_err = e
+                    status = getattr(e, "code", None) or getattr(e, "status", None)
+                    # 403 means presigned URL expired — retrying won't help
+                    if status == 403:
+                        log(f"Scratchpad save got HTTP 403 (presigned URL expired)")
+                        break
+                    if attempt < 2:
+                        wait = 2 ** attempt
+                        log(f"Scratchpad save attempt {attempt + 1} failed: {e} — retry in {wait}s")
+                        _time.sleep(wait)
+
+            log(f"Scratchpad save failed after retries: {last_err}")
             return False
-
-        with open(archive_path, "rb") as f:
-            data = f.read()
-
-        last_err = None
-        for attempt in range(3):
-            try:
-                client.put(url, data, content_type="application/gzip")
+        finally:
+            if archive_path and os.path.exists(archive_path):
                 os.remove(archive_path)
-                log(f"Saved scratchpad ({size_mb:.1f}MB)")
-                return True
-            except Exception as e:
-                last_err = e
-                status = getattr(e, "code", None) or getattr(e, "status", None)
-                # 403 means presigned URL expired — retrying won't help
-                if status == 403:
-                    log(f"Scratchpad save got HTTP 403 (presigned URL expired)")
-                    break
-                if attempt < 2:
-                    wait = 2 ** attempt
-                    log(f"Scratchpad save attempt {attempt + 1} failed: {e} — retry in {wait}s")
-                    _time.sleep(wait)
-
-        os.remove(archive_path)
-        log(f"Scratchpad save failed after retries: {last_err}")
-        return False
     except Exception as e:
         log(f"Scratchpad save failed: {e}")
+        if archive_path and os.path.exists(archive_path):
+            try:
+                os.remove(archive_path)
+            except OSError:
+                pass
         return False
 
 
@@ -161,6 +168,10 @@ def main():
 
     client = GatedClient(allowed_prefixes, default_headers=default_headers)
     log(f"GatedClient initialised with {len(allowed_prefixes)} allowed prefixes")
+    log(
+        f"GatedClient timeouts: connect/read={client._timeout}s, "
+        f"llm={client._llm_timeout}s, retries={client._max_retries}"
+    )
 
     # 3. Load miner's agent module
     agent_path = os.environ.get("AGENT_MODULE", "/workspace/agent/agent.py")

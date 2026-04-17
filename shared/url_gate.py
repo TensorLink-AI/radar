@@ -99,9 +99,9 @@ class GatedClient:
         self,
         allowed_prefixes: list[str],
         default_headers: dict[str, str] | None = None,
-        timeout: int = 15,
-        llm_timeout: int = 90,
-        max_retries: int = 2,
+        timeout: int = 10,
+        llm_timeout: int = 30,
+        max_retries: int = 1,
     ):
         self._allowed = allowed_prefixes
         self._default_headers = default_headers or {}
@@ -147,6 +147,7 @@ class GatedClient:
         max_retries = self._retries_for_url(url)
         last_err: BaseException | None = None
 
+        # Note: max_retries=N means N+1 total attempts (1 initial + N retries).
         for attempt in range(1 + max_retries):
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
