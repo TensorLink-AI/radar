@@ -100,7 +100,7 @@ class GatedClient:
         allowed_prefixes: list[str],
         default_headers: dict[str, str] | None = None,
         timeout: int = 15,
-        llm_timeout: int = 120,
+        llm_timeout: int = 90,
         max_retries: int = 2,
     ):
         self._allowed = allowed_prefixes

@@ -139,10 +139,12 @@ async def _get_client() -> httpx.AsyncClient:
     return _client
 
 
-# LLM timeout: Chutes AI can take ~120s for reasoning models.
-# Must be shorter than GatedClient's llm_timeout (120s) to avoid
-# the proxy doing work after the agent-side caller has given up.
-_LLM_TIMEOUT = httpx.Timeout(130.0, connect=10.0)
+# LLM timeout: the llm_proxy layer handles its own retries and circuit
+# breaking against Chutes AI.  The db_proxy is a thin passthrough — its
+# timeout just needs to cover one llm_proxy round-trip.  Keep well under
+# the GatedClient's llm_timeout (120s) so we never do work after the
+# agent has already given up.
+_LLM_TIMEOUT = httpx.Timeout(90.0, connect=5.0)
 
 
 def _check_rate_limit(identity: str, category: str) -> bool:
@@ -276,10 +278,10 @@ async def _proxy_request(request: Request, path: str) -> Response:
         return await _proxy_stream(client, target, body, headers, timeout)
 
     is_llm = path.startswith("/llm")
-    max_retries = 1 if is_llm else 0
-    # Hard cap on total time spent retrying — prevents cascading timeouts
-    # from eating the agent's entire budget.
-    retry_budget = 150.0 if is_llm else 35.0
+    # No retries at the proxy layer — the llm_proxy has its own retry +
+    # circuit breaker.  Retrying here just doubles the timeout burn.
+    max_retries = 0
+    retry_budget = 35.0
     t0 = time.time()
 
     for attempt in range(1 + max_retries):

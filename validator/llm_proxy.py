@@ -50,13 +50,12 @@ class LLMProxy:
         self.max_queries = max_queries
         self.tempo_seconds = tempo_seconds
         self.pool = pool
-        # Granular timeouts: LLM models can think for 60-120s before the
-        # first token, then stream for another 30-60s.  Keep read timeout
-        # under the db_proxy's _LLM_TIMEOUT (130s) so this layer fails
-        # before the proxy gives up and the agent's connection is already dead.
+        # Timeout budget per attempt: 60s read covers most reasoning
+        # models.  The circuit breaker trips on the first timeout so
+        # subsequent calls fail instantly instead of burning budget.
         self.timeout = httpx.Timeout(
             connect=10.0,
-            read=120.0,
+            read=60.0,
             write=30.0,
             pool=30.0,
         )
