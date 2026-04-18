@@ -48,6 +48,51 @@ from validator.pod_manager import pre_validate_code
 logger = logging.getLogger(__name__)
 
 
+def compute_live_validator_uids(
+    metagraph,
+    miner_uids: Optional[set[int]] = None,
+    current_block: Optional[int] = None,
+    stale_blocks: int = 600,
+) -> list[int]:
+    """Filter ``metagraph.validator_permit`` to live, non-miner validators.
+
+    A UID counts as a live validator iff:
+      * it has ``validator_permit=True`` on chain, AND
+      * it is not running as a miner this round (no commitment), AND
+      * its on-chain ``last_update`` is within ``stale_blocks`` of
+        ``current_block``.
+
+    ``miner_uids`` / ``current_block`` are optional; when absent, the
+    corresponding check is skipped. A ``last_update`` of 0 is treated as
+    "never updated" and is not filtered (bootstrap case).
+    """
+    permits = getattr(metagraph, "validator_permit", None)
+    if permits is None:
+        return []
+
+    last_update = getattr(metagraph, "last_update", None)
+    miners = miner_uids or set()
+    result: list[int] = []
+    for uid in range(metagraph.n):
+        if uid >= len(permits) or not permits[uid]:
+            continue
+        if uid in miners:
+            continue
+        if (
+            current_block is not None
+            and last_update is not None
+            and uid < len(last_update)
+        ):
+            try:
+                last = int(last_update[uid])
+            except (TypeError, ValueError):
+                last = 0
+            if last > 0 and current_block - last > stale_blocks:
+                continue
+        result.append(uid)
+    return result
+
+
 def get_my_assignments(
     all_uids: list[int],
     validator_uids: list[int],
@@ -182,15 +227,18 @@ class Validator:
             return hotkeys.index(hotkey)
         return -1
 
-    def _get_validator_uids(self) -> list[int]:
-        """Get UIDs of all validators with permits."""
-        permits = self.metagraph.validator_permit
-        if permits is None:
-            return []
-        return [
-            uid for uid in range(self.metagraph.n)
-            if uid < len(permits) and permits[uid]
-        ]
+    def _get_validator_uids(
+        self,
+        miner_uids: Optional[set[int]] = None,
+        current_block: Optional[int] = None,
+    ) -> list[int]:
+        """Instance wrapper for :func:`compute_live_validator_uids`."""
+        return compute_live_validator_uids(
+            self.metagraph,
+            miner_uids=miner_uids,
+            current_block=current_block,
+            stale_blocks=Config.VALIDATOR_STALE_BLOCKS,
+        )
 
     def _proxy_base_url(self) -> str:
         """Return the externally-reachable base URL for the validator proxy.
@@ -301,8 +349,20 @@ class Validator:
         )
 
         # ── PHASE A: RUN AGENTS + COLLECT ────────────────────
-        validator_uids = self._get_validator_uids()
         commitments = read_miner_commitments(self.subtensor, self.netuid, self.metagraph)
+        try:
+            current_block = self.subtensor.get_current_block()
+        except Exception as e:
+            logger.warning("Failed to read current block for liveness filter: %s", e)
+            current_block = None
+        validator_uids = self._get_validator_uids(
+            miner_uids=set(commitments.keys()),
+            current_block=current_block,
+        )
+        logger.info(
+            "Live validators this round: %s (filtered miners + stale last_update)",
+            validator_uids,
+        )
 
         if not self.r2:
             logger.warning("No R2 configured — skipping Phase A/B/C")
