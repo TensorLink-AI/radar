@@ -65,18 +65,17 @@ def generate_scratchpad_urls(
     r2: "R2AuditLog",
     miner_hotkey: str,
     ttl: int = 1800,
-    max_size_bytes: int = 10 * 1024 * 1024,
 ) -> tuple[str, str]:
     """Generate presigned GET and PUT URLs for a miner's scratchpad.
 
     Returns (get_url, put_url). GET URL returns 404 if no scratchpad exists yet.
-    PUT URL includes a Content-Length condition to enforce max_size_bytes.
+    Size limit is enforced agent-side in save_scratchpad — signing a
+    Content-Length into the PUT URL would force the upload to match it
+    exactly (S3/R2 signature check), breaking every smaller upload with 403.
     """
     key = scratchpad_key(miner_hotkey)
     get_url = r2.generate_presigned_get_url(key, ttl=ttl)
-    put_url = r2.generate_presigned_put_url(
-        key, ttl=ttl, max_content_length=max_size_bytes,
-    )
+    put_url = r2.generate_presigned_put_url(key, ttl=ttl)
     return get_url, put_url
 
 

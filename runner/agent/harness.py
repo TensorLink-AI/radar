@@ -57,7 +57,11 @@ def load_scratchpad(challenge: dict, client: GatedClient,
         os.remove(archive_path)
         log(f"Loaded scratchpad ({len(os.listdir(local_dir))} files)")
     except Exception as e:
-        log(f"Scratchpad load: {e} (starting fresh)")
+        status = getattr(e, "code", None) or getattr(e, "status", None)
+        if status == 404:
+            log("No prior scratchpad found — starting fresh")
+        else:
+            log(f"Scratchpad load: {e} (starting fresh)")
     return local_dir
 
 
