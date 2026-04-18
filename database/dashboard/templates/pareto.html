@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Radar — Pareto{% endblock %}
+{% block content %}
+<h1>Pareto frontier</h1>
+
+<form class="filters" method="get" action="/dashboard/pareto">
+    <label>Task
+        <select name="task" onchange="this.form.submit()">
+            <option value="">(any)</option>
+            {% for t in tasks %}
+            <option value="{{ t }}" {% if t == task %}selected{% endif %}>{{ t }}</option>
+            {% endfor %}
+        </select>
+    </label>
+</form>
+
+<p class="muted">Lower-is-better metric on Y. FLOPs-equivalent size on X (log scale).
+Frontier members are highlighted; dominated points are greyed.</p>
+
+<canvas id="pareto-scatter" height="420" data-task="{{ task }}"></canvas>
+<div id="pareto-legend" class="muted"></div>
+{% endblock %}
