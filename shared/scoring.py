@@ -93,6 +93,8 @@ def score_round(
             scores[uid] = 1.0 - (rank / max(n, 1))
     else:
         # Rank by improvement beyond frontier best CRPS
+        from config import Config
+        threshold = Config.FRONTIER_IMPROVEMENT_THRESHOLD
         best_front_crps = min(
             (c.element.objectives.get("crps", float("inf")) for c in feasible_front),
             default=float("inf"),
@@ -103,6 +105,19 @@ def score_round(
                 improvement = (best_front_crps - crps) / max(abs(best_front_crps), 1e-8)
             else:
                 improvement = 0.0
+
+            # Gate: must beat the feasible frontier's best CRPS by at least
+            # `threshold` (fractional) to earn a score. Ties and regressions → 0.
+            if improvement < threshold:
+                scores[uid] = 0.0
+                logger.info(
+                    "UID %d scored 0: CRPS %.6f vs frontier best %.6f "
+                    "(improvement %.4f%% < threshold %.4f%%)",
+                    uid, crps, best_front_crps,
+                    improvement * 100.0, threshold * 100.0,
+                )
+                continue
+
             scores[uid] = _sigmoid(improvement, steepness=20.0)
 
             # Pareto dominance bonus — merge training meta for full objective vector

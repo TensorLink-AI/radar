@@ -157,6 +157,12 @@ class Config:
     # ── Scoring ──────────────────────────────────────────────────
     EMA_ALPHA: float = float(os.getenv("RADAR_EMA_ALPHA", "0.3"))
     SOFTMAX_TEMPERATURE: float = float(os.getenv("RADAR_SOFTMAX_TEMP", "0.1"))
+    # Minimum fractional CRPS improvement over the feasible frontier's best
+    # CRPS required to earn a nonzero score. 0.005 = 0.5%. Set to 0 to keep
+    # the old behaviour (any positive sigmoid score counts).
+    FRONTIER_IMPROVEMENT_THRESHOLD: float = float(
+        os.getenv("RADAR_FRONTIER_IMPROVEMENT_THRESHOLD", "0.005"),
+    )
 
     # ── Agent Scratchpad ────────────────────────────────────────
     SCRATCHPAD_ENABLED: bool = os.getenv("RADAR_SCRATCHPAD_ENABLED", "true").lower() == "true"
