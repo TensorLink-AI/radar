@@ -103,8 +103,13 @@ class Config:
     SUBMISSION_WINDOW_BLOCKS: int = int(os.getenv("RADAR_SUBMISSION_WINDOW", "50"))
     TRAINING_WINDOW_BLOCKS: int = int(os.getenv("RADAR_TRAINING_WINDOW", "150"))
     EVAL_WINDOW_BLOCKS: int = int(os.getenv("RADAR_EVAL_WINDOW", "25"))
-    FALLBACK_ENABLED: bool = os.getenv("RADAR_FALLBACK_ENABLED", "false").lower() == "true"
+    FALLBACK_ENABLED: bool = os.getenv("RADAR_FALLBACK_ENABLED", "true").lower() == "true"
     FALLBACK_WINDOW_BLOCKS: int = int(os.getenv("RADAR_FALLBACK_WINDOW", "50"))
+
+    # Liveness filter: validators whose on-chain last_update is older than
+    # this many blocks are treated as offline and skipped when computing
+    # work-splitting / dispatch assignments. Default ~2 hours (600 × 12s).
+    VALIDATOR_STALE_BLOCKS: int = int(os.getenv("RADAR_VALIDATOR_STALE_BLOCKS", "600"))
 
     SKIP_TRAINING_WAIT: bool = os.getenv("RADAR_SKIP_TRAINING_WAIT", "false").lower() == "true"
     SIZE_GATE_TOLERANCE: float = float(os.getenv("RADAR_SIZE_GATE_TOLERANCE", "0.10"))
