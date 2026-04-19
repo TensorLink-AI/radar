@@ -106,11 +106,27 @@ class TSForecastingRunner:
 
         return _val_iter()
 
+    @staticmethod
+    def _align_pred_target(predictions: Any, targets: Any):
+        """Truncate predictions/targets to a common forecast horizon.
+
+        Models always output PREDICTION_LEN=96 steps, but GIFT-Eval datasets
+        each have their own native prediction length (e.g. hourly=48).
+        Without this alignment, the loss call broadcasts 96 vs 48 at dim 1
+        and PyTorch raises a tensor-size mismatch that fails training.
+        """
+        p, t = predictions.shape[1], targets.shape[1]
+        if p == t:
+            return predictions, targets
+        n = min(p, t)
+        return predictions[:, :n], targets[:, :n]
+
     def default_loss(self, predictions: Any, targets: Any) -> Any:
         """Quantile loss (pinball) — the ts_forecasting default."""
         import torch
         c = self._load_constants()
         quantiles = c["quantiles"]
+        predictions, targets = self._align_pred_target(predictions, targets)
         target_expanded = targets.unsqueeze(-1)
         errors = target_expanded - predictions
         q = torch.tensor(quantiles, device=predictions.device)
@@ -121,16 +137,24 @@ class TSForecastingRunner:
 
         Old ts_forecasting harness called compute_loss(preds, targets, QUANTILES).
         Generic harness calls loss_fn(preds, targets). This adapter handles both.
+        Also aligns prediction/target horizons so miners don't have to worry
+        about GIFT-Eval per-dataset prediction lengths.
         """
         c = self._load_constants()
         quantiles = c["quantiles"]
         sig = inspect.signature(sub_loss_fn)
+        align = self._align_pred_target
         if len(sig.parameters) >= 3:
             # Old-style 3-arg: compute_loss(preds, targets, quantiles)
             def wrapped(predictions, targets):
+                predictions, targets = align(predictions, targets)
                 return sub_loss_fn(predictions, targets, quantiles)
             return wrapped
-        return sub_loss_fn
+
+        def wrapped_2arg(predictions, targets):
+            predictions, targets = align(predictions, targets)
+            return sub_loss_fn(predictions, targets)
+        return wrapped_2arg
 
     def measure_flops(self, model: Any, device: str) -> int:
         try:

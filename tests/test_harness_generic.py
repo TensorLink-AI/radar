@@ -1,5 +1,7 @@
 """Tests for runner/harness.py — the generic training harness."""
 
+import pytest
+
 from runner.harness import (
     TrainingConfig, _read_config, _read_amp_config,
     _has_callable, _check_size_gate, _load_submission,
@@ -107,3 +109,110 @@ class TestTSForecastingRunner:
     def test_run_training_callable(self):
         from runner.timeseries_forecast.train import run_training
         assert callable(run_training)
+
+
+class TestPredTargetAlignment:
+    """Regression: model outputs PREDICTION_LEN=96 but GIFT-Eval per-freq
+    datasets (e.g. hourly) have native pred_len=48. Loss must not crash
+    on shape mismatch — it should truncate to the common horizon.
+    """
+
+    def _runner(self):
+        from runner.timeseries_forecast.train import TSForecastingRunner
+        r = TSForecastingRunner()
+        # Skip the prepare.py import (not always available in test env) —
+        # provide constants directly so _align_pred_target works standalone.
+        r._constants = {
+            "context_len": 512,
+            "prediction_len": 96,
+            "num_variates": 1,
+            "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+        }
+        return r
+
+    def test_align_equal_shapes_passthrough(self):
+        torch = pytest.importorskip("torch")
+        r = self._runner()
+        preds = torch.zeros(4, 96, 1, 9)
+        tgts = torch.zeros(4, 96, 1)
+        p, t = r._align_pred_target(preds, tgts)
+        assert p.shape == (4, 96, 1, 9)
+        assert t.shape == (4, 96, 1)
+
+    def test_align_truncates_to_shorter_target(self):
+        torch = pytest.importorskip("torch")
+        r = self._runner()
+        preds = torch.zeros(4, 96, 1, 9)
+        tgts = torch.zeros(4, 48, 1)
+        p, t = r._align_pred_target(preds, tgts)
+        assert p.shape == (4, 48, 1, 9)
+        assert t.shape == (4, 48, 1)
+
+    def test_align_truncates_to_shorter_predictions(self):
+        torch = pytest.importorskip("torch")
+        r = self._runner()
+        preds = torch.zeros(4, 24, 1, 9)
+        tgts = torch.zeros(4, 48, 1)
+        p, t = r._align_pred_target(preds, tgts)
+        assert p.shape == (4, 24, 1, 9)
+        assert t.shape == (4, 24, 1)
+
+    def test_default_loss_handles_mismatched_horizons(self):
+        """Reproduces the training crash: pred=96, target=48 (GIFT-Eval hourly)."""
+        torch = pytest.importorskip("torch")
+        r = self._runner()
+        preds = torch.randn(2, 96, 1, 9)
+        tgts = torch.randn(2, 48, 1)
+        loss = r.default_loss(preds, tgts)
+        assert torch.isfinite(loss)
+        assert loss.ndim == 0  # scalar
+
+    def test_default_loss_matches_evaluator_truncation_semantics(self):
+        """Truncating predictions[:, :48] must give same loss as the aligned call."""
+        torch = pytest.importorskip("torch")
+        r = self._runner()
+        preds = torch.randn(2, 96, 1, 9)
+        tgts = torch.randn(2, 48, 1)
+        aligned_loss = r.default_loss(preds, tgts)
+        manual_loss = r.default_loss(preds[:, :48], tgts)
+        assert torch.allclose(aligned_loss, manual_loss)
+
+    def test_wrap_loss_2arg_aligns_shapes(self):
+        """Miner's 2-arg compute_loss must receive aligned shapes."""
+        torch = pytest.importorskip("torch")
+        r = self._runner()
+        seen_shapes = {}
+
+        def miner_loss(predictions, targets):
+            seen_shapes["pred"] = predictions.shape
+            seen_shapes["tgt"] = targets.shape
+            return (predictions.mean() - targets.mean()).abs()
+
+        wrapped = r.wrap_loss(miner_loss)
+        preds = torch.randn(2, 96, 1, 9)
+        tgts = torch.randn(2, 48, 1)
+        loss = wrapped(preds, tgts)
+        assert seen_shapes["pred"] == (2, 48, 1, 9)
+        assert seen_shapes["tgt"] == (2, 48, 1)
+        assert torch.isfinite(loss)
+
+    def test_wrap_loss_3arg_aligns_shapes(self):
+        """Miner's legacy 3-arg compute_loss(preds, targets, quantiles) also aligned."""
+        torch = pytest.importorskip("torch")
+        r = self._runner()
+        seen_shapes = {}
+
+        def miner_loss(predictions, targets, quantiles):
+            seen_shapes["pred"] = predictions.shape
+            seen_shapes["tgt"] = targets.shape
+            seen_shapes["q"] = list(quantiles)
+            return (predictions.mean() - targets.mean()).abs()
+
+        wrapped = r.wrap_loss(miner_loss)
+        preds = torch.randn(2, 96, 1, 9)
+        tgts = torch.randn(2, 48, 1)
+        loss = wrapped(preds, tgts)
+        assert seen_shapes["pred"] == (2, 48, 1, 9)
+        assert seen_shapes["tgt"] == (2, 48, 1)
+        assert len(seen_shapes["q"]) == 9
+        assert torch.isfinite(loss)
