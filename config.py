@@ -25,6 +25,8 @@ class Config:
     # ── Desearch Proxy ────────────────────────────────────────────────
     # SN22 Desearch endpoint URL
     DESEARCH_SN22_URL: str = os.getenv("RADAR_DESEARCH_SN22_URL", "https://desearch.ai/api/v1")
+    # Desearch API key (subnet owner provides). Sent as `Authorization: <key>`.
+    DESEARCH_API_KEY: str = os.getenv("RADAR_DESEARCH_API_KEY", "")
     # Max queries per miner per tempo
     DESEARCH_MAX_QUERIES: int = int(os.getenv("RADAR_DESEARCH_MAX_QUERIES", "20"))
     # Enable desearch proxy (set to "true" to enable)

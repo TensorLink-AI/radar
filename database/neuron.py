@@ -114,6 +114,7 @@ class DatabaseNeuron:
             from validator.desearch_proxy import DesearchProxy, set_proxy, register_routes
             desearch = DesearchProxy(
                 sn22_url=Config.DESEARCH_SN22_URL,
+                api_key=Config.DESEARCH_API_KEY,
                 max_queries=Config.DESEARCH_MAX_QUERIES,
                 pool=self.pool,
             )

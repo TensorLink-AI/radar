@@ -71,8 +71,10 @@ class DesearchProxy:
         max_queries: int = MAX_QUERIES_PER_TEMPO,
         tempo_seconds: int = TEMPO_DURATION_SECONDS,
         pool=None,
+        api_key: str = "",
     ):
         self.sn22_url = sn22_url
+        self.api_key = api_key
         self.max_queries = max_queries
         self.tempo_seconds = tempo_seconds
         self.pool = pool  # asyncpg pool for query logging
@@ -142,11 +144,14 @@ class DesearchProxy:
         self._record_query(miner_uid)
         remaining -= 1
 
+        headers = {"Authorization": self.api_key} if self.api_key else {}
+
         try:
             client = await self._get_client()
             resp = await client.post(
                 f"{self.sn22_url}/search/arxiv",
                 json={"query": query, "max_results": max_results},
+                headers=headers,
                 timeout=30.0,
             )
             resp.raise_for_status()
