@@ -153,20 +153,20 @@ class TrainingCoordinator:
         submissions: dict[int, Proposal],
         trainer_endpoints: dict[int, str],
         commitments: dict[int, "ImageCommitment"] | None = None,
-        gift_eval_urls: dict[str, str] | None = None,
-        pretrain_shard_urls: list[str] | None = None,
-        pretrain_val_shard_urls: list[str] | None = None,
+        extras: dict | None = None,
     ) -> list[TrainingResult]:
         """POST to trainer endpoints with Epistula-signed payload.
 
         Dispatches concurrently. Attestation is already verified in
         prepare_trainers() when TrainerReady arrives; fallback proxy
         is trusted subnet-owner infrastructure.
+
+        `extras` is a task-provided dict merged into every dispatch
+        payload (e.g. ts_forecasting supplies `gift_eval_urls` and
+        `pretrain_shard_urls`).
         """
         commitments = commitments or {}
-        gift_eval_urls = gift_eval_urls or {}
-        pretrain_shard_urls = pretrain_shard_urls or []
-        pretrain_val_shard_urls = pretrain_val_shard_urls or []
+        extras = extras or {}
         # Each job is sent to exactly one trainer (1:1 arch→trainer).
         # `trainer_endpoints` is the available pool, not the fan-out.
         logger.info(
@@ -242,12 +242,7 @@ class TrainingCoordinator:
                 "task_name": task_name,
                 "runner_dir": runner_dir,
             }
-            if gift_eval_urls:
-                dispatch_payload["gift_eval_urls"] = gift_eval_urls
-            if pretrain_shard_urls:
-                dispatch_payload["pretrain_shard_urls"] = pretrain_shard_urls
-            if pretrain_val_shard_urls:
-                dispatch_payload["pretrain_val_shard_urls"] = pretrain_val_shard_urls
+            dispatch_payload.update(extras)
             payload = json.dumps(dispatch_payload).encode()
 
             dispatch_tasks.append((job, trainer_url, payload))
