@@ -41,17 +41,15 @@ Structured records (experiments, provenance, access logs, frontier metadata) liv
 Four phases per round, each with a different trust property:
 
 ```mermaid
-flowchart TD
-    Start([Round start<br/>block hash → FLOPs size bucket])
-    Start --> A
-    A["<b>Phase A · DESIGN</b> — ~10 min / 50 blocks<br/><br/>Validator fetches miner's agent .py bundle and injects it<br/>into the subnet's sandboxed agent container.<br/>Egress allowlist: validator proxy · LLM proxy · presigned R2<br/>(iptables + GatedClient enforcement).<br/><br/>Agent reads Challenge → writes Proposal<br/>(PyTorch arch + training recipe)."]
-    A --> B
-    B["<b>Phase B · TRAINING</b> — ~30 min / 150 blocks · runs ONCE<br/><br/>Miner A's architecture trains on Miner B's attested trainer pod.<br/>Frozen training image; digest attested vs on-chain commitment.<br/>Checkpoint + SHA-256 uploaded to R2 via presigned URLs<br/>(no R2 credentials on trainer pods)."]
-    B --> C
-    C["<b>Phase C · EVALUATION</b> — ~5 min / 25 blocks · every validator<br/><br/>Download checkpoint → verify hash → load safetensors →<br/>run frozen eval → CRPS, MASE, FLOPs.<br/><br/><i>Trust anchor: cheap, deterministic, identical scores<br/>across validators from identical checkpoints.</i>"]
-    C --> D
-    D["<b>Phase D · FALLBACK / SCORING</b> — ~10 min / 50 blocks<br/><br/>Re-dispatch stalled jobs to subnet owner's fallback proxy.<br/>softmax(temp=0.1) → EMA(α=0.3) → set_weights on chain."]
-    D --> End([Total: 275 blocks / ~55 min])
+flowchart LR
+    Start([Block hash<br/>→ size bucket])
+    A["<b>A · DESIGN</b><br/>~10 min · 50 blocks<br/><br/>Agent .py runs in<br/>sandboxed container<br/>(egress allowlist).<br/>Challenge → Proposal<br/>(arch + recipe)."]
+    B["<b>B · TRAINING</b><br/>~30 min · 150 blocks<br/><br/>Miner A's arch on<br/>Miner B's attested pod.<br/>Frozen image, digest<br/>verified on-chain.<br/>Checkpoint → R2."]
+    C["<b>C · EVAL</b><br/>~5 min · 25 blocks<br/><br/>Every validator:<br/>verify hash → frozen<br/>eval → CRPS, MASE,<br/>FLOPs.<br/><i>Trust anchor.</i>"]
+    D["<b>D · SCORING</b><br/>~10 min · 50 blocks<br/><br/>Re-dispatch stalled.<br/>softmax(0.1) → EMA(0.3)<br/>→ set_weights."]
+    End([275 blocks<br/>~55 min])
+
+    Start --> A --> B --> C --> D --> End
 ```
 
 Each round targets a FLOPs size bucket derived deterministically from the block hash. Outside the bucket = zero score. Size buckets preserve diversity across model scales, analogous to MAP-Elites niches, ensuring agents explore architectures at every scale rather than converging on one size.
