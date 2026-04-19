@@ -23,14 +23,32 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 # Default Desearch (SN22) endpoint base URL.
-# The actual path used is /desearch/ai/search/links/web.
+# The actual path used is /desearch/ai/search.
 DEFAULT_SN22_URL = "https://api.desearch.ai"
+DESEARCH_SEARCH_PATH = "/desearch/ai/search"
 
 # Desearch "tools" values — restrict to arxiv/web; miners don't get to
 # choose other tools (twitter, etc.) through this proxy.
 DESEARCH_TOOL_ARXIV = "arxiv"
 DESEARCH_TOOL_WEB = "web"
 ALLOWED_TOOLS = {DESEARCH_TOOL_ARXIV, DESEARCH_TOOL_WEB}
+
+# Allowed values for the Desearch `date_filter` field.
+ALLOWED_DATE_FILTERS = {
+    "NONE",
+    "PAST_24_HOURS",
+    "PAST_2_DAYS",
+    "PAST_WEEK",
+    "PAST_2_WEEKS",
+    "PAST_MONTH",
+    "PAST_2_MONTHS",
+    "PAST_YEAR",
+    "PAST_2_YEARS",
+}
+
+# Desearch response shape we request. Gives us a list of link objects plus
+# a final summary string.
+DESEARCH_RESULT_TYPE = "LINKS_WITH_FINAL_SUMMARY"
 
 # Rate limit: max queries per miner per tempo
 MAX_QUERIES_PER_TEMPO = 20
@@ -45,6 +63,7 @@ class SearchQuery(BaseModel):
     query: str = Field(..., min_length=1, max_length=500)
     max_results: int = Field(default=5, ge=1, le=20)
     tool: str = Field(default=DESEARCH_TOOL_ARXIV)
+    date_filter: str = Field(default="NONE")
 
 
 class SearchResult(BaseModel):
@@ -136,9 +155,10 @@ class DesearchProxy:
     async def search(
         self, miner_uid: int, query: str, max_results: int = 5,
         miner_hotkey: str = "", tool: str = DESEARCH_TOOL_ARXIV,
+        date_filter: str = "NONE",
     ) -> SearchResponse:
         """
-        Search via the Desearch /desearch/ai/search/links/web endpoint.
+        Search via the Desearch /desearch/ai/search endpoint.
 
         Raises HTTPException(429) if the miner has exhausted their quota.
         """
@@ -146,6 +166,11 @@ class DesearchProxy:
             raise HTTPException(
                 status_code=400,
                 detail=f"Unsupported tool '{tool}'. Allowed: {sorted(ALLOWED_TOOLS)}.",
+            )
+        if date_filter not in ALLOWED_DATE_FILTERS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported date_filter '{date_filter}'.",
             )
 
         remaining = self.remaining_queries(miner_uid)
@@ -159,12 +184,19 @@ class DesearchProxy:
         remaining -= 1
 
         headers = {"Authorization": self.api_key} if self.api_key else {}
+        body = {
+            "prompt": query,
+            "tools": [tool],
+            "date_filter": date_filter,
+            "result_type": DESEARCH_RESULT_TYPE,
+            "count": max_results,
+        }
 
         try:
             client = await self._get_client()
             resp = await client.post(
-                f"{self.sn22_url}/desearch/ai/search/links/web",
-                json={"prompt": query, "tools": [tool]},
+                f"{self.sn22_url}{DESEARCH_SEARCH_PATH}",
+                json=body,
                 headers=headers,
                 timeout=30.0,
             )
@@ -250,7 +282,8 @@ def register_routes(app: FastAPI):
         miner_uid = _extract_miner_uid(request)
         miner_hotkey = _extract_miner_hotkey(request)
         return await proxy.search(
-            miner_uid, req.query, req.max_results, miner_hotkey, req.tool,
+            miner_uid, req.query, req.max_results, miner_hotkey,
+            req.tool, req.date_filter,
         )
 
     @app.get("/desearch/quota")
