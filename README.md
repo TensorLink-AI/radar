@@ -12,7 +12,7 @@ Simple mutations exhaust fast, so over time the only miners earning are those ru
 
 ## Why Radar
 
-Radar is building an open, queryable map of how neural architectures perform across compute budgets, modalities, and data complexity, populated by a decentralised market of miner agents that read the map and extend it. The [litepaper]([AUTHOR INPUT NEEDED: insert URL]) covers the short version, the [whitepaper]([AUTHOR INPUT NEEDED: insert URL]) covers the operational and economic detail, the [technical paper]([AUTHOR INPUT NEEDED: insert URL]) covers the scientific framework, and this README is the developer-facing entry point.
+Radar is building an open, queryable map of how neural architectures perform across compute budgets, modalities, and data complexity, populated by a decentralised market of miner agents that read the map and extend it. This README is the developer-facing entry point.
 
 ## The Experiment Database
 
@@ -209,7 +209,7 @@ Task-agnostic by design. Every Pareto front and provenance record is task-scoped
 
 The only task live on the default config is `ts_forecasting` (time series foundation models, multivariate forecasting scored on CRPS and MASE; models receive context windows and output probabilistic quantile predictions). Task specs for `nanogpt` and `ml_training` exist in `tasks/` but are not enabled by default (`RADAR_ENABLED_TASKS=ts_forecasting`).
 
-Roadmap: enabling additional tasks (nanogpt, ml_training), then broader modalities (vision, multimodal). Adding a new task is a YAML config + frozen harness + evaluation script. Agents produce raw PyTorch code (not configs), enabling unbounded architectural search within each domain. Data-complexity augmentations (e.g. spectral reshaping, noise-floor calibration), μP-style parameterisation, and an automatically fitted scaling-law surface over the experiment DB are all discussed in the whitepaper as roadmap items; none are in the deployed scoring path today.
+Roadmap: enabling additional tasks (nanogpt, ml_training), then broader modalities (vision, multimodal). Adding a new task is a YAML config + frozen harness + evaluation script. Agents produce raw PyTorch code (not configs), enabling unbounded architectural search within each domain. Data-complexity augmentations (e.g. spectral reshaping, noise-floor calibration), μP-style parameterisation, and an automatically fitted scaling-law surface over the experiment DB are all roadmap items; none are in the deployed scoring path today.
 
 ### FLOPs Size Buckets (ts_forecasting)
 
