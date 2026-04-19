@@ -47,7 +47,7 @@ _MAX_BODY_BYTES: int = 5 * 1024 * 1024
 
 # Agent code limits
 _MAX_AGENT_FILES: int = 25          # max .py files per submission
-_MAX_AGENT_FILE_BYTES: int = 50_000  # 50 KB per file
+_MAX_AGENT_FILE_BYTES: int = 100_000  # 100 KB per file
 
 # Nonce replay protection: track recently seen nonces
 _nonce_cache: set[str] = set()
