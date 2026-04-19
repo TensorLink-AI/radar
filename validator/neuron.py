@@ -475,8 +475,9 @@ class Validator:
             except Exception as e:
                 logger.warning("Failed to generate GIFT-Eval presigned URLs: %s", e)
 
-        # Generate presigned GET URLs for pretrain shards (training)
+        # Generate presigned GET URLs for pretrain shards (training + val)
         pretrain_shard_urls: list[str] = []
+        pretrain_val_shard_urls: list[str] = []
         if self.pretrain_r2:
             try:
                 from shared.pretrain_data import PretrainBenchmark
@@ -489,6 +490,11 @@ class Validator:
                     n=Config.PRETRAIN_SHARDS_PER_ROUND,
                 )
                 pretrain_shard_urls = pretrain.generate_presigned_shard_urls(shard_keys)
+                val_shard_keys = pretrain.get_val_shard_keys()
+                if val_shard_keys:
+                    pretrain_val_shard_urls = pretrain.generate_presigned_shard_urls(
+                        val_shard_keys,
+                    )
             except Exception as e:
                 logger.warning("Failed to generate pretrain shard URLs: %s", e)
 
@@ -497,6 +503,7 @@ class Validator:
             commitments=commitments,
             gift_eval_urls=gift_eval_urls,
             pretrain_shard_urls=pretrain_shard_urls,
+            pretrain_val_shard_urls=pretrain_val_shard_urls,
         )
         _OK_STATUSES = ("success", "accepted", "already_running")
         succeeded = sum(1 for r in my_results if r.status == "success")

@@ -174,10 +174,12 @@ async def train(request: Request):
     upload_urls = data.get("upload_urls", {})
     gift_eval_urls = data.get("gift_eval_urls", {})
     pretrain_shard_urls = data.get("pretrain_shard_urls", [])
+    pretrain_val_shard_urls = data.get("pretrain_val_shard_urls", [])
 
     asyncio.create_task(_train_and_upload(
         runner_fn, architecture_code, training_config,
         upload_urls, gift_eval_urls, pretrain_shard_urls,
+        pretrain_val_shard_urls,
     ))
 
     logger.info(
@@ -197,6 +199,7 @@ async def _train_and_upload(
     upload_urls: dict,
     gift_eval_urls: dict,
     pretrain_shard_urls: list[str] | None = None,
+    pretrain_val_shard_urls: list[str] | None = None,
 ):
     """Background task: download data, train, upload artifacts, release semaphore."""
     round_id = training_config["round_id"]
@@ -216,6 +219,12 @@ async def _train_and_upload(
             logger.info("Set %d pretrain shard URLs for training", len(pretrain_shard_urls))
         else:
             os.environ.pop("RADAR_PRETRAIN_SHARD_URLS", None)
+
+        if pretrain_val_shard_urls:
+            os.environ["RADAR_PRETRAIN_VAL_SHARD_URLS"] = json.dumps(pretrain_val_shard_urls)
+            logger.info("Set %d pretrain val shard URLs", len(pretrain_val_shard_urls))
+        else:
+            os.environ.pop("RADAR_PRETRAIN_VAL_SHARD_URLS", None)
 
         # Run training
         t0 = time.time()
@@ -300,6 +309,10 @@ def _upload_artifacts(
         num_steps=result.get("num_steps", 0),
         num_params_M=result.get("num_params_M", 0),
         peak_vram_mb=result.get("peak_vram_mb", 0),
+        train_loss_history=result.get("train_loss_history", []),
+        val_loss_history=result.get("val_loss_history", []),
+        best_val_loss=result.get("best_val_loss"),
+        best_val_step=result.get("best_val_step", -1),
     )
 
     upload_ok = True
