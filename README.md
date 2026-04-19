@@ -40,34 +40,18 @@ Structured records (experiments, provenance, access logs, frontier metadata) liv
 
 Four phases per round, each with a different trust property:
 
-```
-Phase A: DESIGN (~10 min, 50 blocks)
-  Validators fetch each miner's agent code (.py bundle) and inject it
-  into the subnet's official sandboxed agent container. Network egress
-  is allowlist-gated (iptables + GatedClient); the only reachable hosts
-  are the validator proxy, the subnet's LLM proxy, and presigned R2 URLs.
-  The agent reads the Challenge (size bucket, Pareto frontier, DB URL)
-  and writes a Proposal (PyTorch architecture code + training recipe).
-
-Phase B: TRAINING (~30 min, 150 blocks, runs ONCE per submission)
-  Miner A's architecture trains on Miner B's attested trainer pod.
-  The pod runs the subnet's frozen training image on the pluggable GPU
-  backend; the image digest is cryptographically attested against the
-  on-chain commitment. Nobody can tamper with training. Checkpoints +
-  SHA-256 hashes are uploaded to shared R2 storage via time-limited
-  presigned URLs (no R2 credentials on trainer pods).
-
-Phase C: EVALUATION (~5 min, 25 blocks, EVERY validator independently)
-  Download checkpoint -> verify hashes -> load weights (safetensors) ->
-  run frozen eval -> CRPS, MASE, FLOPs verification.
-
-  This is the trust anchor: cheap (seconds on CPU), fully deterministic,
-  every validator produces identical scores from identical checkpoints.
-
-Phase D: FALLBACK / SCORING (~10 min, 50 blocks)
-  Re-dispatch any jobs whose trainer pod failed to the subnet owner's
-  fallback proxy, finalise scores, apply softmax + EMA, call set_weights
-  on chain. Total round: 275 blocks (~55 min) at default config.
+```mermaid
+flowchart TD
+    Start([Round start<br/>block hash → FLOPs size bucket])
+    Start --> A
+    A["<b>Phase A · DESIGN</b> — ~10 min / 50 blocks<br/><br/>Validator fetches miner's agent .py bundle and injects it<br/>into the subnet's sandboxed agent container.<br/>Egress allowlist: validator proxy · LLM proxy · presigned R2<br/>(iptables + GatedClient enforcement).<br/><br/>Agent reads Challenge → writes Proposal<br/>(PyTorch arch + training recipe)."]
+    A --> B
+    B["<b>Phase B · TRAINING</b> — ~30 min / 150 blocks · runs ONCE<br/><br/>Miner A's architecture trains on Miner B's attested trainer pod.<br/>Frozen training image; digest attested vs on-chain commitment.<br/>Checkpoint + SHA-256 uploaded to R2 via presigned URLs<br/>(no R2 credentials on trainer pods)."]
+    B --> C
+    C["<b>Phase C · EVALUATION</b> — ~5 min / 25 blocks · every validator<br/><br/>Download checkpoint → verify hash → load safetensors →<br/>run frozen eval → CRPS, MASE, FLOPs.<br/><br/><i>Trust anchor: cheap, deterministic, identical scores<br/>across validators from identical checkpoints.</i>"]
+    C --> D
+    D["<b>Phase D · FALLBACK / SCORING</b> — ~10 min / 50 blocks<br/><br/>Re-dispatch stalled jobs to subnet owner's fallback proxy.<br/>softmax(temp=0.1) → EMA(α=0.3) → set_weights on chain."]
+    D --> End([Total: 275 blocks / ~55 min])
 ```
 
 Each round targets a FLOPs size bucket derived deterministically from the block hash. Outside the bucket = zero score. Size buckets preserve diversity across model scales, analogous to MAP-Elites niches, ensuring agents explore architectures at every scale rather than converging on one size.
