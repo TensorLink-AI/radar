@@ -2,7 +2,7 @@
 
 from shared.challenge import (
     generate_challenge, round_start_block, current_phase,
-    SIZE_BUCKETS,
+    select_task, SIZE_BUCKETS,
 )
 
 
@@ -63,17 +63,55 @@ def test_current_phase_evaluation():
     assert current_phase(324, 100) == "evaluation"
 
 
-def test_current_phase_scoring_with_fallback():
-    """Scoring phase only appears when fallback_window > 0."""
-    assert current_phase(325, 100, fallback_window=50) == "scoring"
-    assert current_phase(374, 100, fallback_window=50) == "scoring"
+def test_current_phase_scoring():
+    """Scoring phase covers fallback/scoring window after evaluation."""
+    assert current_phase(325, 100) == "scoring"
+    assert current_phase(374, 100) == "scoring"
 
 
-def test_current_phase_no_scoring_by_default():
-    """Without fallback window, evaluation goes straight to idle."""
-    assert current_phase(325, 100) == "idle"
+def test_current_phase_no_scoring_zero_window():
+    """Without scoring window, evaluation goes straight to idle."""
+    assert current_phase(325, 100, scoring_window=0) == "idle"
 
 
 def test_current_phase_idle():
-    assert current_phase(375, 100, fallback_window=50) == "idle"
+    assert current_phase(375, 100) == "idle"
     assert current_phase(99, 100) == "idle"
+
+
+# ── Task Selection ──────────────────────────────────────────────
+
+
+def test_select_task_single():
+    """Single task always selected."""
+    result = select_task("a" * 64, ["ts_forecasting"])
+    assert result == "ts_forecasting"
+
+
+def test_select_task_deterministic():
+    """Same block hash -> same task."""
+    h = "abcdef1234567890" * 4
+    t1 = select_task(h, ["ts_forecasting", "nanogpt", "ml_training"])
+    t2 = select_task(h, ["ts_forecasting", "nanogpt", "ml_training"])
+    assert t1 == t2
+
+
+def test_select_task_varies_by_hash():
+    """Different hashes usually pick different tasks (with enough tasks)."""
+    import hashlib
+    tasks = ["task_a", "task_b", "task_c", "task_d", "task_e"]
+    # Use sha256 of integers so the first 16 hex chars vary widely
+    selections = {
+        select_task(hashlib.sha256(str(i).encode()).hexdigest(), tasks)
+        for i in range(100)
+    }
+    # With 100 hashes and 5 tasks, we should see more than 1 task
+    assert len(selections) > 1
+
+
+def test_select_task_order_independent():
+    """Task list order doesn't matter — sorted internally."""
+    h = "f" * 64
+    t1 = select_task(h, ["b_task", "a_task", "c_task"])
+    t2 = select_task(h, ["c_task", "a_task", "b_task"])
+    assert t1 == t2

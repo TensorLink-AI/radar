@@ -1,11 +1,9 @@
 """
-Pareto front management with diversity-aware candidate sampling.
+Pareto front management for multi-objective experiment tracking.
 
-Now task-agnostic: objectives come from the TaskSpec, not hardcoded.
+Task-agnostic: objectives come from the TaskSpec, not hardcoded.
 """
 
-import math
-import random
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -14,16 +12,13 @@ from shared.database import DataElement
 
 @dataclass
 class ParetoCandidate:
-    """A candidate on the Pareto front with selection metadata."""
+    """A candidate on the Pareto front."""
     element: DataElement
-    selection_count: int = 0
-    successful_children: int = 0
-    ucb_score: float = float("inf")
 
 
 class ParetoFront:
     """
-    Multi-objective Pareto front with UCT-inspired sampling.
+    Multi-objective Pareto front.
 
     Objectives are defined by a pluggable function. All values normalized
     so that lower = better internally for dominance comparisons.
@@ -36,7 +31,6 @@ class ParetoFront:
     ):
         self.max_size = max_size
         self.candidates: list[ParetoCandidate] = []
-        self.total_selections: int = 0
         self._objective_fn = objective_fn or self._default_objectives
 
     def _dominates(self, a: DataElement, b: DataElement) -> bool:
@@ -70,55 +64,22 @@ class ParetoFront:
         self.candidates.append(ParetoCandidate(element=element))
 
         if len(self.candidates) > self.max_size:
-            self.candidates.sort(key=lambda c: -c.selection_count)
-            self.candidates.pop(0)
+            # Evict worst primary objective; break ties by index for determinism
+            self.candidates.sort(
+                key=lambda c: (self._objective_fn(c.element)[0], -c.element.index),
+            )
+            self.candidates.pop()
 
         return True
 
     def would_add(self, element: DataElement) -> bool:
-        """Return True if this element would be added to the front (is non-dominated)."""
+        """Return True if this element would be added to the front."""
         if not element.success or element.metric is None:
             return False
         for c in self.candidates:
             if self._dominates(c.element, element):
                 return False
         return True
-
-    def sample_via_uct(self, exploration_weight: float = 1.414) -> Optional[DataElement]:
-        """Sample one candidate using UCT scoring."""
-        samples = self.sample(n=1, exploration_weight=exploration_weight)
-        return samples[0] if samples else None
-
-    def sample(self, n: int = 1, exploration_weight: float = 1.414) -> list[DataElement]:
-        """Sample n candidates using UCT scoring."""
-        if not self.candidates:
-            return []
-
-        n = min(n, len(self.candidates))
-
-        for c in self.candidates:
-            if c.selection_count == 0:
-                c.ucb_score = float("inf")
-            else:
-                metrics = sorted(set(
-                    self._objective_fn(cand.element)[0]
-                    for cand in self.candidates
-                ))
-                rank = metrics.index(self._objective_fn(c.element)[0])
-                exploitation = 1.0 - (rank / max(len(metrics) - 1, 1))
-                exploration = exploration_weight * math.sqrt(
-                    math.log(self.total_selections + 1) / c.selection_count
-                )
-                c.ucb_score = exploitation + exploration
-
-        ranked = sorted(self.candidates, key=lambda c: -c.ucb_score)
-        selected = ranked[:n]
-
-        for c in selected:
-            c.selection_count += 1
-        self.total_selections += n
-
-        return [c.element for c in selected]
 
     def count_dominated_by(self, element: DataElement) -> int:
         """Count how many current front members are dominated by element."""
@@ -127,11 +88,6 @@ class ParetoFront:
             if self._dominates(element, c.element):
                 count += 1
         return count
-
-    def record_child_outcome(self, parent_index: int, success: bool):
-        for c in self.candidates:
-            if c.element.index == parent_index and success:
-                c.successful_children += 1
 
     @property
     def best(self) -> Optional[DataElement]:
@@ -163,6 +119,6 @@ class ParetoFront:
             objs = self._objective_fn(c.element)
             lines.append(
                 f"  [{c.element.index:04d}] {c.element.name} | "
-                f"metric={objs[0]:.6f} | selected={c.selection_count}"
+                f"metric={objs[0]:.6f}"
             )
         return "\n".join(lines)

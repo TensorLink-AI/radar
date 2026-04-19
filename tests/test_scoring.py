@@ -51,28 +51,29 @@ def test_size_gate_at_boundary():
 
 
 def test_size_gate_tolerance():
-    """Models within 50% of bucket boundary should pass (default tolerance)."""
-    # Over max (500K * 1.50 = 750K) — should pass
-    metrics = {"flops_equivalent_size": 700_000}
+    """Models within 10% of bucket boundary should pass (default tolerance)."""
+    # Over max (500K * 1.10 = 550K) — should pass
+    metrics = {"flops_equivalent_size": 540_000}
     assert passes_size_gate(metrics, _MockChallenge())
-    # Under min (100K * 0.50 = 50K) — should pass
-    metrics = {"flops_equivalent_size": 55_000}
+    # Under min (100K * 0.90 = 90K) — should pass
+    metrics = {"flops_equivalent_size": 92_000}
     assert passes_size_gate(metrics, _MockChallenge())
-    # Way over — should fail
-    metrics = {"flops_equivalent_size": 900_000}
+    # Over 10% tolerance — should fail
+    metrics = {"flops_equivalent_size": 600_000}
     assert not passes_size_gate(metrics, _MockChallenge())
 
 
 def test_size_gate_tolerance_large_bucket():
-    """150M FLOPs should pass the large bucket (max 125M) with 50% tolerance."""
+    """137M FLOPs should pass the large bucket (max 125M) with 10% tolerance."""
     class _LargeBucket:
         min_flops_equivalent = 100_000
         max_flops_equivalent = 125_000_000
 
-    metrics = {"flops_equivalent_size": 150_000_000}
+    # 125M * 1.10 = 137.5M — should pass
+    metrics = {"flops_equivalent_size": 135_000_000}
     assert passes_size_gate(metrics, _LargeBucket())
-    # Way over should still fail
-    metrics = {"flops_equivalent_size": 250_000_000}
+    # Over 10% tolerance — should fail
+    metrics = {"flops_equivalent_size": 150_000_000}
     assert not passes_size_gate(metrics, _LargeBucket())
 
 
@@ -131,7 +132,8 @@ def test_penalties_failed_trainer():
     training_metas = {0: {"status": "failed", "trainer_uid": 1}}
     eval_results = {}
     penalties = compute_penalties(training_metas, eval_results)
-    assert penalties.get(1, 0) > 0
+    # Penalty is on arch_owner (uid=0), not trainer_uid
+    assert penalties.get(0, 0) > 0
 
 
 def test_penalties_flops_mismatch():
@@ -185,3 +187,59 @@ def test_ema_update_existing():
     ema = {0: 1.0}
     ema = ema_update(ema, {0: 0.0}, [0], alpha=0.3)
     assert abs(ema[0] - 0.7) < 1e-6  # 0.3*0.0 + 0.7*1.0
+
+
+# ── frontier improvement threshold tests ──
+
+def _frontier_with_best_crps(best_crps: float) -> ParetoFront:
+    """Build a frontier seeded with one member at the given CRPS, in-bucket."""
+    elem = DataElement(
+        metric=best_crps, success=True,
+        objectives={
+            "crps": best_crps,
+            "flops_equivalent_size": 200_000,
+        },
+    )
+    return _pareto([elem])
+
+
+def test_score_round_tie_with_frontier_scores_zero():
+    """Matching the frontier's best CRPS is not enough — must beat it."""
+    frontier = _frontier_with_best_crps(0.4)
+    eval_results = {
+        0: {"crps": 0.4, "mase": 0.5, "flops_equivalent_size": 200_000, "passed_size_gate": True},
+    }
+    scores = score_round(eval_results, _MockChallenge(), frontier, _objectives(), {})
+    assert scores[0] == 0.0
+
+
+def test_score_round_below_threshold_scores_zero():
+    """Improvement under the 0.5% default threshold scores zero."""
+    frontier = _frontier_with_best_crps(0.4)
+    # 0.1% improvement (well below 0.5% threshold)
+    eval_results = {
+        0: {"crps": 0.4 * 0.999, "mase": 0.5, "flops_equivalent_size": 200_000, "passed_size_gate": True},
+    }
+    scores = score_round(eval_results, _MockChallenge(), frontier, _objectives(), {})
+    assert scores[0] == 0.0
+
+
+def test_score_round_above_threshold_scores_positive():
+    """Beating the frontier by more than the threshold earns a score."""
+    frontier = _frontier_with_best_crps(0.4)
+    # 5% improvement — well above 0.5% threshold
+    eval_results = {
+        0: {"crps": 0.4 * 0.95, "mase": 0.5, "flops_equivalent_size": 200_000, "passed_size_gate": True},
+    }
+    scores = score_round(eval_results, _MockChallenge(), frontier, _objectives(), {})
+    assert scores[0] > 0.0
+
+
+def test_score_round_regression_scores_zero():
+    """Worse than frontier → zero."""
+    frontier = _frontier_with_best_crps(0.4)
+    eval_results = {
+        0: {"crps": 0.5, "mase": 0.6, "flops_equivalent_size": 200_000, "passed_size_gate": True},
+    }
+    scores = score_round(eval_results, _MockChallenge(), frontier, _objectives(), {})
+    assert scores[0] == 0.0

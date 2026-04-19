@@ -7,6 +7,7 @@ identical scores from identical checkpoints.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import TYPE_CHECKING
 
@@ -14,12 +15,14 @@ if TYPE_CHECKING:
     from shared.pareto import ParetoFront
     from shared.task import Objective
 
+logger = logging.getLogger(__name__)
+
 
 def passes_size_gate(metrics: dict, challenge) -> bool:
-    """Hard gate with configurable tolerance for wallclock calibration noise.
+    """Hard gate with configurable tolerance for FLOPs measurement variance.
 
-    Default 50% — wallclock calibration varies significantly across CPU
-    hardware, especially for small models where overhead dominates compute.
+    Default 10% — analytical FLOPs counting (torch.utils.flop_counter) is
+    exact for standard ops; wallclock calibration fallback for custom ops.
     """
     from config import Config
     tolerance = Config.SIZE_GATE_TOLERANCE
@@ -35,6 +38,7 @@ def score_round(
     frontier: "ParetoFront",
     objectives: list["Objective"],
     penalties: dict[int, float],
+    training_metas: dict[int, dict] | None = None,
 ) -> dict[int, float]:
     """Score all miners in a round using Phase C eval results.
 
@@ -54,8 +58,20 @@ def score_round(
     for uid, metrics in eval_results.items():
         if not metrics.get("passed_size_gate", False):
             scores[uid] = 0.0
+            logger.info(
+                "UID %d scored 0: failed size gate "
+                "(flops=%d, allowed=[%d, %d], error=%s)",
+                uid, metrics.get("flops_equivalent_size", 0),
+                challenge.min_flops_equivalent,
+                challenge.max_flops_equivalent,
+                metrics.get("error", ""),
+            )
         elif metrics.get("crps") is None or not math.isfinite(metrics.get("crps", float("inf"))):
             scores[uid] = 0.0
+            logger.info(
+                "UID %d scored 0: invalid CRPS=%s error=%s",
+                uid, metrics.get("crps"), metrics.get("error", ""),
+            )
         else:
             feasible[uid] = metrics
 
@@ -77,22 +93,42 @@ def score_round(
             scores[uid] = 1.0 - (rank / max(n, 1))
     else:
         # Rank by improvement beyond frontier best CRPS
+        from config import Config
+        threshold = Config.FRONTIER_IMPROVEMENT_THRESHOLD
         best_front_crps = min(
             (c.element.objectives.get("crps", float("inf")) for c in feasible_front),
             default=float("inf"),
         )
         for uid, metrics in ranked:
             crps = metrics.get("crps", float("inf"))
-            if best_front_crps > 0:
+            if best_front_crps > 1e-9:
                 improvement = (best_front_crps - crps) / max(abs(best_front_crps), 1e-8)
             else:
                 improvement = 0.0
+
+            # Gate: must beat the feasible frontier's best CRPS by at least
+            # `threshold` (fractional) to earn a score. Ties and regressions → 0.
+            if improvement < threshold:
+                scores[uid] = 0.0
+                logger.info(
+                    "UID %d scored 0: CRPS %.6f vs frontier best %.6f "
+                    "(improvement %.4f%% < threshold %.4f%%)",
+                    uid, crps, best_front_crps,
+                    improvement * 100.0, threshold * 100.0,
+                )
+                continue
+
             scores[uid] = _sigmoid(improvement, steepness=20.0)
 
-            # Pareto dominance bonus
+            # Pareto dominance bonus — merge training meta for full objective vector
+            merged_objectives = dict(metrics)
+            if training_metas and uid in training_metas:
+                tm = training_metas[uid]
+                merged_objectives.setdefault("exec_time", tm.get("training_time_seconds", float("inf")))
+                merged_objectives.setdefault("memory_mb", tm.get("peak_vram_mb", float("inf")))
             temp = DataElement(
                 metric=crps, success=True,
-                objectives=metrics,
+                objectives=merged_objectives,
             )
             if frontier.count_dominated_by(temp) > 0:
                 scores[uid] *= 1.5
@@ -109,27 +145,24 @@ def compute_penalties(
     training_metas: dict[int, dict],
     eval_results: dict[int, dict],
 ) -> dict[int, float]:
-    """Compute per-miner penalties.
+    """Compute per-miner penalties keyed by arch_owner UID.
 
-    - Trainer claimed FLOPs doesn't match validator-measured FLOPs -> penalty on trainer
-    - Trainer returned failure/timeout -> reliability penalty on trainer
+    Penalties apply to the architecture owner (the miner being scored),
+    not the trainer (who may be a different miner in cross-eval).
     """
     penalties: dict[int, float] = {}
 
     for uid, meta in training_metas.items():
         status = meta.get("status", "")
         if status == "attestation_failed":
-            trainer_uid = meta.get("trainer_uid", uid)
-            penalties[trainer_uid] = penalties.get(trainer_uid, 0.0) + 1.0
-        elif status in ("failed", "timeout", "build_failed"):
-            trainer_uid = meta.get("trainer_uid", uid)
-            penalties[trainer_uid] = penalties.get(trainer_uid, 0.0) + 0.5
+            penalties[uid] = min(1.0, penalties.get(uid, 0.0) + 1.0)
+        elif status in ("failed", "timeout", "build_failed", "size_violation"):
+            penalties[uid] = min(1.0, penalties.get(uid, 0.0) + 0.5)
 
         if uid in eval_results:
             ev = eval_results[uid]
             if not ev.get("flops_verified", True):
-                trainer_uid = meta.get("trainer_uid", uid)
-                penalties[trainer_uid] = penalties.get(trainer_uid, 0.0) + 0.3
+                penalties[uid] = min(1.0, penalties.get(uid, 0.0) + 0.3)
 
     return penalties
 

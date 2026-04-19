@@ -1,12 +1,8 @@
 """
-Code similarity and parent identity checking.
+Code similarity for provenance queries.
 
-The only objective deduplication gate: did the miner actually change the code
-from the parent they were given? Cross-miner similarity is gameable (rename
-variables, add dead code, reorder functions), so we don't use it as a gate.
-
-The Pareto front + metrics handle the rest — two identical models produce
-identical metrics, and only the first one joins the front.
+Used by shared/provenance.py for observational similarity analysis —
+not used as a submission gate.
 """
 
 import re
@@ -33,20 +29,6 @@ def code_similarity(code_a: str, code_b: str) -> float:
 
     return intersection / union if union > 0 else 0.0
 
-
-def is_unchanged_from_parent(code: str, parent_code: str, threshold: float = 0.95) -> bool:
-    """
-    Check if submitted code is essentially unchanged from the parent.
-
-    This is the hard gate: miners MUST modify the code they receive.
-    Threshold of 0.95 catches copy-paste with trivial whitespace changes
-    while allowing submissions that make real modifications.
-
-    Returns: True if code is too similar to parent (should be rejected).
-    """
-    if not code or not parent_code:
-        return False
-    return code_similarity(code, parent_code) >= threshold
 
 
 def _tokenize_code(code: str) -> list[str]:

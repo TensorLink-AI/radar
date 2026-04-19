@@ -157,24 +157,14 @@ if envs:
             docker rm $ORPHANED 2>/dev/null || true
         fi
     done
-    # Delete Basilica deployments if any
-    if [ -f "$LOG_DIR/trainer_urls.txt.deployments" ] 2>/dev/null; then
-        python3 -c "
-from basilica import BasilicaClient
-client = BasilicaClient()
-with open('$LOG_DIR/trainer_urls.txt.deployments') as f:
-    for name in f:
-        name = name.strip()
-        if name:
-            try:
-                client.delete_deployment(name)
-                print(f'Deleted Basilica deployment: {name}')
-            except Exception as e:
-                print(f'Failed to delete {name}: {e}')
-" 2>&1 | while IFS= read -r line; do echo "  $line"; done || warn "Basilica cleanup failed — deployments may need manual deletion (TTL: 1h)"
+    # Clean up Basilica deployments (warm-standby model — miners manage their own,
+    # but TTL safety net ensures cleanup even without explicit teardown)
+    if [ "$USE_BASILICA" = true ]; then
+        info "Basilica deployments auto-cleanup via TTL (no manual teardown needed)"
     fi
     # Clean commitment files
-    rm -rf /tmp/radar_commitments 2>/dev/null || true
+    # Don't delete commitments — they may be needed across test restarts
+    # rm -rf /tmp/radar_commitments 2>/dev/null || true
     echo ""
     ok "Cleanup complete. Logs preserved at: $LOG_DIR/"
 }
@@ -304,7 +294,7 @@ echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${GITHUB_USER:-dev}" --password-
 ok "Logged in to ghcr.io"
 
 # Map of available agents — cycle through them for N miners
-AGENT_DIRS=("example_agents/systematic" "example_agents/failure_analyst" "example_agents/lineage_tracker")
+AGENT_DIRS=("miner_template" "miner_template" "miner_template")
 AGENT_NAMES=("agent-systematic" "agent-failure" "agent-lineage")
 AGENT_GHCR_URLS=()
 
@@ -335,29 +325,41 @@ for i in "${!AGENT_DIRS[@]}"; do
 done
 
 # =============================================================================
-# STEP 2b: Build trainer Docker image and push to GHCR
+# STEP 2b: Build generalist trainer Docker image and push to GHCR
 # =============================================================================
-step "Step 2b: Building trainer image and pushing to GHCR"
+step "Step 2b: Building generalist trainer image and pushing to GHCR"
 
-TRAINER_IMAGE="${GHCR_REPO}/ts-runner:latest"
+TRAINER_IMAGE="${GHCR_REPO}/radar-runner:latest"
 
-# Copy shared modules into runner build context (Dockerfile expects them)
-cp shared/auth.py runner/timeseries_forecast/auth.py
-cp shared/artifacts.py runner/timeseries_forecast/artifacts.py
-cp shared/r2_audit.py runner/timeseries_forecast/r2_audit.py
+# Copy shared modules into runner/ build context (top-level Dockerfile expects them)
+cp shared/auth.py runner/shared_auth.py
+cp shared/artifacts.py runner/shared_artifacts.py
+cp shared/r2_audit.py runner/shared_r2_audit.py
+cp shared/pretrain_data.py runner/shared_pretrain_data.py
+cp shared/gift_eval.py runner/shared_gift_eval.py
 
 TRAINER_LOG="${LOG_DIR}/trainer_build.log"
-if ! docker build -t ts-runner:latest runner/timeseries_forecast/ > "$TRAINER_LOG" 2>&1; then
-    rm -f runner/timeseries_forecast/auth.py runner/timeseries_forecast/artifacts.py runner/timeseries_forecast/r2_audit.py
-    echo "  Trainer build log: $TRAINER_LOG"
-    tail -20 "$TRAINER_LOG"
-    fail "Trainer Docker build failed — see log above"
+if ! docker build -t radar-runner:latest -f runner/Dockerfile runner/ > "$TRAINER_LOG" 2>&1; then
+    # Fallback: try the old per-task Dockerfile if the generalist one fails
+    warn "Generalist Dockerfile failed, falling back to timeseries_forecast Dockerfile"
+    cp shared/auth.py runner/timeseries_forecast/auth.py
+    cp shared/artifacts.py runner/timeseries_forecast/artifacts.py
+    cp shared/r2_audit.py runner/timeseries_forecast/r2_audit.py
+    cp shared/pretrain_data.py runner/timeseries_forecast/pretrain_data.py
+    cp shared/gift_eval.py runner/timeseries_forecast/gift_eval.py
+    if ! docker build -t radar-runner:latest runner/timeseries_forecast/ >> "$TRAINER_LOG" 2>&1; then
+        rm -f runner/timeseries_forecast/auth.py runner/timeseries_forecast/artifacts.py runner/timeseries_forecast/r2_audit.py runner/timeseries_forecast/pretrain_data.py runner/timeseries_forecast/gift_eval.py
+        echo "  Trainer build log: $TRAINER_LOG"
+        tail -20 "$TRAINER_LOG"
+        fail "Trainer Docker build failed — see log above"
+    fi
+    rm -f runner/timeseries_forecast/auth.py runner/timeseries_forecast/artifacts.py runner/timeseries_forecast/r2_audit.py runner/timeseries_forecast/pretrain_data.py runner/timeseries_forecast/gift_eval.py
 fi
 
 # Clean up copied files
-rm -f runner/timeseries_forecast/auth.py runner/timeseries_forecast/artifacts.py runner/timeseries_forecast/r2_audit.py
+rm -f runner/shared_auth.py runner/shared_artifacts.py runner/shared_r2_audit.py runner/shared_pretrain_data.py runner/shared_gift_eval.py
 
-docker tag ts-runner:latest "$TRAINER_IMAGE"
+docker tag radar-runner:latest "$TRAINER_IMAGE"
 if ! docker push "$TRAINER_IMAGE" > /dev/null 2>&1; then
     fail "Failed to push ${TRAINER_IMAGE}"
 fi
@@ -370,7 +372,7 @@ export OFFICIAL_TRAINING_IMAGE="$TRAINER_IMAGE"
 step "Step 2c: Making GHCR packages public"
 
 GHCR_ORG="tensorlink-ai"
-ALL_PACKAGES=("${AGENT_NAMES[@]}" "ts-runner")
+ALL_PACKAGES=("${AGENT_NAMES[@]}" "radar-runner")
 for pkg in "${ALL_PACKAGES[@]}"; do
     # GHCR package names use the repo as a namespace: radar/<name>
     encoded_pkg="radar%2F${pkg}"
@@ -524,93 +526,125 @@ fi
 ok "All neurons registered"
 
 # =============================================================================
-# STEP 4b: Start trainer containers (simulates miner-deployed trainers)
+# STEP 4b: Set up trainer infrastructure (warm-standby model)
 # =============================================================================
-step "Step 4b: Starting trainer containers for Phase B"
+# =============================================================================
+# STEP 4a.5: Start mock R2 server (local S3-compatible storage for artifacts)
+# =============================================================================
+step "Step 4a.5: Mock R2 server (artifact storage)"
 
-TRAINER_PORT_BASE=8090
-TRAINER_CONTAINERS=()
+if [ -z "${R2_BUCKET:-}" ]; then
+    # No real R2 configured — start a local mock
+    MOCK_R2_PORT=9000
+    MOCK_R2_STORAGE="$LOG_DIR/mock_r2"
+    mkdir -p "$MOCK_R2_STORAGE"
 
-TRAINER_URLS=()  # populated by whichever path runs
+    R2_BUCKET="radar-test"
+
+    if command -v fuser &>/dev/null; then
+        fuser -k "${MOCK_R2_PORT}/tcp" 2>/dev/null || true
+    fi
+
+    PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}" python3 "$PROJECT_DIR/scripts/mock_r2_server.py" \
+        --port "$MOCK_R2_PORT" \
+        --storage "$MOCK_R2_STORAGE" \
+        > "$LOG_DIR/mock_r2.log" 2>&1 &
+    PIDS+=($!)
+
+    for attempt in $(seq 1 10); do
+        if curl -sf "http://127.0.0.1:${MOCK_R2_PORT}/" >/dev/null 2>&1; then
+            break
+        fi
+        [ "$attempt" = 10 ] && { fail "Mock R2 server not responding"; exit 1; }
+        sleep 1
+    done
+
+    mkdir -p "$MOCK_R2_STORAGE/$R2_BUCKET"
+
+    export MOCK_R2_ENDPOINT="http://127.0.0.1:${MOCK_R2_PORT}"
+    export R2_ACCOUNT_ID="local"
+    export R2_ACCESS_KEY_ID="test"
+    export R2_SECRET_ACCESS_KEY="test"
+    export R2_BUCKET="$R2_BUCKET"
+
+    ok "Mock R2 server on port $MOCK_R2_PORT (storage: $MOCK_R2_STORAGE/$R2_BUCKET/)"
+else
+    ok "Using real R2 (bucket: $R2_BUCKET)"
+fi
+
+step "Step 4b: Setting up trainer infrastructure for Phase B (warm-standby)"
+
+# In the warm-standby model, miners don't pre-deploy GPU pods. Instead:
+# - Miners run a lightweight listener (no GPU) on their neuron process
+# - Validators send TrainerRequests at Phase A start
+# - Miners deploy Basilica GPU pods on-demand when notified
+# - A fallback proxy handles jobs from non-responsive miners
+#
+# For localnet testing, we:
+# 1. Start a local trainer server (simulates what a Basilica pod would run)
+# 2. Install a mock Basilica SDK so miners can "deploy" without a real API
+# 3. Set FALLBACK_PROXY_URL to the local trainer so training always works
+
+TRAINER_PORT_BASE=9090  # local trainer server(s)
+LISTENER_PORT_BASE=8090  # miner listener ports
 
 if [ "$CPU_ONLY" = true ]; then
-    info "CPU-only mode: skipping trainer containers"
+    info "CPU-only mode: skipping trainer setup"
 elif [ "$USE_BASILICA" = true ]; then
-    # Deploy trainers on Basilica via affinetes
-    info "Deploying $NUM_MINERS trainer pod(s) on Basilica..."
-    TRAINER_URLS_FILE="$LOG_DIR/trainer_urls.txt"
+    # Real Basilica mode: miners deploy real GPU pods on-demand via Basilica SDK.
+    # Fallback proxy is optional — if RADAR_FALLBACK_PROXY_URL is already set, use it.
+    # Otherwise try to start a local Docker container as fallback.
+    info "Basilica mode: miners deploy GPU pods on-demand via Basilica SDK"
 
-    python3 -c "
-import sys, os, time
-sys.path.insert(0, '.')
-
-from basilica import BasilicaClient
-
-client = BasilicaClient()
-num_miners = $NUM_MINERS
-ts = int(time.time())
-
-DEPLOY_KWARGS = dict(
-    image='${TRAINER_IMAGE}',
-    port=8081,
-    cpu='2000m',
-    memory='8Gi',
-    gpu_count=1,
-    gpu_models=['RTX-A4000', 'RTX-A6000'],
-    ttl_seconds=3600,
-    timeout=900,
-    public=True,
-    env={
-        'SUBTENSOR_NETWORK': '${NETWORK}',
-        'NETUID': '${NETUID}',
-    },
-)
-
-urls = []
-deployment_names = []
-for i in range(num_miners):
-    name = f'radar-trainer-{i}-{ts}'
-    # Retry up to 3 times with backoff — Basilica scheduler can fail
-    # under concurrent GPU allocation pressure
-    last_err = None
-    for attempt in range(3):
-        try:
-            print(f'Trainer {i}: deploying {name} (attempt {attempt+1})...', file=sys.stderr)
-            dep = client.deploy(name=name, **DEPLOY_KWARGS)
-            print(f'Trainer {i}: READY at {dep.url} (instance={dep.name})', file=sys.stderr)
-            urls.append(dep.url)
-            deployment_names.append(dep.name)
-            last_err = None
-            break
-        except Exception as e:
-            last_err = e
-            # Use a fresh name on retry to avoid name collision
-            name = f'radar-trainer-{i}-{int(time.time())}'
-            wait = 10 * (attempt + 1)
-            print(f'Trainer {i}: deploy failed ({e}), retrying in {wait}s...', file=sys.stderr)
-            time.sleep(wait)
-    if last_err:
-        print(f'Trainer {i}: FAILED after 3 attempts: {last_err}', file=sys.stderr)
-        sys.exit(1)
-
-with open('${TRAINER_URLS_FILE}', 'w') as f:
-    for u in urls:
-        f.write(u + '\n')
-
-with open('${TRAINER_URLS_FILE}.deployments', 'w') as f:
-    for d in deployment_names:
-        f.write(d + '\n')
-" 2>&1 | while IFS= read -r line; do echo "  $line"; done
-
-    if [ -f "$TRAINER_URLS_FILE" ]; then
-        while IFS= read -r url; do
-            TRAINER_URLS+=("$url")
-        done < "$TRAINER_URLS_FILE"
-        ok "Deployed ${#TRAINER_URLS[@]} trainer pod(s) on Basilica"
+    if [ -n "${RADAR_FALLBACK_PROXY_URL:-}" ]; then
+        ok "Using existing fallback proxy: $RADAR_FALLBACK_PROXY_URL"
     else
-        fail "Failed to deploy trainer pods on Basilica"
+        # Try to start a local fallback container (best-effort, not required)
+        FALLBACK_PORT=$((TRAINER_PORT_BASE))
+        FALLBACK_CONTAINER="radar-fallback-trainer-$$"
+
+        GPU_FLAGS=""
+        if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+            GPU_FLAGS="--gpus all"
+        fi
+
+        if docker run -d --name "$FALLBACK_CONTAINER" \
+            $GPU_FLAGS \
+            -p "${FALLBACK_PORT}:8081" \
+            -e TRAINER_PORT=8081 \
+            -e SUBTENSOR_NETWORK="${NETWORK}" \
+            -e NETUID="${NETUID}" \
+            "$TRAINER_IMAGE" >/dev/null 2>&1; then
+
+            TRAINER_CONTAINERS+=("$FALLBACK_CONTAINER")
+
+            # Wait for health
+            HEALTHY=false
+            for attempt in $(seq 1 30); do
+                if curl -sf "http://localhost:${FALLBACK_PORT}/health" >/dev/null 2>&1; then
+                    HEALTHY=true
+                    break
+                fi
+                sleep 2
+            done
+
+            if [ "$HEALTHY" = true ]; then
+                export RADAR_FALLBACK_PROXY_URL="http://localhost:${FALLBACK_PORT}"
+                ok "Fallback proxy started on port $FALLBACK_PORT"
+            else
+                warn "Fallback proxy failed to start — continuing without it"
+                docker rm -f "$FALLBACK_CONTAINER" 2>/dev/null || true
+            fi
+        else
+            warn "Could not start fallback proxy container (image: $TRAINER_IMAGE)"
+            warn "Continuing without fallback — miners must respond to TrainerRequests"
+        fi
     fi
 else
+    # Local Docker mode: start trainer server(s) and mock Basilica SDK
+    info "Local mode: starting trainer server(s) + mock Basilica SDK"
+
+    TRAINER_URLS=()
     for i in $(seq 0 $((NUM_MINERS - 1))); do
         TRAINER_PORT=$((TRAINER_PORT_BASE + i))
         CONTAINER_NAME="radar-trainer-${i}-$$"
@@ -648,19 +682,105 @@ else
             warn "Trainer $i not responding on port $TRAINER_PORT after 60s"
             docker logs "${TRAINER_CONTAINERS[$i]}" 2>&1 | tail -10
         fi
-    done
-
-    # Populate TRAINER_URLS for local Docker path
-    for i in $(seq 0 $((NUM_MINERS - 1))); do
-        TRAINER_PORT=$((TRAINER_PORT_BASE + i))
         TRAINER_URLS+=("http://localhost:${TRAINER_PORT}")
     done
+
+    # Create mock Basilica SDK — each miner's "deployment" points to their local trainer
+    MOCK_BASILICA_DIR=$(mktemp -d)
+    cat > "$MOCK_BASILICA_DIR/basilica.py" << 'MOCKEOF'
+"""Mock Basilica SDK for multi-node localnet testing.
+
+Each create_deployment call returns a fake deployment pointing to a local
+trainer server. The mock tracks deployments so get_public_deployment_metadata
+returns correct image info for attestation checks.
+"""
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+_deployments = {}
+_trainer_urls = {}  # instance_name -> url
+
+
+class _Replicas:
+    def __init__(self, ready=1, desired=1):
+        self.ready = ready
+        self.desired = desired
+
+
+class _Metadata:
+    def __init__(self, image, image_tag, state, replicas, uptime_seconds=10):
+        self.image = image
+        self.image_tag = image_tag
+        self.state = state
+        self.replicas = replicas
+        self.uptime_seconds = uptime_seconds
+
+
+class _Deployment:
+    def __init__(self, instance_name, image, url):
+        self.instance_name = instance_name
+        self.image = image
+        self.url = url
+
+    def wait_until_ready(self):
+        logger.info("Mock Basilica: deployment %s ready at %s", self.instance_name, self.url)
+
+
+class BasilicaClient:
+    # Round-robin index for assigning trainer URLs
+    _url_index = 0
+
+    def create_deployment(self, instance_name, image, port=8001, replicas=1,
+                          public_metadata=False, ttl_seconds=600,
+                          gpu_count=1, gpu_models=None, memory="16Gi", **kwargs):
+        # Pick a trainer URL from the pool (set via MOCK_TRAINER_URLS env var)
+        urls = os.environ.get("MOCK_TRAINER_URLS", "").split(",")
+        urls = [u.strip() for u in urls if u.strip()]
+        if urls:
+            url = urls[BasilicaClient._url_index % len(urls)]
+            BasilicaClient._url_index += 1
+        else:
+            url = f"http://localhost:9090"  # fallback
+
+        dep = _Deployment(instance_name=instance_name, image=image, url=url)
+        _deployments[instance_name] = {
+            "image": image.rsplit(":", 1)[0] if ":" in image else image,
+            "image_tag": image.rsplit(":", 1)[1] if ":" in image else "latest",
+        }
+        _trainer_urls[instance_name] = url
+        logger.info("Mock Basilica: created %s -> %s", instance_name, url)
+        return dep
+
+    def delete_deployment(self, instance_name):
+        _deployments.pop(instance_name, None)
+        _trainer_urls.pop(instance_name, None)
+        logger.info("Mock Basilica: deleted %s", instance_name)
+
+    def get_public_deployment_metadata(self, instance_name):
+        info = _deployments.get(instance_name, {})
+        return _Metadata(
+            image=info.get("image", "mock-image"),
+            image_tag=info.get("image_tag", "latest"),
+            state="running",
+            replicas=_Replicas(ready=1, desired=1),
+        )
+MOCKEOF
+
+    export PYTHONPATH="${MOCK_BASILICA_DIR}:${PYTHONPATH:-}"
+    export MOCK_TRAINER_URLS=$(IFS=,; echo "${TRAINER_URLS[*]}")
+    ok "Mock Basilica SDK installed (${#TRAINER_URLS[@]} trainer URLs)"
+
+    # Also set fallback proxy to first trainer (safety net)
+    export RADAR_FALLBACK_PROXY_URL="${TRAINER_URLS[0]}"
+    ok "Fallback proxy URL: $RADAR_FALLBACK_PROXY_URL"
 fi
 
 # =============================================================================
-# STEP 5: Start miners (commit trainer URL so validators can dispatch)
+# STEP 5: Start miners (commit listener URL so validators can send TrainerRequests)
 # =============================================================================
-step "Step 5: Starting $NUM_MINERS miner(s)"
+step "Step 5: Starting $NUM_MINERS miner(s) with warm-standby listeners"
 
 NUM_AGENT_TYPES=${#AGENT_GHCR_URLS[@]}
 
@@ -669,22 +789,47 @@ for i in $(seq 0 $((NUM_MINERS - 1))); do
     AGENT_IMAGE="${AGENT_GHCR_URLS[$AGENT_IDX]}"
     MINER_LOG="$LOG_DIR/miner${i}.log"
 
-    # Miner commits this URL so the validator's coordinator can POST to it
-    TRAINER_URL="${TRAINER_URLS[$i]:-}"
+    # Each miner gets a unique listener port
+    LISTENER_PORT=$((LISTENER_PORT_BASE + i))
+
+    # Kill anything on this port from previous runs
+    if command -v fuser &>/dev/null; then
+        fuser -k "${LISTENER_PORT}/tcp" 2>/dev/null || true
+    elif command -v lsof &>/dev/null; then
+        lsof -ti :"$LISTENER_PORT" 2>/dev/null | xargs -r kill 2>/dev/null || true
+    fi
 
     python3 miner/neuron.py \
         --netuid "$NETUID" \
         --subtensor.network "$NETWORK" \
         --wallet.name "miner${i}" \
         --docker_image "$AGENT_IMAGE" \
-        --trainer_url "$TRAINER_URL" \
-        --axon.external_ip 127.0.0.1 \
+        --listener_port "$LISTENER_PORT" \
+        --trainer_image "$TRAINER_IMAGE" \
+        --external_ip 127.0.0.1 \
         > "$MINER_LOG" 2>&1 &
     PIDS+=($!)
-    ok "Miner $i started (PID $!) — $AGENT_IMAGE — trainer: ${TRAINER_URL:-none} — log: $MINER_LOG"
+    ok "Miner $i started (PID $!) — $AGENT_IMAGE — listener: port $LISTENER_PORT — log: $MINER_LOG"
 done
 
-sleep 5  # Let miners commit images
+sleep 10  # Let miners commit images (chain call can be slow) and start listeners
+
+# Verify listener health
+for i in $(seq 0 $((NUM_MINERS - 1))); do
+    LISTENER_PORT=$((LISTENER_PORT_BASE + i))
+    HEALTHY=false
+    for attempt in $(seq 1 10); do
+        if curl -sf "http://localhost:${LISTENER_PORT}/health" >/dev/null 2>&1; then
+            ok "Miner $i listener healthy on port $LISTENER_PORT"
+            HEALTHY=true
+            break
+        fi
+        sleep 1
+    done
+    if [ "$HEALTHY" = false ]; then
+        warn "Miner $i listener not responding on port $LISTENER_PORT"
+    fi
+done
 
 # Verify commitments (localnet uses file fallback, testnet uses chain)
 if [ "$USE_TESTNET" = true ]; then
@@ -725,7 +870,6 @@ if [ "$USE_TESTNET" = true ]; then
     export RADAR_SUBMISSION_WINDOW=${RADAR_SUBMISSION_WINDOW:-50}
     export RADAR_TRAINING_WINDOW=${RADAR_TRAINING_WINDOW:-150}
     export RADAR_EVAL_WINDOW=${RADAR_EVAL_WINDOW:-25}
-    export RADAR_TRAINING_TIMEOUT=${RADAR_TRAINING_TIMEOUT:-1800}
     export RADAR_AGENT_TIMEOUT=${RADAR_AGENT_TIMEOUT:-600}
     export RADAR_TIME_BUDGET=${RADAR_TIME_BUDGET:-300}
     # Skip the training-window block wait — in test mode, dispatch already finished
@@ -737,7 +881,6 @@ else
     export RADAR_SUBMISSION_WINDOW=${RADAR_SUBMISSION_WINDOW:-15}
     export RADAR_TRAINING_WINDOW=${RADAR_TRAINING_WINDOW:-40}
     export RADAR_EVAL_WINDOW=${RADAR_EVAL_WINDOW:-10}
-    export RADAR_TRAINING_TIMEOUT=${RADAR_TRAINING_TIMEOUT:-420}
     # Agent timeout: 120s for fast test iterations (default 600s — too long for localnet rounds)
     export RADAR_AGENT_TIMEOUT=${RADAR_AGENT_TIMEOUT:-120}
     # Trainer time_budget: 120s for fast test iterations (default 300s)
@@ -746,6 +889,16 @@ else
     # wait for the full window to close on localnet.
     export RADAR_SKIP_TRAINING_WAIT=${RADAR_SKIP_TRAINING_WAIT:-true}
 fi
+
+# ── Warm-standby trainer settings ──
+if [ "$USE_TESTNET" = true ]; then
+    # Testnet with real Basilica: deployments take 2-5 min to pull image + start
+    export RADAR_TRAINER_PREPARE_TIMEOUT=${RADAR_TRAINER_PREPARE_TIMEOUT:-600}
+else
+    export RADAR_TRAINER_PREPARE_TIMEOUT=${RADAR_TRAINER_PREPARE_TIMEOUT:-60}
+fi
+export RADAR_TRAINER_READY_POLL=${RADAR_TRAINER_READY_POLL:-5}
+# RADAR_FALLBACK_PROXY_URL already set in step 4b
 
 if [ "$CPU_ONLY" = true ]; then
     info "CPU-only mode: training will be skipped"
@@ -827,19 +980,25 @@ while [ "$ELAPSED" -lt "$TOTAL_TIMEOUT" ] && [ "$ROUNDS_COMPLETED" -lt "$WAIT_RO
         fi
     fi
 
-    # Check for round completion in any validator log
+    # Check for round completion — require ALL validators to complete
+    MIN_COMPLETED=$((999999))
     for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
         COMPLETED=$(grep -c "Round.*complete\|Weights set\|forward.*complete" "$LOG_DIR/validator${i}.log" 2>/dev/null || true)
         COMPLETED="${COMPLETED:-0}"
-        if [ "$COMPLETED" -gt "$ROUNDS_COMPLETED" ]; then
-            ROUNDS_COMPLETED=$COMPLETED
-            ok "Round $ROUNDS_COMPLETED completed (detected in validator $i)"
+        if [ "$COMPLETED" -lt "$MIN_COMPLETED" ]; then
+            MIN_COMPLETED=$COMPLETED
         fi
     done
+    if [ "$MIN_COMPLETED" -gt "$ROUNDS_COMPLETED" ]; then
+        ROUNDS_COMPLETED=$MIN_COMPLETED
+        ok "Round $ROUNDS_COMPLETED completed by ALL validators"
+    fi
 
-    # Also check DB for experiments
-    DB_PORT=$((DB_PORT_BASE))
-    EXP_COUNT=$(curl -sf "http://localhost:${DB_PORT}/experiments/stats" 2>/dev/null | python3 -c "
+    # Also check DB for experiments across ALL validators
+    ALL_HAVE_EXPERIMENTS=true
+    for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
+        V_PORT=$((DB_PORT_BASE + i))
+        V_EXP=$(curl -sf "http://localhost:${V_PORT}/experiments/stats" 2>/dev/null | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -847,12 +1006,16 @@ try:
 except:
     print(0)
 " 2>/dev/null | tail -1 || echo 0)
-    EXP_COUNT="${EXP_COUNT//[^0-9]/}"
-    EXP_COUNT="${EXP_COUNT:-0}"
+        V_EXP="${V_EXP//[^0-9]/}"
+        V_EXP="${V_EXP:-0}"
+        if [ "$V_EXP" -eq 0 ]; then
+            ALL_HAVE_EXPERIMENTS=false
+        fi
+    done
 
-    if [ "$EXP_COUNT" -gt 0 ] && [ "$ROUNDS_COMPLETED" -eq 0 ]; then
+    if [ "$ALL_HAVE_EXPERIMENTS" = true ] && [ "$ROUNDS_COMPLETED" -eq 0 ]; then
         ROUNDS_COMPLETED=1
-        ok "Experiments found in DB ($EXP_COUNT total)"
+        ok "Experiments found in ALL validator DBs"
     fi
 
     if [ "$ROUNDS_COMPLETED" -ge "$WAIT_ROUNDS" ]; then
@@ -922,30 +1085,47 @@ fi
 for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     DB_PORT=$((DB_PORT_BASE + i))
     STATS=$(curl -sf "http://localhost:${DB_PORT}/experiments/stats" 2>/dev/null || echo "{}")
-    TOTAL=$(echo "$STATS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
-    check "Validator $i DB has experiments ($TOTAL)" "$([ "$TOTAL" -gt 0 ] && echo true || echo false)"
+    TOTAL=$(echo "$STATS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null | head -1 || echo 0)
+    TOTAL="${TOTAL:-0}"
+    check "Validator $i DB has experiments ($TOTAL)" "$([ "$TOTAL" -gt 0 ] 2>/dev/null && echo true || echo false)"
 done
 
-# 8.4 Pareto front
-PARETO_SIZE=$(curl -sf "http://localhost:${DB_PORT_BASE}/experiments/pareto" 2>/dev/null | python3 -c "
+# 8.4 Pareto front (check all validators, take max)
+PARETO_SIZE=0
+for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
+    DB_PORT=$((DB_PORT_BASE + i))
+    P=$(curl -sf "http://localhost:${DB_PORT}/experiments/pareto" 2>/dev/null | python3 -c "
 import sys, json
 try:
-    print(len(json.load(sys.stdin)))
-except:
+    data = json.load(sys.stdin)
+    print(len(data))
+except Exception:
     print(0)
-" 2>/dev/null || echo 0)
-check "Pareto front has members ($PARETO_SIZE)" "$([ "$PARETO_SIZE" -gt 0 ] && echo true || echo false)"
+" 2>/dev/null | head -1)
+    P="${P:-0}"
+    P=$(echo "$P" | tr -d '[:space:]')
+    P="${P:-0}"
+    if [ "$P" -gt "$PARETO_SIZE" ] 2>/dev/null; then
+        PARETO_SIZE="$P"
+    fi
+done
+check "Pareto front has members ($PARETO_SIZE)" "$([ "$PARETO_SIZE" -gt 0 ] 2>/dev/null && echo true || echo false)"
 
-# 8.5 Cross-eval (verify arch_owner != trainer_uid in dispatch logs)
-# coordinator.py logs "Job arch=X trainer=Y: status" — check no job has arch==trainer
-SELF_TRAIN=$(grep -cP "Job arch=(\d+) trainer=\1:" "$LOG_DIR/validator0.log" 2>/dev/null) || SELF_TRAIN=0
-check "No self-training detected ($SELF_TRAIN)" "$([ "$SELF_TRAIN" -eq 0 ] && echo true || echo false)"
+# 8.5 Training dispatch (check all validator logs)
+JOB_COUNT=0
+for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
+    J=$(grep -c "Job arch=" "$LOG_DIR/validator${i}.log" 2>/dev/null) || J=0
+    JOB_COUNT=$((JOB_COUNT + J))
+done
+check "Training jobs dispatched ($JOB_COUNT)" "$([ "$JOB_COUNT" -gt 0 ] && echo true || echo false)"
 
 # 8.6 Validator consistency (both have same experiment count, within tolerance)
 if [ "$NUM_VALIDATORS" -ge 2 ]; then
-    TOTAL_V0=$(curl -sf "http://localhost:${DB_PORT_BASE}/experiments/stats" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
-    TOTAL_V1=$(curl -sf "http://localhost:$((DB_PORT_BASE+1))/experiments/stats" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
-    DIFF=$(( TOTAL_V0 > TOTAL_V1 ? TOTAL_V0 - TOTAL_V1 : TOTAL_V1 - TOTAL_V0 ))
+    TOTAL_V0=$(curl -sf "http://localhost:${DB_PORT_BASE}/experiments/stats" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null | head -1 || echo 0)
+    TOTAL_V0="${TOTAL_V0:-0}"
+    TOTAL_V1=$(curl -sf "http://localhost:$((DB_PORT_BASE+1))/experiments/stats" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null | head -1 || echo 0)
+    TOTAL_V1="${TOTAL_V1:-0}"
+    DIFF=$(( ${TOTAL_V0:-0} > ${TOTAL_V1:-0} ? ${TOTAL_V0:-0} - ${TOTAL_V1:-0} : ${TOTAL_V1:-0} - ${TOTAL_V0:-0} ))
     check "Validators consistent (v0=$TOTAL_V0, v1=$TOTAL_V1, diff=$DIFF)" "$([ "$DIFF" -le 2 ] && echo true || echo false)"
 fi
 

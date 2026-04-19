@@ -171,14 +171,14 @@ class TestMultiMinerPenalties:
     """Penalty computation with many miners in cross-eval roles."""
 
     def test_penalties_across_8_miners(self):
-        """8 miners training each other; failures penalize the trainer, not arch owner."""
+        """8 miners training each other; failures penalize the arch owner."""
         training_metas = {
             0: {"status": "success", "trainer_uid": 1, "flops_equivalent_size": 200_000},
-            1: {"status": "failed", "trainer_uid": 2},    # Miner 2 fails as trainer
+            1: {"status": "failed", "trainer_uid": 2},    # Arch owner 1 penalized
             2: {"status": "success", "trainer_uid": 3, "flops_equivalent_size": 200_000},
-            3: {"status": "timeout", "trainer_uid": 4},   # Miner 4 times out
+            3: {"status": "timeout", "trainer_uid": 4},   # Arch owner 3 penalized
             4: {"status": "success", "trainer_uid": 5, "flops_equivalent_size": 200_000},
-            5: {"status": "build_failed", "trainer_uid": 6},  # Miner 6 build fail
+            5: {"status": "build_failed", "trainer_uid": 6},  # Arch owner 5 penalized
             6: {"status": "success", "trainer_uid": 7, "flops_equivalent_size": 200_000},
             7: {"status": "success", "trainer_uid": 0, "flops_equivalent_size": 200_000},
         }
@@ -188,17 +188,17 @@ class TestMultiMinerPenalties:
 
         penalties = compute_penalties(training_metas, eval_results)
 
-        # Trainers that failed get penalized
-        assert penalties.get(2, 0) > 0, "Miner 2 should be penalized (failed as trainer)"
-        assert penalties.get(4, 0) > 0, "Miner 4 should be penalized (timeout as trainer)"
-        assert penalties.get(6, 0) > 0, "Miner 6 should be penalized (build_failed as trainer)"
-        # Successful trainers should not be penalized
-        assert penalties.get(1, 0) == 0
-        assert penalties.get(3, 0) == 0
-        assert penalties.get(5, 0) == 0
+        # Arch owners whose training failed get penalized
+        assert penalties.get(1, 0) > 0, "Arch owner 1 should be penalized (trainer failed)"
+        assert penalties.get(3, 0) > 0, "Arch owner 3 should be penalized (trainer timed out)"
+        assert penalties.get(5, 0) > 0, "Arch owner 5 should be penalized (trainer build_failed)"
+        # Successful arch owners should not be penalized
+        assert penalties.get(0, 0) == 0
+        assert penalties.get(2, 0) == 0
+        assert penalties.get(4, 0) == 0
 
     def test_double_failure_stacks_penalties(self):
-        """A miner that fails as trainer for 2 different arch owners gets stacked penalty."""
+        """Two arch owners whose training failed get individual penalties."""
         training_metas = {
             0: {"status": "failed", "trainer_uid": 5},
             1: {"status": "failed", "trainer_uid": 5},  # Same trainer fails twice
@@ -207,10 +207,11 @@ class TestMultiMinerPenalties:
         eval_results = {uid: {"flops_verified": True} for uid in range(3)}
 
         penalties = compute_penalties(training_metas, eval_results)
-        assert penalties.get(5, 0) >= 1.0, "Double failure should stack to >= 1.0"
+        assert penalties.get(0, 0) == 0.5, "Arch owner 0 penalized for failed training"
+        assert penalties.get(1, 0) == 0.5, "Arch owner 1 penalized for failed training"
 
-    def test_flops_mismatch_penalty_with_many_miners(self):
-        """FLOPs mismatch penalty on trainer, not arch owner."""
+    def test_flops_mismatch_penalty_on_arch_owner(self):
+        """FLOPs mismatch penalty on arch owner, not trainer."""
         training_metas = {}
         eval_results = {}
         for uid in range(6):
@@ -225,10 +226,9 @@ class TestMultiMinerPenalties:
 
         penalties = compute_penalties(training_metas, eval_results)
 
-        # Trainers for UIDs 0, 2, 4 should be penalized
+        # Arch owners with FLOPs mismatch should be penalized
         for uid in [0, 2, 4]:
-            trainer = (uid + 1) % 6
-            assert penalties.get(trainer, 0) > 0, f"Trainer {trainer} should be penalized"
+            assert penalties.get(uid, 0) > 0, f"Arch owner {uid} should be penalized"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -314,10 +314,10 @@ class TestMultiValidatorCoordination:
         jobs = compute_assignments("a" * 64, submissions, miner_uids, validator_uids, round_id=1)
 
         assert len(jobs) == 10
+        # Self-training is allowed — just verify all jobs have valid UIDs
         for job in jobs:
-            assert job.arch_owner != job.trainer_uid, (
-                f"Self-training detected: UID {job.arch_owner}"
-            )
+            assert job.arch_owner in miner_uids
+            assert job.trainer_uid in miner_uids
 
     def test_dispatch_distributed_across_validators(self):
         """Jobs are spread across all validators, not concentrated on one."""
@@ -623,10 +623,10 @@ class TestEndToEndMultiRound:
                 round_id=challenge.round_id,
             )
 
-            # Verify cross-eval invariant
+            # Self-training is allowed — verify jobs have valid UIDs
             for job in jobs:
-                if len(all_miner_uids) > 1:
-                    assert job.arch_owner != job.trainer_uid
+                assert job.arch_owner in all_miner_uids
+                assert job.trainer_uid in all_miner_uids
 
             # Verify all archs get trained
             trained_archs = {j.arch_owner for j in jobs}

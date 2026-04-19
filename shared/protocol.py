@@ -26,9 +26,23 @@ class Challenge:
     desearch_url: str = ""
     llm_url: str = ""
 
+    # Per-round ephemeral token for authenticating agent pod → proxy requests
+    agent_token: str = ""
+
+    # Phase A wall-clock budget (seconds) for the agent pod. The agent is
+    # expected to return a proposal within this window; the validator will
+    # kill the pod if it runs longer. Independent of task["time_budget"],
+    # which is the *trainer's* training-loop budget in Phase B.
+    agent_seconds: int = 600
+
     # Pareto front filtered to this round's size bucket
     # Each entry: {code, metric, objectives} for frontier points in range
     feasible_frontier: list = field(default_factory=list)
+
+    # Agent scratchpad — presigned R2 URLs for persistent private storage
+    scratchpad_get_url: str = ""   # presigned GET URL for scratchpad.tar.gz
+    scratchpad_put_url: str = ""   # presigned PUT URL for scratchpad.tar.gz
+    scratchpad_max_mb: int = 10    # size limit enforced by agent
 
     def to_json(self) -> str:
         return json.dumps({
@@ -42,7 +56,12 @@ class Challenge:
             "db_url": self.db_url,
             "desearch_url": self.desearch_url,
             "llm_url": self.llm_url,
+            "agent_token": self.agent_token,
+            "agent_seconds": self.agent_seconds,
             "feasible_frontier": self.feasible_frontier,
+            "scratchpad_get_url": self.scratchpad_get_url,
+            "scratchpad_put_url": self.scratchpad_put_url,
+            "scratchpad_max_mb": self.scratchpad_max_mb,
         })
 
     @classmethod
@@ -68,5 +87,92 @@ class Proposal:
 
     @classmethod
     def from_json(cls, s: str) -> Proposal:
+        d = json.loads(s)
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class TrainerRequest:
+    """Validator → Miner: prepare your trainer pod for this round.
+
+    Includes the GPU spec the miner must deploy on Basilica.
+    The validator controls hardware requirements to ensure consistent
+    training conditions across the round.
+    """
+    round_id: int = 0
+    challenge_id: str = ""
+    seed: int = 0
+    min_flops_equivalent: int = 0
+    max_flops_equivalent: int = 0
+    time_budget: int = 300
+    validator_db_url: str = ""
+
+    # GPU spec — miner must deploy a pod matching these requirements
+    gpu_count: int = 1
+    min_gpu_memory_gb: int = 16
+    memory: str = "16Gi"
+
+    # How long (seconds) until Phase B dispatch arrives after pod creation.
+    # Miners use this to set a pod TTL that survives the full Phase A window.
+    # Default 600s matches the default SUBMISSION_WINDOW of 50 blocks × 12s.
+    submission_window_seconds: int = 600
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "round_id": self.round_id,
+            "challenge_id": self.challenge_id,
+            "seed": self.seed,
+            "min_flops_equivalent": self.min_flops_equivalent,
+            "max_flops_equivalent": self.max_flops_equivalent,
+            "time_budget": self.time_budget,
+            "validator_db_url": self.validator_db_url,
+            "gpu_count": self.gpu_count,
+            "min_gpu_memory_gb": self.min_gpu_memory_gb,
+            "memory": self.memory,
+            "submission_window_seconds": self.submission_window_seconds,
+        })
+
+    @classmethod
+    def from_json(cls, s: str) -> TrainerRequest:
+        d = json.loads(s)
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class TrainerReady:
+    """Miner → Validator: my trainer pod is live at this URL."""
+    round_id: int = 0
+    trainer_url: str = ""
+    instance_name: str = ""
+    miner_hotkey: str = ""
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "round_id": self.round_id,
+            "trainer_url": self.trainer_url,
+            "instance_name": self.instance_name,
+            "miner_hotkey": self.miner_hotkey,
+        })
+
+    @classmethod
+    def from_json(cls, s: str) -> TrainerReady:
+        d = json.loads(s)
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class TrainerRelease:
+    """Validator → Miner: training done, tear down your pod."""
+    round_id: int = 0
+    miner_hotkey: str = ""
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "round_id": self.round_id,
+            "miner_hotkey": self.miner_hotkey,
+        })
+
+    @classmethod
+    def from_json(cls, s: str) -> TrainerRelease:
         d = json.loads(s)
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})

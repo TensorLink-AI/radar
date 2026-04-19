@@ -2,16 +2,23 @@
 
 Every validator independently downloads checkpoints and computes metrics.
 Cheap (seconds per model on CPU), fully deterministic, provides consensus.
+
+Miner-submitted architecture code runs in an isolated subprocess to prevent
+access to the validator's environment variables, filesystem, or memory.
+
+Each task runner provides its own EVAL_TEMPLATE with task-specific imports
+and model signatures. The evaluator loads the right template based on
+the challenge's runner_dir.
 """
 
 from __future__ import annotations
 
-import importlib.util
+import json
 import logging
 import os
-import random
+import subprocess
+import sys
 import tempfile
-import types
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -21,92 +28,176 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# ── Runner registry for eval templates ───────────────────────────────
+# Maps runner_dir -> EVAL_TEMPLATE string
+_EVAL_TEMPLATES: dict[str, str] = {}
+
+
+def _load_eval_templates():
+    """Lazy-load eval templates from runner directories.
+
+    Reads EVAL_TEMPLATE strings from runner train.py files by parsing
+    the source, rather than importing the module (which requires
+    Docker-only dependencies like torch, prepare, flops).
+    """
+    if _EVAL_TEMPLATES:
+        return
+    import ast
+
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+    # Load ts_forecasting eval template
+    train_path = os.path.join(project_root, "runner", "timeseries_forecast", "train.py")
+    template = _extract_eval_template(train_path)
+    if template:
+        _EVAL_TEMPLATES["runner/timeseries_forecast"] = template
+        _EVAL_TEMPLATES[""] = template  # default fallback
+    else:
+        logger.error("Failed to load eval template from %s", train_path)
+
+
+def _extract_eval_template(path: str) -> str | None:
+    """Extract EVAL_TEMPLATE string constant from a Python file via AST."""
+    import ast
+    try:
+        with open(path) as f:
+            tree = ast.parse(f.read())
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "EVAL_TEMPLATE":
+                        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                            return node.value.value
+    except Exception as e:
+        logger.warning("Could not parse %s: %s", path, e)
+    return None
+
+
+def _get_eval_template(runner_dir: str) -> str:
+    """Get the eval template for a runner_dir."""
+    _load_eval_templates()
+    template = _EVAL_TEMPLATES.get(runner_dir)
+    if template is None:
+        logger.warning("No eval template for runner_dir=%s, using default", runner_dir)
+        template = _EVAL_TEMPLATES[""]
+    return template
+
 
 def evaluate_checkpoint(
     architecture_code: str,
     checkpoint_path: str,
     eval_split_seed: int = 42,
     device: str = "cpu",
+    timeout: int = 120,
+    runner_dir: str = "",
 ) -> dict:
-    """Evaluate a single checkpoint. This is the Phase C core function.
+    """Evaluate a single checkpoint in an isolated subprocess.
 
-    1. exec architecture_code -> get build_model()
-    2. model = build_model(CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES)
-    3. model.load_state_dict(torch.load(checkpoint_path))
-    4. flops_equiv = compute_flops_equivalent(model, ...)
-    5. metrics = validate(model)
-    6. return {crps, mase, flops_equivalent_size, param_count}
+    Runs miner code in a separate process so it cannot access the
+    validator's memory, environment variables, or filesystem beyond
+    the temp directory.
+
+    Args:
+        runner_dir: Relative path to the runner directory (e.g.
+                    "runner/timeseries_forecast"). Falls back to
+                    runner/timeseries_forecast if empty.
     """
-    # Import frozen eval dependencies
-    import sys
-    runner_dir = os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast")
-    runner_dir = os.path.abspath(runner_dir)
-    if runner_dir not in sys.path:
-        sys.path.insert(0, runner_dir)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Copy checkpoint into subprocess temp dir so it's co-located
+        # and won't be affected by /tmp cleanup or concurrent access
+        import shutil
+        local_ckpt = os.path.join(tmpdir, "checkpoint.safetensors")
+        shutil.copy2(checkpoint_path, local_ckpt)
 
-    import torch
-    from prepare import validate, CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES
-    from flops import compute_flops_equivalent
-    from safetensors.torch import load_file
+        # Write architecture code
+        arch_path = os.path.join(tmpdir, "submission.py")
+        with open(arch_path, "w") as f:
+            f.write(architecture_code)
 
-    random.seed(eval_split_seed)
-    torch.manual_seed(eval_split_seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+        # Write eval runner script (per-task template)
+        runner_path = os.path.join(tmpdir, "run_eval.py")
+        template = _get_eval_template(runner_dir)
+        runner_code = template.format(
+            arch_path=arch_path,
+            checkpoint_path=local_ckpt,
+            eval_split_seed=eval_split_seed,
+            device=device,
+        )
+        with open(runner_path, "w") as f:
+            f.write(runner_code)
 
-    # 1. Load architecture code
-    mod = types.ModuleType("submission")
-    try:
-        exec(compile(architecture_code, "<submission>", "exec"), mod.__dict__)
-    except Exception as e:
-        logger.error("Architecture code failed to compile: %s", e)
-        return {"crps": float("inf"), "mase": float("inf"), "error": str(e)}
+        # Run in subprocess with restricted environment
+        # Resolve runner_dir — use task's runner_dir, fall back to ts_forecasting
+        effective_runner_dir = runner_dir or "runner/timeseries_forecast"
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        runner_path_abs = os.path.join(project_root, effective_runner_dir)
+        shared_path_abs = project_root
+        clean_env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/usr/local/bin"),
+            "HOME": tmpdir,
+            "PYTHONPATH": f"{runner_path_abs}:{shared_path_abs}",
+            "RADAR_GIFT_EVAL_CACHE": os.environ.get(
+                "RADAR_GIFT_EVAL_CACHE", "/tmp/radar_gift_eval"
+            ),
+            "RADAR_EVAL_DATA": os.environ.get("RADAR_EVAL_DATA", "gift_eval"),
+        }
+        # Do NOT forward R2 credentials, wallet keys, or BASILICA tokens
 
-    if not hasattr(mod, "build_model") or not callable(mod.build_model):
-        return {"crps": float("inf"), "mase": float("inf"), "error": "Missing build_model()"}
+        try:
+            result = subprocess.run(
+                [sys.executable, runner_path],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=clean_env,
+                cwd=tmpdir,
+            )
+            if result.returncode != 0:
+                return {
+                    "crps": float("inf"), "mase": float("inf"),
+                    "flops_equivalent_size": 0,
+                    "error": f"Eval subprocess failed: {result.stderr[:500]}",
+                }
+            # Parse only the last non-empty line of stdout to avoid
+            # spurious output from miner code (print statements, warnings).
+            return _parse_last_json_line(result.stdout)
+        except subprocess.TimeoutExpired:
+            return {
+                "crps": float("inf"), "mase": float("inf"),
+                "flops_equivalent_size": 0,
+                "error": f"Eval subprocess timed out ({timeout}s)",
+            }
+        except (OSError, json.JSONDecodeError) as e:
+            return {
+                "crps": float("inf"), "mase": float("inf"),
+                "flops_equivalent_size": 0,
+                "error": f"Eval subprocess error: {e}",
+            }
 
-    # 2. Build model
-    try:
-        model = mod.build_model(CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES).to(device)
-    except Exception as e:
-        return {"crps": float("inf"), "mase": float("inf"), "error": f"build_model failed: {e}"}
 
-    # 3. Load checkpoint (safetensors — safe, no pickle)
-    try:
-        state_dict = load_file(checkpoint_path, device=device)
-        model.load_state_dict(state_dict)
-    except Exception as e:
-        return {"crps": float("inf"), "mase": float("inf"), "error": f"load_state_dict failed: {e}"}
+def _parse_last_json_line(stdout: str) -> dict:
+    """Parse JSON from the last non-empty line of subprocess stdout.
 
-    # 4. Measure FLOPs
-    try:
-        flops_equiv = compute_flops_equivalent(model, CONTEXT_LEN, NUM_VARIATES, device)
-    except Exception as e:
-        logger.warning("FLOPs measurement failed: %s", e)
-        flops_equiv = 0
-
-    # 5. Validate
-    param_count = sum(p.numel() for p in model.parameters())
-    if hasattr(model, "reset"):
-        model.reset()
-    model.eval()
-
-    try:
-        metrics = validate(model)
-    except Exception as e:
+    Miner code loaded via importlib may produce print output during import.
+    The eval runner template always prints its JSON result as the final line.
+    """
+    lines = [line.strip() for line in stdout.strip().splitlines() if line.strip()]
+    if not lines:
         return {
             "crps": float("inf"), "mase": float("inf"),
-            "flops_equivalent_size": flops_equiv,
-            "param_count": param_count,
-            "error": f"validate failed: {e}",
+            "flops_equivalent_size": 0,
+            "error": "Eval subprocess produced no output",
         }
-
+    # Try last line first (expected), then scan backwards
+    for line in reversed(lines):
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
     return {
-        "crps": metrics["crps"],
-        "ncrps": metrics.get("ncrps", float("inf")),
-        "mase": metrics["mase"],
-        "flops_equivalent_size": flops_equiv,
-        "param_count": param_count,
+        "crps": float("inf"), "mase": float("inf"),
+        "flops_equivalent_size": 0,
+        "error": f"Eval subprocess returned no valid JSON line: {lines[-1][:200]}",
     }
 
 
@@ -133,11 +224,22 @@ async def evaluate_all_checkpoints(
     results: dict[int, dict] = {}
     device = os.getenv("RADAR_EVAL_DEVICE", "cpu")
 
+    success_count = sum(1 for m in training_metas.values() if m.get("status") == "success")
+    skipped = {uid: m.get("status", "?") for uid, m in training_metas.items() if m.get("status") != "success"}
+    logger.info(
+        "Phase C evaluation starting: %d total metas, %d successful, %d skipped (round %d)",
+        len(training_metas), success_count, len(skipped), round_id,
+    )
+    if skipped:
+        for uid, status in skipped.items():
+            logger.info("  UID %d skipped (status=%s)", uid, status)
+
     for uid, meta in training_metas.items():
         if meta.get("status") != "success":
             continue
 
         miner_hotkey = meta.get("miner_hotkey", f"uid_{uid}")
+        logger.info("Evaluating UID %d (miner %s...) round %d", uid, miner_hotkey[:16], round_id)
 
         # Download and verify all artifacts
         artifacts = download_training_artifacts(r2, round_id, miner_hotkey, tmp_dir)
@@ -154,13 +256,48 @@ async def evaluate_all_checkpoints(
             continue
 
         if not artifacts.architecture_code:
+            logger.warning("UID %d: architecture code missing from R2 — skipping eval", uid)
+            results[uid] = {
+                "crps": float("inf"), "mase": float("inf"),
+                "error": "architecture code not found in R2",
+            }
             continue
 
+        # Re-verify checkpoint hash immediately before eval (TOCTOU defense)
+        if artifacts.meta.checkpoint_sha256:
+            from shared.artifacts import sha256_file
+            actual_hash = sha256_file(artifacts.checkpoint_path)
+            if actual_hash != artifacts.meta.checkpoint_sha256:
+                logger.warning("UID %d: checkpoint hash changed after download (TOCTOU)", uid)
+                results[uid] = {
+                    "crps": float("inf"), "mase": float("inf"),
+                    "error": "checkpoint hash mismatch at eval time",
+                }
+                continue
+
         # Evaluate
+        if not os.path.exists(artifacts.checkpoint_path):
+            logger.error(
+                "UID %d: checkpoint file missing before eval: %s",
+                uid, artifacts.checkpoint_path,
+            )
+            results[uid] = {
+                "crps": float("inf"), "mase": float("inf"),
+                "error": f"checkpoint file missing: {artifacts.checkpoint_path}",
+            }
+            continue
+
+        logger.info(
+            "UID %d: starting eval (checkpoint=%.2fMB arch=%d bytes)",
+            uid, os.path.getsize(artifacts.checkpoint_path) / (1024 * 1024),
+            len(artifacts.architecture_code),
+        )
+        runner_dir = challenge.task.get("runner_dir", "") if isinstance(challenge.task, dict) else ""
         metrics = evaluate_checkpoint(
             artifacts.architecture_code, artifacts.checkpoint_path,
             eval_split_seed=challenge.eval_split_seed,
             device=device,
+            runner_dir=runner_dir,
         )
 
         # Verify FLOPs claim

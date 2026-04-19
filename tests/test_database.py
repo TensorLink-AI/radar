@@ -173,3 +173,35 @@ def test_task_defaults_empty():
     assert elem.task == ""
 
 
+def test_to_api_dict_string_objectives():
+    """Regression: when a pool without a JSONB codec surfaces objectives as
+    a raw JSON string, ``to_api_dict`` must still decode it instead of
+    raising ``AttributeError: 'str' object has no attribute 'items'``.
+    This was the cause of the ``/experiments/pareto`` 500.
+    """
+    elem = DataElement(
+        name="x",
+        code="y",
+        objectives='{"crps": 0.12, "flops_equivalent_size": 1000000}',
+        loss_curve="[1.0, 0.5]",
+    )
+    d = elem.to_api_dict()
+    assert d["results"]["crps"] == 0.12
+    assert d["results"]["flops_equivalent_size"] == 1000000
+    assert d["results"]["loss_curve"] == [1.0, 0.5]
+
+
+def test_to_api_dict_malformed_objectives():
+    """Malformed JSON must not raise — fall back to empty dict/list."""
+    elem = DataElement(
+        name="x",
+        code="y",
+        objectives="not-json",
+        loss_curve="also-not-json",
+    )
+    d = elem.to_api_dict()
+    assert d["results"]["loss_curve"] == []
+    # Only success/metric/loss_curve should be present under results.
+    assert set(d["results"].keys()) == {"success", "metric", "loss_curve"}
+
+

@@ -1,0 +1,23 @@
+# Reverse proxy for the RADAR database server.
+# Auto-HTTPS via Let's Encrypt, rate limiting at the edge.
+#
+# Usage:
+#   sudo caddy run --config deploy/Caddyfile
+#
+# Requires: RADAR_DOMAIN env var (e.g. db.radar-subnet.com)
+
+{$RADAR_DOMAIN:localhost} {
+	# Global rate limit: 60 requests/min per IP
+	rate_limit {ip.src} 60r/m
+
+	reverse_proxy localhost:{$RADAR_DB_API_PORT:8090} {
+		# Health checks — Caddy auto-removes unhealthy upstreams
+		health_uri /health
+		health_interval 30s
+	}
+
+	log {
+		output file /var/log/caddy/radar-db.log
+		format json
+	}
+}

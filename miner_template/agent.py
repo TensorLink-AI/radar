@@ -1,22 +1,31 @@
-"""Starter miner agent — reads Challenge from stdin, writes Proposal to stdout.
+"""Starter miner agent — submit this file (or a directory of .py files) to the subnet.
 
-Build: docker build -t my-agent:latest .
-Validators will pull this image and run it in a sandbox.
+Validators inject your code into the official sandboxed agent image and
+call ``design_architecture(challenge, client)``.  The ``client`` is a
+GatedClient that can only reach validator-approved URLs:
+  - challenge["db_url"]      — experiment database (read past results)
+  - challenge["desearch_url"] — arxiv search via Desearch (SN22)
+  - challenge["llm_url"]      — LLM inference via Chutes AI
+  - Scratchpad presigned URLs  — persistent private storage across rounds
 
-The agent receives a Challenge JSON on stdin containing:
-  - feasible_frontier: list of {code, metric, objectives} for frontier
-    points in this round's size bucket
-  - task, db_url, desearch_url, seed
-  - min_flops_equivalent, max_flops_equivalent
-  - round_id, eval_split_seed
+You do NOT build a Docker image. Just write .py files and run the miner:
 
-It must print a Proposal JSON to stdout with:
-  - code: architecture module with build_model() and build_optimizer()
-  - name: human-readable name
-  - motivation: why this architecture should work well
+  python miner/neuron.py --agent_dir miner_template/ --netuid <N> ...
+
+The miner neuron will POST your code to the DB server, commit the hash
+on-chain, and validators fetch + run it every round.
+
+Your agent module MUST define:
+    design_architecture(challenge: dict, client: GatedClient) -> dict
+        Returns {"code": str, "name": str, "motivation": str}
+
+The ``code`` field should be a Python module that defines:
+    build_model(context_len, prediction_len, num_variates, quantiles) -> nn.Module
+    build_optimizer(model) -> torch.optim.Optimizer
 """
 
 import json
+import os
 import sys
 
 
@@ -28,9 +37,7 @@ def log(msg: str):
 def _pick_hyperparams(min_flops: int, max_flops: int) -> dict:
     """Pick d_model, nhead, num_layers, dim_feedforward to fit the FLOPs range.
 
-    Targets 60% of the bucket max to stay safely within bounds. FLOPs scale
-    roughly as: seq_len * num_layers * (4*d^2 + 2*seq*d + 8*d*ff)
-    where seq_len=512, so we use a lookup table with measured values.
+    Targets 60% of the bucket max to stay safely within bounds.
     """
     target = int(max_flops * 0.6)
 
@@ -49,7 +56,6 @@ def _pick_hyperparams(min_flops: int, max_flops: int) -> dict:
         (160, 8, 4,  640, 90_000_000),     # large-mid
     ]
 
-    # Pick the largest preset that fits under target
     best = presets[0]
     for preset in presets:
         if preset[4] <= target:
@@ -63,21 +69,110 @@ def _pick_hyperparams(min_flops: int, max_flops: int) -> dict:
     }
 
 
-def design_architecture(challenge: dict) -> dict:
+def _search_arxiv(client, challenge: dict, query: str) -> list[dict]:
+    """Search arxiv papers via the desearch proxy.
+
+    Returns a list of paper dicts with title, abstract, arxiv_id, etc.
+    """
+    desearch_url = challenge.get("desearch_url", "")
+    if not desearch_url:
+        log("No desearch_url in challenge, skipping arxiv search")
+        return []
+
+    try:
+        resp = client.post_json(
+            f"{desearch_url}/search",
+            {"query": query, "max_results": 5},
+        )
+        return resp.get("results", [])
+    except Exception as e:
+        log(f"Arxiv search failed: {e}")
+        return []
+
+
+def _query_llm(client, challenge: dict, prompt: str, model: str = "") -> str:
+    """Query the LLM proxy for architecture suggestions.
+
+    Returns the LLM response content string.
+    """
+    llm_url = challenge.get("llm_url", "")
+    if not llm_url:
+        log("No llm_url in challenge, skipping LLM query")
+        return ""
+
+    try:
+        # Check available models first
+        models_resp = client.get_json(f"{llm_url}/models")
+        available = models_resp.get("models", [])
+        if available and not model:
+            model = available[0]
+        elif not model:
+            model = "deepseek-ai/DeepSeek-V3-0324"
+
+        resp = client.post_json(
+            f"{llm_url}/chat",
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.7,
+                "max_tokens": 4096,
+            },
+        )
+        return resp.get("content", "")
+    except Exception as e:
+        log(f"LLM query failed: {e}")
+        return ""
+
+
+def _query_experiments(client, challenge: dict) -> list[dict]:
+    """Fetch recent experiment results from the database.
+
+    Returns a list of experiment dicts.
+    """
+    db_url = challenge.get("db_url", "")
+    if not db_url:
+        return []
+
+    try:
+        resp = client.get_json(f"{db_url}/experiments/recent?limit=10")
+        return resp if isinstance(resp, list) else resp.get("experiments", [])
+    except Exception as e:
+        log(f"DB query failed: {e}")
+        return []
+
+
+def design_architecture(challenge: dict, client) -> dict:
     """Design a model architecture for this round.
 
-    Override this function with your agent logic. You can:
-    - Study challenge["feasible_frontier"] to see what's already working
-    - Query the validator DB at challenge["db_url"]
-    - Design architecture within the FLOPs range
-    - Use an LLM, evolutionary strategies, etc.
+    Args:
+        challenge: Round challenge dict with frontier, FLOPs range, URLs, etc.
+        client: GatedClient — the ONLY way to make HTTP requests.
+            Use client.get_json(url), client.post_json(url, payload), etc.
 
-    Returns dict with: code, name, motivation
+    Returns:
+        dict with keys: code, name, motivation
     """
+    # Load persistent state from previous rounds
+    scratch_dir = load_scratchpad(challenge)
+
     frontier = challenge.get("feasible_frontier", [])
     min_flops = challenge.get("min_flops_equivalent", 0)
     max_flops = challenge.get("max_flops_equivalent", 0)
     log(f"Designing for FLOPs range [{min_flops}, {max_flops}], frontier size: {len(frontier)}")
+
+    # Example: search arxiv for relevant papers
+    # papers = _search_arxiv(client, challenge, "time series forecasting transformer")
+    # for p in papers:
+    #     log(f"  Paper: {p.get('title', '?')}")
+
+    # Example: ask the LLM for architecture ideas
+    # llm_response = _query_llm(client, challenge,
+    #     f"Suggest a PyTorch time series model architecture with ~{max_flops} FLOPs"
+    # )
+    # log(f"LLM suggestion: {llm_response[:200]}")
+
+    # Example: check past experiment results
+    # experiments = _query_experiments(client, challenge)
 
     hp = _pick_hyperparams(min_flops, max_flops)
     log(f"Selected hyperparams: {hp}")
@@ -132,20 +227,11 @@ def build_model(context_len, prediction_len, num_variates, quantiles):
 def build_optimizer(model):
     return torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
 '''
+    # Save state for next round
+    save_scratchpad(challenge, scratch_dir)
+
     return {
         "code": code,
         "name": f"transformer_d{d_model}_l{num_layers}_ff{dim_feedforward}",
         "motivation": motivation,
     }
-
-
-def main():
-    challenge = json.loads(sys.stdin.read())
-    log("Agent starting")
-    proposal = design_architecture(challenge)
-    log(f"Proposal: {proposal['name']} — {proposal['motivation']}")
-    print(json.dumps(proposal))
-
-
-if __name__ == "__main__":
-    main()

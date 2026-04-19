@@ -27,7 +27,20 @@ logger = logging.getLogger(__name__)
 
 # ── R2 path helpers ──────────────────────────────────────────────
 
+import re as _re
+
+_SAFE_HOTKEY = _re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_hotkey(miner_hotkey: str) -> str:
+    """Validate hotkey contains no path-traversal characters."""
+    if not _SAFE_HOTKEY.match(miner_hotkey):
+        raise ValueError(f"Invalid miner_hotkey (unsafe characters): {miner_hotkey!r}")
+    return miner_hotkey
+
+
 def checkpoint_key(round_id: int, miner_hotkey: str) -> str:
+    _validate_hotkey(miner_hotkey)
     return f"round_{round_id}/miner_{miner_hotkey}/checkpoint.safetensors"
 
 
@@ -43,6 +56,29 @@ def stdout_key(round_id: int, miner_hotkey: str) -> str:
     return f"round_{round_id}/miner_{miner_hotkey}/stdout.log"
 
 
+def scratchpad_key(miner_hotkey: str) -> str:
+    """R2 key for a miner's persistent scratchpad archive."""
+    return f"scratchpad/{miner_hotkey}/state.tar.gz"
+
+
+def generate_scratchpad_urls(
+    r2: "R2AuditLog",
+    miner_hotkey: str,
+    ttl: int = 1800,
+) -> tuple[str, str]:
+    """Generate presigned GET and PUT URLs for a miner's scratchpad.
+
+    Returns (get_url, put_url). GET URL returns 404 if no scratchpad exists yet.
+    Size limit is enforced agent-side in save_scratchpad — signing a
+    Content-Length into the PUT URL would force the upload to match it
+    exactly (S3/R2 signature check), breaking every smaller upload with 403.
+    """
+    key = scratchpad_key(miner_hotkey)
+    get_url = r2.generate_presigned_get_url(key, ttl=ttl)
+    put_url = r2.generate_presigned_put_url(key, ttl=ttl)
+    return get_url, put_url
+
+
 # ── TrainingMeta ─────────────────────────────────────────────────
 
 @dataclass
@@ -56,8 +92,13 @@ class TrainingMeta:
     training_time_seconds: float = 0.0
     num_steps: int = 0
     num_params_M: float = 0.0
-    loss_curve: list[float] = field(default_factory=list)
     peak_vram_mb: float = 0.0
+    # Loss tracking (Phase B). Self-reported by the miner pod —
+    # NOT a scoring trust anchor (Phase C remains the only one).
+    train_loss_history: list[dict] = field(default_factory=list)  # [{step: int, loss: float}, ...]
+    val_loss_history: list[dict] = field(default_factory=list)
+    best_val_loss: float | None = None
+    best_val_step: int = -1
     # Hash verification chain
     checkpoint_sha256: str = ""
     architecture_sha256: str = ""
@@ -76,8 +117,11 @@ class TrainingMeta:
             "training_time_seconds": self.training_time_seconds,
             "num_steps": self.num_steps,
             "num_params_M": self.num_params_M,
-            "loss_curve": self.loss_curve,
             "peak_vram_mb": self.peak_vram_mb,
+            "train_loss_history": self.train_loss_history,
+            "val_loss_history": self.val_loss_history,
+            "best_val_loss": self.best_val_loss,
+            "best_val_step": self.best_val_step,
             "checkpoint_sha256": self.checkpoint_sha256,
             "architecture_sha256": self.architecture_sha256,
             "stdout_sha256": self.stdout_sha256,
@@ -89,6 +133,7 @@ class TrainingMeta:
 
     @classmethod
     def from_dict(cls, d: dict) -> "TrainingMeta":
+        # Old metas may carry `loss_curve` — silently drop (filtered by field set).
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
@@ -153,6 +198,9 @@ def generate_upload_urls(
 ) -> dict[str, str]:
     """Generate pre-signed PUT URLs for all training artifacts.
 
+    TTL defaults to 5400s (~90 min). URLs are path-locked to the specific
+    round/miner key.
+
     Returns dict mapping artifact name to presigned URL.
     """
     keys = {
@@ -169,6 +217,46 @@ def generate_upload_urls(
         else:
             logger.error("Failed to generate presigned URL for %s", key)
     return urls
+
+
+def verify_uploaded_artifacts(
+    r2: "R2AuditLog",
+    round_id: int,
+    miner_hotkey: str,
+) -> tuple[bool, str]:
+    """Verify that expected artifacts exist in R2 after training upload.
+
+    Checks that checkpoint and meta files exist at the expected keys.
+    This catches cases where a presigned URL was used to write to an
+    unexpected path (which S3 presigned URLs prevent, but defense-in-depth).
+
+    Returns (ok, error_message).
+    """
+    ck = checkpoint_key(round_id, miner_hotkey)
+    mk = meta_key(round_id, miner_hotkey)
+
+    if not r2.key_exists(mk):
+        return False, f"training_meta.json missing at {mk}"
+    if not r2.key_exists(ck):
+        return False, f"checkpoint missing at {ck}"
+
+    # Verify meta contains correct round_id and miner_hotkey
+    meta_dict = r2.download_json(mk)
+    if not meta_dict:
+        return False, "Failed to download training_meta.json for verification"
+
+    if meta_dict.get("round_id") != round_id:
+        return False, (
+            f"Meta round_id mismatch: expected {round_id}, "
+            f"got {meta_dict.get('round_id')}"
+        )
+    if meta_dict.get("miner_hotkey") != miner_hotkey:
+        return False, (
+            f"Meta miner_hotkey mismatch: expected {miner_hotkey}, "
+            f"got {meta_dict.get('miner_hotkey')}"
+        )
+
+    return True, ""
 
 
 def upload_training_artifacts_presigned(
@@ -204,14 +292,31 @@ def upload_training_artifacts_presigned(
         logger.error("No presigned URL for checkpoint")
         ok = False
 
-    # Upload architecture (text)
+    # Upload architecture (text) — retry once on failure since this is critical for eval
     if "architecture" in presigned_urls:
-        try:
-            resp = httpx.put(presigned_urls["architecture"], content=architecture_code.encode(), timeout=30)
-            resp.raise_for_status()
-        except Exception as e:
-            logger.error("Presigned upload failed for architecture: %s", e)
+        arch_bytes = architecture_code.encode()
+        arch_uploaded = False
+        for attempt in range(2):
+            try:
+                if attempt == 0:
+                    logger.info("Uploading architecture (%d bytes) to presigned URL", len(arch_bytes))
+                else:
+                    logger.info("Retrying architecture upload (attempt %d)", attempt + 1)
+                resp = httpx.put(presigned_urls["architecture"], content=arch_bytes, timeout=30)
+                resp.raise_for_status()
+                logger.info("Architecture upload succeeded (HTTP %d)", resp.status_code)
+                arch_uploaded = True
+                break
+            except Exception as e:
+                logger.error(
+                    "Presigned upload failed for architecture (%d bytes, attempt %d): %s",
+                    len(arch_bytes), attempt + 1, e,
+                )
+        if not arch_uploaded:
             ok = False
+    else:
+        logger.error("No presigned URL for architecture — upload_urls keys: %s", list(presigned_urls.keys()))
+        ok = False
 
     # Upload stdout (text)
     if "stdout" in presigned_urls:
@@ -259,22 +364,35 @@ def download_training_artifacts(
     Returns None if meta can't be downloaded.
     Sets verified=False with verification_error if hash mismatch.
     """
+    hk_short = miner_hotkey[:16]
+    logger.info("Downloading artifacts for miner %s... round %d", hk_short, round_id)
+
     # Download meta
     mk = meta_key(round_id, miner_hotkey)
     meta_dict = r2.download_json(mk)
     if not meta_dict:
+        logger.warning("No training_meta.json found for miner %s... round %d", hk_short, round_id)
         return None
 
     meta = TrainingMeta.from_dict(meta_dict)
+    logger.info(
+        "Training meta for %s...: status=%s steps=%d time=%.1fs params=%.2fM",
+        hk_short, meta.status, meta.num_steps,
+        meta.training_time_seconds, meta.num_params_M,
+    )
 
     # Download checkpoint
     ck = checkpoint_key(round_id, miner_hotkey)
     os.makedirs(download_dir, exist_ok=True)
     local_checkpoint = os.path.join(download_dir, f"checkpoint_{miner_hotkey}.safetensors")
     if not r2.download_file_to_disk(ck, local_checkpoint):
+        logger.warning("Failed to download checkpoint for miner %s... round %d", hk_short, round_id)
         return DownloadedArtifacts(
             meta=meta, verification_error="Failed to download checkpoint",
         )
+
+    ckpt_size_mb = os.path.getsize(local_checkpoint) / (1024 * 1024)
+    logger.info("Checkpoint downloaded: %s... (%.2f MB)", hk_short, ckpt_size_mb)
 
     # Download architecture
     ak = architecture_key(round_id, miner_hotkey)
@@ -283,6 +401,10 @@ def download_training_artifacts(
     # Download stdout
     sk = stdout_key(round_id, miner_hotkey)
     stdout_log = r2.download_text(sk) or ""
+    logger.info(
+        "Artifacts downloaded for %s...: checkpoint=%.2fMB arch=%d bytes stdout=%d bytes",
+        hk_short, ckpt_size_mb, len(architecture_code), len(stdout_log),
+    )
 
     # Verify hashes
     result = DownloadedArtifacts(
@@ -310,8 +432,10 @@ def download_training_artifacts(
 
     if errors:
         result.verification_error = "; ".join(errors)
+        logger.warning("Hash verification failed for %s...: %s", hk_short, result.verification_error)
     else:
         result.verified = True
+        logger.info("All hashes verified for miner %s...", hk_short)
 
     return result
 

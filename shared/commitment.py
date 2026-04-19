@@ -15,31 +15,31 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-# File-based fallback directory for localnet (no chain commitment API)
-_COMMITMENT_DIR = Path(os.environ.get(
-    "RADAR_COMMITMENT_DIR", "/tmp/radar_commitments"
-))
 
 
 @dataclass
 class ImageCommitment:
-    """A miner's committed image reference with pod URLs."""
+    """A miner's committed identity: agent code hash + listener URL.
 
-    # Agent image (existing)
-    image_url: str = ""       # e.g. "docker.io/myminer/agent:v2"
-    image_digest: str = ""    # e.g. "sha256:abc123..."
-    subnet_version: str = ""  # e.g. "0.1.0" — must match official
+    Agent code is served from the miner's listener (GET /agent_code).
+    The code_hash is committed on-chain so validators can verify
+    integrity after fetching.
+    """
 
-    # Training pod (miner-hosted on Basilica)
-    pod_url: str = ""                    # Basilica pod URL
-    pod_attestation_id: str = ""         # Basilica attestation for training pod
+    # Agent code (new — replaces Docker image)
+    code_hash: str = ""       # e.g. "sha256:abc123..." — hash of agent code bundle
+    image_url: str = ""       # DEPRECATED: Docker image (kept for backward compat reads)
+    image_digest: str = ""    # DEPRECATED
+
+    subnet_version: str = ""  # e.g. "0.3.0" — must match official
+
+    # Warm-standby trainer (miner-hosted lightweight listener, no GPU)
+    listener_url: str = ""               # always-on HTTP endpoint on miner's neuron process
+    trainer_image: str = ""              # Docker image miner will deploy on Basilica when requested
 
     # Agent pod (miner-hosted on Basilica)
     agent_url: str = ""                  # Basilica pod URL for agent
@@ -49,66 +49,199 @@ class ImageCommitment:
     miner_uid: int = -1
     hotkey: str = ""
 
+    # Compact key mapping for serialization.
+    _KEY_MAP = {
+        "i": "image_url",
+        "d": "image_digest",
+        "v": "subnet_version",
+        "l": "listener_url",
+        "t": "trainer_image",
+        "a": "agent_url",
+        "at": "agent_attestation_id",
+        "ch": "code_hash",
+    }
+    _REV_MAP = {v: k for k, v in _KEY_MAP.items()}
+
+    # On-chain limit is Raw128 (128 bytes). Only essential fields go on-chain.
+    _CHAIN_KEYS = ("ch", "l", "v")
+    _MAX_CHAIN_BYTES = 128
+
     def to_json(self) -> str:
-        return json.dumps({
-            "image_url": self.image_url,
-            "image_digest": self.image_digest,
-            "subnet_version": self.subnet_version,
-            "pod_url": self.pod_url,
-            "pod_attestation_id": self.pod_attestation_id,
-            "agent_url": self.agent_url,
-            "agent_attestation_id": self.agent_attestation_id,
-        })
+        """Serialize to compact JSON (short keys, no empty values)."""
+        data = {}
+        for short, field in self._KEY_MAP.items():
+            val = getattr(self, field, "")
+            if val:
+                data[short] = val
+        return json.dumps(data, separators=(",", ":"))
+
+    def to_chain_json(self) -> str:
+        """Serialize for on-chain storage (<=128 bytes, essential fields only).
+
+        The bittensor Commitments pallet Data enum supports Raw0-Raw128.
+        Only image_url and listener_url (+ version if space allows) are included.
+        Full data should be committed to file or fetched via the listener.
+        """
+        data: dict[str, str] = {}
+        for short in self._CHAIN_KEYS:
+            field = self._KEY_MAP[short]
+            val = getattr(self, field, "")
+            if val:
+                data[short] = val
+        result = json.dumps(data, separators=(",", ":"))
+        # If still over limit, drop version to save space
+        if len(result) > self._MAX_CHAIN_BYTES and "v" in data:
+            del data["v"]
+            result = json.dumps(data, separators=(",", ":"))
+        return result
 
     @classmethod
     def from_json(cls, s: str, miner_uid: int = -1, hotkey: str = "") -> ImageCommitment:
         d = json.loads(s)
+        # Support both compact (short) and legacy (full) keys
+        def _get(short: str, full: str) -> str:
+            return d.get(short, d.get(full, ""))
         return cls(
-            image_url=d.get("image_url", ""),
-            image_digest=d.get("image_digest", ""),
-            subnet_version=d.get("subnet_version", ""),
-            pod_url=d.get("pod_url", ""),
-            pod_attestation_id=d.get("pod_attestation_id", ""),
-            agent_url=d.get("agent_url", ""),
-            agent_attestation_id=d.get("agent_attestation_id", ""),
+            image_url=_get("i", "image_url"),
+            image_digest=_get("d", "image_digest"),
+            subnet_version=_get("v", "subnet_version"),
+            listener_url=_get("l", "listener_url"),
+            trainer_image=_get("t", "trainer_image"),
+            agent_url=_get("a", "agent_url"),
+            agent_attestation_id=_get("at", "agent_attestation_id"),
+            code_hash=_get("ch", "code_hash"),
             miner_uid=miner_uid,
             hotkey=hotkey,
         )
 
     @property
     def is_valid(self) -> bool:
-        """Basic validation: image URL and digest present."""
-        return bool(self.image_url) and bool(self.image_digest)
+        """Basic validation: code_hash and listener_url present."""
+        return bool(self.code_hash) and bool(self.listener_url)
 
 
 def read_miner_commitments(subtensor, netuid: int, metagraph) -> dict[int, ImageCommitment]:
     """
-    Read image commitments from all miners in the metagraph.
+    Read image commitments from all neurons in the metagraph.
 
-    Tries chain first, falls back to file-based commitments for localnet.
+    Any UID with a valid commitment (code_hash + listener_url) is included,
+    regardless of validator_permit. On small subnets, miners may have
+    validator_permit=true even though they run as miners.
 
-    Returns: {uid: ImageCommitment} for miners with valid commitments.
+    Priority: get_all_commitments (single RPC) → per-UID fallback.
+
+    Returns: {uid: ImageCommitment} for neurons with valid commitments.
     """
-    # Try file-based commitments first (always available, used by localnet)
-    file_commitments = _read_from_files(netuid, metagraph)
-    if file_commitments:
-        logger.info("Found %d commitments from file fallback", len(file_commitments))
-        return file_commitments
-
-    # Fall back to chain API
     hotkeys = metagraph.hotkeys if metagraph.hotkeys is not None else []
-    commitments = {}
-    for uid in range(metagraph.n):
-        try:
-            raw = subtensor.get_commitment(netuid=netuid, uid=uid)
-            if raw:
-                hotkey = hotkeys[uid] if uid < len(hotkeys) else ""
-                commitment = ImageCommitment.from_json(raw, miner_uid=uid, hotkey=hotkey)
-                if commitment.image_url:
-                    commitments[uid] = commitment
-        except Exception as e:
-            logger.debug("No commitment for UID %d: %s", uid, e)
 
+    # Build hotkey→uid map for ALL neurons
+    hotkey_to_uid: dict[str, int] = {}
+    all_uids: set[int] = set()
+    for uid in range(metagraph.n):
+        if uid < len(hotkeys) and hotkeys[uid]:
+            hotkey_to_uid[hotkeys[uid]] = uid
+        all_uids.add(uid)
+    logger.info("Checking %d UIDs for commitments", len(all_uids))
+
+    # Primary: get_all_commitments — single RPC call, SDK handles decoding
+    commitments = _read_all_commitments(
+        subtensor, netuid, hotkey_to_uid, all_uids,
+    )
+    if commitments:
+        logger.info("Found %d commitments via get_all_commitments", len(commitments))
+        return commitments
+
+    # Fallback: per-UID get_commitment (slower, but works if map query fails)
+    commitments = _read_per_uid_commitments(
+        subtensor, netuid, hotkeys, sorted(all_uids),
+    )
+    if commitments:
+        logger.info("Found %d commitments via per-UID fallback", len(commitments))
+    return commitments
+
+
+def _read_all_commitments(
+    subtensor, netuid: int,
+    hotkey_to_uid: dict[str, int],
+    miner_uids: set[int],
+) -> dict[int, ImageCommitment]:
+    """Read all commitments in a single RPC call via SDK get_all_commitments."""
+    commitments: dict[int, ImageCommitment] = {}
+    try:
+        all_raw = subtensor.get_all_commitments(netuid=netuid)
+    except Exception as e:
+        logger.warning("get_all_commitments RPC failed: %s", e)
+        return commitments
+
+    miner_entries = 0
+    for hotkey, raw_text in all_raw.items():
+        uid = hotkey_to_uid.get(hotkey)
+        if uid is None or uid not in miner_uids:
+            continue
+        miner_entries += 1
+        if not raw_text:
+            logger.warning("UID %d: commitment on chain is empty", uid)
+            continue
+        try:
+            c = ImageCommitment.from_json(raw_text, miner_uid=uid, hotkey=hotkey)
+            if c.code_hash:
+                commitments[uid] = c
+            else:
+                logger.warning(
+                    "UID %d: commitment has no code_hash (raw=%s)",
+                    uid, raw_text[:120],
+                )
+        except Exception as e:
+            logger.warning("UID %d: bad commitment JSON: %s (raw=%s)", uid, e, raw_text[:120])
+    logger.info(
+        "get_all_commitments: %d total on chain, %d miner entries, %d valid",
+        len(all_raw), miner_entries, len(commitments),
+    )
+    return commitments
+
+
+def _read_per_uid_commitments(
+    subtensor, netuid: int, hotkeys: list, miner_uids: list[int],
+) -> dict[int, ImageCommitment]:
+    """Per-UID commitment reads via get_commitment_metadata + decode."""
+    commitments: dict[int, ImageCommitment] = {}
+    bt_logger = logging.getLogger("bittensor")
+    prev_level = bt_logger.level
+    bt_logger.setLevel(logging.CRITICAL)
+    try:
+        for uid in miner_uids:
+            hotkey = hotkeys[uid] if uid < len(hotkeys) else ""
+            if not hotkey:
+                continue
+            try:
+                metadata = subtensor.get_commitment_metadata(
+                    netuid=netuid, hotkey_ss58=hotkey,
+                )
+                if not metadata:
+                    logger.info("UID %d: no commitment on chain", uid)
+                    continue
+                if not isinstance(metadata, dict):
+                    logger.warning(
+                        "UID %d: commitment metadata is %s, not dict: %s",
+                        uid, type(metadata).__name__, str(metadata)[:120],
+                    )
+                    continue
+                # Use SDK decoding — handles current on-chain byte tuple format
+                from bittensor.core.chain_data.utils import decode_metadata
+                raw = decode_metadata(metadata)
+                if raw:
+                    c = ImageCommitment.from_json(raw, miner_uid=uid, hotkey=hotkey)
+                    if c.code_hash:
+                        commitments[uid] = c
+                    else:
+                        logger.warning(
+                            "UID %d: per-UID commitment has no code_hash (raw=%s)",
+                            uid, raw[:120],
+                        )
+            except Exception as e:
+                logger.warning("Per-UID commitment read failed for UID %d: %s", uid, e)
+    finally:
+        bt_logger.setLevel(prev_level)
     return commitments
 
 
@@ -203,59 +336,11 @@ def commit_image_to_chain(
         image_digest=image_digest,
         subnet_version=subnet_version,
     )
-    try:
-        subtensor.commit(
-            wallet=wallet,
-            netuid=netuid,
-            data=commitment.to_json(),
-        )
-        logger.info("Committed image to chain: %s @ %s", image_url, image_digest[:16])
-        return True
-    except Exception as e:
-        logger.warning("Chain commit unavailable (%s), using file fallback", e)
-        return _commit_to_file(wallet, netuid, commitment)
-
-
-def _commit_to_file(wallet, netuid: int, commitment: ImageCommitment) -> bool:
-    """Write commitment to a shared temp directory (localnet fallback)."""
-    try:
-        d = _COMMITMENT_DIR / str(netuid)
-        d.mkdir(parents=True, exist_ok=True)
-        hotkey = wallet.hotkey.ss58_address
-        path = d / f"{hotkey}.json"
-        path.write_text(commitment.to_json())
-        logger.info("Committed image to file: %s -> %s", commitment.image_url, path)
-        return True
-    except Exception as e:
-        logger.error("File commitment failed: %s", e)
-        return False
-
-
-def _read_from_files(netuid: int, metagraph) -> dict[int, ImageCommitment]:
-    """Read commitments from shared temp directory (localnet fallback)."""
-    commitments = {}
-    d = _COMMITMENT_DIR / str(netuid)
-    if not d.exists():
-        return commitments
-
-    # Map hotkeys to UIDs
-    hotkeys = metagraph.hotkeys if metagraph.hotkeys is not None else []
-    hotkey_to_uid = {}
-    for uid in range(metagraph.n):
-        if uid < len(hotkeys):
-            hotkey_to_uid[hotkeys[uid]] = uid
-
-    for path in d.glob("*.json"):
-        try:
-            hotkey = path.stem
-            uid = hotkey_to_uid.get(hotkey)
-            if uid is None:
-                continue
-            commitment = ImageCommitment.from_json(
-                path.read_text(), miner_uid=uid, hotkey=hotkey,
-            )
-            if commitment.image_url:
-                commitments[uid] = commitment
-        except Exception as e:
-            logger.debug("Bad commitment file %s: %s", path, e)
-    return commitments
+    chain_json = commitment.to_chain_json()
+    subtensor.set_commitment(
+        wallet=wallet,
+        netuid=netuid,
+        data=chain_json,
+    )
+    logger.info("Committed image to chain: %s @ %s", image_url, image_digest[:16])
+    return True

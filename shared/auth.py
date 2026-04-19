@@ -7,6 +7,7 @@ for authenticating HTTP requests with SR25519 hotkey signatures.
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from typing import Optional
@@ -15,8 +16,8 @@ import bittensor as bt
 
 logger = logging.getLogger(__name__)
 
-# Epistula timestamp tolerance (seconds)
-EPISTULA_TIMESTAMP_TOLERANCE = 30
+# Epistula timestamp tolerance (seconds) — increase for cross-machine clock skew
+EPISTULA_TIMESTAMP_TOLERANCE = int(os.getenv("RADAR_EPISTULA_TOLERANCE", "30"))
 
 
 def sign_request(wallet: bt.Wallet, body: bytes) -> dict[str, str]:
@@ -85,7 +86,10 @@ def verify_request(
 
 def get_uid_for_hotkey(metagraph, hotkey: str) -> Optional[int]:
     """Look up UID for a hotkey in the metagraph."""
+    hotkeys = metagraph.hotkeys
+    if hotkeys is None:
+        return None
     for i in range(metagraph.n):
-        if metagraph.hotkeys[i] == hotkey:
+        if i < len(hotkeys) and hotkeys[i] == hotkey:
             return i
     return None

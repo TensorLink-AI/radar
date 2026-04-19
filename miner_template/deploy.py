@@ -1,61 +1,83 @@
-"""Deploy trainer on Basilica + commit agent image to chain.
+"""Deploy guide for Radar miners.
 
 Miners have two components:
-  1. Agent: a Docker image pushed to a registry. Validators pull and run it.
-  2. Trainer: the sanctioned training image deployed on Basilica.
+  1. Agent code: .py files in a directory. The miner neuron POSTs them to
+     the DB server and commits the code hash on-chain. Validators fetch
+     the code and run it inside the official sandboxed agent image.
+  2. Trainer listener: a lightweight HTTP server on the miner's neuron
+     process. GPU pods deploy on-demand via Basilica when validators send
+     TrainerRequests.
+
+No Docker image needed for agents — just write .py files.
+No upfront GPU cost — pods deploy on-demand.
 
 Usage:
-  # 1. Build and push your agent Docker image
-  docker build -t myregistry/my-agent:v1 miner_template/
-  docker push myregistry/my-agent:v1
-
-  # 2. Deploy trainer on Basilica + commit to chain
-  python miner_template/deploy.py \\
-      --docker_image myregistry/my-agent:v1 \\
-      --trainer_image ghcr.io/tensorlink-ai/radar/ts-runner:latest
+  # Start miner (agent code auto-submitted from --agent_dir)
+  python miner/neuron.py \\
+      --agent_dir miner_template/ \\
+      --listener_port 8090 \\
+      --netuid <N> \\
+      --subtensor.network <network> \\
+      --wallet.name <name>
 """
 
 import argparse
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
 
-def deploy_trainer(image: str) -> str:
-    """Deploy the sanctioned trainer container on Basilica. Returns URL."""
-    # TODO: Implement Basilica deployment via basilica-sdk
-    # from basilica import BasilicaClient
-    # client = BasilicaClient()
-    # pod = client.deploy(name="radar-trainer", image=image, port=8001,
-    #                     gpu_count=1, memory="16Gi")
-    # return pod.url
-    logger.info("Deploy trainer image: %s", image)
-    return ""
-
-
 def main():
     logging.basicConfig(level=logging.INFO)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
     parser = argparse.ArgumentParser(description="Deploy Radar miner")
-    parser.add_argument("--docker_image", type=str, required=True,
-                        help="Agent Docker image (e.g. myregistry/my-agent:v1)")
+    parser.add_argument("--agent_dir", type=str, default="miner_template/",
+                        help="Directory containing agent .py files")
     parser.add_argument("--trainer_image", type=str,
-                        default="ghcr.io/tensorlink-ai/radar/ts-runner:latest",
-                        help="Sanctioned trainer image")
+                        default="ghcr.io/tensorlink-ai/radar/radar-runner:latest",
+                        help="Trainer image (deployed on Basilica on-demand)")
+    parser.add_argument("--listener_port", type=int, default=8090,
+                        help="Port for warm-standby trainer listener")
     args = parser.parse_args()
 
-    trainer_url = deploy_trainer(args.trainer_image)
+    # Check agent directory
+    if not os.path.isdir(args.agent_dir):
+        print(f"Error: agent directory not found: {args.agent_dir}")
+        return
 
-    print(f"Agent image: {args.docker_image}")
-    print(f"Trainer URL: {trainer_url}")
+    py_files = [f for f in os.listdir(args.agent_dir) if f.endswith(".py")]
+    if not py_files:
+        print(f"Error: no .py files found in {args.agent_dir}")
+        return
+
+    print(f"Agent directory: {args.agent_dir}")
+    print(f"  .py files:    {sorted(py_files)}")
+    print(f"Trainer image:  {args.trainer_image}")
+    print(f"Listener port:  {args.listener_port}")
     print()
-    print("Next steps:")
-    print(f"  1. Push your agent image: docker push {args.docker_image}")
-    print(f"  2. Start miner:")
-    print(f"     python miner/neuron.py \\")
-    print(f"       --docker_image {args.docker_image} \\")
-    print(f"       --trainer_url {trainer_url or '<basilica-url>'}")
+    print("How it works:")
+    print("  1. Miner neuron reads .py files from --agent_dir")
+    print("  2. POSTs them to the DB server (stored in R2 + Postgres)")
+    print("  3. Commits code_hash on-chain for validator verification")
+    print("  4. Validators fetch code, inject into official agent image, run it")
+    print()
+    print("Start miner:")
+    print(f"  python miner/neuron.py \\")
+    print(f"    --agent_dir {args.agent_dir} \\")
+    print(f"    --listener_port {args.listener_port} \\")
+    print(f"    --trainer_image {args.trainer_image} \\")
+    print(f"    --netuid <N> --subtensor.network <network> --wallet.name <name>")
+    print()
+    print("Notes:")
+    print("  - Agent code must define: design_architecture(challenge, client)")
+    print("  - The client is a GatedClient — the only way to make HTTP requests")
+    print("  - Available proxy endpoints in the challenge:")
+    print("      challenge['db_url']       — experiment database")
+    print("      challenge['desearch_url'] — arxiv search (Desearch/SN22)")
+    print("      challenge['llm_url']      — LLM inference (Chutes AI)")
+    print("  - No GPU needed to start — trainer pods deploy on-demand via Basilica")
+    print("  - Set BASILICA_API_TOKEN env var for Basilica SDK auth")
+    print("  - To update agent code, edit .py files and restart the miner")
 
 
 if __name__ == "__main__":

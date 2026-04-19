@@ -5,5 +5,11 @@ pyyaml>=6.0
 python-dotenv>=1.0
 tiktoken>=0.5
 
+# Data processing
+pyarrow
+
+# Postgres (async)
+asyncpg>=0.29.0
+
 # Cloud execution (optional — only needed for RUNNER_BACKEND=basilica)
 basilica-sdk

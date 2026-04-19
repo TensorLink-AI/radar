@@ -6,6 +6,7 @@ analysis, motivation, parent index, and more.
 """
 
 import json
+import math
 import re
 import time
 from collections import Counter
@@ -37,6 +38,7 @@ class DataElement:
     manifest_sha256: str = ""
     generated_samples: list = field(default_factory=list)
     task: str = ""
+    round_id: int = -1
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -46,7 +48,41 @@ class DataElement:
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
     def to_api_dict(self) -> dict:
-        """JSON shape exposed to miners via the DB API."""
+        """JSON shape exposed to miners via the DB API.
+
+        Defensive against ``objectives`` / ``loss_curve`` arriving as JSON
+        strings — this happens when a DataElement is built from a row whose
+        JSONB columns weren't decoded by asyncpg (pools without a codec). The
+        handler must never raise on well-formed DB rows.
+        """
+        objectives = self.objectives
+        if isinstance(objectives, str):
+            try:
+                objectives = json.loads(objectives)
+            except (ValueError, TypeError):
+                objectives = {}
+        if not isinstance(objectives, dict):
+            objectives = {}
+        loss_curve = self.loss_curve
+        if isinstance(loss_curve, str):
+            try:
+                loss_curve = json.loads(loss_curve)
+            except (ValueError, TypeError):
+                loss_curve = []
+        if not isinstance(loss_curve, list):
+            loss_curve = []
+
+        def _safe(v):
+            """Replace inf/nan floats with None for JSON compliance."""
+            if isinstance(v, float) and (math.isinf(v) or math.isnan(v)):
+                return None
+            return v
+
+        metric = _safe(self.metric)
+        score = _safe(self.score)
+        safe_obj = {k: _safe(v) for k, v in objectives.items()}
+        safe_lc = [_safe(v) for v in loss_curve]
+
         return {
             "index": self.index,
             "timestamp": self.timestamp,
@@ -60,12 +96,13 @@ class DataElement:
             "motivation": self.motivation,
             "results": {
                 "success": self.success,
-                "metric": self.metric,
-                **{k: v for k, v in self.objectives.items()},
-                "loss_curve": self.loss_curve,
+                "metric": metric,
+                **safe_obj,
+                "loss_curve": safe_lc,
             },
             "analysis": self.analysis,
-            "score": self.score,
+            "score": score,
+            "round_id": self.round_id,
         }
 
     def summary(self) -> str:
