@@ -288,5 +288,5 @@ def test_nonce_replay_protection():
 
 def test_agent_code_file_limits():
     """Agent code rejects too many files or oversized files."""
-    assert _MAX_AGENT_FILES == 10
-    assert _MAX_AGENT_FILE_BYTES == 50_000
+    assert _MAX_AGENT_FILES == 25
+    assert _MAX_AGENT_FILE_BYTES == 100_000
