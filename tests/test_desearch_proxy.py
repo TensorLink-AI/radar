@@ -67,6 +67,88 @@ class TestDesearchProxy:
             await proxy.search(0, "attention mechanisms")
         assert exc_info.value.status_code == 429
 
+    @pytest.mark.asyncio
+    async def test_search_sends_authorization_header(self):
+        """When api_key is set, outbound request carries `Authorization: <key>`
+        and the body matches the Desearch /desearch/ai/search schema."""
+        proxy = DesearchProxy(
+            sn22_url="https://api.desearch.ai",
+            max_queries=5,
+            api_key="dt_testkey",
+        )
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.json = lambda: []
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
+            await proxy.search(0, "attention", max_results=7)
+        args, kwargs = mock_client.post.call_args
+        assert args[0] == "https://api.desearch.ai/desearch/ai/search"
+        assert kwargs["headers"] == {"Authorization": "dt_testkey"}
+        assert kwargs["json"] == {
+            "prompt": "attention",
+            "tools": ["arxiv"],
+            "date_filter": "NONE",
+            "result_type": "LINKS_WITH_FINAL_SUMMARY",
+            "count": 7,
+        }
+
+    @pytest.mark.asyncio
+    async def test_search_omits_header_when_no_key(self):
+        """When api_key is empty, no Authorization header is sent."""
+        proxy = DesearchProxy(max_queries=5)
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.json = lambda: []
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
+            await proxy.search(0, "attention")
+        _, kwargs = mock_client.post.call_args
+        assert kwargs["headers"] == {}
+
+    @pytest.mark.asyncio
+    async def test_search_web_tool(self):
+        """tool='web' forwards `tools: ['web']` to Desearch."""
+        proxy = DesearchProxy(max_queries=5, api_key="dt_testkey")
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.json = lambda: []
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
+            await proxy.search(0, "llms", tool="web")
+        _, kwargs = mock_client.post.call_args
+        assert kwargs["json"]["tools"] == ["web"]
+
+    @pytest.mark.asyncio
+    async def test_search_date_filter_forwarded(self):
+        proxy = DesearchProxy(max_queries=5, api_key="dt_testkey")
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.json = lambda: []
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
+            await proxy.search(0, "x", date_filter="PAST_2_MONTHS")
+        _, kwargs = mock_client.post.call_args
+        assert kwargs["json"]["date_filter"] == "PAST_2_MONTHS"
+
+    @pytest.mark.asyncio
+    async def test_search_rejects_unknown_tool(self):
+        proxy = DesearchProxy(max_queries=5)
+        with pytest.raises(HTTPException) as exc_info:
+            await proxy.search(0, "x", tool="twitter")
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_search_rejects_unknown_date_filter(self):
+        proxy = DesearchProxy(max_queries=5)
+        with pytest.raises(HTTPException) as exc_info:
+            await proxy.search(0, "x", date_filter="LAST_FRIDAY")
+        assert exc_info.value.status_code == 400
+
 
 # ── Unit tests for response parsing ─────────────────────────────────────────
 
