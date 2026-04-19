@@ -22,8 +22,15 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-# Default SN22 endpoint (Desearch/arxiv search subnet)
-DEFAULT_SN22_URL = "https://desearch.ai/api/v1"
+# Default Desearch (SN22) endpoint base URL.
+# The actual path used is /desearch/ai/search/links/web.
+DEFAULT_SN22_URL = "https://api.desearch.ai"
+
+# Desearch "tools" values — restrict to arxiv/web; miners don't get to
+# choose other tools (twitter, etc.) through this proxy.
+DESEARCH_TOOL_ARXIV = "arxiv"
+DESEARCH_TOOL_WEB = "web"
+ALLOWED_TOOLS = {DESEARCH_TOOL_ARXIV, DESEARCH_TOOL_WEB}
 
 # Rate limit: max queries per miner per tempo
 MAX_QUERIES_PER_TEMPO = 20
@@ -33,10 +40,11 @@ TEMPO_DURATION_SECONDS = 360 * 12
 
 
 class SearchQuery(BaseModel):
-    """Arxiv search request from a miner."""
+    """Search request from a miner."""
 
     query: str = Field(..., min_length=1, max_length=500)
     max_results: int = Field(default=5, ge=1, le=20)
+    tool: str = Field(default=DESEARCH_TOOL_ARXIV)
 
 
 class SearchResult(BaseModel):
@@ -127,13 +135,19 @@ class DesearchProxy:
 
     async def search(
         self, miner_uid: int, query: str, max_results: int = 5,
-        miner_hotkey: str = "",
+        miner_hotkey: str = "", tool: str = DESEARCH_TOOL_ARXIV,
     ) -> SearchResponse:
         """
-        Search arxiv via the SN22 Desearch endpoint.
+        Search via the Desearch /desearch/ai/search/links/web endpoint.
 
         Raises HTTPException(429) if the miner has exhausted their quota.
         """
+        if tool not in ALLOWED_TOOLS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported tool '{tool}'. Allowed: {sorted(ALLOWED_TOOLS)}.",
+            )
+
         remaining = self.remaining_queries(miner_uid)
         if remaining <= 0:
             raise HTTPException(
@@ -149,8 +163,8 @@ class DesearchProxy:
         try:
             client = await self._get_client()
             resp = await client.post(
-                f"{self.sn22_url}/search/arxiv",
-                json={"query": query, "max_results": max_results},
+                f"{self.sn22_url}/desearch/ai/search/links/web",
+                json={"prompt": query, "tools": [tool]},
                 headers=headers,
                 timeout=30.0,
             )
@@ -180,8 +194,20 @@ class DesearchProxy:
 
 
 def _parse_sn22_response(data: dict | list) -> list[SearchResult]:
-    """Parse the SN22 API response into SearchResult objects."""
-    papers = data if isinstance(data, list) else data.get("results", data.get("papers", []))
+    """Parse the Desearch API response into SearchResult objects.
+
+    Desearch's /search/links/web endpoint returns a list of link objects
+    (or, for some variants, a dict containing one of: links/results/papers).
+    """
+    if isinstance(data, list):
+        papers = data
+    else:
+        papers = (
+            data.get("links")
+            or data.get("results")
+            or data.get("papers")
+            or []
+        )
     results = []
     for paper in papers:
         if not isinstance(paper, dict):
@@ -189,7 +215,7 @@ def _parse_sn22_response(data: dict | list) -> list[SearchResult]:
         results.append(SearchResult(
             title=paper.get("title", ""),
             authors=paper.get("authors", []),
-            abstract=paper.get("abstract", ""),
+            abstract=paper.get("abstract", paper.get("snippet", "")),
             arxiv_id=paper.get("arxiv_id", paper.get("id", "")),
             published=paper.get("published", paper.get("date", "")),
             url=paper.get("url", paper.get("link", "")),
@@ -219,11 +245,13 @@ def register_routes(app: FastAPI):
 
     @app.post("/desearch/search")
     async def desearch_search(req: SearchQuery, request: Request):
-        """Search arxiv papers. Requires X-Miner-UID header."""
+        """Search arxiv/web via Desearch. Requires X-Miner-UID header."""
         proxy = get_proxy()
         miner_uid = _extract_miner_uid(request)
         miner_hotkey = _extract_miner_hotkey(request)
-        return await proxy.search(miner_uid, req.query, req.max_results, miner_hotkey)
+        return await proxy.search(
+            miner_uid, req.query, req.max_results, miner_hotkey, req.tool,
+        )
 
     @app.get("/desearch/quota")
     def desearch_quota(request: Request):
