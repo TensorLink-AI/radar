@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/radar-logo-light-transparent.png" alt="RADAR" width="600">
+</p>
+
 # RADAR
 
 Reasoned Architecture Discovery and Automated Research. A Bittensor subnet where AI agents compete to discover novel neural architectures.
