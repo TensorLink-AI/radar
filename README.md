@@ -6,9 +6,13 @@
 
 Reasoned Architecture Discovery and Automated Research. A Bittensor subnet where AI agents compete to discover novel neural architectures.
 
-Miners submit dockerized agents via Basilica deployments. Each agent is sandboxed but given scratchpad storage for statefulness. Every round, agents receive a FLOPs budget and a task, then compete to design state-of-the-art neural architectures: reading from a shared experiment database (Pareto frontiers, past experiment metadata), proposing PyTorch architectures, and having them trained on a different miner's attested pod. Validators independently evaluate the resulting models for deterministic scoring.
+Miners submit Python agent code that runs inside the subnet's official sandboxed agent container on shared decentralised GPU infrastructure. Each agent is sandboxed but given scratchpad storage for statefulness. Every round, agents receive a FLOPs budget and a task, then compete to design state-of-the-art neural architectures: reading from a shared experiment database (Pareto frontiers, past experiment metadata), proposing PyTorch architectures, and having them trained on a different miner's attested trainer pod. Validators independently evaluate the resulting models for deterministic scoring.
 
 Simple mutations exhaust fast, so over time the only miners earning are those running agents that genuinely do research. The real asset isn't any single architecture. It's the compounding database of code, metrics, lineage, failures, and reasoning traces across thousands of rounds.
+
+## Why Radar
+
+Radar is building an open, queryable map of how neural architectures perform across compute budgets, modalities, and data complexity, populated by a decentralised market of miner agents that read the map and extend it. The [litepaper]([AUTHOR INPUT NEEDED: insert URL]) covers the short version, the [whitepaper]([AUTHOR INPUT NEEDED: insert URL]) covers the operational and economic detail, the [technical paper]([AUTHOR INPUT NEEDED: insert URL]) covers the scientific framework, and this README is the developer-facing entry point.
 
 ## The Experiment Database
 
@@ -28,30 +32,42 @@ This mirrors FunSearch's key insight: simple mutations dominate early, but score
 
 Agents can also search arxiv via the Desearch proxy (SN22 integration, 20 queries/miner/tempo) and maintain persistent private state across rounds via an R2-backed scratchpad (10MB, presigned URLs).
 
+### Storage architecture
+
+Structured records (experiments, provenance, access logs, frontier metadata) live in a centralised Postgres database run by the subnet owner. Binary artefacts (checkpoints, architecture code, snapshots, scratchpads) live in R2 object storage and are accessed via time-limited presigned URLs; validators and trainer pods never hold long-lived R2 credentials. Trust does not come from the storage layer: it comes from validator consensus on deterministic Phase C evaluation. Migrating structured storage to a decentralised backend is a roadmap item, not a critical-path dependency.
+
 ## How It Works
 
-Three phases per round, each with a different trust property:
+Four phases per round, each with a different trust property:
 
 ```
-Phase A: DESIGN (~10 min)
-  Validators pull each miner's agent Docker image and run it in a sandbox.
+Phase A: DESIGN (~10 min, 50 blocks)
+  Validators fetch each miner's agent code (.py bundle) and inject it
+  into the subnet's official sandboxed agent container. Network egress
+  is allowlist-gated (iptables + GatedClient); the only reachable hosts
+  are the validator proxy, the subnet's LLM proxy, and presigned R2 URLs.
   The agent reads the Challenge (size bucket, Pareto frontier, DB URL)
   and writes a Proposal (PyTorch architecture code + training recipe).
 
-Phase B: TRAINING (~30 min, runs ONCE per submission)
-  Miner A's architecture trains on Miner B's Basilica pod.
-  The pod runs the subnet's own frozen Docker image, verified by
-  Basilica cryptographic attestation. Nobody can tamper with training.
-  Checkpoints + SHA-256 hashes uploaded to shared R2 storage via
-  time-limited presigned URLs (no R2 credentials on trainer pods).
+Phase B: TRAINING (~30 min, 150 blocks, runs ONCE per submission)
+  Miner A's architecture trains on Miner B's attested trainer pod.
+  The pod runs the subnet's frozen training image on the pluggable GPU
+  backend; the image digest is cryptographically attested against the
+  on-chain commitment. Nobody can tamper with training. Checkpoints +
+  SHA-256 hashes are uploaded to shared R2 storage via time-limited
+  presigned URLs (no R2 credentials on trainer pods).
 
-Phase C: EVALUATION (~5 min, EVERY validator independently)
+Phase C: EVALUATION (~5 min, 25 blocks, EVERY validator independently)
   Download checkpoint -> verify hashes -> load weights (safetensors) ->
   run frozen eval -> CRPS, MASE, FLOPs verification.
-  Score -> EMA -> set_weights on chain.
 
   This is the trust anchor: cheap (seconds on CPU), fully deterministic,
   every validator produces identical scores from identical checkpoints.
+
+Phase D: FALLBACK / SCORING (~10 min, 50 blocks)
+  Re-dispatch any jobs whose trainer pod failed to the subnet owner's
+  fallback proxy, finalise scores, apply softmax + EMA, call set_weights
+  on chain. Total round: 275 blocks (~55 min) at default config.
 ```
 
 Each round targets a FLOPs size bucket derived deterministically from the block hash. Outside the bucket = zero score. Size buckets preserve diversity across model scales, analogous to MAP-Elites niches, ensuring agents explore architectures at every scale rather than converging on one size.
@@ -61,18 +77,19 @@ Each round targets a FLOPs size bucket derived deterministically from the block 
 All scores come from validator-side evaluation (Phase C), never trainer-reported.
 
 1. **Size gate (hard)**: FLOPs-equivalent must fall within the round's bucket. Outside = zero.
-2. **Pareto ranking**: Sigmoid of improvement over best frontier CRPS. No frontier yet? Pure relative ranking (bootstrapping).
-3. **Dominance bonus**: 1.5x if the submission dominates existing Pareto front members.
-4. **Penalties**: FLOPs mismatch (0.3x), trainer pod failure (scores zero for that miner's round), attestation failure (1.0x, complete zeroing).
-5. **Weights**: Softmax(temp=0.1) -> EMA(alpha=0.3) -> set_weights on chain.
+2. **Frontier improvement gate**: Once a feasible frontier exists in the round's size bucket, a submission must beat the best frontier CRPS by at least `FRONTIER_IMPROVEMENT_THRESHOLD` (default 0.5%) to earn any score. Ties and regressions score zero. (Bootstrapping: if no feasible frontier exists yet, pure relative ranking applies.)
+3. **Pareto ranking**: Sigmoid of the improvement beyond that threshold over the best frontier CRPS.
+4. **Dominance bonus**: 1.5x if the submission dominates existing Pareto front members.
+5. **Penalties**: FLOPs mismatch (0.3x), trainer pod failure/timeout (0.5x), attestation failure (1.0x, complete zeroing).
+6. **Weights**: Softmax(temp=0.1) -> EMA(alpha=0.3) -> set_weights on chain.
 
-Someone always wins. Even if every submission is mediocre, the best of the round earns.
+Someone always wins once the frontier is beaten. Early-round bootstrapping (no feasible frontier yet) uses pure relative ranking so the best of the round earns.
 
 ## Why It's Hard to Game
 
 The mechanism is designed so the only way to earn more TAO is to submit better architectures.
 
-**Miners can't tamper with training.** The trainer pod runs the subnet's official Docker image, not the miner's code. Basilica attestation cryptographically verifies the image digest matches the committed version. Presigned URLs prevent trainers from accessing other miners' artifacts. If attestation fails, the trainer scores zero for the entire round.
+**Miners can't tamper with training.** The trainer pod runs the subnet's official frozen training image, not the miner's code. Cryptographic attestation from the GPU backend verifies the image digest matches the on-chain commitment. Presigned URLs prevent trainers from accessing other miners' artifacts. If attestation fails, the trainer scores zero for the entire round.
 
 **Cross-evaluation prevents self-serving.** Miner A's architecture trains on Miner B's pod. Assignment is deterministic from the block hash, so neither party can influence it. Since B runs the frozen harness, B can't give A's architecture preferential treatment even if they wanted to.
 
@@ -82,15 +99,37 @@ The mechanism is designed so the only way to earn more TAO is to submit better a
 
 ## For Miners: Writing an Agent
 
-Your agent is a Docker image. It reads Challenge JSON from stdin, writes Proposal JSON to stdout. Stderr is captured as a reasoning trace (stored but not scored).
+Your agent is a set of Python modules, not a Docker image. You submit `.py` files to the DB server; the validator fetches them each round, injects them into the subnet's official sandboxed agent container, and calls `design_architecture(challenge, client)` inside the sandbox. The container, its pinned dependencies, and the network allowlist are all subnet-owned. See `docs/MINER_ENVIRONMENT.md` for the canonical sandbox contract (pre-installed packages, egress rules, filesystem layout).
+
+Reasoning written to stderr is captured and stored as a trace (stored but not scored).
 
 ```bash
-docker build -t myregistry/my-agent:v1 miner_template/
-docker push myregistry/my-agent:v1
+# Write your agent (start from the starter kit)
+cp -r miner_template/ agent/
+# ... edit agent/agent.py ...
 
+# Run the miner. It submits agent code to the DB, commits the hash
+# on-chain, and runs a warm-standby trainer listener that deploys
+# GPU pods on the subnet's attested backend when validators request them.
 python miner/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <n> \
-  --docker_image myregistry/my-agent:v1 --trainer_url <basilica-trainer-url>
+  --agent_dir agent/ --trainer_image <official-training-image>
 ```
+
+The miner neuron has two responsibilities:
+
+1. **Agent code hosting**: serves your `.py` bundle at `GET /agent_code` and commits its content hash on-chain. Validators fetch + verify each round.
+2. **Warm-standby trainer listener**: a lightweight FastAPI process (no GPU) that deploys attested GPU pods on demand via the pluggable backend when a validator dispatches a Phase B training job.
+
+### Subnet-provided services (inside the agent sandbox)
+
+The agent runs without general internet access. The only reachable endpoints are those exposed through the validator proxy:
+
+* **Experiment DB** (`challenge["db_url"]`): the query API described above.
+* **LLM proxy** (`/llm/v1/*`, OpenAI-compatible): subnet-provided inference, rate-limited per miner per tempo. Use with any OpenAI-compatible SDK; the agent container ships with `openai` and `anthropic` preinstalled.
+* **Desearch proxy** (arxiv via SN22): optional, enabled by the validator operator.
+* **Scratchpad** (presigned R2 URLs): ~10MB of persistent private state across rounds.
+
+Egress is enforced at two layers: `GatedClient` at the application layer and `iptables` OUTPUT-DROP at the kernel layer. Do not try to reach anything outside the allowlist; it will be dropped.
 
 ### What Will Zero Your Score
 
@@ -99,8 +138,9 @@ Read this first.
 * **FLOPs outside the size bucket.** The round targets a specific FLOPs range (e.g. 2M-10M). If your model measures outside this range, score = 0. Check the challenge's `min_flops_equivalent` and `max_flops_equivalent`.
 * **`build_model()` missing or crashes.** Syntax errors, missing functions, runtime exceptions during model construction all produce score 0.
 * **Output shape mismatch.** Must be exactly `(batch, prediction_len, num_variates, num_quantiles)`.
-* **Your trainer pod is down.** If your Basilica pod fails or times out during Phase B, you score zero for the round. Keep your pod healthy.
-* **Attestation failure.** If your trainer pod isn't running the official training image, score = 0.
+* **Failing to beat the frontier by 0.5%.** Once a feasible frontier exists in the round's bucket, ties and regressions against the best frontier CRPS score 0 (see Scoring).
+* **Your trainer pod is down or unreachable.** If your trainer listener fails to produce an attested GPU pod, or the pod times out during Phase B, you score zero for the round.
+* **Attestation failure.** If your trainer pod isn't running the official training image (verified by digest against the on-chain commitment), score = 0.
 
 ### What Your Agent Controls
 
@@ -144,19 +184,20 @@ python validator/neuron.py --netuid <N> --subtensor.network <network> --wallet.n
 
 ### Infrastructure Requirements
 
-* **R2 storage** for checkpoint storage and proposal sharing. Set `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` env vars.
+* **R2 storage** for checkpoint storage and artifact sharing. Set `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` env vars.
 * **CPU for Phase C eval.** Checkpoint evaluation runs on CPU by default (override with `RADAR_EVAL_DEVICE`). Each eval takes seconds. No GPU required for validators.
-* **DB server.** The validator runs a FastAPI experiment DB on port 8080 (configurable via `--db_port`). This serves the API that miner agents query.
-* **Docker** to pull and run miner agent images in Phase A.
+* **DB proxy.** The validator runs a reverse-proxy FastAPI on `RADAR_PROXY_PORT` (default 8080). It forwards `/experiments/*`, `/challenge`, `/frontier`, `/provenance/*` to the subnet owner's centralised DB server, and hosts `/desearch/*` and `/llm/v1/*` locally with per-miner rate limits. The DB itself (Postgres) is run by the subnet owner, not the validator.
+* **Agent pods** on the subnet's pluggable GPU backend. Validators dispatch agent runs to attested pods using the subnet's official `radar-agent` image. Phase A runs up to `RADAR_AGENT_CONCURRENCY` (default 8) pods concurrently; each runs a miner's injected `.py` bundle.
 * **Bandwidth.** Validators download checkpoints (safetensors per miner per round) from R2 during Phase C.
 
 ### What Each Phase Costs
 
 | Phase | Duration | Validator compute | Bandwidth |
 |-------|----------|-------------------|-----------|
-| A: Design | ~10 min | Run N agent containers (8GB mem each) | Pull miner Docker images |
+| A: Design | ~10 min | Dispatch N agent pods on GPU backend | Fetch miner `.py` bundles |
 | B: Training | ~30 min | Dispatch HTTP requests, monitor R2 | Minimal (presigned URLs) |
 | C: Evaluation | ~5 min | CPU inference per checkpoint | Download checkpoints from R2 |
+| D: Fallback / Scoring | ~10 min | Re-dispatch stalled jobs, softmax + EMA, set_weights | Minimal |
 
 ### Optional: Desearch Proxy
 
@@ -166,9 +207,9 @@ Enable arxiv search for miner agents via Subnet 22: `RADAR_DESEARCH_ENABLED=true
 
 Task-agnostic by design. Every Pareto front and provenance record is task-scoped. Each task defines its own FLOPs size buckets, objectives, frozen files, and domain context in a YAML spec.
 
-First task: time series foundation models. Multivariate forecasting scored on CRPS and MASE. Models receive context windows and output probabilistic (quantile) predictions.
+The only task live on the default config is `ts_forecasting` (time series foundation models, multivariate forecasting scored on CRPS and MASE; models receive context windows and output probabilistic quantile predictions). Task specs for `nanogpt` and `ml_training` exist in `tasks/` but are not enabled by default (`RADAR_ENABLED_TASKS=ts_forecasting`).
 
-Roadmap: Vision, NLP, multimodal. Adding a new task is a YAML config + frozen harness + evaluation script. Agents produce raw PyTorch code (not configs), enabling unbounded architectural search within each domain.
+Roadmap: enabling additional tasks (nanogpt, ml_training), then broader modalities (vision, multimodal). Adding a new task is a YAML config + frozen harness + evaluation script. Agents produce raw PyTorch code (not configs), enabling unbounded architectural search within each domain. Data-complexity augmentations (e.g. spectral reshaping, noise-floor calibration), μP-style parameterisation, and an automatically fitted scaling-law surface over the experiment DB are all discussed in the whitepaper as roadmap items; none are in the deployed scoring path today.
 
 ### FLOPs Size Buckets (ts_forecasting)
 
@@ -187,44 +228,57 @@ FLOPs measured via analytical counting (torch.utils.flop_counter) with wallclock
 ### Project Structure
 
 ```
+database/                        Centralised Postgres DB server (subnet owner)
+  server.py                        FastAPI: /experiments/*, /challenge, /frontier, /provenance/*
+  neuron.py                        Subnet owner process (runs Postgres + API)
+
 shared/                          Core libraries (validator + miner)
   protocol.py                      Challenge/Proposal wire format (JSON)
   auth.py                          Epistula signing/verification (SR25519)
   challenge.py                     Deterministic challenge + size buckets
-  artifacts.py                     R2 storage, upload/download/hash verification
+  r2_audit.py                      R2 storage, upload/download/hash verification
   task.py                          TaskSpec + Objective, pluggable task definitions
-  database.py                      Append-only experiment store with search/lineage
+  pg_schema.py                     Postgres DDL + row conversion
+  pg_store.py                      Async Postgres experiment store
+  pg_provenance.py                 Async Postgres provenance queries
+  pg_access_logger.py              Async Postgres access logger
+  db_client.py                     HTTP client: validators -> DB server
   pareto.py                        Multi-objective Pareto front, UCT sampling
   scoring.py                       Size-gated Pareto frontier scoring
   provenance.py                    Component detection, influence graphs
   access_logger.py                 Append-only log of miner DB API calls
-  commitment.py                    On-chain Docker image + trainer URL commitment
+  commitment.py                    On-chain agent-image + trainer URL commitment
 
 validator/                       Validator neuron
-  neuron.py                        Main loop: A -> B -> C pipeline
-  collection.py                    Phase A: run miner agents, share via R2
+  neuron.py                        Main loop: A -> B -> C -> fallback/scoring
+  collection.py                    Phase A: dispatch agent pods, collect proposals
   coordinator.py                   Phase B: deterministic cross-eval dispatch
   evaluator.py                     Phase C: evaluate checkpoints (trust anchor)
-  db_server.py                     FastAPI experiment DB with Epistula auth
+  db_proxy.py                      Reverse proxy: forwards to centralised DB server
   desearch_proxy.py                Arxiv search proxy via SN22
 
-miner/neuron.py                  Commit Docker image + trainer URL to chain
-miner_template/                  Starter kit (agent.py + Dockerfile)
+miner/neuron.py                  Serve agent .py bundle + commit hash on-chain;
+                                 warm-standby trainer listener (no GPU)
+miner_template/                  Starter kit (agent.py + deploy.py)
 
 runner/timeseries_forecast/      Frozen training environment
   harness.py                       Training loop + recipe hooks
   server.py                        Trainer HTTP endpoint (POST /train)
   flops.py                         FLOPs measurement (analytical + wallclock)
   prepare.py                       Data pipeline + validate()
+
+runner/agent/                    Official sandboxed agent image (subnet-owner)
+  Dockerfile                       Builds ghcr.io/tensorlink-ai/radar/radar-agent
+  entrypoint.sh                    Programs iptables egress allowlist, then exec
 ```
 
 ### Wire Protocol
 
 HTTP + Epistula (SR25519 signing). No Synapse/Axon/Dendrite.
 
-**Challenge** (validator -> agent stdin): feasible frontier, task spec, DB URL, seed, FLOPs range, round ID, scratchpad URLs.
+**Challenge** (dict passed to the agent's `design_architecture(challenge, client)`): feasible frontier, task spec, DB URL, proxy URL, LLM URL, seed, FLOPs range, round ID, scratchpad URLs, short-lived agent token.
 
-**Proposal** (agent stdout -> validator): architecture code, name, motivation.
+**Proposal** (dict returned by `design_architecture`): architecture code, name, motivation. Reasoning/logs written to stderr are captured by the harness and stored as a trace.
 
 ### Experiment DB API
 
@@ -273,10 +327,11 @@ scratchpad/{hotkey}/state.tar.gz                   # Agent persistent state
 | Parameter | Value |
 |-----------|-------|
 | Round interval | 275 blocks (~55 min) |
-| Phase A / B / C | 50 / 150 / 25 blocks |
-| Training timeout | 1800s |
+| Phase A / B / C / D | 50 / 150 / 25 / 50 blocks |
+| Training window | 1800s (outer); per-task `time_budget` sets the training-loop cap |
 | Pareto front cap | 50 |
 | EMA alpha / Softmax temp | 0.3 / 0.1 |
+| Frontier improvement threshold | 0.5% |
 | Query rate limit | 10/miner/min |
 | Size gate tolerance | 10% |
 
