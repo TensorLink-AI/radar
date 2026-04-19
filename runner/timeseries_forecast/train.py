@@ -61,6 +61,51 @@ class TSForecastingRunner:
             pretrain_shard_urls=pretrain_shard_urls,
         )
 
+    def get_val_dataloader(self, batch_size: int):
+        """Yield val batches from the reserved pretrain val shard.
+
+        Reads RADAR_PRETRAIN_VAL_SHARD_URLS (JSON list). Returns None if unset.
+        Val batches come from a shard that is fixed across rounds (the
+        coordinator presigns the same shard URL every round for val).
+
+        Contract: finite + deterministic — same batches in same order every call.
+        """
+        import json
+        import os
+
+        urls_raw = os.environ.get("RADAR_PRETRAIN_VAL_SHARD_URLS", "")
+        if not urls_raw:
+            return None
+        try:
+            shard_urls = json.loads(urls_raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not shard_urls:
+            return None
+
+        from pretrain_loader import pretrain_dataloader
+        from prepare import CONTEXT_LEN
+
+        max_val_batches = int(os.environ.get("RADAR_VAL_MAX_BATCHES", "50"))
+
+        def _val_iter():
+            # shuffle_buffer_size=1 disables shuffling. seed=0 fixes the
+            # deterministic shard/row iteration order so every call to this
+            # function yields the same batches.
+            loader = pretrain_dataloader(
+                shard_urls=shard_urls,
+                batch_size=batch_size,
+                context_len=CONTEXT_LEN,
+                shuffle_buffer_size=1,
+                seed=0,
+            )
+            for i, batch in enumerate(loader):
+                if i >= max_val_batches:
+                    break
+                yield batch
+
+        return _val_iter()
+
     def default_loss(self, predictions: Any, targets: Any) -> Any:
         """Quantile loss (pinball) — the ts_forecasting default."""
         import torch

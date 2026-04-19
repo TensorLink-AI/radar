@@ -30,7 +30,10 @@ def test_training_meta_roundtrip():
         round_id=1, miner_hotkey="5Bar", status="success",
         flops_equivalent_size=500_000, training_time_seconds=120.5,
         num_steps=1000, num_params_M=2.5,
-        loss_curve=[1.0, 0.8, 0.6], peak_vram_mb=1024.0,
+        peak_vram_mb=1024.0,
+        train_loss_history=[{"step": 10, "loss": 1.0}, {"step": 20, "loss": 0.8}],
+        val_loss_history=[{"step": 10, "loss": 0.9}],
+        best_val_loss=0.9, best_val_step=10,
         checkpoint_sha256="abc123", architecture_sha256="def456",
         stdout_sha256="ghi789",
     )
@@ -38,8 +41,27 @@ def test_training_meta_roundtrip():
     restored = TrainingMeta.from_json(text)
     assert restored.round_id == 1
     assert restored.miner_hotkey == "5Bar"
-    assert restored.loss_curve == [1.0, 0.8, 0.6]
+    assert restored.train_loss_history == [{"step": 10, "loss": 1.0}, {"step": 20, "loss": 0.8}]
+    assert restored.val_loss_history == [{"step": 10, "loss": 0.9}]
+    assert restored.best_val_loss == 0.9
+    assert restored.best_val_step == 10
     assert restored.checkpoint_sha256 == "abc123"
+
+
+def test_training_meta_old_format_without_new_fields():
+    """Old metas (pre-loss-tracking) must still parse via from_dict."""
+    old = {
+        "round_id": 7, "miner_hotkey": "5Old", "status": "success",
+        "loss_curve": [1.0, 0.5],  # legacy field — should be silently dropped
+        "num_steps": 100,
+    }
+    meta = TrainingMeta.from_dict(old)
+    assert meta.round_id == 7
+    assert meta.num_steps == 100
+    assert meta.train_loss_history == []
+    assert meta.val_loss_history == []
+    assert meta.best_val_loss is None
+    assert meta.best_val_step == -1
 
 
 def test_training_meta_from_dict_ignores_extra_keys():

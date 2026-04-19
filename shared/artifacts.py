@@ -92,8 +92,13 @@ class TrainingMeta:
     training_time_seconds: float = 0.0
     num_steps: int = 0
     num_params_M: float = 0.0
-    loss_curve: list[float] = field(default_factory=list)
     peak_vram_mb: float = 0.0
+    # Loss tracking (Phase B). Self-reported by the miner pod —
+    # NOT a scoring trust anchor (Phase C remains the only one).
+    train_loss_history: list[dict] = field(default_factory=list)  # [{step: int, loss: float}, ...]
+    val_loss_history: list[dict] = field(default_factory=list)
+    best_val_loss: float | None = None
+    best_val_step: int = -1
     # Hash verification chain
     checkpoint_sha256: str = ""
     architecture_sha256: str = ""
@@ -112,8 +117,11 @@ class TrainingMeta:
             "training_time_seconds": self.training_time_seconds,
             "num_steps": self.num_steps,
             "num_params_M": self.num_params_M,
-            "loss_curve": self.loss_curve,
             "peak_vram_mb": self.peak_vram_mb,
+            "train_loss_history": self.train_loss_history,
+            "val_loss_history": self.val_loss_history,
+            "best_val_loss": self.best_val_loss,
+            "best_val_step": self.best_val_step,
             "checkpoint_sha256": self.checkpoint_sha256,
             "architecture_sha256": self.architecture_sha256,
             "stdout_sha256": self.stdout_sha256,
@@ -125,6 +133,7 @@ class TrainingMeta:
 
     @classmethod
     def from_dict(cls, d: dict) -> "TrainingMeta":
+        # Old metas may carry `loss_curve` — silently drop (filtered by field set).
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
