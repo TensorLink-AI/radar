@@ -104,9 +104,36 @@ class PretrainBenchmark:
             if "s3_key" in s
         ]
 
+    def get_val_shard_keys(self) -> list[str]:
+        """Return reserved val shard keys from the manifest.
+
+        Val shards are fixed across rounds — same keys every call — so miners
+        can compute comparable val loss curves. Empty list means no val shards
+        are configured (old manifest format).
+        """
+        manifest = self._load_manifest()
+        keys = list(manifest.get("val_shard_keys", []))
+        if keys and not getattr(self, "_val_keys_logged", False):
+            logger.info("Pretrain manifest exposes %d val shard keys", len(keys))
+            self._val_keys_logged = True
+        return keys
+
     def select_shards(self, seed: int, n: int) -> list[str]:
-        """Deterministic selection of N shard keys for a round."""
+        """Deterministic selection of N training shard keys for a round.
+
+        Val shard keys (if declared in the manifest) are excluded from the
+        training pool so val stays a held-out split.
+        """
         all_keys = self.get_shard_keys()
+        val_keys = set(self.get_val_shard_keys())
+        if val_keys:
+            overlap = [k for k in all_keys if k in val_keys]
+            if overlap:
+                logger.warning(
+                    "Manifest has %d val shard keys overlapping the training pool; excluding",
+                    len(overlap),
+                )
+            all_keys = [k for k in all_keys if k not in val_keys]
         if n <= 0 or n >= len(all_keys):
             return all_keys
         rng = random.Random(seed)

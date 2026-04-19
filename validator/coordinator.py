@@ -155,6 +155,7 @@ class TrainingCoordinator:
         commitments: dict[int, "ImageCommitment"] | None = None,
         gift_eval_urls: dict[str, str] | None = None,
         pretrain_shard_urls: list[str] | None = None,
+        pretrain_val_shard_urls: list[str] | None = None,
     ) -> list[TrainingResult]:
         """POST to trainer endpoints with Epistula-signed payload.
 
@@ -165,6 +166,7 @@ class TrainingCoordinator:
         commitments = commitments or {}
         gift_eval_urls = gift_eval_urls or {}
         pretrain_shard_urls = pretrain_shard_urls or []
+        pretrain_val_shard_urls = pretrain_val_shard_urls or []
         # Each job is sent to exactly one trainer (1:1 arch→trainer).
         # `trainer_endpoints` is the available pool, not the fan-out.
         logger.info(
@@ -244,6 +246,8 @@ class TrainingCoordinator:
                 dispatch_payload["gift_eval_urls"] = gift_eval_urls
             if pretrain_shard_urls:
                 dispatch_payload["pretrain_shard_urls"] = pretrain_shard_urls
+            if pretrain_val_shard_urls:
+                dispatch_payload["pretrain_val_shard_urls"] = pretrain_val_shard_urls
             payload = json.dumps(dispatch_payload).encode()
 
             dispatch_tasks.append((job, trainer_url, payload))
