@@ -294,7 +294,7 @@ echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${GITHUB_USER:-dev}" --password-
 ok "Logged in to ghcr.io"
 
 # Map of available agents — cycle through them for N miners
-AGENT_DIRS=("example_agents/systematic" "example_agents/failure_analyst" "example_agents/lineage_tracker")
+AGENT_DIRS=("miner_template" "miner_template" "miner_template")
 AGENT_NAMES=("agent-systematic" "agent-failure" "agent-lineage")
 AGENT_GHCR_URLS=()
 

@@ -212,26 +212,10 @@ ok "All unit tests passed."
 echo ""
 
 # =============================================================================
-# STEP 3: Build agent Docker image
+# STEP 3: Start local subtensor
 # =============================================================================
 echo "-----------------------------------------"
-info "Step 3: Building systematic agent Docker image..."
-echo "-----------------------------------------"
-
-if command -v docker &>/dev/null; then
-    docker build -t systematic:latest example_agents/systematic/ \
-        && ok "Docker image 'systematic:latest' built." \
-        || warn "Docker build failed. Continuing without Docker agent."
-else
-    warn "Docker not found. Skipping agent image build."
-fi
-echo ""
-
-# =============================================================================
-# STEP 4: Start local subtensor
-# =============================================================================
-echo "-----------------------------------------"
-info "Step 4: Starting local subtensor..."
+info "Step 3: Starting local subtensor..."
 echo "-----------------------------------------"
 
 # Check if subtensor is already running

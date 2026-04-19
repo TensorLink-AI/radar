@@ -173,7 +173,7 @@ Your agent gets the DB URL in the Challenge JSON (`db_url` field). The most effe
 4. Learn from failures (`GET /experiments/failures`) to avoid repeating mistakes
 5. Search for similar architectures (`GET /provenance/{id}/similar`) to find unexplored variations
 
-See `example_agents/` for reference implementations.
+See `miner_template/` for a starter agent.
 
 ## For Validators: Running a Validator
 
