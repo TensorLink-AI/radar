@@ -166,7 +166,7 @@ async def test_dispatch_includes_val_urls_when_provided():
 
         await coord.dispatch_jobs(
             jobs, _make_challenge(), submissions, endpoints,
-            pretrain_val_shard_urls=val_urls,
+            extras={"pretrain_val_shard_urls": val_urls},
         )
 
     assert mock_post.await_count == 1

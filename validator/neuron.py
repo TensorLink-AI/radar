@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import importlib
 import logging
 import os
 import random
@@ -268,6 +269,42 @@ class Validator:
             return urlunparse(parsed).rstrip("/")
         return ext
 
+    def _build_dispatch_extras(self, challenge, task) -> dict:
+        """Call the task's `dispatch.build_dispatch_extras` hook if present.
+
+        Loads `{runner_dir}.dispatch` via importlib and invokes
+        `build_dispatch_extras` to produce any task-specific keys that
+        get merged into the trainer payload. Missing module returns {}.
+        """
+        runner_dir = ""
+        if isinstance(challenge.task, dict):
+            runner_dir = challenge.task.get("runner_dir", "")
+        if not runner_dir:
+            return {}
+        mod_path = runner_dir.replace("/", ".") + ".dispatch"
+        try:
+            dispatch_mod = importlib.import_module(mod_path)
+        except ModuleNotFoundError:
+            return {}
+        try:
+            return dispatch_mod.build_dispatch_extras(
+                task,
+                gift_r2=self.gift_r2,
+                pretrain_r2=self.pretrain_r2,
+                seed=challenge.seed,
+                shards_per_round=Config.PRETRAIN_SHARDS_PER_ROUND,
+                r2_prefixes={
+                    "gift": Config.GIFT_EVAL_R2_PREFIX,
+                    "pretrain": Config.PRETRAIN_R2_PREFIX,
+                },
+            )
+        except Exception as e:
+            logger.warning(
+                "build_dispatch_extras failed for runner_dir=%s: %s",
+                runner_dir, e,
+            )
+            return {}
+
     def start_proxy_server(self):
         """Start the reverse proxy server in a background thread."""
         def _run():
@@ -462,48 +499,16 @@ class Validator:
                 "or trainer pods failed to deploy. Training will fail for all jobs."
             )
 
-        # Generate presigned GET URLs for GIFT-Eval data (evaluation)
-        gift_eval_urls = {}
-        if self.gift_r2:
-            try:
-                from shared.gift_eval import GiftEvalBenchmark
-                gift = GiftEvalBenchmark(
-                    r2=self.gift_r2,
-                    r2_prefix=Config.GIFT_EVAL_R2_PREFIX,
-                )
-                gift_eval_urls = gift.generate_presigned_get_urls()
-            except Exception as e:
-                logger.warning("Failed to generate GIFT-Eval presigned URLs: %s", e)
-
-        # Generate presigned GET URLs for pretrain shards (training + val)
-        pretrain_shard_urls: list[str] = []
-        pretrain_val_shard_urls: list[str] = []
-        if self.pretrain_r2:
-            try:
-                from shared.pretrain_data import PretrainBenchmark
-                pretrain = PretrainBenchmark(
-                    r2=self.pretrain_r2,
-                    r2_prefix=Config.PRETRAIN_R2_PREFIX,
-                )
-                shard_keys = pretrain.select_shards(
-                    seed=challenge.seed,
-                    n=Config.PRETRAIN_SHARDS_PER_ROUND,
-                )
-                pretrain_shard_urls = pretrain.generate_presigned_shard_urls(shard_keys)
-                val_shard_keys = pretrain.get_val_shard_keys()
-                if val_shard_keys:
-                    pretrain_val_shard_urls = pretrain.generate_presigned_shard_urls(
-                        val_shard_keys,
-                    )
-            except Exception as e:
-                logger.warning("Failed to generate pretrain shard URLs: %s", e)
+        # Task-specific dispatch extras (e.g. GIFT-Eval + pretrain shard URLs
+        # for ts_forecasting). Each task's runner_dir may ship a `dispatch`
+        # module exposing `build_dispatch_extras(task, ...)`. Missing module
+        # is fine — the extras dict stays empty.
+        extras = self._build_dispatch_extras(challenge, round_task)
 
         my_results = await self.coordinator.dispatch_jobs(
             my_jobs, challenge, filtered, trainer_endpoints,
             commitments=commitments,
-            gift_eval_urls=gift_eval_urls,
-            pretrain_shard_urls=pretrain_shard_urls,
-            pretrain_val_shard_urls=pretrain_val_shard_urls,
+            extras=extras,
         )
         _OK_STATUSES = ("success", "accepted", "already_running")
         succeeded = sum(1 for r in my_results if r.status == "success")
@@ -591,9 +596,11 @@ class Validator:
                 )
                 my_fallback = [j for j in fallback_jobs if j.dispatcher == my_uid]
                 if my_fallback:
+                    fb_extras = self._build_dispatch_extras(challenge, round_task)
                     fb_results = await self.coordinator.dispatch_jobs(
                         my_fallback, challenge, filtered, trainer_endpoints,
                         commitments=commitments,
+                        extras=fb_extras,
                     )
                     await self.coordinator.write_dispatch_record(
                         challenge.round_id, fb_results,
@@ -647,11 +654,14 @@ class Validator:
         )
 
         logger.info("Phase C: evaluated %d checkpoints", len(eval_results))
+        primary_obj = round_task.primary_objective
+        primary_name = primary_obj.name if primary_obj else "metric"
+        primary_default = primary_obj.default if primary_obj else float("inf")
         for uid, metrics in eval_results.items():
             logger.info(
-                "  UID %d: crps=%.6f flops=%d gate=%s error=%s",
-                uid,
-                metrics.get("crps", float("inf")),
+                "  UID %d: %s=%.6f flops=%d gate=%s error=%s",
+                uid, primary_name,
+                metrics.get(primary_name, primary_default),
                 metrics.get("flops_equivalent_size", 0),
                 metrics.get("passed_size_gate", False),
                 metrics.get("error", ""),
@@ -723,7 +733,7 @@ class Validator:
                 element = DataElement(
                     name=f"round_{challenge.round_id}_miner_{uid}",
                     code=proposal.code,
-                    metric=metrics.get("crps"),
+                    metric=metrics.get(primary_name),
                     success=True,
                     objectives=metrics,
                     miner_uid=uid,

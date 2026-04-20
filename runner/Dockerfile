@@ -24,6 +24,7 @@ COPY server.py /workspace/server.py
 RUN mkdir -p /workspace/runner/timeseries_forecast
 COPY timeseries_forecast/__init__.py /workspace/runner/timeseries_forecast/__init__.py
 COPY timeseries_forecast/train.py /workspace/runner/timeseries_forecast/train.py
+COPY timeseries_forecast/eval_template.py /workspace/runner/timeseries_forecast/eval_template.py
 COPY timeseries_forecast/harness.py /workspace/runner/timeseries_forecast/harness.py
 COPY timeseries_forecast/prepare.py /workspace/runner/timeseries_forecast/prepare.py
 COPY timeseries_forecast/evaluate.py /workspace/runner/timeseries_forecast/evaluate.py
