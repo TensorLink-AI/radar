@@ -42,6 +42,7 @@ class Actor:
         challenge_json: str,
         timeout: int = 600,
         agent_code: dict | None = None,
+        **kwargs,
     ) -> dict:
         """Run the frozen harness with a Challenge, return Proposal.
 

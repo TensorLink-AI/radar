@@ -159,6 +159,7 @@ async def _run_single_agent(
             agent_env, miner_challenge_json,
             timeout=agent_timeout,
             allowed_urls=allowed_urls,
+            task_id=uid,
         )
         if result and isinstance(result, dict) and "code" in result:
             proposal = Proposal(
