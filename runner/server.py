@@ -7,9 +7,12 @@ Miners deploy this unmodified on Basilica. Validators dispatch via POST /train.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -192,6 +195,60 @@ async def train(request: Request):
     )
 
 
+_LOG_CAPTURE_CAP = 10 * 1024 * 1024  # 10 MB
+
+
+class _TeeStream(io.TextIOBase):
+    """Mirror writes to an original stream AND a capped buffer."""
+
+    def __init__(self, original, buffer: io.StringIO, cap: int):
+        self._original = original
+        self._buffer = buffer
+        self._cap = cap
+
+    def write(self, s):
+        try:
+            self._original.write(s)
+        except Exception:
+            pass
+        if self._buffer.tell() < self._cap:
+            self._buffer.write(s)
+        return len(s)
+
+    def flush(self):
+        try:
+            self._original.flush()
+        except Exception:
+            pass
+
+
+@contextlib.contextmanager
+def _capture_training_logs():
+    """Capture stdout + root-logger output during a training run.
+
+    Yields a getter that returns the captured text. The original stdout
+    keeps receiving output (so pod logs still show live progress).
+    """
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    prev_level = root.level
+    if prev_level > logging.INFO:
+        root.setLevel(logging.INFO)
+    root.addHandler(handler)
+
+    original_stdout = sys.stdout
+    sys.stdout = _TeeStream(original_stdout, buf, _LOG_CAPTURE_CAP)
+    try:
+        yield buf.getvalue  # callable so caller reads final value
+    finally:
+        sys.stdout = original_stdout
+        root.removeHandler(handler)
+        root.setLevel(prev_level)
+
+
 async def _train_and_upload(
     runner_fn,
     architecture_code: str,
@@ -226,9 +283,12 @@ async def _train_and_upload(
         else:
             os.environ.pop("RADAR_PRETRAIN_VAL_SHARD_URLS", None)
 
-        # Run training
+        # Run training with stdout + root-logger capture so artifacts carry
+        # the harness trace (print() + logger output) instead of empty logs.
         t0 = time.time()
-        result = await asyncio.to_thread(runner_fn, architecture_code, training_config)
+        with _capture_training_logs() as get_log:
+            result = await asyncio.to_thread(runner_fn, architecture_code, training_config)
+        result["stdout_log"] = get_log()
         elapsed = time.time() - t0
         logger.info(
             "Training complete: round=%d miner=%s status=%s elapsed=%.1fs",
@@ -297,6 +357,7 @@ def _upload_artifacts(
     )
 
     checkpoint_path = result.get("checkpoint_path", "")
+    stdout_log = result.get("stdout_log", "")
     ck_str = ck_fn(round_id, miner_hotkey)
     ak_str = ak_fn(round_id, miner_hotkey)
 
@@ -323,7 +384,7 @@ def _upload_artifacts(
                 presigned_urls=upload_urls,
                 checkpoint_path=checkpoint_path,
                 architecture_code=architecture_code,
-                stdout_log="", meta=meta,
+                stdout_log=stdout_log, meta=meta,
             )
         else:
             from shared.artifacts import upload_training_artifacts
@@ -331,7 +392,7 @@ def _upload_artifacts(
                 r2=_get_r2(), round_id=round_id, miner_hotkey=miner_hotkey,
                 checkpoint_path=checkpoint_path,
                 architecture_code=architecture_code,
-                stdout_log="", meta=meta,
+                stdout_log=stdout_log, meta=meta,
             )
     except Exception as e:
         logger.error("R2 upload failed: %s", e)
@@ -341,8 +402,9 @@ def _upload_artifacts(
     if not upload_ok:
         logger.error("Artifact upload incomplete for round %d miner %s", round_id, miner_hotkey)
 
-    # Remove internal-only field, add R2 keys
+    # Remove internal-only fields, add R2 keys
     result.pop("checkpoint_path", None)
+    result.pop("stdout_log", None)
     result["status"] = status
     result["checkpoint_key"] = ck_str
     result["architecture_key"] = ak_str
