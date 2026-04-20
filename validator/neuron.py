@@ -484,9 +484,10 @@ class Validator:
         dispatch_validators = list(validator_uids)
         if my_uid >= 0 and my_uid not in dispatch_validators:
             logger.info(
-                "My UID %d not in validator_uids %s — will use safety-net dispatch",
+                "My UID %d not in validator_uids %s — adding self as safety-net dispatcher",
                 my_uid, dispatch_validators,
             )
+            dispatch_validators.append(my_uid)
 
         all_jobs = compute_assignments(
             block_hash, filtered,
