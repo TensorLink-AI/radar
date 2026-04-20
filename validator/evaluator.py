@@ -13,7 +13,7 @@ the challenge's runner_dir.
 
 from __future__ import annotations
 
-import importlib
+import importlib.util
 import json
 import logging
 import os
@@ -32,6 +32,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEFAULT_RUNNER_DIR = "runner/timeseries_forecast"
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _load_eval_template_from_path(runner_dir: str) -> Optional[str]:
+    """Load EVAL_TEMPLATE from `{project_root}/{runner_dir}/eval_template.py`.
+
+    Uses file-based loading so we don't rely on the `runner` package being
+    importable — it isn't pip-installed and won't be on sys.path when the
+    validator runs from outside the project root.
+
+    Returns None if the file doesn't exist or lacks EVAL_TEMPLATE.
+    """
+    template_path = os.path.join(_PROJECT_ROOT, runner_dir, "eval_template.py")
+    if not os.path.isfile(template_path):
+        return None
+    mod_name = f"_radar_eval_template_{runner_dir.replace('/', '_').replace('.', '_')}"
+    spec = importlib.util.spec_from_file_location(mod_name, template_path)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return getattr(mod, "EVAL_TEMPLATE", None)
 
 
 def _get_eval_template(runner_dir: str) -> str:
@@ -39,19 +61,23 @@ def _get_eval_template(runner_dir: str) -> str:
 
     Each task exposes EVAL_TEMPLATE at module level in
     `{runner_dir}/eval_template.py`. Falls back to ts_forecasting if the
-    task module isn't importable.
+    task module isn't loadable.
     """
-    mod_path = (runner_dir or _DEFAULT_RUNNER_DIR).replace("/", ".")
-    try:
-        mod = importlib.import_module(f"{mod_path}.eval_template")
-    except ModuleNotFoundError:
+    effective = runner_dir or _DEFAULT_RUNNER_DIR
+    template = _load_eval_template_from_path(effective)
+    if template is not None:
+        return template
+    if effective != _DEFAULT_RUNNER_DIR:
         logger.warning(
             "No eval_template module for runner_dir=%s; falling back to %s",
             runner_dir, _DEFAULT_RUNNER_DIR,
         )
-        fallback = _DEFAULT_RUNNER_DIR.replace("/", ".")
-        mod = importlib.import_module(f"{fallback}.eval_template")
-    return mod.EVAL_TEMPLATE
+        template = _load_eval_template_from_path(_DEFAULT_RUNNER_DIR)
+        if template is not None:
+            return template
+    raise ModuleNotFoundError(
+        f"eval_template not found at {runner_dir} or {_DEFAULT_RUNNER_DIR}"
+    )
 
 
 def evaluate_checkpoint(
