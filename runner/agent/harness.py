@@ -20,6 +20,7 @@ blocks all egress except to allowed hosts.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -188,30 +189,36 @@ def main():
     if agent_dir not in sys.path:
         sys.path.insert(0, agent_dir)
 
-    try:
-        agent_mod = _load_agent(agent_path)
-    except Exception as e:
-        log(f"Failed to load agent module: {e}")
-        log(traceback.format_exc())
-        print(json.dumps({"error": f"Agent load failed: {e}"}))
-        sys.exit(1)
+    # Redirect miner stdout → stderr. Stdout is reserved for the final JSON
+    # proposal; without this, any plain print() inside miner code either
+    # silently vanishes or corrupts the JSON the caller tries to parse. Errors
+    # are emitted to the real stdout via sys.__stdout__.
+    result: dict | None = None
+    with contextlib.redirect_stdout(sys.stderr):
+        try:
+            agent_mod = _load_agent(agent_path)
+        except Exception as e:
+            log(f"Failed to load agent module: {e}")
+            log(traceback.format_exc())
+            print(json.dumps({"error": f"Agent load failed: {e}"}), file=sys.__stdout__)
+            sys.exit(1)
 
-    if not hasattr(agent_mod, "design_architecture") or not callable(agent_mod.design_architecture):
-        print(json.dumps({"error": "Agent module missing design_architecture()"}))
-        sys.exit(1)
+        if not hasattr(agent_mod, "design_architecture") or not callable(agent_mod.design_architecture):
+            print(json.dumps({"error": "Agent module missing design_architecture()"}), file=sys.__stdout__)
+            sys.exit(1)
 
-    # 4. Inject scratchpad helpers into the module namespace
-    agent_mod.load_scratchpad = lambda ch, local_dir="/tmp/scratchpad": load_scratchpad(ch, client, local_dir)
-    agent_mod.save_scratchpad = lambda ch, local_dir="/tmp/scratchpad": save_scratchpad(ch, client, local_dir)
+        # 4. Inject scratchpad helpers into the module namespace
+        agent_mod.load_scratchpad = lambda ch, local_dir="/tmp/scratchpad": load_scratchpad(ch, client, local_dir)
+        agent_mod.save_scratchpad = lambda ch, local_dir="/tmp/scratchpad": save_scratchpad(ch, client, local_dir)
 
-    # 5. Call the miner's agent
-    try:
-        result = agent_mod.design_architecture(challenge, client)
-    except Exception as e:
-        log(f"design_architecture() failed: {e}")
-        log(traceback.format_exc())
-        print(json.dumps({"error": f"Agent failed: {e}"}))
-        sys.exit(1)
+        # 5. Call the miner's agent
+        try:
+            result = agent_mod.design_architecture(challenge, client)
+        except Exception as e:
+            log(f"design_architecture() failed: {e}")
+            log(traceback.format_exc())
+            print(json.dumps({"error": f"Agent failed: {e}"}), file=sys.__stdout__)
+            sys.exit(1)
 
     # 6. Validate and output
     if not isinstance(result, dict) or "code" not in result:
