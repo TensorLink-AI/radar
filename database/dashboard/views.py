@@ -205,6 +205,7 @@ async def logs_view(request: Request, round_id: int, hotkey: str):
     state = get_state()
     meta = log_helpers.fetch_meta(state.r2, round_id, hotkey)
     stdout = log_helpers.fetch_stdout(state.r2, round_id, hotkey)
+    architecture = log_helpers.fetch_architecture(state.r2, round_id, hotkey)
     return _html(
         "logs.html",
         request,
@@ -212,6 +213,7 @@ async def logs_view(request: Request, round_id: int, hotkey: str):
         hotkey=hotkey,
         meta=meta,
         stdout=stdout,
+        architecture=architecture,
     )
 
 
@@ -235,4 +237,18 @@ async def logs_stdout(round_id: int, hotkey: str, direct: int = 0):
     payload = log_helpers.fetch_stdout(state.r2, round_id, hotkey)
     if payload is None:
         raise HTTPException(status_code=404, detail="No stdout.log in R2")
+    return JSONResponse(payload)
+
+
+@router.get("/logs/{round_id}/{hotkey}/architecture")
+async def logs_architecture(round_id: int, hotkey: str, direct: int = 0):
+    state = get_state()
+    if direct:
+        url = log_helpers.presigned_architecture_url(state.r2, round_id, hotkey)
+        if not url:
+            raise HTTPException(status_code=503, detail="R2 presign unavailable")
+        return RedirectResponse(url=url, status_code=302)
+    payload = log_helpers.fetch_architecture(state.r2, round_id, hotkey)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="No architecture.py in R2")
     return JSONResponse(payload)

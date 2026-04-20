@@ -257,7 +257,19 @@ def dashboard_client():
     r2 = FakeR2()
     # Seed a training log file so the log route has something to read.
     r2.upload_text("round_7/miner_hk_a/stdout.log", "epoch 0 loss=2.0\nepoch 1 loss=1.5\n")
-    r2.upload_json("round_7/miner_hk_a/training_meta.json", {"flops": 1234, "ok": True})
+    r2.upload_json("round_7/miner_hk_a/training_meta.json", {
+        "flops": 1234, "ok": True,
+        "train_loss_history": [
+            {"step": 10, "loss": 22.19}, {"step": 20, "loss": 14.71},
+        ],
+        "val_loss_history": [
+            {"step": 10, "loss": 27.20}, {"step": 20, "loss": 21.28},
+        ],
+    })
+    r2.upload_text(
+        "round_7/miner_hk_a/architecture.py",
+        "class Model:\n    def __init__(self):\n        self.name = 'unit-test-model'\n",
+    )
 
     set_db(store)
 
@@ -441,7 +453,9 @@ def test_logs_view_renders(logged_in):
 def test_logs_meta_json(logged_in):
     r = logged_in.get("/dashboard/logs/7/hk_a/meta")
     assert r.status_code == 200
-    assert r.json() == {"flops": 1234, "ok": True}
+    body = r.json()
+    assert body["flops"] == 1234
+    assert body["ok"] is True
 
 
 def test_logs_stdout_cap(logged_in):
@@ -468,3 +482,43 @@ def test_logs_stdout_direct_redirect(logged_in):
     )
     assert r.status_code == 302
     assert r.headers["location"].startswith("https://fake-r2.example/")
+
+
+def test_logs_view_renders_architecture_and_loss_canvas(logged_in):
+    r = logged_in.get("/dashboard/logs/7/hk_a")
+    assert r.status_code == 200
+    # Architecture code is inlined into the page
+    assert "unit-test-model" in r.text
+    assert "architecture.py" in r.text
+    # Loss-history canvas is rendered when meta contains loss arrays
+    assert 'id="loss-history"' in r.text
+    assert 'data-round="7"' in r.text
+
+
+def test_logs_architecture_json(logged_in):
+    r = logged_in.get("/dashboard/logs/7/hk_a/architecture")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["truncated"] is False
+    assert "unit-test-model" in body["text"]
+
+
+def test_logs_architecture_direct_redirect(logged_in):
+    r = logged_in.get(
+        "/dashboard/logs/7/hk_a/architecture?direct=1", follow_redirects=False,
+    )
+    assert r.status_code == 302
+    assert r.headers["location"].startswith("https://fake-r2.example/")
+
+
+def test_logs_architecture_missing(logged_in):
+    r = logged_in.get("/dashboard/logs/99/hk_missing/architecture")
+    assert r.status_code == 404
+
+
+def test_logs_meta_includes_loss_history(logged_in):
+    r = logged_in.get("/dashboard/logs/7/hk_a/meta")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["train_loss_history"][0] == {"step": 10, "loss": 22.19}
+    assert body["val_loss_history"][1] == {"step": 20, "loss": 21.28}

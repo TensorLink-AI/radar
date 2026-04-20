@@ -16,6 +16,32 @@
     {% endif %}
 </section>
 
+{% if meta and (meta.get('train_loss_history') or meta.get('val_loss_history') or meta.get('loss_curve')) %}
+<section>
+    <h2>Loss history</h2>
+    <canvas id="loss-history" height="320"
+            data-round="{{ round_id }}"
+            data-hotkey="{{ hotkey }}"></canvas>
+</section>
+{% endif %}
+
+<section>
+    <h2>
+        architecture.py
+        {% if architecture %}
+        <a class="muted" href="/dashboard/logs/{{ round_id }}/{{ hotkey }}/architecture?direct=1">raw download</a>
+        {% endif %}
+    </h2>
+    {% if architecture %}
+        <p class="muted">
+            {{ architecture.size }} bytes{% if architecture.truncated %} (showing head){% endif %}
+        </p>
+        <pre><code class="language-python">{{ architecture.text }}</code></pre>
+    {% else %}
+        <p class="muted">No <code>architecture.py</code> in R2 for this (round, miner).</p>
+    {% endif %}
+</section>
+
 <section>
     <h2>
         stdout
