@@ -110,6 +110,73 @@
             .catch((err) => console.warn("pareto fetch failed:", err));
     }
 
+    // ── Loss history on logs page (train + val) ──
+    const lossHist = document.getElementById("loss-history");
+    if (lossHist) {
+        const round = lossHist.dataset.round;
+        const hk = lossHist.dataset.hotkey;
+        fetch(`/dashboard/logs/${round}/${encodeURIComponent(hk)}/meta`)
+            .then((r) => r.json())
+            .then((meta) => {
+                const toXY = (arr) => (arr || [])
+                    .map((p) => {
+                        if (typeof p === "number") return null;
+                        return {x: p.step, y: p.loss};
+                    })
+                    .filter((p) => p && Number.isFinite(p.x) && Number.isFinite(p.y));
+                const train = toXY(meta.train_loss_history);
+                const val = toXY(meta.val_loss_history);
+                // Legacy fallback: loss_curve is a bare array of floats
+                const legacy = Array.isArray(meta.loss_curve)
+                    ? meta.loss_curve.map((y, i) => ({x: i, y})).filter((p) => Number.isFinite(p.y))
+                    : [];
+
+                const datasets = [];
+                if (train.length) datasets.push({
+                    label: "train", data: train,
+                    borderColor: "#6ea8fe", backgroundColor: "rgba(110,168,254,0.15)",
+                    tension: 0.15, pointRadius: 0, borderWidth: 2,
+                });
+                if (val.length) datasets.push({
+                    label: "val", data: val,
+                    borderColor: "#f0b429", backgroundColor: "rgba(240,180,41,0.12)",
+                    tension: 0.15, pointRadius: 0, borderWidth: 2,
+                });
+                if (!datasets.length && legacy.length) datasets.push({
+                    label: "loss", data: legacy,
+                    borderColor: "#6ea8fe", backgroundColor: "rgba(110,168,254,0.15)",
+                    tension: 0.15, pointRadius: 0, borderWidth: 2,
+                });
+                if (!datasets.length) {
+                    lossHist.replaceWith(Object.assign(document.createElement("p"), {
+                        className: "muted",
+                        textContent: "No loss history recorded.",
+                    }));
+                    return;
+                }
+                new Chart(lossHist, {
+                    type: "line",
+                    data: {datasets},
+                    options: {
+                        parsing: false,
+                        plugins: { legend: { labels: { color: "#e6e6e6" } } },
+                        scales: {
+                            x: {
+                                type: "linear",
+                                title: { display: true, text: "step", color: "#8a8f99" },
+                                ticks: { color: "#8a8f99" },
+                            },
+                            y: {
+                                title: { display: true, text: "loss", color: "#8a8f99" },
+                                ticks: { color: "#8a8f99" },
+                            },
+                        },
+                    },
+                });
+            })
+            .catch((err) => console.warn("loss history fetch failed:", err));
+    }
+
     // ── Highlight HTMX-swapped diffs with Prism ──
     document.body.addEventListener("htmx:afterSwap", () => {
         if (window.Prism) window.Prism.highlightAll();

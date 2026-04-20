@@ -1,4 +1,4 @@
-"""Training log access via R2 (stdout + training_meta.json).
+"""Training log access via R2 (stdout + training_meta.json + architecture.py).
 
 Wraps ``shared.r2_audit.R2AuditLog`` with a byte cap so the dashboard
 never streams pathologically large stdout blobs over HTTP. Callers that
@@ -21,6 +21,10 @@ def _stdout_key(round_id: int, hotkey: str) -> str:
 
 def _meta_key(round_id: int, hotkey: str) -> str:
     return f"round_{round_id}/miner_{hotkey}/training_meta.json"
+
+
+def _arch_key(round_id: int, hotkey: str) -> str:
+    return f"round_{round_id}/miner_{hotkey}/architecture.py"
 
 
 def fetch_meta(r2, round_id: int, hotkey: str) -> Optional[dict]:
@@ -78,4 +82,51 @@ def presigned_stdout_url(r2, round_id: int, hotkey: str, ttl: int = 900) -> str:
         return ""
 
 
-__all__ = ["fetch_meta", "fetch_stdout", "presigned_stdout_url"]
+def fetch_architecture(
+    r2,
+    round_id: int,
+    hotkey: str,
+    max_bytes: Optional[int] = None,
+) -> Optional[dict]:
+    """Return ``{text, truncated, size}`` for architecture.py, or None."""
+    if r2 is None:
+        return None
+    cap = max_bytes if max_bytes is not None else Config.DASHBOARD_MAX_LOG_BYTES
+    try:
+        raw = r2.download_text(_arch_key(round_id, hotkey))
+    except Exception:
+        logger.exception(
+            "fetch_architecture failed: round=%s hotkey=%s", round_id, hotkey[:16],
+        )
+        return None
+    if raw is None:
+        return None
+    data = raw.encode("utf-8", errors="replace")
+    size = len(data)
+    if size > cap:
+        head = data[:cap].decode("utf-8", errors="replace")
+        return {"text": head, "truncated": True, "size": size}
+    return {"text": raw, "truncated": False, "size": size}
+
+
+def presigned_architecture_url(r2, round_id: int, hotkey: str, ttl: int = 900) -> str:
+    """Return a 15-minute presigned GET URL for architecture.py."""
+    if r2 is None:
+        return ""
+    try:
+        return r2.generate_presigned_get_url(_arch_key(round_id, hotkey), ttl=ttl)
+    except Exception:
+        logger.exception(
+            "presigned_architecture_url failed: round=%s hotkey=%s",
+            round_id, hotkey[:16],
+        )
+        return ""
+
+
+__all__ = [
+    "fetch_meta",
+    "fetch_stdout",
+    "fetch_architecture",
+    "presigned_stdout_url",
+    "presigned_architecture_url",
+]
