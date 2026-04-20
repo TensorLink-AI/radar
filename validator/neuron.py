@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
-import importlib
+import importlib.util
 import logging
 import os
 import random
@@ -272,19 +272,35 @@ class Validator:
     def _build_dispatch_extras(self, challenge, task) -> dict:
         """Call the task's `dispatch.build_dispatch_extras` hook if present.
 
-        Loads `{runner_dir}.dispatch` via importlib and invokes
+        Loads `{runner_dir}/dispatch.py` by file path and invokes
         `build_dispatch_extras` to produce any task-specific keys that
         get merged into the trainer payload. Missing module returns {}.
+        File-path loading avoids depending on `runner` being on sys.path
+        (it isn't pip-installed).
         """
         runner_dir = ""
         if isinstance(challenge.task, dict):
             runner_dir = challenge.task.get("runner_dir", "")
         if not runner_dir:
             return {}
-        mod_path = runner_dir.replace("/", ".") + ".dispatch"
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        dispatch_path = os.path.join(project_root, runner_dir, "dispatch.py")
+        if not os.path.isfile(dispatch_path):
+            return {}
+        mod_name = f"_radar_dispatch_{runner_dir.replace('/', '_').replace('.', '_')}"
+        spec = importlib.util.spec_from_file_location(mod_name, dispatch_path)
+        if spec is None or spec.loader is None:
+            return {}
+        dispatch_mod = importlib.util.module_from_spec(spec)
         try:
-            dispatch_mod = importlib.import_module(mod_path)
-        except ModuleNotFoundError:
+            spec.loader.exec_module(dispatch_mod)
+        except Exception as e:
+            logger.warning(
+                "Failed to load dispatch module for runner_dir=%s: %s",
+                runner_dir, e,
+            )
+            return {}
+        if not hasattr(dispatch_mod, "build_dispatch_extras"):
             return {}
         try:
             return dispatch_mod.build_dispatch_extras(
