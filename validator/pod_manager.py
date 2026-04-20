@@ -218,6 +218,7 @@ async def launch_agent_pod(
 async def run_agent_on_pod(
     env, challenge_json: str, timeout: int = 300,
     allowed_urls: str = "",
+    task_id: Optional[int] = None,
 ) -> Optional[dict]:
     """
     Send a Challenge to a running agent pod and get the Proposal back.
@@ -231,6 +232,10 @@ async def run_agent_on_pod(
 
     Retries up to ``RADAR_AGENT_POD_RETRIES`` times (default 2) with
     exponential backoff for transient Basilica deployment failures.
+
+    ``task_id`` disambiguates the Basilica deployment name so concurrent
+    ``process_challenge`` calls from ``asyncio.gather`` do not collide on
+    the same ``{image}-{method}-{timestamp}`` slug.  Pass the miner UID.
 
     Returns: dict with code/name/motivation, or dict with "error" key, or None.
     """
@@ -246,6 +251,13 @@ async def run_agent_on_pod(
         # TTL calculation instead of its 1800s default.
         timeout=timeout,
     )
+    if task_id is not None:
+        # affinetes reads task_id from kwargs to disambiguate deployment
+        # names; without it, two concurrent calls to the same method in
+        # the same wallclock second collide and one serialises behind
+        # the other.  The remote Actor accepts **kwargs so this is a no-op
+        # on the pod side.
+        call_kwargs["task_id"] = int(task_id)
     agent_code = getattr(env, "_agent_code", None)
     if agent_code:
         call_kwargs["agent_code"] = agent_code
