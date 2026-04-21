@@ -304,6 +304,53 @@ def _dataset_key_to_manifest(dataset: str, freq: str | None) -> str:
     return f"{dataset}__{freq}" if freq else dataset
 
 
+def ensure_datasets_cached(
+    dataset_names: list[str] | tuple[str, ...],
+    cache_dir: str,
+) -> dict[str, bool]:
+    """Download any missing GIFT-Eval Arrow files from R2 into `cache_dir`.
+
+    Reads R2 credentials from env (R2_ACCOUNT_ID / R2_ACCESS_KEY_ID /
+    R2_SECRET_ACCESS_KEY / R2_BUCKET). Datasets already on disk are
+    skipped. Failures are logged and swallowed — the task loop will
+    skip tasks whose data still isn't present.
+
+    Returns {manifest_key: bool} indicating which datasets are on disk
+    after the call.
+    """
+    try:
+        from shared.r2_audit import R2AuditLog
+    except ImportError:
+        logger.warning("R2AuditLog unavailable — cannot fetch GIFT-Eval data")
+        return {}
+
+    try:
+        r2 = R2AuditLog()
+    except Exception as e:
+        logger.warning("Failed to construct R2AuditLog: %s", e)
+        return {}
+
+    loader = GiftEvalBenchmark(r2=r2, cache_dir=cache_dir)
+    status: dict[str, bool] = {}
+    manifest_keys: list[str] = []
+    for name in dataset_names:
+        dataset, freq = _parse_dataset_spec(name)
+        manifest_keys.append(_dataset_key_to_manifest(dataset, freq))
+
+    for key in dict.fromkeys(manifest_keys):  # dedupe, preserve order
+        local_path = Path(cache_dir) / key / "data-00000-of-00001.arrow"
+        if local_path.exists() and local_path.stat().st_size > 0:
+            status[key] = True
+            continue
+        try:
+            loader.download_dataset(key)
+            status[key] = local_path.exists() and local_path.stat().st_size > 0
+        except Exception as e:
+            logger.warning("Failed to fetch GIFT-Eval dataset %s: %s", key, e)
+            status[key] = False
+    return status
+
+
 def build_task_configs(dataset_names: list[str] | tuple[str, ...]) -> list[dict]:
     """Expand leaderboard dataset names into full task configs.
 

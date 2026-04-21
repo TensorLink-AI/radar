@@ -334,12 +334,16 @@ def _gift_eval_validate(
     seed: int, data_dir: str,
 ) -> dict:
     """Evaluate across GIFT-Eval tasks and aggregate by geometric mean."""
-    from shared.gift_eval import build_task_configs
+    from shared.gift_eval import build_task_configs, ensure_datasets_cached
 
     device = next(model.parameters()).device
     quantiles_t = torch.tensor(QUANTILES, device=device)
     max_series = int(os.environ.get("RADAR_GIFT_EVAL_MAX_SERIES", "0"))
     max_tasks = int(os.environ.get("RADAR_GIFT_EVAL_MAX_TASKS", "0"))
+
+    # Pull any missing arrow files from R2 before the task loop.
+    # Tasks whose data can't be fetched will be skipped inside _eval_one_task.
+    ensure_datasets_cached(dataset_names, data_dir)
 
     tasks = build_task_configs(dataset_names)
     if max_tasks > 0:
