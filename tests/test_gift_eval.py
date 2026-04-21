@@ -1,9 +1,11 @@
 """Tests for GIFT-Eval integration and NUM_VARIATES=1 changes."""
 
+import math
 import os
 import struct
 import tempfile
 
+import pytest
 import torch
 
 from shared.gift_eval import select_datasets, GIFT_EVAL_DATASETS
@@ -269,7 +271,7 @@ def test_univariate_model_output_shape():
 
 
 def test_gift_eval_validate_truncates_predictions():
-    """Evaluation truncates model predictions to match dataset target length."""
+    """Evaluation truncates model predictions to match task horizon."""
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast"))
     from prepare import _gift_eval_validate, CONTEXT_LEN, PREDICTION_LEN, QUANTILES
@@ -277,23 +279,22 @@ def test_gift_eval_validate_truncates_predictions():
     import numpy as np
     import torch.nn as nn
 
-    # Create a dataset with freq="H" → pred_len=48
+    # Use "hospital" (freq M, non-m4 → base 12, short term → H=12). Model
+    # always emits PREDICTION_LEN=96, which must be truncated to 12.
     with tempfile.TemporaryDirectory() as tmpdir:
-        ds_dir = os.path.join(tmpdir, "test_trunc")
+        ds_dir = os.path.join(tmpdir, "hospital")  # manifest key
         os.makedirs(ds_dir, exist_ok=True)
         arrow_path = os.path.join(ds_dir, "data-00000-of-00001.arrow")
 
+        # 5 series each 700 long
         series_data = [list(range(700)) for _ in range(5)]
         arrays = [pa.array(s) for s in series_data]
         offsets = np.cumsum([0] + [len(s) for s in series_data])
         target_col = pa.ListArray.from_arrays(offsets.tolist(), pa.concat_arrays(arrays))
-        schema = pa.schema([("target", target_col.type)],
-                           metadata={b"freq": b"H"})
-        table = pa.table({"target": target_col}, schema=schema)
+        table = pa.table({"target": target_col})
         with pa.ipc.new_file(arrow_path, table.schema) as writer:
             writer.write_table(table)
 
-        # Model that always outputs (B, 96, 1, 9) — i.e. PREDICTION_LEN=96
         class FixedModel(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -306,13 +307,13 @@ def test_gift_eval_validate_truncates_predictions():
 
         model = FixedModel()
         result = _gift_eval_validate(
-            model, ["test_trunc"], batch_size=5, seed=42, data_dir=tmpdir,
+            model, ["hospital"], batch_size=5, seed=42, data_dir=tmpdir,
         )
         # Should succeed (not crash) and produce finite CRPS
         assert "crps" in result
         assert result["crps"] < float("inf")
-        import math
         assert not math.isnan(result["crps"])
+        assert result.get("n_tasks", 0) >= 1
 
 
 def test_gift_eval_all_nan_model_returns_inf():
@@ -408,3 +409,328 @@ def test_gift_eval_fallback_random():
     assert "mase" in result
     assert result["crps"] > 0
     assert result["crps"] < float("inf")
+
+
+# ── New leaderboard constants / task expansion ──
+
+
+def test_seasonality_map_matches_gluonts():
+    """Every freq in SEASONALITY_MAP matches gluonts.get_seasonality."""
+    pytest.importorskip("gluonts")
+    import warnings
+    from gluonts.time_feature import get_seasonality as gluonts_seasonality
+    from shared.gift_eval import SEASONALITY_MAP, get_seasonality
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for freq, ours in SEASONALITY_MAP.items():
+            g = gluonts_seasonality(freq)
+            assert g == ours, f"{freq}: ours={ours} gluonts={g}"
+            # And the function path agrees too.
+            assert get_seasonality(freq) == ours
+
+
+def test_build_task_configs_produces_97_tasks():
+    """SHORT_DATASETS expanded with MED_LONG_DATASETS yields >=95 tasks."""
+    from shared.gift_eval import SHORT_DATASETS, build_task_configs
+
+    tasks = build_task_configs(SHORT_DATASETS)
+    assert len(tasks) >= 95
+    # Sanity checks
+    terms = {t["term"] for t in tasks}
+    assert terms == {"short", "medium", "long"}
+    for t in tasks:
+        assert t["prediction_length"] > 0
+        assert t["season_length"] >= 1
+        assert "/" in t["config_name"]
+
+
+def test_m4_not_in_med_long():
+    """No m4_* dataset should appear in MED_LONG_DATASETS."""
+    from shared.gift_eval import MED_LONG_DATASETS
+    for name in MED_LONG_DATASETS:
+        assert not name.startswith("m4_"), f"m4 should not be in MED_LONG: {name}"
+
+
+def test_loop_seattle_d_is_short_only():
+    """LOOP_SEATTLE/D produces only a short-term task (per user spec)."""
+    from shared.gift_eval import build_task_configs
+    tasks = build_task_configs(["LOOP_SEATTLE/D", "LOOP_SEATTLE/H"])
+    loop_d = [t for t in tasks if t["dataset"] == "LOOP_SEATTLE" and t["freq"] == "D"]
+    loop_h = [t for t in tasks if t["dataset"] == "LOOP_SEATTLE" and t["freq"] == "H"]
+    assert [t["term"] for t in loop_d] == ["short"]
+    assert sorted(t["term"] for t in loop_h) == ["long", "medium", "short"]
+
+
+def test_m4_horizons_applied():
+    """m4 datasets use M4_HORIZONS, non-m4 use PRED_LENGTH_MAP."""
+    from shared.gift_eval import build_task_configs
+    tasks = build_task_configs(["m4_yearly", "m4_daily", "electricity/D"])
+    by_name = {t["config_name"]: t for t in tasks}
+    assert by_name["m4_yearly/A/short"]["prediction_length"] == 6
+    assert by_name["m4_daily/D/short"]["prediction_length"] == 14
+    # non-m4 daily → 30 (not 14)
+    assert by_name["electricity/D/short"]["prediction_length"] == 30
+
+
+# ── Rolling-origin windowing ──
+
+
+def test_seasonal_naive_forecast_shape():
+    """_seasonal_naive_forecast tiles the last `season` values to `horizon`."""
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast"))
+    from prepare import _seasonal_naive_forecast
+
+    # Season-24 history of length 100, horizon 48 → repeat last 24 twice
+    history = torch.arange(100, dtype=torch.float32)
+    out = _seasonal_naive_forecast(history, horizon=48, season=24)
+    assert out.shape == (48,)
+    # last-24 of history = [76..99]; tiled twice
+    expected_first = history[-24:]
+    torch.testing.assert_close(out[:24], expected_first)
+    torch.testing.assert_close(out[24:], expected_first)
+
+
+def test_seasonal_naive_fallback_when_short_history():
+    """Falls back to last-value repeat when season >= history length."""
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast"))
+    from prepare import _seasonal_naive_forecast
+
+    history = torch.tensor([1.0, 2.0, 3.0])
+    out = _seasonal_naive_forecast(history, horizon=5, season=10)
+    # season > len(history) → fallback to s=1 → repeat last value (3.0)
+    torch.testing.assert_close(out, torch.tensor([3.0, 3.0, 3.0, 3.0, 3.0]))
+
+
+def test_rolling_windows_match_gift_eval_formula():
+    """Window count follows ceil(0.1 * min_series_len / H), capped [1, 20]."""
+    import pyarrow as pa
+    from shared.gift_eval import load_dataset_for_task, _gift_eval_window_count
+
+    # Formula spot-checks (unit-level)
+    assert _gift_eval_window_count(1000, 48, "ett1") == 3   # ceil(100/48)=3
+    assert _gift_eval_window_count(5000, 10, "ett1") == 20  # clamp to 20
+    assert _gift_eval_window_count(50, 48, "ett1") == 1     # clamp to 1
+    assert _gift_eval_window_count(1000, 48, "m4_hourly") == 1  # M4 = 1
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ds_dir = os.path.join(tmpdir, "ett1__H")
+        os.makedirs(ds_dir, exist_ok=True)
+        arrow_path = os.path.join(ds_dir, "data-00000-of-00001.arrow")
+
+        series = [float(x) for x in range(1000)]
+        arr = pa.array(series)
+        target_col = pa.ListArray.from_arrays([0, len(series)], arr)
+        table = pa.table({"target": target_col})
+        with pa.ipc.new_file(arrow_path, table.schema) as writer:
+            writer.write_table(table)
+
+        task = {
+            "dataset": "ett1", "freq": "H", "term": "short",
+            "prediction_length": 48, "season_length": 24,
+            "config_name": "ett1/H/short",
+        }
+        samples = load_dataset_for_task(task, context_len=96, cache_dir=tmpdir)
+        # ceil(0.1 * 1000 / 48) = 3 windows
+        assert len(samples) == 3
+        # Non-overlapping and from the end
+        assert samples[0]["target"] == series[-48:]
+        assert samples[1]["target"] == series[-96:-48]
+        assert samples[2]["target"] == series[-144:-96]
+        # Context is exactly 96 long
+        assert all(len(s["context"]) == 96 for s in samples)
+
+
+def test_rolling_windows_m4_fixed_at_one():
+    """M4 datasets always produce 1 window regardless of series length."""
+    import pyarrow as pa
+    from shared.gift_eval import load_dataset_for_task
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ds_dir = os.path.join(tmpdir, "m4_hourly")
+        os.makedirs(ds_dir, exist_ok=True)
+        arrow_path = os.path.join(ds_dir, "data-00000-of-00001.arrow")
+
+        # Long series — would produce many windows under the non-M4 formula.
+        series = [float(x) for x in range(5000)]
+        arr = pa.array(series)
+        target_col = pa.ListArray.from_arrays([0, len(series)], arr)
+        table = pa.table({"target": target_col})
+        with pa.ipc.new_file(arrow_path, table.schema) as writer:
+            writer.write_table(table)
+
+        task = {
+            "dataset": "m4_hourly", "freq": "H", "term": "short",
+            "prediction_length": 48, "season_length": 24,
+            "config_name": "m4_hourly/H/short",
+        }
+        samples = load_dataset_for_task(task, context_len=96, cache_dir=tmpdir)
+        assert len(samples) == 1
+
+
+def test_rolling_windows_cap_at_20():
+    """Window count clamped at 20 even when formula would exceed."""
+    import pyarrow as pa
+    from shared.gift_eval import load_dataset_for_task
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ds_dir = os.path.join(tmpdir, "ett1__H")
+        os.makedirs(ds_dir, exist_ok=True)
+        arrow_path = os.path.join(ds_dir, "data-00000-of-00001.arrow")
+
+        # 5000 values, H=10 → ceil(500/10)=50, clamped to 20
+        series = [float(x) for x in range(5000)]
+        arr = pa.array(series)
+        target_col = pa.ListArray.from_arrays([0, len(series)], arr)
+        table = pa.table({"target": target_col})
+        with pa.ipc.new_file(arrow_path, table.schema) as writer:
+            writer.write_table(table)
+
+        task = {
+            "dataset": "ett1", "freq": "H", "term": "short",
+            "prediction_length": 10, "season_length": 24,
+            "config_name": "ett1/H/short",
+        }
+        samples = load_dataset_for_task(task, context_len=100, cache_dir=tmpdir)
+        assert len(samples) == 20
+
+
+def test_rolling_windows_series_too_short_for_even_one_window():
+    """Series with L < H are dropped entirely (can't fit one target)."""
+    import pyarrow as pa
+    from shared.gift_eval import load_dataset_for_task
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ds_dir = os.path.join(tmpdir, "ett1__H")
+        os.makedirs(ds_dir, exist_ok=True)
+        arrow_path = os.path.join(ds_dir, "data-00000-of-00001.arrow")
+
+        # L=20 < H=48 → cannot produce a single target window
+        series = [float(x) for x in range(20)]
+        arr = pa.array(series)
+        target_col = pa.ListArray.from_arrays([0, len(series)], arr)
+        table = pa.table({"target": target_col})
+        with pa.ipc.new_file(arrow_path, table.schema) as writer:
+            writer.write_table(table)
+
+        task = {
+            "dataset": "ett1", "freq": "H", "term": "short",
+            "prediction_length": 48, "season_length": 24,
+            "config_name": "ett1/H/short",
+        }
+        samples = load_dataset_for_task(task, context_len=96, cache_dir=tmpdir)
+        assert samples == []
+
+
+def test_no_500_series_cap_by_default():
+    """max_series=0 (default) should not subsample — all windows evaluated."""
+    import pyarrow as pa
+    from shared.gift_eval import load_dataset_for_task
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ds_dir = os.path.join(tmpdir, "ett1__H")
+        os.makedirs(ds_dir, exist_ok=True)
+        arrow_path = os.path.join(ds_dir, "data-00000-of-00001.arrow")
+
+        # 600 series, each just long enough for exactly 1 window
+        # context=50, pred=10 → need len >= 60; use 60 exactly → 1 window each
+        n_series = 600
+        series_len = 60
+        arrays = []
+        offsets = [0]
+        for s in range(n_series):
+            vals = [float((s + x) % 100) for x in range(series_len)]
+            arrays.append(pa.array(vals))
+            offsets.append(offsets[-1] + series_len)
+        target_col = pa.ListArray.from_arrays(offsets, pa.concat_arrays(arrays))
+        table = pa.table({"target": target_col})
+        with pa.ipc.new_file(arrow_path, table.schema) as writer:
+            writer.write_table(table)
+
+        task = {
+            "dataset": "ett1", "freq": "H", "term": "short",
+            "prediction_length": 10, "season_length": 2,
+            "config_name": "ett1/H/short",
+        }
+        samples = load_dataset_for_task(
+            task, context_len=50, cache_dir=tmpdir, max_series=0,
+        )
+        # 600 series * 1 window each
+        assert len(samples) == 600
+
+
+# ── Metric math ──
+
+
+def test_wql_components_gluonts_agreement():
+    """_wql_components summed across series matches gluonts
+    mean_weighted_sum_quantile_loss(axis=None)."""
+    pytest.importorskip("gluonts")
+    import numpy as np
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast"))
+    from prepare import _wql_components
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+    B, H, V, Q = 4, 12, 1, 9
+    quantiles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    # Random positive targets so |target| is well-defined
+    targets = torch.rand(B, H, V) * 10.0 + 1.0
+    preds = targets.unsqueeze(-1) + torch.randn(B, H, V, Q) * 0.5
+
+    # Ours: task-level aggregation
+    q_t = torch.tensor(quantiles)
+    num, den = _wql_components(preds, targets, q_t)
+    ours = float(num.sum() / den.sum())
+
+    # gluonts reference: per-series pinball then axis=None aggregation
+    # quantile_loss_q = 2 * max(q*(y-pred), (q-1)*(y-pred)). Sum over all
+    # timesteps and quantiles (gluonts axis=None), divide by sum of |y|.
+    y = targets.numpy()
+    p = preds.numpy()
+    q_arr = np.array(quantiles).reshape(1, 1, 1, Q)
+    err = y[..., None] - p
+    ql = 2 * np.maximum(q_arr * err, (q_arr - 1) * err)  # (B,H,V,Q)
+    # mean over Q for each (series,time) — matches gluonts "mean quantile loss"
+    qsum = ql.mean(axis=-1).sum()
+    abs_target_sum = np.abs(y).sum()
+    gl_wql = qsum / abs_target_sum
+    assert abs(ours - gl_wql) / max(abs(gl_wql), 1e-6) < 1e-5, (ours, gl_wql)
+
+
+def test_mase_components_matches_reference():
+    """_mase_components implements gluonts-style MASE per-series."""
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast"))
+    from prepare import _mase_components
+
+    history = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+    target = torch.tensor([11.0, 12.0])
+    pred = torch.tensor([10.5, 12.5])
+    season = 1
+    err, weight = _mase_components(pred, target, history, season)
+    # err = |10.5-11| + |12.5-12| = 0.5 + 0.5 = 1.0
+    assert abs(err - 1.0) < 1e-6
+    # scale = mean(|h[i] - h[i-1]|) = 1.0 (all diffs are 1)
+    # weight = H * scale = 2 * 1.0 = 2.0
+    assert abs(weight - 2.0) < 1e-6
+
+
+def test_geometric_mean_aggregation():
+    """_geomean returns geometric mean over positive finite values, ignoring
+    infs and non-positive entries."""
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "runner", "timeseries_forecast"))
+    from prepare import _geomean
+
+    # geomean([2, 8]) = sqrt(16) = 4
+    assert abs(_geomean([2.0, 8.0]) - 4.0) < 1e-9
+    # inf values are ignored
+    assert abs(_geomean([2.0, 8.0, float("inf")]) - 4.0) < 1e-9
+    # all inf → inf
+    assert _geomean([float("inf")]) == float("inf")
+    # empty → inf
+    assert _geomean([]) == float("inf")

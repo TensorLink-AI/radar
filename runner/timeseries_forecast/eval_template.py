@@ -54,16 +54,22 @@ try:
     model.eval()
 
     data_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "")
+    # RADAR_GIFT_EVAL_MAX_SERIES (default 0 = all) and RADAR_GIFT_EVAL_MAX_TASKS
+    # (default 0 = all) are read inside validate() via os.environ.
     metrics = validate(model, seed={eval_split_seed},
                        data_dir=data_dir if data_dir else None)
 
     result = {{
         "crps": metrics["crps"],
-        "ncrps": metrics.get("ncrps", float("inf")),
+        "ncrps": metrics.get("ncrps", metrics["crps"]),
         "mase": metrics["mase"],
         "flops_equivalent_size": flops_equiv,
         "param_count": param_count,
     }}
+    if "n_tasks" in metrics:
+        result["n_tasks"] = metrics["n_tasks"]
+        result["per_task"] = metrics.get("per_task", [])
+    # legacy mirrors for back-compat with one-release-older validators:
     if "n_datasets" in metrics:
         result["n_datasets"] = metrics["n_datasets"]
     print(json.dumps(result))

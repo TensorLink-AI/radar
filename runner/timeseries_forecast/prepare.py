@@ -97,35 +97,78 @@ def _discover_cached_datasets(data_dir: str) -> list[str]:
     )
 
 
-def _crps_from_quantiles(predictions, targets, quantiles_t):
-    """Compute per-sample CRPS from quantile predictions via pinball loss.
+def _wql_components(predictions, targets, quantiles_t):
+    """Per-series weighted quantile loss numerator and abs-target denominator.
+
+    Implements gluonts mean_weighted_sum_quantile_loss axis=None aggregation:
+    numerator = (2/Q) * Σ_{q,t} pinball(y, q_pred), denominator = Σ_t |y|.
+    Caller sums across series then divides.
 
     Args:
         predictions: (B, P, V, Q) quantile predictions
-        targets: (B, P, V) ground truth
-        quantiles_t: (Q,) quantile levels tensor on same device
+        targets:     (B, P, V)    ground truth
+        quantiles_t: (Q,)         quantile levels on same device
 
     Returns:
-        (B,) per-sample CRPS — mean pinball loss over (P, V, Q) dimensions.
+        (num_per_series, den_per_series): both (B,) tensors.
     """
-    target_expanded = targets.unsqueeze(-1)      # (B, P, V, 1)
-    errors = target_expanded - predictions        # (B, P, V, Q)
-    q = quantiles_t.view(1, 1, 1, -1)            # (1, 1, 1, Q)
-    pinball = torch.max(q * errors, (q - 1) * errors)  # (B, P, V, Q)
-    return pinball.mean(dim=(1, 2, 3))            # (B,)
+    target_expanded = targets.unsqueeze(-1)               # (B, P, V, 1)
+    errors = target_expanded - predictions                 # (B, P, V, Q)
+    q = quantiles_t.view(1, 1, 1, -1)                     # (1, 1, 1, Q)
+    pinball = torch.max(q * errors, (q - 1) * errors)     # (B, P, V, Q)
+    num = (2.0 / quantiles_t.numel()) * pinball.sum(dim=(1, 2, 3))  # (B,)
+    den = targets.abs().sum(dim=(1, 2))                   # (B,)
+    return num, den
 
 
-def _naive_crps(targets):
-    """Compute per-sample naive baseline CRPS (last-value-repeated).
+def _crps_from_quantiles(predictions, targets, quantiles_t):
+    """Per-series weighted quantile loss (wQL), for back-compat callers."""
+    num, den = _wql_components(predictions, targets, quantiles_t)
+    return num / den.clamp(min=1e-8)
 
-    Args:
-        targets: (B, P, V) ground truth
 
-    Returns:
-        (B,) per-sample naive CRPS (MAE of last-context-value forecast).
+def _seasonal_naive_forecast(history: torch.Tensor, horizon: int, season: int) -> torch.Tensor:
+    """Tile the last `season` values of history across `horizon` steps.
+
+    If history is shorter than `season` (or season<=0), falls back to the
+    last-value repeat. Returns a (horizon,) tensor on history's device.
     """
-    naive_pred = targets[:, 0:1, :].expand_as(targets)  # (B, P, V)
-    return (targets - naive_pred).abs().mean(dim=(1, 2))  # (B,)
+    L = history.numel()
+    if L == 0:
+        return torch.zeros(horizon, dtype=history.dtype, device=history.device)
+    s = max(int(season), 1)
+    if s > L:
+        s = 1
+    last_cycle = history[L - s:]                               # (s,)
+    reps = (horizon + s - 1) // s
+    return last_cycle.repeat(reps)[:horizon]
+
+
+def _mase_components(
+    median_pred: torch.Tensor,
+    target: torch.Tensor,
+    history: torch.Tensor,
+    season: int,
+) -> tuple[float, float]:
+    """Return (err_sum, horizon*scale) for a single series.
+
+    err_sum  = Σ_t |target - median_pred|
+    scale    = mean(|h[k] - h[k - season]|) over the history
+    Caller sums both across series and divides.
+    """
+    err_sum = float((target - median_pred).abs().sum().item())
+    H = int(target.numel())
+    L = history.numel()
+    s = max(int(season), 1)
+    if s >= L:
+        s = 1
+    if L <= s:
+        return err_sum, float(H)  # degenerate → scale=1
+    diffs = (history[s:] - history[:-s]).abs()
+    scale = float(diffs.mean().item()) if diffs.numel() else 1.0
+    if scale <= 0.0 or not math.isfinite(scale):
+        scale = 1.0
+    return err_sum, float(H) * scale
 
 
 def validate(
@@ -136,7 +179,13 @@ def validate(
     data_dir: str | None = None,
     dataset_names: list[str] | None = None,
 ) -> dict:
-    """Evaluate a model. GIFT-Eval mode evaluates per-dataset then aggregates."""
+    """Evaluate a model across GIFT-Eval tasks (dataset, freq, term).
+
+    `dataset_names` accepts the leaderboard spelling (e.g. "ett1/15T"); when
+    omitted we default to the full SHORT_DATASETS list (which expands to 97
+    tasks via MED_LONG_DATASETS). Per-task metrics are geometric-mean
+    normalized against seasonal-naive for leaderboard comparability.
+    """
     if data_dir is None:
         data_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "")
 
@@ -144,125 +193,182 @@ def validate(
         return _random_validate(model, n_batches, batch_size)
 
     try:
-        from shared.gift_eval import load_dataset, get_eval_batches
-        names = dataset_names or _discover_cached_datasets(data_dir)
-        if not names:
-            return _random_validate(model, n_batches, batch_size)
+        from shared.gift_eval import SHORT_DATASETS
+        names = list(dataset_names) if dataset_names else list(SHORT_DATASETS)
         return _gift_eval_validate(model, names, batch_size, seed, data_dir)
     except ImportError:
         return _random_validate(model, n_batches, batch_size)
+
+
+def _eval_one_task(
+    model, task: dict, batch_size: int, data_dir: str,
+    quantiles_t, device, max_series: int,
+) -> dict | None:
+    """Run a single (dataset, freq, term) task. Returns per-task metrics or None."""
+    from shared.gift_eval import (
+        load_dataset_for_task, get_eval_batches_with_history,
+    )
+
+    try:
+        samples = load_dataset_for_task(
+            task, CONTEXT_LEN, cache_dir=data_dir, max_series=max_series,
+        )
+    except (FileNotFoundError, KeyError, ValueError):
+        return None
+    if not samples:
+        return None
+
+    season = int(task.get("season_length", 1))
+    H = int(task["prediction_length"])
+
+    # Running sums for task-level aggregation (gluonts axis=None style).
+    wql_num_sum = 0.0
+    wql_den_sum = 0.0
+    snaive_wql_num_sum = 0.0
+    snaive_wql_den_sum = 0.0
+    mase_err_sum = 0.0
+    mase_scale_sum = 0.0
+    snaive_err_sum = 0.0
+    snaive_scale_sum = 0.0
+    n_windows = 0
+
+    median_idx = len(QUANTILES) // 2
+
+    with torch.no_grad():
+        for batch in get_eval_batches_with_history(samples, batch_size):
+            context = batch["context"].to(device)
+            targets = batch["target"].to(device)
+            histories: list[list[float]] = batch["history"]
+
+            predictions = model(context)
+            # Truncate (model may emit CONTEXT-tied length larger than H).
+            if predictions.shape[1] > H:
+                predictions = predictions[:, :H, :, :]
+            # Pad if too short (rare — only if a model underproduces).
+            if predictions.shape[1] < H:
+                pad = predictions.new_zeros(
+                    predictions.shape[0], H - predictions.shape[1],
+                    *predictions.shape[2:],
+                )
+                predictions = torch.cat([predictions, pad], dim=1)
+
+            valid = (
+                torch.isfinite(predictions).flatten(1).all(dim=1)
+                & torch.isfinite(targets).flatten(1).all(dim=1)
+            )
+            if not valid.any():
+                continue
+            predictions = predictions[valid]
+            targets = targets[valid]
+            kept_idx = valid.nonzero(as_tuple=True)[0].tolist()
+
+            # Model wQL components
+            num, den = _wql_components(predictions, targets, quantiles_t)
+            wql_num_sum += float(num.sum().item())
+            wql_den_sum += float(den.sum().item())
+
+            # Per-series seasonal-naive + MASE
+            median_pred = predictions[..., median_idx]   # (B, H, V)
+            B = predictions.shape[0]
+            for bi in range(B):
+                hist_list = histories[kept_idx[bi]]
+                hist_t = torch.tensor(hist_list, dtype=torch.float32, device=device)
+                target_s = targets[bi, :, 0]
+                median_s = median_pred[bi, :, 0]
+
+                # MASE for the model prediction
+                err, w = _mase_components(median_s, target_s, hist_t, season)
+                if math.isfinite(err) and math.isfinite(w) and w > 0:
+                    mase_err_sum += err
+                    mase_scale_sum += w
+
+                # Seasonal-naive baseline forecast → wQL + MASE
+                snaive = _seasonal_naive_forecast(hist_t, H, season)  # (H,)
+                # wQL for a point forecast reduces to 2 * |y - q_0.5| * 0.5 per
+                # quantile symmetrically; gluonts treats point forecast as the
+                # same prediction at every quantile level (median). Equivalent:
+                # num = Σ_t |y - m|, den = Σ_t |y|.
+                sn_num = float((target_s - snaive).abs().sum().item())
+                sn_den = float(target_s.abs().sum().item())
+                snaive_wql_num_sum += sn_num
+                snaive_wql_den_sum += sn_den
+
+                sn_err, sn_w = _mase_components(snaive, target_s, hist_t, season)
+                if math.isfinite(sn_err) and math.isfinite(sn_w) and sn_w > 0:
+                    snaive_err_sum += sn_err
+                    snaive_scale_sum += sn_w
+                n_windows += 1
+
+    if n_windows == 0 or wql_den_sum <= 0.0:
+        return None
+
+    task_wql = wql_num_sum / max(wql_den_sum, 1e-12)
+    task_mase = mase_err_sum / max(mase_scale_sum, 1e-12)
+    snaive_wql = snaive_wql_num_sum / max(snaive_wql_den_sum, 1e-12)
+    snaive_mase = snaive_err_sum / max(snaive_scale_sum, 1e-12)
+
+    norm_crps = task_wql / snaive_wql if snaive_wql > 0 else float("inf")
+    norm_mase = task_mase / snaive_mase if snaive_mase > 0 else float("inf")
+
+    return {
+        "config_name": task["config_name"],
+        "crps": task_wql,
+        "mase": task_mase,
+        "seasonal_naive_crps": snaive_wql,
+        "seasonal_naive_mase": snaive_mase,
+        "normalized_crps": norm_crps,
+        "normalized_mase": norm_mase,
+        "n_windows": n_windows,
+    }
+
+
+def _geomean(values: list[float]) -> float:
+    logs = [math.log(v) for v in values if math.isfinite(v) and v > 0]
+    if not logs:
+        return float("inf")
+    return math.exp(sum(logs) / len(logs))
 
 
 def _gift_eval_validate(
     model, dataset_names: list[str], batch_size: int,
     seed: int, data_dir: str,
 ) -> dict:
-    """Evaluate across multiple GIFT-Eval datasets."""
-    from shared.gift_eval import load_dataset, get_eval_batches
+    """Evaluate across GIFT-Eval tasks and aggregate by geometric mean."""
+    from shared.gift_eval import build_task_configs
 
     device = next(model.parameters()).device
     quantiles_t = torch.tensor(QUANTILES, device=device)
-    per_dataset = []
-    all_crps = []
-    all_ncrps_logs = []
-    all_mase = []
+    max_series = int(os.environ.get("RADAR_GIFT_EVAL_MAX_SERIES", "0"))
+    max_tasks = int(os.environ.get("RADAR_GIFT_EVAL_MAX_TASKS", "0"))
 
-    for name in dataset_names:
-        try:
-            samples = load_dataset(
-                name, CONTEXT_LEN, PREDICTION_LEN,
-                max_series=int(os.environ.get("RADAR_GIFT_EVAL_MAX_SERIES", "500")),
-                seed=seed, cache_dir=data_dir,
-            )
-        except Exception:
-            continue
+    tasks = build_task_configs(dataset_names)
+    if max_tasks > 0:
+        tasks = tasks[:max_tasks]
 
-        if not samples:
-            continue
-
-        ds_crps_sum = 0.0
-        ds_mase_sum = 0.0
-        ds_samples = 0
-        ds_log_ratios = []
-
-        with torch.no_grad():
-            for batch in get_eval_batches(samples, batch_size):
-                context = batch["context"].to(device)
-                targets = batch["target"].to(device)
-                predictions = model(context)
-
-                # Truncate predictions to match dataset prediction length
-                # (model outputs PREDICTION_LEN=96, dataset may need fewer)
-                target_pred_len = targets.shape[1]
-                if predictions.shape[1] > target_pred_len:
-                    predictions = predictions[:, :target_pred_len, :, :]
-
-                # Mask: keep samples where predictions and targets are finite (no NaN/inf)
-                valid = (
-                    torch.isfinite(predictions).flatten(1).all(dim=1)
-                    & torch.isfinite(targets).flatten(1).all(dim=1)
-                )
-                if not valid.any():
-                    continue
-
-                predictions = predictions[valid]
-                targets = targets[valid]
-
-                sample_crps = _crps_from_quantiles(predictions, targets, quantiles_t)
-                sample_naive = _naive_crps(targets).to(device)
-
-                # Drop samples with non-finite CRPS (overflow from large preds)
-                finite_mask = torch.isfinite(sample_crps)
-                if not finite_mask.any():
-                    continue
-                sample_crps = sample_crps[finite_mask]
-                sample_naive = sample_naive[finite_mask]
-                predictions = predictions[finite_mask]
-                targets = targets[finite_mask]
-
-                ratio = sample_crps / sample_naive.clamp(min=1e-8)
-                ds_log_ratios.append(torch.log(ratio.clamp(min=1e-8)))
-
-                ds_crps_sum += sample_crps.sum().item()
-                ds_samples += sample_crps.shape[0]
-
-                median_idx = len(QUANTILES) // 2
-                median_pred = predictions[..., median_idx]
-                naive_scale = (targets[:, 1:] - targets[:, :-1]).abs().mean().clamp(min=1e-6)
-                ds_mase_sum += ((median_pred - targets).abs().mean() / naive_scale).item()
-
-        if ds_samples == 0:
-            continue
-
-        n_batches_ds = max(len(ds_log_ratios), 1)
-        ds_avg_crps = ds_crps_sum / ds_samples
-        ds_ncrps = torch.exp(torch.cat(ds_log_ratios).mean()).item() if ds_log_ratios else float("inf")
-        ds_avg_mase = ds_mase_sum / n_batches_ds
-
-        per_dataset.append({
-            "name": name, "crps": ds_avg_crps,
-            "ncrps": ds_ncrps, "mase": ds_avg_mase,
-            "n_series": ds_samples,
-        })
-        all_crps.append(ds_avg_crps)
-        all_ncrps_logs.extend(
-            [lr for t in ds_log_ratios for lr in t.tolist()]
+    per_task: list[dict] = []
+    for task in tasks:
+        res = _eval_one_task(
+            model, task, batch_size, data_dir,
+            quantiles_t, device, max_series,
         )
-        all_mase.append(ds_avg_mase)
+        if res is not None:
+            per_task.append(res)
 
-    if not per_dataset:
+    if not per_task:
         return _random_validate(model, 10, batch_size)
 
-    agg_crps = sum(all_crps) / len(all_crps)
-    agg_ncrps = math.exp(sum(all_ncrps_logs) / len(all_ncrps_logs)) if all_ncrps_logs else float("inf")
-    agg_mase = sum(all_mase) / len(all_mase)
+    agg_crps = _geomean([t["normalized_crps"] for t in per_task])
+    agg_mase = _geomean([t["normalized_mase"] for t in per_task])
 
     return {
         "crps": agg_crps,
-        "ncrps": agg_ncrps,
         "mase": agg_mase,
-        "n_datasets": len(per_dataset),
-        "per_dataset": per_dataset,
+        "n_tasks": len(per_task),
+        "per_task": per_task,
+        # legacy mirrors for one-release back-compat:
+        "ncrps": agg_crps,
+        "n_datasets": len(per_task),
+        "per_dataset": per_task,
     }
 
 
@@ -294,7 +400,8 @@ def _random_validate(model, n_batches: int = 10, batch_size: int = 32) -> dict:
             targets = targets[valid]
 
             sample_crps = _crps_from_quantiles(predictions, targets, quantiles_t)
-            sample_naive = _naive_crps(targets).to(device)
+            naive_pred = targets[:, 0:1, :].expand_as(targets)
+            sample_naive = (targets - naive_pred).abs().mean(dim=(1, 2))
 
             # Drop samples with non-finite CRPS (overflow from large preds)
             finite_mask = torch.isfinite(sample_crps)
