@@ -82,10 +82,255 @@ GIFT_EVAL_MANIFEST: dict[str, str] = {
 
 GIFT_EVAL_DATASETS = sorted(GIFT_EVAL_MANIFEST.keys())
 
+# Legacy freq→prediction-length (used by load_dataset). Preserved for back-compat.
+# New code should use get_base_prediction_length() which matches the GIFT-Eval spec.
 FREQ_TO_PRED_LEN = {
     "H": 48, "T": 60, "D": 14, "W": 8, "M": 12, "Q": 8, "Y": 4,
-    "B": 14, "5T": 60, "10T": 60, "15T": 48, "30T": 48,
+    "B": 14, "5T": 60, "10T": 60, "15T": 48, "30T": 48, "S": 60,
 }
+
+# ── GIFT-Eval leaderboard dataset lists ─────────────────────────
+# Verbatim from SalesforceAIResearch/gift-eval notebooks/naive.ipynb.
+# SHORT_DATASETS: every dataset/freq pair evaluated on the leaderboard.
+# MED_LONG_DATASETS: the subset that also gets "medium" and "long" terms.
+# Total tasks = len(SHORT) + 2 * len(MED_LONG) = 55 + 2*21 = 97.
+SHORT_DATASETS: tuple[str, ...] = (
+    "m4_yearly", "m4_quarterly", "m4_monthly", "m4_weekly", "m4_daily", "m4_hourly",
+    "electricity/15T", "electricity/H", "electricity/D", "electricity/W",
+    "solar/10T", "solar/H", "solar/D", "solar/W",
+    "hospital", "covid_deaths",
+    "us_births/D", "us_births/M", "us_births/W",
+    "saugeenday/D", "saugeenday/M", "saugeenday/W",
+    "temperature_rain_with_missing",
+    "kdd_cup_2018_with_missing/H", "kdd_cup_2018_with_missing/D",
+    "car_parts_with_missing", "restaurant",
+    "hierarchical_sales/D", "hierarchical_sales/W",
+    "LOOP_SEATTLE/5T", "LOOP_SEATTLE/H", "LOOP_SEATTLE/D",
+    "SZ_TAXI/15T", "SZ_TAXI/H",
+    "M_DENSE/H", "M_DENSE/D",
+    "ett1/15T", "ett1/H", "ett1/D", "ett1/W",
+    "ett2/15T", "ett2/H", "ett2/D", "ett2/W",
+    "jena_weather/10T", "jena_weather/H", "jena_weather/D",
+    "bitbrains_fast_storage/5T", "bitbrains_fast_storage/H",
+    "bitbrains_rnd/5T", "bitbrains_rnd/H",
+    "bizitobs_application", "bizitobs_service",
+    "bizitobs_l2c/5T", "bizitobs_l2c/H",
+)
+
+MED_LONG_DATASETS: tuple[str, ...] = (
+    "electricity/15T", "electricity/H",
+    "solar/10T", "solar/H",
+    "kdd_cup_2018_with_missing/H",
+    "LOOP_SEATTLE/5T", "LOOP_SEATTLE/H",
+    "SZ_TAXI/15T",
+    "M_DENSE/H",
+    "ett1/15T", "ett1/H",
+    "ett2/15T", "ett2/H",
+    "jena_weather/10T", "jena_weather/H",
+    "bitbrains_fast_storage/5T",
+    "bitbrains_rnd/5T",
+    "bizitobs_application", "bizitobs_service",
+    "bizitobs_l2c/5T", "bizitobs_l2c/H",
+)
+
+TERMS: tuple[str, str, str] = ("short", "medium", "long")
+
+# Term multiplier applied to the base prediction length.
+_TERM_MULTIPLIER = {"short": 1, "medium": 10, "long": 15}
+
+# Native freq for single-freq datasets (those without a `/freq` in the leaderboard
+# name). Values from gift-eval notebooks/dataset_properties.json. Keys here are
+# the POST-pretty-name form, matching the lowercased leaderboard name after
+# _PRETTY_NAMES substitution.
+_DATASET_PROPERTIES: dict[str, str] = {
+    "m4_yearly": "A",
+    "m4_quarterly": "Q",
+    "m4_monthly": "M",
+    "m4_weekly": "W",
+    "m4_daily": "D",
+    "m4_hourly": "H",
+    "hospital": "M",
+    "covid_deaths": "D",
+    "us_births": "M",
+    "saugeen": "M",
+    "temperature_rain": "D",
+    "kdd_cup_2018": "D",
+    "jena_weather": "D",
+    "car_parts": "M",
+    "restaurant": "D",
+    "hierarchical_sales": "W-WED",
+    "loop_seattle": "D",
+    "sz_taxi": "H",
+    "m_dense": "D",
+    "bitbrains_fast_storage": "H",
+    "bitbrains_rnd": "H",
+    "bizitobs_application": "10S",
+    "bizitobs_service": "10S",
+    "bizitobs_l2c": "H",
+    "electricity": "W",
+    "ett1": "W",
+    "ett2": "W",
+    "solar": "W",
+}
+
+# Lowercased-name aliases used by dataset_properties.json.
+_PRETTY_NAMES: dict[str, str] = {
+    "saugeenday": "saugeen",
+    "temperature_rain_with_missing": "temperature_rain",
+    "kdd_cup_2018_with_missing": "kdd_cup_2018",
+    "car_parts_with_missing": "car_parts",
+}
+
+# M4 base horizons (per M4 competition spec). Used when "m4" in dataset name.
+M4_HORIZONS: dict[str, int] = {
+    "A": 6, "Q": 8, "M": 18, "W": 13, "D": 14, "H": 48,
+}
+
+# Non-M4 base horizon per freq family (GIFT-Eval canonical PRED_LENGTH_MAP).
+_PRED_LENGTH_MAP: dict[str, int] = {
+    "M": 12, "W": 8, "D": 30, "H": 48, "T": 48, "S": 60,
+}
+
+# Seasonality for each freq we may encounter. Values verified against
+# gluonts.time_feature.get_seasonality (gluonts==0.16.2):
+#   base(S)=3600, base(T)=1440, base(H)=24, base(D)=1, base(W)=1,
+#   base(M)=12, base(Q)=4, base(A/Y)=1, base(B)=5
+# For multiplied freqs like "5T", gluonts divides base by the multiplier.
+SEASONALITY_MAP: dict[str, int] = {
+    "S": 3600,
+    "10S": 360,      # 3600 / 10
+    "T": 1440,
+    "1T": 1440,
+    "5T": 288,       # 1440 / 5
+    "10T": 144,      # 1440 / 10
+    "15T": 96,       # 1440 / 15
+    "30T": 48,       # 1440 / 30
+    "H": 24,
+    "6H": 4,         # 24 / 6
+    "D": 1,
+    "B": 5,
+    "W": 1,
+    "W-SUN": 1,
+    "W-WED": 1,
+    "M": 12,
+    "MS": 12,
+    "Q": 4,
+    "Q-DEC": 4,
+    "A": 1,
+    "A-DEC": 1,
+    "Y": 1,
+}
+
+
+def _normalize_freq_base(freq: str) -> str:
+    """Strip multiplier prefix and map deprecated codes to legacy ones.
+
+    "15T" → "T", "10S" → "S", "6H" → "H", "W-WED" → "W", "ME" → "M".
+    """
+    import re
+    m = re.match(r"^(\d+)?([A-Za-z]+)", freq)
+    if not m:
+        return freq
+    base = m.group(2)
+    # pandas newer codes → gift-eval legacy (from maybe_reconvert_freq)
+    reconvert = {
+        "Y": "A", "YE": "A", "QE": "Q", "ME": "M",
+        "h": "H", "min": "T", "s": "S", "us": "U",
+    }
+    return reconvert.get(base, base)
+
+
+def get_seasonality(freq: str) -> int:
+    """Return the seasonality period for a freq string. Matches gluonts.
+
+    Unknown freqs fall back to 1 (matches gluonts default).
+    """
+    if freq in SEASONALITY_MAP:
+        return SEASONALITY_MAP[freq]
+    # Derive from base + multiplier (mimics gluonts divmod logic).
+    import re
+    m = re.match(r"^(\d+)?([A-Za-z]+)", freq)
+    if not m:
+        return 1
+    n = int(m.group(1)) if m.group(1) else 1
+    base = _normalize_freq_base(freq)
+    base_season = SEASONALITY_MAP.get(base, 1)
+    season, remainder = divmod(base_season, n)
+    return season if remainder == 0 else 1
+
+
+def get_base_prediction_length(freq: str, dataset_name: str) -> int:
+    """Base prediction length for (dataset, freq) per GIFT-Eval spec.
+
+    M4 datasets use M4_HORIZONS, all others use PRED_LENGTH_MAP. Caller
+    multiplies by the term multiplier (short=1, medium=10, long=15).
+    """
+    base = _normalize_freq_base(freq)
+    if "m4" in dataset_name.lower():
+        return M4_HORIZONS.get(base, 14)
+    return _PRED_LENGTH_MAP.get(base, 48)
+
+
+def _parse_dataset_spec(name: str) -> tuple[str, str]:
+    """Split a leaderboard name into (dataset, freq).
+
+    "ett1/15T" → ("ett1", "15T")
+    "hospital"  → ("hospital", "M") via _DATASET_PROPERTIES lookup
+    """
+    if "/" in name:
+        dataset, freq = name.split("/", 1)
+        return dataset, freq
+    key = _PRETTY_NAMES.get(name.lower(), name.lower())
+    freq = _DATASET_PROPERTIES.get(key)
+    if freq is None:
+        raise KeyError(f"No default freq for single-freq dataset: {name!r}")
+    return name, freq
+
+
+def _dataset_key_to_manifest(dataset: str, freq: str | None) -> str:
+    """Bridge leaderboard spelling to GIFT_EVAL_MANIFEST key.
+
+    Leaderboard uses "electricity/15T"; manifest uses "electricity__15T".
+    For single-freq datasets (e.g. "hospital"), freq is inferred but the
+    manifest key has no suffix.
+    """
+    if freq is not None:
+        candidate = f"{dataset}__{freq}"
+        if candidate in GIFT_EVAL_MANIFEST:
+            return candidate
+    if dataset in GIFT_EVAL_MANIFEST:
+        return dataset
+    # Fall through — caller will surface the KeyError when downloading.
+    return f"{dataset}__{freq}" if freq else dataset
+
+
+def build_task_configs(dataset_names: list[str] | tuple[str, ...]) -> list[dict]:
+    """Expand leaderboard dataset names into full task configs.
+
+    Each short-dataset entry yields one "short" task; if the same entry is
+    also in MED_LONG_DATASETS, it additionally yields "medium" and "long"
+    tasks. Returns list of dicts with keys: dataset, freq, term,
+    prediction_length, season_length, config_name.
+    """
+    med_long = set(MED_LONG_DATASETS)
+    tasks: list[dict] = []
+    for name in dataset_names:
+        dataset, freq = _parse_dataset_spec(name)
+        base_pred = get_base_prediction_length(freq, dataset)
+        season = get_seasonality(freq)
+        for term in TERMS:
+            if term != "short" and name not in med_long:
+                continue
+            pred_len = base_pred * _TERM_MULTIPLIER[term]
+            tasks.append({
+                "dataset": dataset,
+                "freq": freq,
+                "term": term,
+                "prediction_length": pred_len,
+                "season_length": season,
+                "config_name": f"{dataset}/{freq}/{term}",
+            })
+    return tasks
 
 
 def _has_nan(values: list) -> bool:
@@ -279,3 +524,125 @@ def get_eval_batches(
             [s["target"] for s in batch], dtype=torch.float32,
         ).unsqueeze(-1)  # (B, pred_len, 1)
         yield {"context": ctx, "target": tgt}
+
+
+# ── Rolling-origin window loader (new evaluation path) ──────────────────
+
+
+_MAX_WINDOWS_PER_SERIES = 20  # matches gluonts default cap
+
+
+def _extract_series(table) -> list[list[float]]:
+    """Pull flat 1D series from an Arrow table, handling multivariate flatten."""
+    out: list[list[float]] = []
+    shape_col = "target._np_shape" if "target._np_shape" in table.column_names else None
+    for i in range(table.num_rows):
+        target_col = table.column("target")[i].as_py()
+        values = target_col if isinstance(target_col, list) else list(target_col)
+        if shape_col is not None:
+            shape = table.column(shape_col)[i].as_py()
+            if shape and len(shape) >= 2:
+                n_variates = shape[-1]
+                if n_variates > 1:
+                    series_len = len(values) // n_variates
+                    values = values[:series_len]
+        if _has_nan(values):
+            continue
+        out.append(values)
+    return out
+
+
+def load_dataset_for_task(
+    task: dict,
+    context_len: int,
+    cache_dir: str,
+    max_series: int = 0,
+) -> list[dict]:
+    """Build rolling-origin evaluation windows for a single task.
+
+    For each raw series of length L, non-overlapping windows are carved from
+    the END backwards, each with horizon H = task["prediction_length"] and
+    context of length context_len immediately preceding the target. When the
+    history preceding the context is shorter than context_len, the context is
+    left-padded with zeros (documented: matches how gluonts predictors
+    internally pad short history).
+
+    Returns [{context, target, history, freq}] where `history` is every
+    value before the target (used for seasonal-naive + MASE scale).
+    """
+    import pyarrow.ipc as ipc
+
+    dataset, freq = task["dataset"], task["freq"]
+    manifest_key = _dataset_key_to_manifest(dataset, freq)
+    # path-traversal guard (manifest keys are controlled, but be defensive)
+    if "/" in manifest_key or "\\" in manifest_key or ".." in manifest_key:
+        raise ValueError(f"Invalid manifest key: {manifest_key!r}")
+    arrow_path = Path(cache_dir) / manifest_key / "data-00000-of-00001.arrow"
+    if not arrow_path.exists():
+        raise FileNotFoundError(f"Arrow file not found: {arrow_path}")
+
+    reader = ipc.open_file(str(arrow_path))
+    table = reader.read_all()
+    raw_series = _extract_series(table)
+
+    H = int(task["prediction_length"])
+    if H <= 0:
+        return []
+
+    samples: list[dict] = []
+    for series in raw_series:
+        L = len(series)
+        # Need at least one full (context, target) pair.
+        if L < context_len + H:
+            continue
+        max_windows = (L - context_len) // H
+        n_windows = min(max_windows, _MAX_WINDOWS_PER_SERIES)
+        for i in range(n_windows):
+            end = L - i * H
+            target = series[end - H:end]
+            history = series[:end - H]
+            # Left-pad context with zeros when the series is shorter than
+            # context_len to the left of the target.
+            if len(history) >= context_len:
+                context = history[-context_len:]
+            else:
+                context = [0.0] * (context_len - len(history)) + history
+            samples.append({
+                "context": context,
+                "target": target,
+                "history": history,
+                "freq": freq,
+            })
+
+    # Optional deterministic subsample AFTER windowing so every validator sees
+    # the same subset. Default 0 = keep all.
+    if max_series and len(samples) > max_series:
+        rng = random.Random(hash((task.get("config_name", ""), max_series)))
+        samples = rng.sample(samples, max_series)
+
+    return samples
+
+
+def get_eval_batches_with_history(
+    samples: list[dict],
+    batch_size: int = 32,
+):
+    """Batch rolling-origin samples. Yields dicts with context/target tensors
+    plus a list-of-lists `history` (variable length per series).
+    """
+    import torch
+
+    for start in range(0, len(samples), batch_size):
+        batch = samples[start:start + batch_size]
+        ctx = torch.tensor(
+            [s["context"] for s in batch], dtype=torch.float32,
+        ).unsqueeze(-1)
+        tgt = torch.tensor(
+            [s["target"] for s in batch], dtype=torch.float32,
+        ).unsqueeze(-1)
+        yield {
+            "context": ctx,
+            "target": tgt,
+            "history": [s["history"] for s in batch],
+            "freq": batch[0].get("freq", ""),
+        }
