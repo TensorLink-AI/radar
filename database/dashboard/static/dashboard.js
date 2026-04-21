@@ -177,6 +177,82 @@
             .catch((err) => console.warn("loss history fetch failed:", err));
     }
 
+    // ── Heatmaps (provenance page) ──
+    const renderHeatmap = (el, data) => {
+        const rows = data.miners || [];
+        const cols = data.rounds || (data.experiments || []).map((e) => e.id);
+        const colLabels = data.rounds
+            ? cols.map((c) => String(c))
+            : (data.experiments || []).map((e) => `#${e.id}`);
+        const matrix = data.matrix || [];
+        if (!rows.length || !cols.length) {
+            el.innerHTML = '<div class="hm-empty">No access log activity yet.</div>';
+            return;
+        }
+        let max = 0;
+        for (const r of matrix) for (const v of r) if (v > max) max = v;
+
+        const colLinkTpl = el.dataset.colLink || "";
+        const rowLinkTpl = el.dataset.rowLink || "";
+        const shade = (v) => {
+            if (!v || max === 0) return "#12151b";
+            const t = Math.log1p(v) / Math.log1p(max);
+            const alpha = 0.12 + t * 0.88;
+            return `rgba(110, 168, 254, ${alpha.toFixed(3)})`;
+        };
+
+        const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({
+            "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+        }[c]));
+        const shortRow = (s) => (s.length > 18 ? s.slice(0, 16) + "…" : s);
+
+        const head = ["<thead><tr><th></th>"];
+        cols.forEach((c, j) => {
+            const label = colLabels[j];
+            const href = colLinkTpl ? colLinkTpl.replace("{col}", encodeURIComponent(c)) : "";
+            head.push(
+                href
+                    ? `<th class="hm-col"><a href="${esc(href)}">${esc(label)}</a></th>`
+                    : `<th class="hm-col">${esc(label)}</th>`,
+            );
+        });
+        head.push("</tr></thead>");
+
+        const body = ["<tbody>"];
+        rows.forEach((hk, i) => {
+            const rowHref = rowLinkTpl ? rowLinkTpl.replace("{row}", encodeURIComponent(hk)) : "";
+            body.push(
+                rowHref
+                    ? `<tr><th class="hm-row"><a href="${esc(rowHref)}" title="${esc(hk)}">${esc(shortRow(hk))}</a></th>`
+                    : `<tr><th class="hm-row" title="${esc(hk)}">${esc(shortRow(hk))}</th>`,
+            );
+            cols.forEach((c, j) => {
+                const v = (matrix[i] && matrix[i][j]) || 0;
+                const bg = shade(v);
+                const colorStyle = v && max && v / max > 0.55 ? "color:#0b0d11" : "color:var(--muted)";
+                const cellLabel = v ? String(v) : "";
+                const title = `${hk} × ${colLabels[j]}: ${v}`;
+                body.push(
+                    `<td class="hm-cell" style="background:${bg};${colorStyle}" title="${esc(title)}">${esc(cellLabel)}</td>`,
+                );
+            });
+            body.push("</tr>");
+        });
+        body.push("</tbody>");
+
+        el.innerHTML = `<table>${head.join("")}${body.join("")}</table>`;
+    };
+
+    document.querySelectorAll(".heatmap[data-endpoint]").forEach((el) => {
+        fetch(el.dataset.endpoint)
+            .then((r) => r.json())
+            .then((data) => renderHeatmap(el, data))
+            .catch((err) => {
+                console.warn("heatmap fetch failed:", err);
+                el.innerHTML = '<div class="hm-empty">Failed to load activity data.</div>';
+            });
+    });
+
     // ── Highlight HTMX-swapped diffs with Prism ──
     document.body.addEventListener("htmx:afterSwap", () => {
         if (window.Prism) window.Prism.highlightAll();

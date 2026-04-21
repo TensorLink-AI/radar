@@ -104,3 +104,23 @@ async def stats_json(task: str = "") -> dict:
     state = get_state()
     kw = {"task": task} if task else {}
     return await state.store.stats(**kw)
+
+
+@router.get("/provenance/miner_rounds.json")
+async def provenance_miner_rounds(rounds: int = 30) -> dict:
+    """Miner × round heatmap — unique experiments queried per round."""
+    from database.dashboard import queries as q
+
+    state = get_state()
+    rounds = max(1, min(int(rounds), 100))
+    return await q.miner_round_activity(state.pool, rounds=rounds)
+
+
+@router.get("/provenance/top_experiments.json")
+async def provenance_top_experiments(top_k: int = 20) -> dict:
+    """Miner × top-K experiments heatmap — raw query counts per pair."""
+    from database.dashboard import queries as q
+
+    state = get_state()
+    top_k = max(1, min(int(top_k), 100))
+    return await q.top_experiments_activity(state.pool, top_k=top_k)
