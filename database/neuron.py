@@ -23,7 +23,11 @@ from database.server import (
 )
 from shared.pareto import ParetoFront
 from shared.pg_access_logger import PgAccessLogger
-from shared.pg_store import PgExperimentStore, create_pg_pool
+from shared.pg_store import (
+    PgExperimentStore,
+    create_pg_pool,
+    ensure_schema_exists,
+)
 from shared.task import load_enabled_tasks
 
 logger = logging.getLogger(__name__)
@@ -66,24 +70,52 @@ class DatabaseNeuron:
         """Create asyncpg pool and init schemas."""
         import ssl as _ssl
 
+        import asyncpg
+
         pg_dsn = getattr(self.config, "pg_dsn", None) or Config.PG_DSN
+        network = Config.NETWORK
 
         pool_kwargs: dict = {"min_size": 2, "max_size": 10}
 
         # SSL support (required for Supabase / managed Postgres)
+        ssl_ctx = None
         if Config.PG_SSL:
-            ctx = _ssl.create_default_context()
+            ssl_ctx = _ssl.create_default_context()
             if Config.PG_SSL == "require":
-                ctx.check_hostname = False
-                ctx.verify_mode = _ssl.CERT_NONE
-            pool_kwargs["ssl"] = ctx
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = _ssl.CERT_NONE
+            pool_kwargs["ssl"] = ssl_ctx
 
         # Disable prepared-statement cache when using connection poolers
         # (e.g. Supabase Supavisor in transaction mode).
-        if Config.PG_SSL or "supabase" in pg_dsn:
+        uses_pooler = bool(Config.PG_SSL or "supabase" in pg_dsn)
+        if uses_pooler:
             pool_kwargs["statement_cache_size"] = 0
 
-        self.pool = await create_pg_pool(pg_dsn, **pool_kwargs)
+        # Bootstrap step: CREATE SCHEMA must run on a connection whose
+        # search_path is NOT already set to that schema (otherwise we're
+        # asking the schema to create itself). Use a bare asyncpg.connect
+        # so no pool init hook runs.
+        logger.info(
+            "Bootstrapping Postgres schema %r (RADAR_NETWORK)", network,
+        )
+        bootstrap_kwargs: dict = {}
+        if ssl_ctx is not None:
+            bootstrap_kwargs["ssl"] = ssl_ctx
+        if uses_pooler:
+            bootstrap_kwargs["statement_cache_size"] = 0
+        bootstrap_conn = await asyncpg.connect(pg_dsn, **bootstrap_kwargs)
+        try:
+            await ensure_schema_exists(bootstrap_conn, network)
+        finally:
+            await bootstrap_conn.close()
+
+        # Every connection borrowed from this pool will have its search_path
+        # pinned to `"<network>", public`, so all unqualified DDL/DML that
+        # follows resolves to tables inside this schema.
+        self.pool = await create_pg_pool(
+            pg_dsn, schema=network, **pool_kwargs,
+        )
         self.store = PgExperimentStore(self.pool)
         await self.store.init_schema()
 
@@ -161,7 +193,9 @@ class DatabaseNeuron:
             except Exception as e:
                 logger.warning("Dashboard mount failed: %s", e)
 
-        logger.info("Database initialized, schemas created")
+        logger.info(
+            "Database initialized, tables created in schema %r", network,
+        )
 
     async def _rebuild_pareto(self):
         """Rebuild Pareto fronts from all DB elements."""
@@ -219,8 +253,9 @@ class DatabaseNeuron:
 
         db_size = await self.store.get_size()
         logger.info(
-            "Database server starting on port %d. DB: %d experiments, tasks: %s",
-            self.port, db_size, list(self.tasks.keys()),
+            "Database server starting on port %d (network=%s). "
+            "DB: %d experiments, tasks: %s",
+            self.port, Config.NETWORK, db_size, list(self.tasks.keys()),
         )
 
         # Start uvicorn in background
