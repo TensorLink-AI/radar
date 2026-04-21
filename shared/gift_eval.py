@@ -529,7 +529,24 @@ def get_eval_batches(
 # ── Rolling-origin window loader (new evaluation path) ──────────────────
 
 
-_MAX_WINDOWS_PER_SERIES = 20  # matches gluonts default cap
+_MAX_WINDOWS = 20         # matches gluonts / GIFT-Eval MAX_WINDOW cap
+_TEST_SPLIT = 0.1         # fraction of min_series_length used for windowing
+
+
+def _gift_eval_window_count(
+    min_series_length: int, prediction_length: int, dataset_name: str,
+) -> int:
+    """Compute number of rolling-origin windows per GIFT-Eval spec.
+
+    Matches src/gift_eval/data.py::Dataset.windows:
+      - M4 datasets: always 1 window.
+      - Others: ceil(TEST_SPLIT * min_series_length / H), clamped to [1, 20].
+    """
+    if "m4" in dataset_name.lower():
+        return 1
+    import math as _math
+    w = _math.ceil(_TEST_SPLIT * min_series_length / max(prediction_length, 1))
+    return min(max(1, w), _MAX_WINDOWS)
 
 
 def _extract_series(table) -> list[list[float]]:
@@ -560,12 +577,15 @@ def load_dataset_for_task(
 ) -> list[dict]:
     """Build rolling-origin evaluation windows for a single task.
 
-    For each raw series of length L, non-overlapping windows are carved from
-    the END backwards, each with horizon H = task["prediction_length"] and
-    context of length context_len immediately preceding the target. When the
+    Window count is a DATASET-level property matching the GIFT-Eval benchmark:
+      windows = ceil(0.1 * min_series_length / H), clamped to [1, 20]
+      (M4 datasets fixed at 1).
+    Every series in the dataset uses this same window count; any series too
+    short to support it is skipped so the eval stays apples-to-apples.
+
+    Context of `context_len` is taken immediately before each target. If the
     history preceding the context is shorter than context_len, the context is
-    left-padded with zeros (documented: matches how gluonts predictors
-    internally pad short history).
+    left-padded with zeros (matches predictor internal padding in gluonts).
 
     Returns [{context, target, history, freq}] where `history` is every
     value before the target (used for seasonal-naive + MASE scale).
@@ -584,25 +604,27 @@ def load_dataset_for_task(
     reader = ipc.open_file(str(arrow_path))
     table = reader.read_all()
     raw_series = _extract_series(table)
+    if not raw_series:
+        return []
 
     H = int(task["prediction_length"])
     if H <= 0:
         return []
 
+    # Dataset-level window count, matching GIFT-Eval Dataset.windows.
+    min_L = min(len(s) for s in raw_series)
+    n_windows = _gift_eval_window_count(min_L, H, dataset)
+
     samples: list[dict] = []
     for series in raw_series:
         L = len(series)
-        # Need at least one full (context, target) pair.
-        if L < context_len + H:
+        # Skip series too short to support the full rolling evaluation.
+        if L < n_windows * H:
             continue
-        max_windows = (L - context_len) // H
-        n_windows = min(max_windows, _MAX_WINDOWS_PER_SERIES)
         for i in range(n_windows):
             end = L - i * H
             target = series[end - H:end]
             history = series[:end - H]
-            # Left-pad context with zeros when the series is shorter than
-            # context_len to the left of the target.
             if len(history) >= context_len:
                 context = history[-context_len:]
             else:

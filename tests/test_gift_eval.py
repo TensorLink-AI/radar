@@ -504,13 +504,18 @@ def test_seasonal_naive_fallback_when_short_history():
     torch.testing.assert_close(out, torch.tensor([3.0, 3.0, 3.0, 3.0, 3.0]))
 
 
-def test_rolling_windows_non_overlapping():
-    """load_dataset_for_task carves non-overlapping windows from the end."""
+def test_rolling_windows_match_gift_eval_formula():
+    """Window count follows ceil(0.1 * min_series_len / H), capped [1, 20]."""
     import pyarrow as pa
-    from shared.gift_eval import load_dataset_for_task
+    from shared.gift_eval import load_dataset_for_task, _gift_eval_window_count
+
+    # Formula spot-checks (unit-level)
+    assert _gift_eval_window_count(1000, 48, "ett1") == 3   # ceil(100/48)=3
+    assert _gift_eval_window_count(5000, 10, "ett1") == 20  # clamp to 20
+    assert _gift_eval_window_count(50, 48, "ett1") == 1     # clamp to 1
+    assert _gift_eval_window_count(1000, 48, "m4_hourly") == 1  # M4 = 1
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Manifest key "ett1__H" expected for (ett1, H). Create that dir.
         ds_dir = os.path.join(tmpdir, "ett1__H")
         os.makedirs(ds_dir, exist_ok=True)
         arrow_path = os.path.join(ds_dir, "data-00000-of-00001.arrow")
@@ -523,26 +528,50 @@ def test_rolling_windows_non_overlapping():
             writer.write_table(table)
 
         task = {
-            "dataset": "ett1",
-            "freq": "H",
-            "term": "short",
-            "prediction_length": 48,
-            "season_length": 24,
+            "dataset": "ett1", "freq": "H", "term": "short",
+            "prediction_length": 48, "season_length": 24,
             "config_name": "ett1/H/short",
         }
         samples = load_dataset_for_task(task, context_len=96, cache_dir=tmpdir)
-        # 1000 - 96 = 904 usable, // 48 = 18 windows (under cap of 20)
-        assert len(samples) == 18
-        # i=0 → target is last 48 values
+        # ceil(0.1 * 1000 / 48) = 3 windows
+        assert len(samples) == 3
+        # Non-overlapping and from the end
         assert samples[0]["target"] == series[-48:]
-        # i=1 → target is 48 values before that
         assert samples[1]["target"] == series[-96:-48]
-        # context is exactly 96 long
+        assert samples[2]["target"] == series[-144:-96]
+        # Context is exactly 96 long
         assert all(len(s["context"]) == 96 for s in samples)
 
 
-def test_rolling_windows_max_20_cap():
-    """Caps at 20 windows per series even if more are available."""
+def test_rolling_windows_m4_fixed_at_one():
+    """M4 datasets always produce 1 window regardless of series length."""
+    import pyarrow as pa
+    from shared.gift_eval import load_dataset_for_task
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ds_dir = os.path.join(tmpdir, "m4_hourly")
+        os.makedirs(ds_dir, exist_ok=True)
+        arrow_path = os.path.join(ds_dir, "data-00000-of-00001.arrow")
+
+        # Long series — would produce many windows under the non-M4 formula.
+        series = [float(x) for x in range(5000)]
+        arr = pa.array(series)
+        target_col = pa.ListArray.from_arrays([0, len(series)], arr)
+        table = pa.table({"target": target_col})
+        with pa.ipc.new_file(arrow_path, table.schema) as writer:
+            writer.write_table(table)
+
+        task = {
+            "dataset": "m4_hourly", "freq": "H", "term": "short",
+            "prediction_length": 48, "season_length": 24,
+            "config_name": "m4_hourly/H/short",
+        }
+        samples = load_dataset_for_task(task, context_len=96, cache_dir=tmpdir)
+        assert len(samples) == 1
+
+
+def test_rolling_windows_cap_at_20():
+    """Window count clamped at 20 even when formula would exceed."""
     import pyarrow as pa
     from shared.gift_eval import load_dataset_for_task
 
@@ -551,7 +580,7 @@ def test_rolling_windows_max_20_cap():
         os.makedirs(ds_dir, exist_ok=True)
         arrow_path = os.path.join(ds_dir, "data-00000-of-00001.arrow")
 
-        # 5000 values, context=100, pred=10 → 490 possible, capped at 20
+        # 5000 values, H=10 → ceil(500/10)=50, clamped to 20
         series = [float(x) for x in range(5000)]
         arr = pa.array(series)
         target_col = pa.ListArray.from_arrays([0, len(series)], arr)
@@ -568,8 +597,8 @@ def test_rolling_windows_max_20_cap():
         assert len(samples) == 20
 
 
-def test_rolling_windows_too_short_series_skipped():
-    """Series with len(series) < context_len + H are dropped."""
+def test_rolling_windows_series_too_short_for_even_one_window():
+    """Series with L < H are dropped entirely (can't fit one target)."""
     import pyarrow as pa
     from shared.gift_eval import load_dataset_for_task
 
@@ -578,7 +607,8 @@ def test_rolling_windows_too_short_series_skipped():
         os.makedirs(ds_dir, exist_ok=True)
         arrow_path = os.path.join(ds_dir, "data-00000-of-00001.arrow")
 
-        series = [float(x) for x in range(50)]  # too short
+        # L=20 < H=48 → cannot produce a single target window
+        series = [float(x) for x in range(20)]
         arr = pa.array(series)
         target_col = pa.ListArray.from_arrays([0, len(series)], arr)
         table = pa.table({"target": target_col})
