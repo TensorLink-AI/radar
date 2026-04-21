@@ -40,6 +40,44 @@ def test_challenge_preserves_task():
     assert c.task == task_dict
 
 
+def test_challenge_uses_task_specific_buckets():
+    """Tasks declaring `size_buckets` draw from their own list, not globals."""
+    custom = [
+        [1_000_000_000, 10_000_000_000],
+        [10_000_000_000, 100_000_000_000],
+    ]
+    task_dict = {"name": "nanogpt", "size_buckets": custom}
+    # Sample many block hashes; every bucket choice must land in the custom list.
+    for i in range(50):
+        h = f"{i:064x}"
+        c = generate_challenge(h, task_dict)
+        bucket = (c.min_flops_equivalent, c.max_flops_equivalent)
+        assert bucket in {tuple(b) for b in custom}
+    # And at least one hash must fall outside the global SIZE_BUCKETS range,
+    # proving it's actually using the task-specific list.
+    all_from_globals = all(
+        (generate_challenge(f"{i:064x}", task_dict).min_flops_equivalent,
+         generate_challenge(f"{i:064x}", task_dict).max_flops_equivalent)
+        in SIZE_BUCKETS
+        for i in range(50)
+    )
+    assert not all_from_globals
+
+
+def test_challenge_falls_back_to_global_when_buckets_empty():
+    """Empty size_buckets → fall back to global SIZE_BUCKETS."""
+    task_dict = {"name": "task", "size_buckets": []}
+    c = generate_challenge("a" * 64, task_dict)
+    assert (c.min_flops_equivalent, c.max_flops_equivalent) in SIZE_BUCKETS
+
+
+def test_challenge_ignores_malformed_buckets():
+    """Malformed entries are skipped; if nothing valid remains, fall back."""
+    task_dict = {"name": "task", "size_buckets": [["bad"], [0, 0], [10, 5]]}
+    c = generate_challenge("a" * 64, task_dict)
+    assert (c.min_flops_equivalent, c.max_flops_equivalent) in SIZE_BUCKETS
+
+
 def test_round_start_block():
     assert round_start_block(0, 275) == 0
     assert round_start_block(274, 275) == 0

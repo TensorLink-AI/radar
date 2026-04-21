@@ -64,6 +64,64 @@ def test_build_error_result_none_task_falls_back_to_ts_forecasting():
     assert result["error"] == "legacy path"
 
 
+# ── TaskSpec size_buckets round-trip ──────────────────────────────────
+
+
+def test_task_size_buckets_round_trip_via_dict():
+    """size_buckets survive to_dict/from_dict as lists of (min, max) tuples."""
+    spec = TaskSpec(
+        name="custom",
+        size_buckets=[(1_000_000, 10_000_000), (10_000_000, 100_000_000)],
+    )
+    d = spec.to_dict()
+    # YAML-friendly representation: list of lists.
+    assert d["size_buckets"] == [[1_000_000, 10_000_000], [10_000_000, 100_000_000]]
+
+    spec2 = TaskSpec.from_dict(d)
+    assert spec2.size_buckets == [(1_000_000, 10_000_000), (10_000_000, 100_000_000)]
+
+
+def test_task_size_buckets_accepts_dict_form():
+    """`{min, max}` dict entries also parse — friendlier to some YAMLs."""
+    spec = TaskSpec.from_dict({
+        "name": "custom",
+        "objectives": [],
+        "size_buckets": [{"min": 500, "max": 5000}],
+    })
+    assert spec.size_buckets == [(500, 5000)]
+
+
+def test_task_size_buckets_default_empty():
+    """Default is an empty list — generate_challenge falls back to globals."""
+    spec = TaskSpec(name="custom")
+    assert spec.size_buckets == []
+
+
+def test_ts_forecasting_yaml_declares_size_buckets():
+    """The ts_forecasting YAML now carries explicit size buckets."""
+    from pathlib import Path
+    from shared.task import load_task
+    yaml_path = Path(__file__).parent.parent / "tasks" / "ts_forecasting" / "ts_forecasting.yaml"
+    task = load_task(str(yaml_path))
+    assert len(task.size_buckets) == 5
+    # Every bucket must be a (lo, hi) pair with lo < hi.
+    for lo, hi in task.size_buckets:
+        assert 0 < lo < hi
+
+
+def test_nanogpt_yaml_declares_broader_buckets():
+    """The nanogpt YAML declares bigger ranges than the global defaults."""
+    from pathlib import Path
+    from shared.challenge import SIZE_BUCKETS
+    from shared.task import load_task
+    yaml_path = Path(__file__).parent.parent / "tasks" / "nanogpt" / "nanogpt.yaml"
+    task = load_task(str(yaml_path))
+    assert task.size_buckets, "nanogpt should declare custom size_buckets"
+    max_global = max(hi for _, hi in SIZE_BUCKETS)
+    max_nanogpt = max(hi for _, hi in task.size_buckets)
+    assert max_nanogpt > max_global
+
+
 # ── evaluator eval-template loader ────────────────────────────────────
 
 
