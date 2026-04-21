@@ -198,6 +198,13 @@ async def miner_detail(request: Request, hotkey: str):
     )
 
 
+# ── Provenance activity heatmaps ──────────────────────────────
+
+@router.get("/provenance", response_class=HTMLResponse)
+async def provenance_view(request: Request):
+    return _html("provenance.html", request)
+
+
 # ── Training logs (R2) ────────────────────────────────────────
 
 @router.get("/logs/{round_id}/{hotkey}", response_class=HTMLResponse)

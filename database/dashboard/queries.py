@@ -181,11 +181,139 @@ async def miner_submissions(
     return [row_to_element(r) for r in rows]
 
 
+async def miner_round_activity(
+    pool, rounds: int = 30, max_miners: int = 40,
+) -> dict:
+    """Heatmap data: unique experiments each miner queried per round.
+
+    Returns ``{miners, rounds, matrix}`` where ``matrix[i][j]`` is the
+    unique-experiment count for ``miners[i]`` in ``rounds[j]``. The miner
+    axis is sorted by total activity (descending) and capped at
+    ``max_miners``; the round axis is the most recent ``rounds`` rounds
+    present in ``miner_access_log``.
+    """
+    rows = await pool.fetch(
+        """
+        SELECT hotkey, round_id,
+               COUNT(DISTINCT ref) AS unique_queried
+        FROM (
+            SELECT hotkey, round_id,
+                   jsonb_array_elements_text(experiment_ids) AS ref
+            FROM miner_access_log
+            WHERE round_id >= 0
+        ) t
+        WHERE round_id IN (
+            SELECT DISTINCT round_id FROM miner_access_log
+            WHERE round_id >= 0
+            ORDER BY round_id DESC LIMIT $1
+        )
+        GROUP BY hotkey, round_id
+        """,
+        rounds,
+    )
+    if not rows:
+        return {"miners": [], "rounds": [], "matrix": []}
+
+    round_ids = sorted({int(r["round_id"]) for r in rows}, reverse=True)[:rounds]
+    round_set = set(round_ids)
+    totals: dict[str, int] = {}
+    cells: dict[tuple[str, int], int] = {}
+    for r in rows:
+        rid = int(r["round_id"])
+        if rid not in round_set:
+            continue
+        hk = r["hotkey"]
+        cnt = int(r["unique_queried"] or 0)
+        totals[hk] = totals.get(hk, 0) + cnt
+        cells[(hk, rid)] = cnt
+
+    miners = sorted(totals, key=lambda h: -totals[h])[:max_miners]
+    matrix = [
+        [cells.get((hk, rid), 0) for rid in round_ids]
+        for hk in miners
+    ]
+    return {"miners": miners, "rounds": round_ids, "matrix": matrix}
+
+
+async def top_experiments_activity(
+    pool, top_k: int = 20, max_miners: int = 40,
+) -> dict:
+    """Heatmap data: per-miner query counts against the top-K referenced experiments.
+
+    Returns ``{miners, experiments, matrix}`` where ``experiments`` is a list
+    of ``{id, name, references}`` for the ``top_k`` most-queried experiment
+    IDs in ``miner_access_log`` and ``matrix[i][j]`` is the number of times
+    ``miners[i]`` queried ``experiments[j]``.
+    """
+    top_rows = await pool.fetch(
+        """
+        WITH refs AS (
+            SELECT (jsonb_array_elements_text(experiment_ids))::int AS exp_id
+            FROM miner_access_log
+        )
+        SELECT exp_id, COUNT(*) AS cnt
+        FROM refs
+        GROUP BY exp_id
+        ORDER BY cnt DESC
+        LIMIT $1
+        """,
+        top_k,
+    )
+    if not top_rows:
+        return {"miners": [], "experiments": [], "matrix": []}
+
+    top_ids = [int(r["exp_id"]) for r in top_rows]
+    top_counts = {int(r["exp_id"]): int(r["cnt"]) for r in top_rows}
+
+    name_rows = await pool.fetch(
+        "SELECT id, name FROM experiments WHERE id = ANY($1::int[])",
+        top_ids,
+    )
+    names = {int(r["id"]): (r["name"] or "") for r in name_rows}
+
+    matrix_rows = await pool.fetch(
+        """
+        WITH refs AS (
+            SELECT hotkey,
+                   (jsonb_array_elements_text(experiment_ids))::int AS exp_id
+            FROM miner_access_log
+        )
+        SELECT hotkey, exp_id, COUNT(*) AS cnt
+        FROM refs
+        WHERE exp_id = ANY($1::int[])
+        GROUP BY hotkey, exp_id
+        """,
+        top_ids,
+    )
+
+    totals: dict[str, int] = {}
+    cells: dict[tuple[str, int], int] = {}
+    for r in matrix_rows:
+        hk = r["hotkey"]
+        eid = int(r["exp_id"])
+        cnt = int(r["cnt"] or 0)
+        totals[hk] = totals.get(hk, 0) + cnt
+        cells[(hk, eid)] = cnt
+
+    miners = sorted(totals, key=lambda h: -totals[h])[:max_miners]
+    experiments = [
+        {"id": eid, "name": names.get(eid, ""), "references": top_counts[eid]}
+        for eid in top_ids
+    ]
+    matrix = [
+        [cells.get((hk, eid), 0) for eid in top_ids]
+        for hk in miners
+    ]
+    return {"miners": miners, "experiments": experiments, "matrix": matrix}
+
+
 __all__ = [
     "BrowseFilters",
     "browse",
     "distinct_hotkeys",
     "distinct_rounds",
+    "miner_round_activity",
     "miner_stats",
     "miner_submissions",
+    "top_experiments_activity",
 ]

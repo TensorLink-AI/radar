@@ -98,8 +98,13 @@ class FakeStore:
 class FakePool:
     """Minimal asyncpg-like pool with pre-canned query responses."""
 
-    def __init__(self, elements: list[DataElement]):
+    def __init__(
+        self,
+        elements: list[DataElement],
+        access_log: Optional[list[dict]] = None,
+    ):
         self.elements = elements
+        self.access_log = access_log or []
 
     def _rows(self):
         return [self._row(e) for e in self.elements]
@@ -141,6 +146,57 @@ class FakePool:
 
     async def fetch(self, sql: str, *params):
         sql_l = sql.lower()
+        # Provenance: miner × round activity
+        if "count(distinct ref)" in sql_l and "group by hotkey, round_id" in sql_l:
+            rounds_limit = params[0] if params else 30
+            distinct = sorted(
+                {a["round_id"] for a in self.access_log if a["round_id"] >= 0},
+                reverse=True,
+            )[:rounds_limit]
+            round_set = set(distinct)
+            agg: dict = {}
+            for a in self.access_log:
+                if a["round_id"] not in round_set:
+                    continue
+                key = (a["hotkey"], a["round_id"])
+                agg.setdefault(key, set()).update(a["experiment_ids"])
+            return [
+                {"hotkey": hk, "round_id": rid, "unique_queried": len(eids)}
+                for (hk, rid), eids in agg.items()
+            ]
+        # Provenance: top experiment counts
+        if "group by exp_id" in sql_l and "order by cnt desc" in sql_l:
+            top_k = params[0] if params else 20
+            counts: dict = {}
+            for a in self.access_log:
+                for eid in a["experiment_ids"]:
+                    counts[eid] = counts.get(eid, 0) + 1
+            sorted_items = sorted(counts.items(), key=lambda x: -x[1])[:top_k]
+            return [{"exp_id": eid, "cnt": cnt} for eid, cnt in sorted_items]
+        # Provenance: names lookup for top experiment ids
+        if (
+            "select id, name from experiments" in sql_l
+            and "= any" in sql_l
+        ):
+            ids = set(params[0]) if params else set()
+            return [
+                {"id": e.index, "name": e.name}
+                for e in self.elements if e.index in ids
+            ]
+        # Provenance: miner × experiment matrix
+        if "group by hotkey, exp_id" in sql_l:
+            ids = set(params[0]) if params else set()
+            agg2: dict = {}
+            for a in self.access_log:
+                for eid in a["experiment_ids"]:
+                    if eid not in ids:
+                        continue
+                    key = (a["hotkey"], eid)
+                    agg2[key] = agg2.get(key, 0) + 1
+            return [
+                {"hotkey": hk, "exp_id": eid, "cnt": cnt}
+                for (hk, eid), cnt in agg2.items()
+            ]
         if "distinct round_id" in sql_l:
             rows = sorted({e.round_id for e in self.elements if e.round_id >= 0}, reverse=True)
             return [{"round_id": r} for r in rows]
@@ -253,7 +309,13 @@ def dashboard_client():
     """Mount the dashboard once and reuse the client across tests."""
     elements = _sample_elements()
     store = FakeStore(elements)
-    pool = FakePool(elements)
+    access_log = [
+        {"hotkey": "hk_a", "round_id": 8, "experiment_ids": [0, 1]},
+        {"hotkey": "hk_a", "round_id": 8, "experiment_ids": [1]},
+        {"hotkey": "hk_b", "round_id": 8, "experiment_ids": [0]},
+        {"hotkey": "hk_a", "round_id": 7, "experiment_ids": [0]},
+    ]
+    pool = FakePool(elements, access_log=access_log)
     r2 = FakeR2()
     # Seed a training log file so the log route has something to read.
     r2.upload_text("round_7/miner_hk_a/stdout.log", "epoch 0 loss=2.0\nepoch 1 loss=1.5\n")
@@ -438,6 +500,54 @@ def test_miner_detail(logged_in):
 def test_miner_detail_missing(logged_in):
     r = logged_in.get("/dashboard/miners/nonexistent_hotkey")
     assert r.status_code == 404
+
+
+# ── Provenance heatmap tests ──────────────────────────────────
+
+
+def test_provenance_view_renders(logged_in):
+    r = logged_in.get("/dashboard/provenance")
+    assert r.status_code == 200
+    assert "Provenance activity" in r.text
+    assert "heatmap-miner-rounds" in r.text
+    assert "heatmap-top-experiments" in r.text
+
+
+def test_provenance_miner_rounds_json(logged_in):
+    r = logged_in.get("/dashboard/api/provenance/miner_rounds.json")
+    assert r.status_code == 200
+    data = r.json()
+    assert set(data["rounds"]) == {7, 8}
+    # hk_a outranks hk_b in activity
+    assert data["miners"][0] == "hk_a"
+    assert "hk_b" in data["miners"]
+    # Unique-experiment count: hk_a round 8 accessed {0, 1} = 2
+    r8 = data["rounds"].index(8)
+    a = data["miners"].index("hk_a")
+    assert data["matrix"][a][r8] == 2
+
+
+def test_provenance_top_experiments_json(logged_in):
+    r = logged_in.get("/dashboard/api/provenance/top_experiments.json")
+    assert r.status_code == 200
+    data = r.json()
+    exp_ids = [e["id"] for e in data["experiments"]]
+    # Experiment 0 was referenced 3 times, experiment 1 twice → both in top-K
+    assert 0 in exp_ids and 1 in exp_ids
+    # Top-referenced first
+    assert exp_ids[0] == 0
+    # Matrix contains per-miner query counts
+    a = data["miners"].index("hk_a")
+    assert data["matrix"][a][exp_ids.index(0)] == 2  # hk_a queried exp 0 twice
+    assert data["matrix"][a][exp_ids.index(1)] == 2  # hk_a queried exp 1 twice
+
+
+def test_provenance_top_experiments_includes_names(logged_in):
+    r = logged_in.get("/dashboard/api/provenance/top_experiments.json")
+    data = r.json()
+    names = {e["id"]: e["name"] for e in data["experiments"]}
+    assert names[0] == "root"
+    assert names[1] == "child"
 
 
 # ── Logs (R2) tests ───────────────────────────────────────────
