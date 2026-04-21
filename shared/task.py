@@ -88,6 +88,12 @@ class TaskSpec:
     docker_cpus: str = "2"
     task_params: dict = field(default_factory=dict)
 
+    # Per-task FLOPs-equivalent size buckets. Each entry is (min, max). An
+    # empty list means fall back to the global SIZE_BUCKETS in
+    # shared/challenge.py. Tasks can declare more or fewer buckets at any
+    # range appropriate to their domain.
+    size_buckets: list[tuple[int, int]] = field(default_factory=list)
+
     @property
     def primary_objective(self) -> Optional[Objective]:
         for obj in self.objectives:
@@ -147,11 +153,19 @@ class TaskSpec:
             "docker_memory": self.docker_memory,
             "docker_cpus": self.docker_cpus,
             "task_params": self.task_params,
+            "size_buckets": [list(b) for b in self.size_buckets],
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> TaskSpec:
         objectives = [Objective(**o) for o in d.get("objectives", [])]
+        raw_buckets = d.get("size_buckets") or []
+        size_buckets: list[tuple[int, int]] = []
+        for entry in raw_buckets:
+            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                size_buckets.append((int(entry[0]), int(entry[1])))
+            elif isinstance(entry, dict) and "min" in entry and "max" in entry:
+                size_buckets.append((int(entry["min"]), int(entry["max"])))
         return cls(
             name=d.get("name", "unnamed"),
             description=d.get("description", ""),
@@ -172,6 +186,7 @@ class TaskSpec:
             docker_memory=d.get("docker_memory", "8Gi"),
             docker_cpus=d.get("docker_cpus", "2"),
             task_params=d.get("task_params", {}),
+            size_buckets=size_buckets,
         )
 
     @classmethod

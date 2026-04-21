@@ -21,6 +21,16 @@ run_command: "python {target}"
 time_budget: 300
 kill_timeout: 600
 
+# FLOPs-equivalent size buckets for this task. Each round deterministically
+# picks one bucket. Language models are compute-heavier than the global
+# default, so the range starts at 100M FLOPs per forward pass and extends
+# into the trillions for the base-size bucket.
+size_buckets:
+  - [100000000, 1000000000]        # nano  (100M – 1B)
+  - [1000000000, 10000000000]      # micro (1B   – 10B)
+  - [10000000000, 100000000000]    # small (10B  – 100B)
+  - [100000000000, 1000000000000]  # base  (100B – 1T)
+
 objectives:
   - name: val_loss
     pattern: "val[_ ]loss[=:\\s]+(\\d+(?:\\.\\d+)?)"
