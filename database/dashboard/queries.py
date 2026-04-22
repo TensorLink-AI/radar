@@ -201,6 +201,7 @@ async def miner_round_activity(
                    jsonb_array_elements_text(experiment_ids) AS ref
             FROM miner_access_log
             WHERE round_id >= 0
+              AND jsonb_typeof(experiment_ids) = 'array'
         ) t
         WHERE round_id IN (
             SELECT DISTINCT round_id FROM miner_access_log
@@ -250,6 +251,7 @@ async def top_experiments_activity(
         WITH refs AS (
             SELECT (jsonb_array_elements_text(experiment_ids))::int AS exp_id
             FROM miner_access_log
+            WHERE jsonb_typeof(experiment_ids) = 'array'
         )
         SELECT exp_id, COUNT(*) AS cnt
         FROM refs
@@ -277,6 +279,7 @@ async def top_experiments_activity(
             SELECT hotkey,
                    (jsonb_array_elements_text(experiment_ids))::int AS exp_id
             FROM miner_access_log
+            WHERE jsonb_typeof(experiment_ids) = 'array'
         )
         SELECT hotkey, exp_id, COUNT(*) AS cnt
         FROM refs
