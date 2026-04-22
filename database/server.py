@@ -15,9 +15,10 @@ from collections import defaultdict
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
+from shared.access_logger import extract_ids_from_body
 from shared.pg_access_logger import PgAccessLogger
 
 app = FastAPI(title="RADAR Experiment DB (Centralized)")
@@ -44,6 +45,19 @@ _IP_RATE_LIMIT: int = 120  # max requests per minute per IP (pre-auth)
 
 # Maximum request body size (5 MB) — reject oversized payloads early
 _MAX_BODY_BYTES: int = 5 * 1024 * 1024
+
+# Cap body size for provenance extraction — beyond this a response is a bulk
+# dump (e.g. /experiments/pareto with thousands of rows) and not useful as
+# per-query provenance evidence. Measured on the response side so oversized
+# payloads still reach the client; we just skip ID extraction.
+_ACCESS_LOG_BODY_CAP: int = 256 * 1024
+
+# Paths whose JSON responses carry experiment IDs worth logging against the
+# caller's access record. Everything else (agent_code blobs, desearch,
+# /health) is skipped to avoid unnecessary body buffering.
+_PROVENANCE_CAPTURE_PREFIXES = (
+    "/experiments", "/frontier", "/challenge",
+)
 
 # Agent code limits
 _MAX_AGENT_FILES: int = 25          # max .py files per submission
@@ -284,6 +298,10 @@ async def auth_middleware(request: Request, call_next):
 
     # Log successful authenticated requests to Postgres for audit
     if _access_logger and needs_auth and response.status_code < 400:
+        exp_ids: list[int] = []
+        if any(path.startswith(p) for p in _PROVENANCE_CAPTURE_PREFIXES):
+            response, exp_ids = await _buffer_and_extract_ids(response)
+
         miner_hotkey = request.headers.get("X-Miner-Hotkey", "")
         miner_uid_str = request.headers.get("X-Miner-UID", "-1")
         try:
@@ -294,11 +312,43 @@ async def auth_middleware(request: Request, call_next):
             hotkey=miner_hotkey or "validator",
             miner_uid=miner_uid,
             endpoint=path,
-            experiment_ids=[],
+            experiment_ids=exp_ids,
             method=request.method,
         ))
 
     return response
+
+
+async def _buffer_and_extract_ids(response) -> tuple[Response, list[int]]:
+    """Drain a streaming response into a buffered Response + extracted IDs.
+
+    The original ``response.body_iterator`` can only be consumed once, so we
+    read it here and hand the client a new ``Response`` carrying the same
+    bytes. Bodies larger than ``_ACCESS_LOG_BODY_CAP`` are passed through
+    unparsed (no extraction) to avoid holding bulk dumps in memory.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    over_cap = False
+    async for chunk in response.body_iterator:
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > _ACCESS_LOG_BODY_CAP:
+            over_cap = True
+    body = b"".join(chunks)
+
+    headers = dict(response.headers)
+    headers.pop("content-length", None)
+    rebuilt = Response(
+        content=body,
+        status_code=response.status_code,
+        headers=headers,
+        media_type=response.media_type,
+    )
+    if over_cap:
+        return rebuilt, []
+    content_type = response.headers.get("content-type", "")
+    return rebuilt, extract_ids_from_body(body, content_type)
 
 
 @app.get("/health")
