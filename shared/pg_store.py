@@ -95,31 +95,48 @@ async def create_pg_pool(
     objects consistently.
 
     If ``schema`` is provided, every connection borrowed from the pool has
-    its ``search_path`` set to ``"<schema>", public`` as part of the init
-    hook — so every unqualified reference (``SELECT ... FROM experiments``)
-    transparently resolves inside that schema, with ``public`` kept as a
-    fallback for cross-schema utilities (e.g. built-in functions). The
-    schema name is validated at pool creation time and will raise
-    ``ValueError`` for anything outside the allowlist, so callers fail fast
-    rather than discovering a mis-set search_path mid-transaction.
+    its ``search_path`` set to ``"<schema>", public`` before it's handed to
+    the caller — so every unqualified reference (``SELECT ... FROM
+    experiments``) transparently resolves inside that schema, with
+    ``public`` kept as a fallback for cross-schema utilities (e.g. built-in
+    functions). The schema name is validated at pool creation time and will
+    raise ``ValueError`` for anything outside the allowlist, so callers
+    fail fast rather than discovering a mis-set search_path mid-transaction.
+
+    Why ``setup`` and not ``init`` for search_path: asyncpg's pool runs
+    ``RESET ALL;`` on every connection release to scrub session state. That
+    wipes ``search_path`` (and any other SET parameter). ``init`` runs once
+    per physical connection — great for client-side things like codecs that
+    survive ``RESET ALL`` — but useless for SET parameters the pool will
+    reset right after. ``setup`` runs on every acquire, so the SET is
+    replayed each time the connection is handed out, which is what we need.
     """
     user_init = kwargs.pop("init", None)
+    user_setup = kwargs.pop("setup", None)
 
     validated_schema = _validate_schema_name(schema) if schema else None
 
     async def _init(conn: asyncpg.Connection) -> None:
-        # Order matters: JSON codecs MUST be registered before any query
-        # that might return JSONB, and the search_path MUST be set before
-        # any DDL / query that references tables by unqualified name.
+        # Runs once when the connection is first created. Used for things
+        # that survive ``RESET ALL`` (client-side codecs).
         await _register_json_codecs(conn)
+        if user_init is not None:
+            await user_init(conn)
+
+    async def _setup(conn: asyncpg.Connection) -> None:
+        # Runs every time a connection is acquired from the pool. Must be
+        # used for any SET parameter the pool's RESET ALL would otherwise
+        # wipe on release (notably search_path).
         if validated_schema is not None:
             await conn.execute(
                 f'SET search_path TO "{validated_schema}", public'
             )
-        if user_init is not None:
-            await user_init(conn)
+        if user_setup is not None:
+            await user_setup(conn)
 
-    return await asyncpg.create_pool(dsn, init=_init, **kwargs)
+    return await asyncpg.create_pool(
+        dsn, init=_init, setup=_setup, **kwargs,
+    )
 
 
 class PgExperimentStore:
