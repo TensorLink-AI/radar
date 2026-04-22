@@ -188,13 +188,86 @@ async def miners_list(request: Request):
 async def miner_detail(request: Request, hotkey: str):
     state = get_state()
     submissions = await q.miner_submissions(state.pool, hotkey, limit=200)
-    if not submissions:
+    agent_history = await q.miner_agent_history(state.pool, hotkey, limit=50)
+    if not submissions and not agent_history:
         raise HTTPException(status_code=404, detail="No submissions for this hotkey")
     return _html(
         "miner_detail.html",
         request,
         hotkey=hotkey,
         submissions=[e.to_api_dict() for e in submissions],
+        agent_history=agent_history,
+    )
+
+
+# ── Agent code bundle viewer + diff ───────────────────────────
+
+@router.get("/agent_code/{code_hash}", response_class=HTMLResponse)
+async def agent_bundle_view(request: Request, code_hash: str):
+    state = get_state()
+    record = await q.agent_bundle_record(state.pool, code_hash)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Unknown code_hash")
+    if state.r2 is None:
+        raise HTTPException(status_code=503, detail="R2 not configured")
+    try:
+        bundle = state.r2.download_json(record["r2_key"])
+    except Exception:
+        bundle = None
+    if not bundle:
+        raise HTTPException(status_code=404, detail="Bundle missing in R2")
+    # History for the same hotkey powers the "compare to" picker
+    history = await q.miner_agent_history(state.pool, record["hotkey"], limit=50)
+    files = sorted((bundle.get("files") or {}).items())
+    return _html(
+        "agent_bundle.html",
+        request,
+        record=record,
+        entry_point=bundle.get("entry_point", record["entry_point"]),
+        files=files,
+        history=[h for h in history if h["code_hash"] != code_hash],
+    )
+
+
+@router.get("/agent_code/{code_hash}/diff/{other_hash}", response_class=HTMLResponse)
+async def agent_bundle_diff(request: Request, code_hash: str, other_hash: str):
+    import difflib
+    state = get_state()
+    if code_hash == other_hash:
+        raise HTTPException(status_code=400, detail="Cannot diff a bundle against itself")
+    rec_a = await q.agent_bundle_record(state.pool, other_hash)
+    rec_b = await q.agent_bundle_record(state.pool, code_hash)
+    if rec_a is None or rec_b is None:
+        raise HTTPException(status_code=404, detail="Unknown code_hash")
+    if state.r2 is None:
+        raise HTTPException(status_code=503, detail="R2 not configured")
+    try:
+        bundle_a = state.r2.download_json(rec_a["r2_key"])
+        bundle_b = state.r2.download_json(rec_b["r2_key"])
+    except Exception:
+        bundle_a = bundle_b = None
+    if not bundle_a or not bundle_b:
+        raise HTTPException(status_code=404, detail="Bundle missing in R2")
+
+    files_a = bundle_a.get("files") or {}
+    files_b = bundle_b.get("files") or {}
+    all_names = sorted(set(files_a) | set(files_b))
+    diffs = []
+    for name in all_names:
+        src_a = (files_a.get(name) or "").splitlines(keepends=True)
+        src_b = (files_b.get(name) or "").splitlines(keepends=True)
+        diff_text = "".join(difflib.unified_diff(
+            src_a, src_b,
+            fromfile=f"{other_hash[:12]}/{name}",
+            tofile=f"{code_hash[:12]}/{name}",
+            lineterm="",
+        ))
+        diffs.append({"name": name, "diff": diff_text})
+    return _html(
+        "agent_bundle_diff.html",
+        request,
+        rec_a=rec_a, rec_b=rec_b,
+        diffs=diffs,
     )
 
 
