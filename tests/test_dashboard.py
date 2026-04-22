@@ -102,9 +102,11 @@ class FakePool:
         self,
         elements: list[DataElement],
         access_log: Optional[list[dict]] = None,
+        agent_history: Optional[list[dict]] = None,
     ):
         self.elements = elements
         self.access_log = access_log or []
+        self.agent_history = agent_history or []
 
     def _rows(self):
         return [self._row(e) for e in self.elements]
@@ -183,6 +185,13 @@ class FakePool:
                 {"id": e.index, "name": e.name}
                 for e in self.elements if e.index in ids
             ]
+        # Agent history for a hotkey
+        if "from agent_submission_history" in sql_l and "where hotkey = $1" in sql_l:
+            hk = params[0]
+            limit = params[1] if len(params) > 1 else 100
+            rows = [h for h in self.agent_history if h["hotkey"] == hk]
+            rows.sort(key=lambda h: h["timestamp"], reverse=True)
+            return rows[:limit]
         # Provenance: miner × experiment matrix
         if "group by hotkey, exp_id" in sql_l:
             ids = set(params[0]) if params else set()
@@ -245,6 +254,13 @@ class FakePool:
                 if e.index == params[0]:
                     return {"loss_curve": json.dumps(e.loss_curve)}
             return None
+        if "from agent_submission_history" in sql_l and "code_hash = $1" in sql_l:
+            target = params[0]
+            matches = [h for h in self.agent_history if h["code_hash"] == target]
+            if not matches:
+                return None
+            matches.sort(key=lambda h: h["timestamp"], reverse=True)
+            return matches[0]
         return None
 
 
@@ -315,8 +331,32 @@ def dashboard_client():
         {"hotkey": "hk_b", "round_id": 8, "experiment_ids": [0]},
         {"hotkey": "hk_a", "round_id": 7, "experiment_ids": [0]},
     ]
-    pool = FakePool(elements, access_log=access_log)
+    agent_history = [
+        {
+            "hotkey": "hk_a", "miner_uid": 1,
+            "code_hash": "hash_v1" + ("0" * 50),
+            "entry_point": "agent.py",
+            "r2_key": "agents/hk_a/hash_v1.json",
+            "round_submitted": 6, "timestamp": 1500.0,
+        },
+        {
+            "hotkey": "hk_a", "miner_uid": 1,
+            "code_hash": "hash_v2" + ("0" * 50),
+            "entry_point": "agent.py",
+            "r2_key": "agents/hk_a/hash_v2.json",
+            "round_submitted": 8, "timestamp": 2500.0,
+        },
+    ]
+    pool = FakePool(elements, access_log=access_log, agent_history=agent_history)
     r2 = FakeR2()
+    r2.upload_json("agents/hk_a/hash_v1.json", {
+        "files": {"agent.py": "def design_architecture():\n    return 'v1'\n"},
+        "entry_point": "agent.py", "code_hash": "hash_v1" + ("0" * 50),
+    })
+    r2.upload_json("agents/hk_a/hash_v2.json", {
+        "files": {"agent.py": "def design_architecture():\n    return 'v2'\n"},
+        "entry_point": "agent.py", "code_hash": "hash_v2" + ("0" * 50),
+    })
     # Seed a training log file so the log route has something to read.
     r2.upload_text("round_7/miner_hk_a/stdout.log", "epoch 0 loss=2.0\nepoch 1 loss=1.5\n")
     r2.upload_json("round_7/miner_hk_a/training_meta.json", {
@@ -548,6 +588,59 @@ def test_provenance_top_experiments_includes_names(logged_in):
     names = {e["id"]: e["name"] for e in data["experiments"]}
     assert names[0] == "root"
     assert names[1] == "child"
+
+
+# ── Agent bundle viewer + diff ────────────────────────────────
+
+
+def test_miner_detail_shows_agent_history(logged_in):
+    r = logged_in.get("/dashboard/miners/hk_a")
+    assert r.status_code == 200
+    assert "Agent code timeline" in r.text
+    # Both hash prefixes render, most recent first
+    v1_prefix = "hash_v1" + ("0" * 9)
+    v2_prefix = "hash_v2" + ("0" * 9)
+    assert v2_prefix in r.text and v1_prefix in r.text
+    # Diff link from v2 → v1 wired up
+    assert "/dashboard/agent_code/" in r.text
+    assert "/diff/" in r.text
+
+
+def test_agent_bundle_view_renders_files(logged_in):
+    hash_v1 = "hash_v1" + ("0" * 50)
+    r = logged_in.get(f"/dashboard/agent_code/{hash_v1}")
+    assert r.status_code == 200
+    # Bundle metadata + source code surfaced (quotes get HTML-escaped)
+    assert "hk_a" in r.text
+    assert "agent.py" in r.text
+    assert "return &#39;v1&#39;" in r.text
+    # The other hash appears in the compare picker
+    assert "hash_v2" in r.text
+
+
+def test_agent_bundle_view_unknown_hash_404(logged_in):
+    r = logged_in.get("/dashboard/agent_code/" + ("f" * 64))
+    assert r.status_code == 404
+
+
+def test_agent_bundle_diff_renders_unified_diff(logged_in):
+    hash_v1 = "hash_v1" + ("0" * 50)
+    hash_v2 = "hash_v2" + ("0" * 50)
+    r = logged_in.get(f"/dashboard/agent_code/{hash_v2}/diff/{hash_v1}")
+    assert r.status_code == 200
+    # Unified diff markers present (quotes are HTML-escaped in rendered text)
+    assert "language-diff" in r.text
+    assert "return &#39;v1&#39;" in r.text
+    assert "return &#39;v2&#39;" in r.text
+    # Unified-diff +/- prefixes on the changed lines
+    assert "-    return &#39;v1&#39;" in r.text
+    assert "+    return &#39;v2&#39;" in r.text
+
+
+def test_agent_bundle_diff_rejects_self(logged_in):
+    hash_v1 = "hash_v1" + ("0" * 50)
+    r = logged_in.get(f"/dashboard/agent_code/{hash_v1}/diff/{hash_v1}")
+    assert r.status_code == 400
 
 
 # ── Logs (R2) tests ───────────────────────────────────────────

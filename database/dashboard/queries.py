@@ -307,11 +307,62 @@ async def top_experiments_activity(
     return {"miners": miners, "experiments": experiments, "matrix": matrix}
 
 
+async def miner_agent_history(
+    pool, hotkey: str, limit: int = 50,
+) -> list[dict]:
+    """Agent code submission timeline for a hotkey (most recent first)."""
+    rows = await pool.fetch(
+        """
+        SELECT code_hash, entry_point, r2_key, round_submitted, timestamp
+        FROM agent_submission_history
+        WHERE hotkey = $1
+        ORDER BY timestamp DESC
+        LIMIT $2
+        """,
+        hotkey, limit,
+    )
+    return [
+        {
+            "code_hash": r["code_hash"],
+            "entry_point": r["entry_point"],
+            "r2_key": r["r2_key"],
+            "round_submitted": int(r["round_submitted"]),
+            "timestamp": float(r["timestamp"]),
+        }
+        for r in rows
+    ]
+
+
+async def agent_bundle_record(pool, code_hash: str) -> Optional[dict]:
+    """Most recent history row for ``code_hash`` — resolves hotkey + R2 key."""
+    row = await pool.fetchrow(
+        """
+        SELECT hotkey, code_hash, entry_point, r2_key, round_submitted, timestamp
+        FROM agent_submission_history
+        WHERE code_hash = $1
+        ORDER BY timestamp DESC LIMIT 1
+        """,
+        code_hash,
+    )
+    if row is None:
+        return None
+    return {
+        "hotkey": row["hotkey"],
+        "code_hash": row["code_hash"],
+        "entry_point": row["entry_point"],
+        "r2_key": row["r2_key"],
+        "round_submitted": int(row["round_submitted"]),
+        "timestamp": float(row["timestamp"]),
+    }
+
+
 __all__ = [
     "BrowseFilters",
+    "agent_bundle_record",
     "browse",
     "distinct_hotkeys",
     "distinct_rounds",
+    "miner_agent_history",
     "miner_round_activity",
     "miner_stats",
     "miner_submissions",

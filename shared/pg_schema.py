@@ -140,6 +140,27 @@ CREATE TABLE IF NOT EXISTS agent_submissions (
 ALTER TABLE agent_submissions ALTER COLUMN round_submitted TYPE BIGINT;
 CREATE INDEX IF NOT EXISTS idx_agent_hotkey ON agent_submissions(hotkey);
 CREATE INDEX IF NOT EXISTS idx_agent_hash ON agent_submissions(code_hash);
+
+-- Append-only history of every agent submission. Unlike agent_submissions
+-- (one row per hotkey, overwritten on each upload), this preserves the full
+-- timeline so we can answer "which exact bytes was miner X running at
+-- round N?" — join miner_access_log entries to the most recent history
+-- row where round_submitted <= round_id.
+CREATE TABLE IF NOT EXISTS agent_submission_history (
+    id SERIAL PRIMARY KEY,
+    hotkey TEXT NOT NULL,
+    miner_uid INTEGER NOT NULL DEFAULT -1,
+    code_hash TEXT NOT NULL,
+    entry_point TEXT NOT NULL DEFAULT 'agent.py',
+    r2_key TEXT NOT NULL,
+    round_submitted BIGINT NOT NULL DEFAULT -1,
+    timestamp DOUBLE PRECISION NOT NULL DEFAULT 0.0
+);
+CREATE INDEX IF NOT EXISTS idx_ash_hotkey ON agent_submission_history(hotkey);
+CREATE INDEX IF NOT EXISTS idx_ash_hash ON agent_submission_history(code_hash);
+CREATE INDEX IF NOT EXISTS idx_ash_round ON agent_submission_history(round_submitted);
+CREATE INDEX IF NOT EXISTS idx_ash_hotkey_round
+    ON agent_submission_history(hotkey, round_submitted DESC);
 """
 
 ACCESS_LOG_SCHEMA = """

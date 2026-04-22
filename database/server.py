@@ -615,39 +615,72 @@ async def submit_agent_code(request: Request, req: SubmitAgentCodeRequest):
     code_hash = compute_code_hash(req.files)
     bundle["code_hash"] = code_hash
 
-    # Upload to R2
-    r2_key = f"agents/{hotkey}/latest.json"
+    # Content-addressed blob (immutable) + mutable "latest" pointer for
+    # readers that still want the current code without a DB round trip.
+    immutable_key = f"agents/{hotkey}/{code_hash}.json"
+    latest_key = f"agents/{hotkey}/latest.json"
     try:
-        _r2.upload_json(r2_key, bundle)
+        _r2.upload_json(immutable_key, bundle)
+        _r2.upload_json(latest_key, bundle)
     except Exception as e:
         logger.error("R2 upload failed for agent code %s: %s", hotkey[:16], e)
         raise HTTPException(status_code=500, detail="Failed to store agent code")
 
-    # Upsert into Postgres
+    # Best-effort current round — populated when a challenge is active.
+    round_submitted = -1
+    if isinstance(_current_challenge, dict):
+        try:
+            round_submitted = int(_current_challenge.get("round_id", -1))
+        except (TypeError, ValueError):
+            round_submitted = -1
+
+    # Upsert into registry + append to history in one transaction so we never
+    # end up with a live registry row that has no matching audit entry.
     try:
-        await _pool.execute(
-            """
-            INSERT INTO agent_submissions
-                (hotkey, miner_uid, code_hash, entry_point, r2_key, timestamp)
-            VALUES ($1, $2, $3, $4, $5, extract(epoch from now()))
-            ON CONFLICT (hotkey) DO UPDATE SET
-                miner_uid = $2,
-                code_hash = $3,
-                entry_point = $4,
-                r2_key = $5,
-                timestamp = extract(epoch from now())
-            """,
-            hotkey, miner_uid, code_hash, req.entry_point, r2_key,
-        )
+        async with _pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO agent_submissions
+                        (hotkey, miner_uid, code_hash, entry_point, r2_key,
+                         round_submitted, timestamp)
+                    VALUES ($1, $2, $3, $4, $5, $6, extract(epoch from now()))
+                    ON CONFLICT (hotkey) DO UPDATE SET
+                        miner_uid = $2,
+                        code_hash = $3,
+                        entry_point = $4,
+                        r2_key = $5,
+                        round_submitted = $6,
+                        timestamp = extract(epoch from now())
+                    """,
+                    hotkey, miner_uid, code_hash, req.entry_point,
+                    immutable_key, round_submitted,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO agent_submission_history
+                        (hotkey, miner_uid, code_hash, entry_point, r2_key,
+                         round_submitted, timestamp)
+                    VALUES ($1, $2, $3, $4, $5, $6, extract(epoch from now()))
+                    """,
+                    hotkey, miner_uid, code_hash, req.entry_point,
+                    immutable_key, round_submitted,
+                )
     except Exception as e:
         logger.error("Postgres write failed for agent code %s: %s", hotkey[:16], e)
         raise HTTPException(status_code=500, detail="Failed to record submission")
 
     logger.info(
-        "Agent code submitted: hotkey=%s uid=%d hash=%s files=%s",
-        hotkey[:16], miner_uid, code_hash[:24], sorted(req.files.keys()),
+        "Agent code submitted: hotkey=%s uid=%d hash=%s round=%d files=%s",
+        hotkey[:16], miner_uid, code_hash[:24], round_submitted,
+        sorted(req.files.keys()),
     )
-    return {"status": "ok", "code_hash": code_hash, "r2_key": r2_key}
+    return {
+        "status": "ok",
+        "code_hash": code_hash,
+        "r2_key": immutable_key,
+        "round_submitted": round_submitted,
+    }
 
 
 @app.get("/agent_code/{hotkey}")
@@ -687,3 +720,64 @@ async def get_agent_code_meta(hotkey: str):
         "entry_point": row["entry_point"],
         "timestamp": row["timestamp"],
     }
+
+
+@app.get("/agent_code/{hotkey}/history")
+async def get_agent_code_history(hotkey: str, limit: int = 100):
+    """Full submission timeline for a hotkey (most recent first)."""
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="DB pool not configured")
+
+    limit = max(1, min(int(limit), 500))
+    rows = await _pool.fetch(
+        """
+        SELECT code_hash, entry_point, r2_key, round_submitted, timestamp
+        FROM agent_submission_history
+        WHERE hotkey = $1
+        ORDER BY timestamp DESC
+        LIMIT $2
+        """,
+        hotkey, limit,
+    )
+    return {
+        "hotkey": hotkey,
+        "submissions": [
+            {
+                "code_hash": r["code_hash"],
+                "entry_point": r["entry_point"],
+                "r2_key": r["r2_key"],
+                "round_submitted": int(r["round_submitted"]),
+                "timestamp": float(r["timestamp"]),
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/agent_code/by_hash/{code_hash}")
+async def get_agent_code_by_hash(code_hash: str):
+    """Fetch an immutable agent bundle by its content hash.
+
+    Lets callers replay the exact bytes that were active for a given round
+    even after the miner has uploaded a new version.
+    """
+    if _r2 is None:
+        raise HTTPException(status_code=503, detail="R2 not configured")
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="DB pool not configured")
+
+    row = await _pool.fetchrow(
+        "SELECT r2_key FROM agent_submission_history "
+        "WHERE code_hash = $1 ORDER BY timestamp DESC LIMIT 1",
+        code_hash,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Unknown code_hash")
+
+    try:
+        bundle = _r2.download_json(row["r2_key"])
+    except Exception:
+        bundle = None
+    if not bundle:
+        raise HTTPException(status_code=404, detail="Bundle missing in R2")
+    return bundle

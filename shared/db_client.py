@@ -156,6 +156,23 @@ class DatabaseClient:
         """GET a miner's agent code bundle from the DB server."""
         return await self._get(f"/agent_code/{hotkey}")
 
+    async def get_agent_code_history(
+        self, hotkey: str, limit: int = 100,
+    ) -> list[dict]:
+        """GET the full submission timeline for a hotkey (most recent first)."""
+        result = await self._get(
+            f"/agent_code/{hotkey}/history", params={"limit": limit},
+        )
+        if isinstance(result, dict):
+            subs = result.get("submissions")
+            if isinstance(subs, list):
+                return subs
+        return []
+
+    async def get_agent_code_by_hash(self, code_hash: str) -> Optional[dict]:
+        """GET an immutable agent bundle by its content hash."""
+        return await self._get(f"/agent_code/by_hash/{code_hash}")
+
     async def submit_agent_code(
         self, files: dict[str, str], entry_point: str = "agent.py",
     ) -> Optional[dict]:
