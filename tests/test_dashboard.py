@@ -148,6 +148,31 @@ class FakePool:
 
     async def fetch(self, sql: str, *params):
         sql_l = sql.lower()
+        # Benchmark: per-round aggregates for a task (with best_hotkey join)
+        if "group by round_id" in sql_l and "lateral" in sql_l:
+            task = params[0] if params else ""
+            limit = params[1] if len(params) > 1 else 100
+            matching = [e for e in self.elements if e.task == task and e.round_id >= 0]
+            per_round: dict[int, list] = {}
+            for e in matching:
+                per_round.setdefault(e.round_id, []).append(e)
+            out = []
+            for rid in sorted(per_round, reverse=True)[:limit]:
+                bucket = per_round[rid]
+                succ = [e for e in bucket if e.success and e.metric is not None]
+                best = min(succ, key=lambda e: e.metric) if succ else None
+                out.append({
+                    "round_id": rid,
+                    "total": len(bucket),
+                    "successes": len(succ),
+                    "best_metric": best.metric if best else None,
+                    "mean_metric": (
+                        sum(e.metric for e in succ) / len(succ) if succ else None
+                    ),
+                    "started_at": min(e.timestamp or 0.0 for e in bucket),
+                    "best_hotkey": best.miner_hotkey if best else None,
+                })
+            return out
         # Provenance: miner × round activity
         if "count(distinct ref)" in sql_l and "group by hotkey, round_id" in sql_l:
             rounds_limit = params[0] if params else 30
@@ -501,6 +526,23 @@ def test_pareto_view_renders(logged_in):
     r = logged_in.get("/dashboard/pareto")
     assert r.status_code == 200
     assert "pareto-scatter" in r.text
+
+
+def test_benchmark_view_renders(logged_in):
+    r = logged_in.get("/dashboard/benchmark")
+    assert r.status_code == 200
+    assert "Benchmark scores over time" in r.text
+    # Task auto-picks the first known task ("ts") so the table renders.
+    assert "0.9000" in r.text  # best metric from round 8
+    assert "1.2000" in r.text  # best metric from round 7
+    # Round IDs in the first column link into the browse view.
+    assert "round_id=8" in r.text and "round_id=7" in r.text
+
+
+def test_benchmark_view_unknown_task(logged_in):
+    r = logged_in.get("/dashboard/benchmark?task=nope")
+    assert r.status_code == 200
+    assert "No completed rounds yet" in r.text
 
 
 def test_pareto_json_flags_dominated(logged_in):

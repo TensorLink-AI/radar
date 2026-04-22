@@ -175,6 +175,25 @@ async def pareto_view(request: Request, task: str = ""):
     return _html("pareto.html", request, task=task, tasks=tasks)
 
 
+# ── Benchmark (eval score over time per task) ────────────────
+
+@router.get("/benchmark", response_class=HTMLResponse)
+async def benchmark_view(request: Request, task: str = ""):
+    state = get_state()
+    tasks = await state.store.get_tasks()
+    # Default to the first known task so the page is useful on first load.
+    if not task and tasks:
+        task = tasks[0]
+    rows = await q.benchmark_by_round(state.pool, task=task) if task else []
+    return _html(
+        "benchmark.html",
+        request,
+        task=task,
+        tasks=tasks,
+        rows=rows,
+    )
+
+
 # ── Miners ───────────────────────────────────────────────────
 
 @router.get("/miners", response_class=HTMLResponse)
