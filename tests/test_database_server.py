@@ -373,3 +373,227 @@ def test_access_log_skips_non_experiment_paths():
         assert logger.calls[-1]["experiment_ids"] == []
     finally:
         _uninstall_access_logger()
+
+
+# ── Agent code submission history ──────────────────────────────
+
+
+class _FakeR2:
+    """In-memory R2 stand-in for agent-code submission tests."""
+
+    def __init__(self):
+        self._blobs: dict[str, dict] = {}
+        self.uploads: list[str] = []
+
+    def upload_json(self, key, data):
+        self._blobs[key] = dict(data)
+        self.uploads.append(key)
+        return True
+
+    def download_json(self, key):
+        blob = self._blobs.get(key)
+        return dict(blob) if blob is not None else None
+
+
+class _FakePool:
+    """In-memory stand-in for the asyncpg pool used by agent_code routes.
+
+    Only implements the three statements the submission + read endpoints
+    exercise (upsert into agent_submissions, append to history, fetch).
+    """
+
+    def __init__(self):
+        self.registry: dict[str, dict] = {}
+        self.history: list[dict] = []
+
+    class _Conn:
+        def __init__(self, parent):
+            self.parent = parent
+
+        async def execute(self, sql, *params):
+            self.parent._execute(sql, *params)
+
+        def transaction(self):
+            parent = self.parent
+
+            class _Tx:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+            return _Tx()
+
+    class _Acquire:
+        def __init__(self, parent):
+            self.parent = parent
+
+        async def __aenter__(self):
+            return _FakePool._Conn(self.parent)
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    def acquire(self):
+        return _FakePool._Acquire(self)
+
+    def _execute(self, sql: str, *params):
+        sql_l = sql.lower()
+        import time as _time
+        if "insert into agent_submissions" in sql_l:
+            hk, uid, h, ep, r2, rs = params
+            self.registry[hk] = {
+                "hotkey": hk, "miner_uid": uid, "code_hash": h,
+                "entry_point": ep, "r2_key": r2, "round_submitted": rs,
+                "timestamp": _time.time(),
+            }
+        elif "insert into agent_submission_history" in sql_l:
+            hk, uid, h, ep, r2, rs = params
+            self.history.append({
+                "hotkey": hk, "miner_uid": uid, "code_hash": h,
+                "entry_point": ep, "r2_key": r2, "round_submitted": rs,
+                "timestamp": _time.time(),
+            })
+
+    async def execute(self, sql, *params):
+        self._execute(sql, *params)
+
+    async def fetch(self, sql: str, *params):
+        sql_l = sql.lower()
+        if "from agent_submission_history" in sql_l and "where hotkey" in sql_l:
+            hk = params[0]
+            limit = params[1] if len(params) > 1 else 100
+            rows = [r for r in self.history if r["hotkey"] == hk]
+            rows.sort(key=lambda r: r["timestamp"], reverse=True)
+            return rows[:limit]
+        return []
+
+    async def fetchrow(self, sql: str, *params):
+        sql_l = sql.lower()
+        if "from agent_submission_history" in sql_l and "code_hash = $1" in sql_l:
+            target = params[0]
+            matches = [r for r in self.history if r["code_hash"] == target]
+            if not matches:
+                return None
+            matches.sort(key=lambda r: r["timestamp"], reverse=True)
+            return matches[0]
+        return None
+
+
+def _call_async(coro):
+    import asyncio as _asyncio
+    loop = _asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _make_request(hotkey: str = "hk_test"):
+    """Construct a minimal fake Request with caller_hotkey in state."""
+
+    class _State:
+        pass
+
+    class _Request:
+        def __init__(self):
+            self.state = _State()
+            self.state.caller_hotkey = hotkey
+
+    return _Request()
+
+
+def test_agent_submission_writes_history_and_content_addressed_blob():
+    from database import server as srv
+    from database.server import SubmitAgentCodeRequest, submit_agent_code
+
+    fake_r2 = _FakeR2()
+    fake_pool = _FakePool()
+    srv._r2 = fake_r2
+    srv._pool = fake_pool
+    srv._current_challenge = {"round_id": 42}
+    try:
+        files = {"agent.py": "def design_architecture():\n    return 'v1'\n"}
+        req = SubmitAgentCodeRequest(files=files, entry_point="agent.py")
+        result = _call_async(submit_agent_code(_make_request("hk_alice"), req))
+        assert result["status"] == "ok"
+        code_hash = result["code_hash"]
+        assert result["round_submitted"] == 42
+        # Both R2 keys were written
+        assert f"agents/hk_alice/{code_hash}.json" in fake_r2.uploads
+        assert "agents/hk_alice/latest.json" in fake_r2.uploads
+        # Registry + history got populated
+        assert fake_pool.registry["hk_alice"]["code_hash"] == code_hash
+        assert fake_pool.registry["hk_alice"]["round_submitted"] == 42
+        assert len(fake_pool.history) == 1
+        assert fake_pool.history[0]["code_hash"] == code_hash
+        assert fake_pool.history[0]["r2_key"] == f"agents/hk_alice/{code_hash}.json"
+    finally:
+        srv._r2 = None
+        srv._pool = None
+        srv._current_challenge = None
+
+
+def test_agent_submission_preserves_previous_via_content_addressing():
+    from database import server as srv
+    from database.server import (
+        SubmitAgentCodeRequest, submit_agent_code,
+        get_agent_code_by_hash, get_agent_code_history,
+    )
+
+    fake_r2 = _FakeR2()
+    fake_pool = _FakePool()
+    srv._r2 = fake_r2
+    srv._pool = fake_pool
+    srv._current_challenge = {"round_id": 10}
+    try:
+        # First submission
+        req1 = SubmitAgentCodeRequest(
+            files={"agent.py": "def design_architecture():\n    return 'v1'\n"},
+            entry_point="agent.py",
+        )
+        r1 = _call_async(submit_agent_code(_make_request("hk_bob"), req1))
+        hash_v1 = r1["code_hash"]
+
+        # Second submission (different content → different hash)
+        srv._current_challenge = {"round_id": 11}
+        req2 = SubmitAgentCodeRequest(
+            files={"agent.py": "def design_architecture():\n    return 'v2'\n"},
+            entry_point="agent.py",
+        )
+        r2 = _call_async(submit_agent_code(_make_request("hk_bob"), req2))
+        hash_v2 = r2["code_hash"]
+        assert hash_v1 != hash_v2
+
+        # by_hash can still retrieve the first submission's exact bytes
+        bundle_v1 = _call_async(get_agent_code_by_hash(hash_v1))
+        assert "return 'v1'" in bundle_v1["files"]["agent.py"]
+        assert bundle_v1["code_hash"] == hash_v1
+
+        # History lists both submissions, most recent first, with round IDs
+        hist = _call_async(get_agent_code_history("hk_bob", limit=100))
+        rounds = [s["round_submitted"] for s in hist["submissions"]]
+        assert rounds == [11, 10]
+        hashes = [s["code_hash"] for s in hist["submissions"]]
+        assert hashes == [hash_v2, hash_v1]
+    finally:
+        srv._r2 = None
+        srv._pool = None
+        srv._current_challenge = None
+
+
+def test_agent_code_by_hash_unknown_returns_404():
+    from database import server as srv
+    from database.server import get_agent_code_by_hash
+    from fastapi import HTTPException
+
+    srv._r2 = _FakeR2()
+    srv._pool = _FakePool()
+    try:
+        with pytest.raises(HTTPException) as exc:
+            _call_async(get_agent_code_by_hash("nonexistent_hash"))
+        assert exc.value.status_code == 404
+    finally:
+        srv._r2 = None
+        srv._pool = None
