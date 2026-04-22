@@ -189,8 +189,24 @@ class Config:
 
     # ── Postgres ──────────────────────────────────────────────
     PG_DSN: str = os.getenv("RADAR_PG_DSN", "postgresql://radar:radar@localhost:5432/radar")
-    # Set to "require" for Supabase/managed Postgres, "" for local
+    # TLS mode for the asyncpg pool:
+    #   ""        → no TLS (local Docker)
+    #   "require" → TLS without verification. DEPRECATED: preserves the
+    #               historical behaviour that skipped hostname/cert checks,
+    #               kept for operators who rely on it. Emits a runtime
+    #               warning.  Prefer "verify" for any managed Postgres.
+    #   "verify"  → TLS with full hostname + certificate verification.
+    #               Required for Crunchy Bridge / any production
+    #               managed-Postgres deployment.
     PG_SSL: str = os.getenv("RADAR_PG_SSL", "")
+    # asyncpg pool sizing. Total max across all DB-server processes
+    # should stay under the cluster's max_connections.
+    PG_POOL_MIN: int = int(os.getenv("RADAR_PG_POOL_MIN", "2"))
+    PG_POOL_MAX: int = int(os.getenv("RADAR_PG_POOL_MAX", "10"))
+    # Set to 0 when the DSN points at a transaction-mode pooler
+    # (Supabase Supavisor, PgBouncer) that forbids server-side
+    # prepared statements. Leave unset for direct connections.
+    PG_STATEMENT_CACHE_SIZE: str = os.getenv("RADAR_PG_STATEMENT_CACHE_SIZE", "")
 
     # ── Network / Schema Isolation ────────────────────────────
     # Which Bittensor network this DB process serves: "testnet" or "mainnet".

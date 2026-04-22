@@ -69,41 +69,62 @@ class DatabaseNeuron:
     async def _init_db(self):
         """Create asyncpg pool and init schemas."""
         import ssl as _ssl
+        import warnings
 
         import asyncpg
 
         pg_dsn = getattr(self.config, "pg_dsn", None) or Config.PG_DSN
         network = Config.NETWORK
 
-        pool_kwargs: dict = {"min_size": 2, "max_size": 10}
+        pool_kwargs: dict = {
+            "min_size": Config.PG_POOL_MIN,
+            "max_size": Config.PG_POOL_MAX,
+        }
 
-        # SSL support (required for Supabase / managed Postgres)
-        ssl_ctx = None
-        if Config.PG_SSL:
-            ssl_ctx = _ssl.create_default_context()
-            if Config.PG_SSL == "require":
-                ssl_ctx.check_hostname = False
-                ssl_ctx.verify_mode = _ssl.CERT_NONE
-            pool_kwargs["ssl"] = ssl_ctx
+        # TLS: "" → off, "verify" → full verification (recommended for
+        # managed Postgres / Crunchy Bridge), "require" → TLS without
+        # verification (deprecated, kept so operators relying on the
+        # legacy skip-verify behaviour aren't silently changed).
+        if Config.PG_SSL == "verify":
+            pool_kwargs["ssl"] = _ssl.create_default_context()
+        elif Config.PG_SSL == "require":
+            warnings.warn(
+                "RADAR_PG_SSL=require establishes TLS but skips hostname / "
+                "certificate verification. This preserves pre-Crunchy "
+                "behaviour and will be removed in a future release. Set "
+                "RADAR_PG_SSL=verify for managed Postgres.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+            pool_kwargs["ssl"] = ctx
+        elif Config.PG_SSL:
+            raise ValueError(
+                f"Unknown RADAR_PG_SSL value: {Config.PG_SSL!r}. "
+                "Valid values: '' (off), 'require' (deprecated), 'verify'."
+            )
 
-        # Disable prepared-statement cache when using connection poolers
-        # (e.g. Supabase Supavisor in transaction mode).
-        uses_pooler = bool(Config.PG_SSL or "supabase" in pg_dsn)
-        if uses_pooler:
-            pool_kwargs["statement_cache_size"] = 0
+        # Explicit opt-in to disable asyncpg's prepared-statement cache
+        # (required by transaction-mode poolers like Supavisor / PgBouncer).
+        # Direct Crunchy / local connections should leave this unset so
+        # asyncpg's normal cache is used.
+        if Config.PG_STATEMENT_CACHE_SIZE != "":
+            pool_kwargs["statement_cache_size"] = int(Config.PG_STATEMENT_CACHE_SIZE)
 
         # Bootstrap step: CREATE SCHEMA must run on a connection whose
         # search_path is NOT already set to that schema (otherwise we're
         # asking the schema to create itself). Use a bare asyncpg.connect
-        # so no pool init hook runs.
+        # so no pool init/setup hook runs.
         logger.info(
             "Bootstrapping Postgres schema %r (RADAR_NETWORK)", network,
         )
-        bootstrap_kwargs: dict = {}
-        if ssl_ctx is not None:
-            bootstrap_kwargs["ssl"] = ssl_ctx
-        if uses_pooler:
-            bootstrap_kwargs["statement_cache_size"] = 0
+        bootstrap_kwargs = {
+            k: pool_kwargs[k]
+            for k in ("ssl", "statement_cache_size")
+            if k in pool_kwargs
+        }
         bootstrap_conn = await asyncpg.connect(pg_dsn, **bootstrap_kwargs)
         try:
             await ensure_schema_exists(bootstrap_conn, network)
@@ -194,7 +215,8 @@ class DatabaseNeuron:
                 logger.warning("Dashboard mount failed: %s", e)
 
         logger.info(
-            "Database initialized, tables created in schema %r", network,
+            "Database initialized: schema=%r pool_min=%d pool_max=%d ssl=%r",
+            network, Config.PG_POOL_MIN, Config.PG_POOL_MAX, Config.PG_SSL or "off",
         )
 
     async def _rebuild_pareto(self):
