@@ -71,10 +71,18 @@ END;
 $$ LANGUAGE plpgsql;
 """
 
+# Schema-scoped check: a trigger with this name may already exist on a
+# sibling schema's ``experiments`` table (testnet vs mainnet on the same
+# cluster). The old check only looked at ``tgname`` and silently skipped
+# trigger creation on every schema after the first. ``'experiments'::regclass``
+# resolves through the session's search_path, so each schema gets its own
+# trigger.
 FTS_TRIGGER_DDL = """
 DO $$ BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM pg_trigger WHERE tgname = 'experiments_search_trigger'
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'experiments_search_trigger'
+          AND tgrelid = 'experiments'::regclass
     ) THEN
         CREATE TRIGGER experiments_search_trigger
             BEFORE INSERT OR UPDATE ON experiments

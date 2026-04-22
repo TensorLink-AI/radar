@@ -44,21 +44,56 @@ async def _register_json_codecs(conn: asyncpg.Connection) -> None:
     )
 
 
-async def create_pg_pool(dsn: str, **kwargs) -> asyncpg.Pool:
+def _quote_ident(name: str) -> str:
+    """Safely quote a Postgres identifier.
+
+    Schema / table / role names reach us via env vars or caller kwargs,
+    so they must be quoted defensively before being spliced into DDL or
+    ``SET`` statements.  Mirrors ``psycopg2.extensions.quote_ident`` /
+    libpq ``PQescapeIdentifier`` — double-quote, and escape embedded
+    double quotes.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"invalid identifier: {name!r}")
+    return '"' + name.replace('"', '""') + '"'
+
+
+async def create_pg_pool(
+    dsn: str, schema: Optional[str] = None, **kwargs,
+) -> asyncpg.Pool:
     """Create an asyncpg pool with JSON/JSONB codecs pre-registered.
 
+    If ``schema`` is given, every new connection in the pool has its
+    ``search_path`` set to ``<schema>, public`` so unqualified
+    identifiers resolve inside that schema. This is how we isolate
+    testnet / mainnet on a shared cluster.
+
     All radar components should use this helper instead of
-    ``asyncpg.create_pool`` directly so JSONB columns are decoded to Python
-    objects consistently.
+    ``asyncpg.create_pool`` directly so JSONB decoding and schema
+    isolation stay consistent.
     """
     user_init = kwargs.pop("init", None)
+    quoted_schema = _quote_ident(schema) if schema else None
 
     async def _init(conn: asyncpg.Connection) -> None:
         await _register_json_codecs(conn)
+        if quoted_schema is not None:
+            # search_path is session-scoped, so every pooled connection
+            # must set it — including ones recycled after a reset.
+            await conn.execute(f"SET search_path TO {quoted_schema}, public")
         if user_init is not None:
             await user_init(conn)
 
     return await asyncpg.create_pool(dsn, init=_init, **kwargs)
+
+
+async def ensure_schema_exists(conn: asyncpg.Connection, schema: str) -> None:
+    """Idempotently create ``schema`` on the target database.
+
+    Must run on a connection whose role has ``CREATE ON DATABASE``
+    privilege. Safe to call on every startup.
+    """
+    await conn.execute(f"CREATE SCHEMA IF NOT EXISTS {_quote_ident(schema)}")
 
 
 class PgExperimentStore:

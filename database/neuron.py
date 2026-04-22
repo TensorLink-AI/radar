@@ -23,7 +23,7 @@ from database.server import (
 )
 from shared.pareto import ParetoFront
 from shared.pg_access_logger import PgAccessLogger
-from shared.pg_store import PgExperimentStore, create_pg_pool
+from shared.pg_store import PgExperimentStore, create_pg_pool, ensure_schema_exists
 from shared.task import load_enabled_tasks
 
 logger = logging.getLogger(__name__)
@@ -65,25 +65,62 @@ class DatabaseNeuron:
     async def _init_db(self):
         """Create asyncpg pool and init schemas."""
         import ssl as _ssl
+        import warnings
 
         pg_dsn = getattr(self.config, "pg_dsn", None) or Config.PG_DSN
+        network = Config.NETWORK
 
-        pool_kwargs: dict = {"min_size": 2, "max_size": 10}
+        pool_kwargs: dict = {
+            "min_size": Config.PG_POOL_MIN,
+            "max_size": Config.PG_POOL_MAX,
+        }
 
-        # SSL support (required for Supabase / managed Postgres)
-        if Config.PG_SSL:
+        # TLS: "" → off, "verify" → full verification (recommended),
+        # "require" → TLS without verification (deprecated).
+        if Config.PG_SSL == "verify":
+            pool_kwargs["ssl"] = _ssl.create_default_context()
+        elif Config.PG_SSL == "require":
+            warnings.warn(
+                "RADAR_PG_SSL=require establishes TLS but skips hostname / "
+                "certificate verification. This preserves pre-Crunchy "
+                "behaviour and will be removed in a future release. Set "
+                "RADAR_PG_SSL=verify for managed Postgres.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             ctx = _ssl.create_default_context()
-            if Config.PG_SSL == "require":
-                ctx.check_hostname = False
-                ctx.verify_mode = _ssl.CERT_NONE
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
             pool_kwargs["ssl"] = ctx
+        elif Config.PG_SSL:
+            raise ValueError(
+                f"Unknown RADAR_PG_SSL value: {Config.PG_SSL!r}. "
+                "Valid values: '' (off), 'require' (deprecated), 'verify'."
+            )
 
-        # Disable prepared-statement cache when using connection poolers
-        # (e.g. Supabase Supavisor in transaction mode).
-        if Config.PG_SSL or "supabase" in pg_dsn:
-            pool_kwargs["statement_cache_size"] = 0
+        # Explicit opt-in to disable asyncpg's prepared-statement cache
+        # (required by transaction-mode poolers like Supavisor / PgBouncer).
+        # Direct Crunchy / local connections should leave this unset.
+        if Config.PG_STATEMENT_CACHE_SIZE != "":
+            pool_kwargs["statement_cache_size"] = int(Config.PG_STATEMENT_CACHE_SIZE)
 
-        self.pool = await create_pg_pool(pg_dsn, **pool_kwargs)
+        # Ensure the network's schema exists before opening the main pool.
+        # Done on a short-lived direct connection so we don't set
+        # search_path to a schema that may not exist yet on a fresh
+        # cluster.  Only ssl / statement_cache_size carry over.
+        import asyncpg as _asyncpg
+        conn_kwargs = {
+            k: pool_kwargs[k]
+            for k in ("ssl", "statement_cache_size")
+            if k in pool_kwargs
+        }
+        bootstrap_conn = await _asyncpg.connect(pg_dsn, **conn_kwargs)
+        try:
+            await ensure_schema_exists(bootstrap_conn, network)
+        finally:
+            await bootstrap_conn.close()
+
+        self.pool = await create_pg_pool(pg_dsn, schema=network, **pool_kwargs)
         self.store = PgExperimentStore(self.pool)
         await self.store.init_schema()
 
@@ -161,7 +198,10 @@ class DatabaseNeuron:
             except Exception as e:
                 logger.warning("Dashboard mount failed: %s", e)
 
-        logger.info("Database initialized, schemas created")
+        logger.info(
+            "Database initialized: schema=%s, pool_min=%d, pool_max=%d, ssl=%r",
+            network, Config.PG_POOL_MIN, Config.PG_POOL_MAX, Config.PG_SSL or "off",
+        )
 
     async def _rebuild_pareto(self):
         """Rebuild Pareto fronts from all DB elements."""
