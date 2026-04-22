@@ -15,15 +15,27 @@ Phase C (Evaluation): Every validator evals every checkpoint (seconds, TRUST ANC
 ### Database Architecture
 
 ```
-Subnet Owner (database/ module)
-  ├── Runs Postgres (single source of truth)
+Subnet Owner (database/ module) — one binary, three deploy modes
+                                  (RADAR_NEURON_MODE={validator,dashboard,all})
+  ├── Runs Postgres (single source of truth, shared across modes)
   ├── FastAPI on RADAR_DB_API_PORT (default 8090)
-  │   ├── All /experiments/* read routes
-  │   ├── POST /experiments/add (validators write after Phase C)
-  │   ├── /challenge, /frontier
-  │   ├── /provenance/* routes
-  │   └── POST /provenance/record_components, record_context
-  └── Epistula auth: only registered validators
+  │   ├── validator mode  — Epistula-authed validator/miner surface
+  │   │   ├── /experiments/*, /challenge, /frontier
+  │   │   ├── /provenance/*, /agent_code/*
+  │   │   ├── /desearch/*, /llm/*  (optional proxies)
+  │   │   └── Internal Jinja operator UI at /dashboard/* when
+  │   │       RADAR_DASHBOARD_ENABLED=true (cookie-gated)
+  │   ├── dashboard mode  — Public JSON API for radarnet.io SPA
+  │   │   └── /dashboard/api/* (no auth, CORS via RADAR_DASHBOARD_CORS_ORIGINS)
+  │   └── all mode (default, dev/legacy)  — every surface on one process
+  ├── Epistula auth: validator surface only. JSON API is public by design.
+  └── Chain sync (metagraph + round loop) runs in {validator, all} modes
+      only. Dashboard mode never imports bittensor or touches a wallet.
+
+Public dashboard JSON API (/dashboard/api/*) is PUBLIC by design — anyone
+on the internet can read agent source code, stdout, experiments, and
+frontier data. Do not add fields to those endpoints that shouldn't be
+world-readable.
 
 Validators (validator/ module)
   ├── Phase A, B, C logic unchanged
@@ -102,8 +114,23 @@ scripts/start_pg.sh
 # Run tests (315+ tests, all passing; Postgres tests need TEST_PG_DSN)
 python -m pytest tests/ -v
 
-# Start database server (subnet owner)
+# Start database server — default (all) mode: validator surface + public JSON
 python database/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <name>
+
+# Validator-only mode (no public JSON API; internal Jinja UI optional)
+RADAR_NEURON_MODE=validator \
+  python database/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <name>
+
+# Public dashboard-only mode (no wallet, no chain sync, no Epistula)
+RADAR_NEURON_MODE=dashboard \
+  RADAR_DASHBOARD_CORS_ORIGINS=https://radarnet.io \
+  python database/neuron.py --port 8091
+
+# Running both locally on the same Postgres (dev)
+# Terminal 1: validator surface on 8090
+RADAR_NEURON_MODE=validator python database/neuron.py --netuid 1 --port 8090
+# Terminal 2: public JSON API on 8091 pointing at the same Postgres
+RADAR_NEURON_MODE=dashboard python database/neuron.py --port 8091
 
 # Start validator (requires subtensor or mainnet)
 python validator/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <name>
@@ -207,6 +234,26 @@ frontier/latest.json                                        # Current Pareto fro
 - [x] Centralized Postgres DB with async API (`database/`, `shared/pg_*.py`)
 - [x] Validator reverse proxy for miners (`validator/db_proxy.py`)
 - [x] DatabaseClient for validator -> DB server communication (`shared/db_client.py`)
+- [x] Validator / dashboard deploy split (`RADAR_NEURON_MODE`)
+
+## Neuron Mode Environment Variables
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `RADAR_NEURON_MODE` | `all` | `validator` (Epistula API + chain), `dashboard` (open public JSON), or `all` (both on one process). |
+| `RADAR_PG_POOL_MIN` | `2` | asyncpg pool min size. Dashboard deploys typically leave as-is; validator deploys can bump. |
+| `RADAR_PG_POOL_MAX` | `10` | asyncpg pool max size. |
+| `RADAR_PG_STATEMENT_TIMEOUT_MS` | `0` | `SET statement_timeout` for every pool connection. `0` disables. Set to `5000` on dashboard deploys so a slow public query can't pressure the shared cluster. |
+| `RADAR_DASHBOARD_CORS_ORIGINS` | `""` | Comma-separated CORS origins for `/dashboard/api/*`. Empty disables CORS. Production dashboard sets this to `https://radarnet.io`. |
+| `RADAR_DASHBOARD_ENABLED` | `false` | Mounts the cookie-gated internal Jinja operator UI at `/dashboard/*` (validator / all modes only). |
+| `RADAR_DASHBOARD_KEY` | `""` | Shared key required to log into the Jinja UI. |
+
+The `/dashboard/api/*` JSON endpoints are **PUBLIC**. Do not add any field
+to them that shouldn't be world-readable. The Jinja `/dashboard/*` HTML
+pages remain operator-gated by cookie auth.
+
+In production these modes run as separate deployments with independent
+lifecycles (validator on a VPS, dashboard on Railway, SPA on Vercel).
 
 ## What's Outstanding
 

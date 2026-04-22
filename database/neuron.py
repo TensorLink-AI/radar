@@ -1,8 +1,19 @@
-"""Subnet owner process — centralized Postgres experiment database.
+"""Subnet owner / dashboard process — centralized Postgres experiment DB.
 
-Runs the FastAPI server that validators write to and miners read from
-(via validator proxy). Single source of truth for experiments, provenance,
-and Pareto frontier.
+Two deployable modes, selected by ``RADAR_NEURON_MODE``:
+
+  * ``validator``  — Epistula-authed write/read API for validators + miners,
+                     plus desearch/LLM proxies. Runs metagraph sync + round
+                     loop. Requires a Bittensor wallet. Optionally also mounts
+                     the internal Jinja dashboard when
+                     ``RADAR_DASHBOARD_ENABLED=true``.
+  * ``dashboard``  — Open public JSON API at ``/dashboard/api/*``. No wallet,
+                     no proxies, no metagraph sync, no Jinja, no Epistula.
+                     This is what gets deployed to Railway behind radarnet.io.
+  * ``all``        — Everything on one process (legacy / dev default).
+
+Both modes share the same Postgres cluster with independent connection
+pools, independent auth, and independent route sets.
 """
 
 from __future__ import annotations
@@ -10,13 +21,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+from typing import Optional
 
-import bittensor as bt
 import uvicorn
 
-from config import Config
+from config import Config, validate_neuron_mode
 from database.server import (
-    app, set_db, set_auth, set_challenge, set_frontier,
+    app, include_validator_routes,
+    set_db, set_auth, set_challenge, set_frontier,
     set_access_logger, set_hotkey_map, set_rate_limit,
     set_r2, set_pool,
     get_current_challenge, get_current_frontier,
@@ -33,26 +45,52 @@ from shared.task import load_enabled_tasks
 logger = logging.getLogger(__name__)
 
 
-class DatabaseNeuron:
-    """Subnet owner database server."""
+def _mode_runs_validator_surface(mode: str) -> bool:
+    """True for modes that mount the Epistula-authed validator/miner routes."""
+    return mode in ("validator", "all")
 
-    def __init__(self, config: bt.Config):
+
+def _mode_runs_dashboard_api(mode: str) -> bool:
+    """True for modes that expose the public JSON API at /dashboard/api/*."""
+    return mode in ("dashboard", "all")
+
+
+def _mode_runs_chain(mode: str) -> bool:
+    """True for modes that read the chain (wallet / subtensor / metagraph)."""
+    return mode in ("validator", "all")
+
+
+class DatabaseNeuron:
+    """Subnet owner database server — surface depends on ``Config.NEURON_MODE``."""
+
+    def __init__(self, config):
         self.config = config
-        self.netuid = config.netuid
+        self.mode = Config.NEURON_MODE
+        validate_neuron_mode()
+
+        self.netuid = getattr(config, "netuid", 1)
         self.port = int(getattr(config, "port", Config.DB_API_PORT))
 
-        # Bittensor components
-        self.wallet = bt.Wallet(config=config)
-        self.subtensor = bt.Subtensor(config=config)
-        self.metagraph = self.subtensor.metagraph(self.netuid)
+        # Bittensor components — only constructed when this process needs to
+        # talk to the chain. Dashboard mode never imports bittensor so it can
+        # start without a wallet file on disk.
+        self.wallet = None
+        self.subtensor = None
+        self.metagraph = None
+        if _mode_runs_chain(self.mode):
+            import bittensor as bt  # lazy import
+            self.wallet = bt.Wallet(config=config)
+            self.subtensor = bt.Subtensor(config=config)
+            self.metagraph = self.subtensor.metagraph(self.netuid)
 
         # Tasks
         self.tasks = load_enabled_tasks(Config.ENABLED_TASKS)
 
-        # Per-task Pareto fronts
+        # Per-task Pareto fronts (only populated in modes that run chain logic)
         self.pareto_fronts: dict[str, ParetoFront] = {}
 
-        # R2 audit log
+        # R2 audit log — used by both validator write path and dashboard
+        # log/bundle viewing, so it's shared across modes when configured.
         self.r2 = None
         if Config.R2_BUCKET:
             try:
@@ -67,7 +105,13 @@ class DatabaseNeuron:
         self.access_logger = None
 
     async def _init_db(self):
-        """Create asyncpg pool and init schemas."""
+        """Create the asyncpg pool + ensure schemas exist.
+
+        Mode-neutral: both validator and dashboard processes need a working
+        pool and the full schema so queries either side issues succeed.
+        Pool sizing and statement_timeout come from config so deployments
+        can tighten dashboard-mode pressure independently.
+        """
         import ssl as _ssl
         import warnings
 
@@ -113,10 +157,26 @@ class DatabaseNeuron:
         if Config.PG_STATEMENT_CACHE_SIZE != "":
             pool_kwargs["statement_cache_size"] = int(Config.PG_STATEMENT_CACHE_SIZE)
 
+        # Apply statement_timeout per-connection when configured — lets
+        # dashboard-mode deployments cap slow public queries without
+        # affecting the validator pool. Runs in `init=` (once per physical
+        # connection) rather than `setup=` because statement_timeout
+        # survives RESET ALL on release.
+        if Config.PG_STATEMENT_TIMEOUT_MS > 0:
+            timeout_ms = int(Config.PG_STATEMENT_TIMEOUT_MS)
+
+            async def _apply_timeout(conn):
+                await conn.execute(f"SET statement_timeout = {timeout_ms}")
+
+            pool_kwargs["init"] = _apply_timeout
+
         # Bootstrap step: CREATE SCHEMA must run on a connection whose
         # search_path is NOT already set to that schema (otherwise we're
         # asking the schema to create itself). Use a bare asyncpg.connect
-        # so no pool init/setup hook runs.
+        # so no pool init/setup hook runs. Both validator and dashboard
+        # modes run this — dashboard mode starting before the validator
+        # needs the schema to exist too, and CREATE SCHEMA IF NOT EXISTS
+        # is idempotent.
         logger.info(
             "Bootstrapping Postgres schema %r (RADAR_NETWORK)", network,
         )
@@ -153,57 +213,78 @@ class DatabaseNeuron:
         async with self.pool.acquire() as conn:
             await conn.execute(PROXY_QUERY_LOG_SCHEMA)
 
-        # Wire into server
+        # ── Shared wiring (both surfaces need DB access) ──
         set_db(self.store)
         set_pool(self.pool)
         if self.r2:
             set_r2(self.r2)
         set_access_logger(self.access_logger)
-        set_auth(self.metagraph)
-        set_rate_limit(Config.DB_VALI_RATE_LIMIT)
 
-        # Desearch proxy (SN22 arxiv search)
-        if Config.DESEARCH_ENABLED:
-            from validator.desearch_proxy import DesearchProxy, set_proxy, register_routes
-            desearch = DesearchProxy(
-                sn22_url=Config.DESEARCH_SN22_URL,
-                api_key=Config.DESEARCH_API_KEY,
-                max_queries=Config.DESEARCH_MAX_QUERIES,
-                pool=self.pool,
-            )
-            set_proxy(desearch)
-            register_routes(app)
-            logger.info("Desearch proxy enabled (SN22: %s)", Config.DESEARCH_SN22_URL)
+        # ── Validator-surface wiring (Epistula auth + rate limit) ──
+        if _mode_runs_validator_surface(self.mode):
+            include_validator_routes(app)
+            set_auth(self.metagraph)
+            set_rate_limit(Config.DB_VALI_RATE_LIMIT)
 
-        # LLM proxy (Chutes AI)
-        if Config.LLM_ENABLED:
-            from validator.llm_proxy import LLMProxy
-            from validator.llm_routes import set_proxy as set_llm_proxy
-            from validator.llm_routes import register_routes as register_llm_routes
-            allowed_models = [
-                m.strip() for m in Config.CHUTES_ALLOWED_MODELS.split(",")
-                if m.strip()
-            ]
-            llm = LLMProxy(
-                chutes_url=Config.CHUTES_API_URL,
-                chutes_api_key=Config.CHUTES_API_KEY,
-                allowed_models=allowed_models,
-                max_queries=Config.LLM_MAX_QUERIES,
-                pool=self.pool,
-                timeout=Config.CHUTES_TIMEOUT,
-            )
-            set_llm_proxy(llm)
-            register_llm_routes(app)
-            logger.info(
-                "LLM proxy enabled (Chutes: %s, models: %s)",
-                Config.CHUTES_API_URL, allowed_models or "all",
-            )
+            # Desearch proxy (SN22 arxiv search)
+            if Config.DESEARCH_ENABLED:
+                from validator.desearch_proxy import (
+                    DesearchProxy, set_proxy, register_routes,
+                )
+                desearch = DesearchProxy(
+                    sn22_url=Config.DESEARCH_SN22_URL,
+                    api_key=Config.DESEARCH_API_KEY,
+                    max_queries=Config.DESEARCH_MAX_QUERIES,
+                    pool=self.pool,
+                )
+                set_proxy(desearch)
+                register_routes(app)
+                logger.info("Desearch proxy enabled (SN22: %s)", Config.DESEARCH_SN22_URL)
 
-        # Read-only web dashboard (subnet-owner operator UI)
-        if Config.DASHBOARD_ENABLED:
+            # LLM proxy (Chutes AI)
+            if Config.LLM_ENABLED:
+                from validator.llm_proxy import LLMProxy
+                from validator.llm_routes import set_proxy as set_llm_proxy
+                from validator.llm_routes import register_routes as register_llm_routes
+                allowed_models = [
+                    m.strip() for m in Config.CHUTES_ALLOWED_MODELS.split(",")
+                    if m.strip()
+                ]
+                llm = LLMProxy(
+                    chutes_url=Config.CHUTES_API_URL,
+                    chutes_api_key=Config.CHUTES_API_KEY,
+                    allowed_models=allowed_models,
+                    max_queries=Config.LLM_MAX_QUERIES,
+                    pool=self.pool,
+                    timeout=Config.CHUTES_TIMEOUT,
+                )
+                set_llm_proxy(llm)
+                register_llm_routes(app)
+                logger.info(
+                    "LLM proxy enabled (Chutes: %s, models: %s)",
+                    Config.CHUTES_API_URL, allowed_models or "all",
+                )
+
+            # Internal Jinja operator UI (still behind cookie auth)
+            if Config.DASHBOARD_ENABLED:
+                try:
+                    from database.dashboard import mount_dashboard
+                    mount_dashboard(
+                        app,
+                        store=self.store,
+                        pool=self.pool,
+                        r2=self.r2,
+                        get_challenge=get_current_challenge,
+                        get_frontier=get_current_frontier,
+                    )
+                except Exception as e:
+                    logger.warning("Dashboard mount failed: %s", e)
+
+        # ── Public JSON API (no auth, served in dashboard + all modes) ──
+        if _mode_runs_dashboard_api(self.mode):
             try:
-                from database.dashboard import mount_dashboard
-                mount_dashboard(
+                from database.dashboard import mount_public_api
+                mount_public_api(
                     app,
                     store=self.store,
                     pool=self.pool,
@@ -212,11 +293,48 @@ class DatabaseNeuron:
                     get_frontier=get_current_frontier,
                 )
             except Exception as e:
-                logger.warning("Dashboard mount failed: %s", e)
+                logger.warning("Public JSON API mount failed: %s", e)
+
+        # ── CORS (only when origins are configured) ──
+        self._maybe_mount_cors()
 
         logger.info(
-            "Database initialized: schema=%r pool_min=%d pool_max=%d ssl=%r",
-            network, Config.PG_POOL_MIN, Config.PG_POOL_MAX, Config.PG_SSL or "off",
+            "Database initialized: mode=%s schema=%r pool_min=%d pool_max=%d ssl=%r",
+            self.mode, Config.NETWORK,
+            Config.PG_POOL_MIN, Config.PG_POOL_MAX, Config.PG_SSL or "off",
+        )
+
+    def _maybe_mount_cors(self):
+        """Enable CORS for the public JSON API when origins are configured.
+
+        Only applies when the public JSON API is served (dashboard + all
+        modes). Validator-only processes never mount it since their
+        traffic doesn't come from browsers.
+        """
+        if not _mode_runs_dashboard_api(self.mode):
+            return
+        origins_raw = Config.DASHBOARD_CORS_ORIGINS or ""
+        origins = [o.strip() for o in origins_raw.split(",") if o.strip()]
+        if not origins:
+            return
+
+        # Idempotent: don't double-register if re-called
+        from fastapi.middleware.cors import CORSMiddleware
+        for m in getattr(app, "user_middleware", []):
+            if m.cls is CORSMiddleware:
+                return
+
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["Content-Type"],
+            allow_credentials=False,
+            max_age=600,
+        )
+        logger.info(
+            "CORS enabled on /dashboard/api/* for origins: %s",
+            ", ".join(origins),
         )
 
     async def _rebuild_pareto(self):
@@ -256,7 +374,9 @@ class DatabaseNeuron:
         )
 
     def _sync_metagraph(self):
-        """Sync metagraph and update hotkey map."""
+        """Sync metagraph and update hotkey map. No-op outside chain modes."""
+        if not _mode_runs_chain(self.mode) or self.metagraph is None:
+            return
         self.metagraph.sync()
         hotkeys = self.metagraph.hotkeys or []
         hotkey_map = {
@@ -268,12 +388,9 @@ class DatabaseNeuron:
         set_auth(self.metagraph)
 
     def _refresh_round_id(self) -> int:
-        """Recompute the current round_id from chain height and push it to
-        the access logger so miner_access_log rows get the right tag.
-
-        Returns the round_id now in effect, or -1 if the subtensor read
-        failed.
-        """
+        """Recompute round_id from chain height. Returns -1 outside chain modes."""
+        if not _mode_runs_chain(self.mode) or self.subtensor is None:
+            return -1
         from shared.challenge import round_id_from_block
         try:
             current_block = self.subtensor.block
@@ -288,17 +405,22 @@ class DatabaseNeuron:
         return round_id
 
     async def run(self):
-        """Main loop: init DB, start server, periodic metagraph sync."""
+        """Main loop: init DB, start server, periodic loops (chain modes only)."""
         await self._init_db()
-        await self._rebuild_pareto()
-        self._sync_metagraph()
-        self._refresh_round_id()
+
+        # Chain-driven state only runs in modes with a subtensor connection.
+        # Dashboard mode skips Pareto rebuild + metagraph sync + round loop.
+        if _mode_runs_chain(self.mode):
+            await self._rebuild_pareto()
+            self._sync_metagraph()
+            self._refresh_round_id()
 
         db_size = await self.store.get_size()
         logger.info(
-            "Database server starting on port %d (network=%s). "
+            "DB server starting on port %d (mode=%s network=%s). "
             "DB: %d experiments, tasks: %s",
-            self.port, Config.NETWORK, db_size, list(self.tasks.keys()),
+            self.port, self.mode, Config.NETWORK,
+            db_size, list(self.tasks.keys()),
         )
 
         # Start uvicorn in background
@@ -310,43 +432,64 @@ class DatabaseNeuron:
         server = uvicorn.Server(server_config)
         server_task = asyncio.create_task(server.serve())
 
-        # Round tracker — rounds are ~55 min (275 blocks × 12s), so a 30s
-        # poll keeps miner_access_log.round_id within one block of the
-        # actual round boundary.
-        async def _round_loop():
-            while True:
-                await asyncio.sleep(30)
-                try:
-                    self._refresh_round_id()
-                except Exception as e:
-                    logger.warning("Round refresh loop: %s", e)
+        round_task: Optional[asyncio.Task] = None
 
-        round_task = asyncio.create_task(_round_loop())
+        if _mode_runs_chain(self.mode):
+            # Round tracker — rounds are ~55 min (275 blocks × 12s), so a
+            # 30s poll keeps miner_access_log.round_id within one block of
+            # the actual round boundary.
+            async def _round_loop():
+                while True:
+                    await asyncio.sleep(30)
+                    try:
+                        self._refresh_round_id()
+                    except Exception as e:
+                        logger.warning("Round refresh loop: %s", e)
 
-        # Periodic metagraph sync
-        try:
-            while True:
-                await asyncio.sleep(300)  # 5 minutes
-                try:
-                    self._sync_metagraph()
-                    logger.info("Metagraph synced: %d neurons", self.metagraph.n)
-                except Exception as e:
-                    logger.warning("Metagraph sync failed: %s", e)
-        except asyncio.CancelledError:
-            round_task.cancel()
-            server.should_exit = True
-            await server_task
+            round_task = asyncio.create_task(_round_loop())
+
+            # Periodic metagraph sync
+            try:
+                while True:
+                    await asyncio.sleep(300)  # 5 minutes
+                    try:
+                        self._sync_metagraph()
+                        logger.info("Metagraph synced: %d neurons", self.metagraph.n)
+                    except Exception as e:
+                        logger.warning("Metagraph sync failed: %s", e)
+            except asyncio.CancelledError:
+                if round_task is not None:
+                    round_task.cancel()
+                server.should_exit = True
+                await server_task
+        else:
+            # Dashboard mode: no chain loops, just serve HTTP until killed.
+            try:
+                await server_task
+            except asyncio.CancelledError:
+                server.should_exit = True
+                await server_task
 
 
-def get_config() -> bt.Config:
+def get_config():
     parser = argparse.ArgumentParser(description="Radar Database Server")
     parser.add_argument("--netuid", type=int, default=1)
     parser.add_argument("--port", type=int, default=Config.DB_API_PORT)
     parser.add_argument("--pg_dsn", type=str, default="")
     parser.add_argument("--task", type=str, default="")
-    bt.Wallet.add_args(parser)
-    bt.Subtensor.add_args(parser)
-    return bt.Config(parser)
+
+    # Only stitch the wallet / subtensor argparse extensions in when the
+    # process actually needs them. Dashboard mode must parse without
+    # importing bittensor at all.
+    if _mode_runs_chain(Config.NEURON_MODE):
+        import bittensor as bt
+        bt.Wallet.add_args(parser)
+        bt.Subtensor.add_args(parser)
+        return bt.Config(parser)
+
+    # Dashboard mode: return a plain namespace that behaves like bt.Config
+    # for the attribute access patterns we use.
+    return parser.parse_args()
 
 
 def main():
@@ -356,6 +499,7 @@ def main():
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    validate_neuron_mode()
     config = get_config()
     neuron = DatabaseNeuron(config)
     asyncio.run(neuron.run())
