@@ -310,6 +310,66 @@ async def top_experiments_activity(
     return {"miners": miners, "experiments": experiments, "matrix": matrix}
 
 
+async def benchmark_by_round(
+    pool, task: str, limit: int = 100,
+) -> list[dict]:
+    """Per-round eval-score summary for a given task, newest first.
+
+    Each row represents one Phase C evaluation round: its best metric
+    (minimum CRPS among successful submissions), the mean across
+    successful submissions, total/successful counts, the hotkey that
+    produced the best metric, and the earliest timestamp observed in
+    the round (used to render "over time" ordering in the UI).
+    """
+    if not task:
+        return []
+    rows = await pool.fetch(
+        """
+        SELECT r.round_id, r.total, r.successes, r.best_metric,
+               r.mean_metric, r.started_at, bpr.best_hotkey
+        FROM (
+            SELECT round_id,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN success THEN 1 ELSE 0 END) AS successes,
+                   MIN(CASE WHEN success THEN metric END) AS best_metric,
+                   AVG(CASE WHEN success THEN metric END) AS mean_metric,
+                   MIN(timestamp) AS started_at
+            FROM experiments
+            WHERE task = $1 AND round_id IS NOT NULL
+            GROUP BY round_id
+            ORDER BY round_id DESC
+            LIMIT $2
+        ) r
+        LEFT JOIN LATERAL (
+            SELECT miner_hotkey AS best_hotkey
+            FROM experiments
+            WHERE task = $1 AND round_id = r.round_id
+              AND success AND metric IS NOT NULL
+            ORDER BY metric ASC
+            LIMIT 1
+        ) bpr ON TRUE
+        ORDER BY r.round_id DESC
+        """,
+        task, max(1, min(int(limit), 500)),
+    )
+    return [
+        {
+            "round_id": int(r["round_id"]),
+            "total": int(r["total"] or 0),
+            "successes": int(r["successes"] or 0),
+            "best_metric": (
+                float(r["best_metric"]) if r["best_metric"] is not None else None
+            ),
+            "mean_metric": (
+                float(r["mean_metric"]) if r["mean_metric"] is not None else None
+            ),
+            "started_at": float(r["started_at"] or 0.0),
+            "best_hotkey": r["best_hotkey"] or "",
+        }
+        for r in rows
+    ]
+
+
 async def miner_agent_history(
     pool, hotkey: str, limit: int = 50,
 ) -> list[dict]:
@@ -362,6 +422,7 @@ async def agent_bundle_record(pool, code_hash: str) -> Optional[dict]:
 __all__ = [
     "BrowseFilters",
     "agent_bundle_record",
+    "benchmark_by_round",
     "browse",
     "distinct_hotkeys",
     "distinct_rounds",
