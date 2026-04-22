@@ -13,6 +13,10 @@
 #   RADAR_PG_DSN          Postgres connection string (default: local Docker)
 #   RADAR_DB_API_PORT     API port (default: 8090)
 #   RADAR_PG_PORT         Postgres port (default: 5432)
+#   RADAR_NETWORK         Postgres schema to write into (default: testnet)
+#                         — a single DB holds BOTH testnet and mainnet data,
+#                           strictly isolated by schema. DO NOT set this to
+#                           "mainnet" unless you really mean it.
 
 set -euo pipefail
 
@@ -25,6 +29,7 @@ PG_USER="radar"
 PG_PASS="radar"
 PG_DB="radar"
 CONTAINER_NAME="radar-pg"
+NETWORK="${RADAR_NETWORK:-testnet}"
 
 # ── Colors ────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -83,14 +88,31 @@ done
 # ── 3. Start DB server ───────────────────────────────────
 info "Step 3/3: Starting database server on port ${API_PORT}..."
 echo ""
+
+# Make the schema selection impossible to miss. Operators have accidentally
+# written mainnet rows into a "testnet" DB when this was silent — don't let
+# that happen here.
+if [ "${NETWORK}" = "mainnet" ]; then
+    warn "╔════════════════════════════════════════════════════╗"
+    warn "║  RADAR_NETWORK=mainnet — writing to MAINNET schema ║"
+    warn "╚════════════════════════════════════════════════════╝"
+else
+    info "╔════════════════════════════════════════════════════╗"
+    info "║  RADAR_NETWORK=${NETWORK} — writing to ${NETWORK} schema"
+    info "╚════════════════════════════════════════════════════╝"
+fi
+
 info "Config:"
 info "  RADAR_PG_DSN=${DSN}"
 info "  RADAR_DB_API_PORT=${API_PORT}"
+info "  RADAR_NETWORK=${NETWORK}"
 info "  Passing args: $*"
 echo ""
 info "Validators should set:"
 info "  RADAR_DB_API_URL=http://<this-host>:${API_PORT}"
 echo ""
+
+export RADAR_NETWORK="${NETWORK}"
 
 cd "${PROJECT_DIR}"
 exec python database/neuron.py --port "${API_PORT}" "$@"

@@ -71,12 +71,14 @@ END;
 $$ LANGUAGE plpgsql;
 """
 
-# Schema-scoped check: a trigger with this name may already exist on a
-# sibling schema's ``experiments`` table (testnet vs mainnet on the same
-# cluster). The old check only looked at ``tgname`` and silently skipped
-# trigger creation on every schema after the first. ``'experiments'::regclass``
-# resolves through the session's search_path, so each schema gets its own
-# trigger.
+# The IF NOT EXISTS guard must be scoped to the current schema's experiments
+# table because tgname is unique per-relation, not globally. Under multi-
+# network deployments (testnet + mainnet schemas in the same database) an
+# unqualified ``tgname = 'experiments_search_trigger'`` check matches the
+# OTHER schema's trigger and silently skips creation here, leaving this
+# schema's experiments without the FTS trigger. Casting ``'experiments'`` to
+# ``regclass`` resolves it via the session's search_path, so each schema
+# gets its own trigger.
 FTS_TRIGGER_DDL = """
 DO $$ BEGIN
     IF NOT EXISTS (

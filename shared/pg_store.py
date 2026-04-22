@@ -22,6 +22,45 @@ from shared.pg_schema import (
 logger = logging.getLogger(__name__)
 
 
+# Schema identifiers are embedded in `SET search_path` and CANNOT be
+# parameterised (Postgres treats identifiers as keywords, not values), so the
+# only protection against SQL injection is a strict allowlist. This regex is
+# intentionally narrow: lowercase start, lowercase/digit/underscore body, max
+# 63 chars (Postgres' NAMEDATALEN-1 identifier limit).
+_SCHEMA_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+
+
+def _validate_schema_name(schema: str) -> str:
+    """Return ``schema`` if it matches the allowlist, else raise ValueError.
+
+    This is the single choke point for validating any schema name that will
+    be embedded in a SQL identifier. Every code path that splices a schema
+    name into SQL must route through this helper.
+    """
+    if not isinstance(schema, str) or not _SCHEMA_NAME_RE.match(schema):
+        raise ValueError(
+            f"Invalid Postgres schema name {schema!r}: must match "
+            f"{_SCHEMA_NAME_RE.pattern} (lowercase start, "
+            "lowercase/digit/underscore only, <=63 chars)"
+        )
+    return schema
+
+
+async def ensure_schema_exists(conn: asyncpg.Connection, schema: str) -> None:
+    """Create ``schema`` if it doesn't exist.
+
+    Call this ONCE, before any DDL, on a bare connection (NOT one obtained
+    from a pool that sets ``search_path`` to the same schema — asking a
+    schema to create itself is a bootstrap paradox).
+
+    The schema name is validated via ``_validate_schema_name`` and then
+    embedded directly in the DDL. There is no parameter binding because
+    Postgres identifiers cannot be parameterised.
+    """
+    schema = _validate_schema_name(schema)
+    await conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+
+
 async def _register_json_codecs(conn: asyncpg.Connection) -> None:
     """Register JSON/JSONB codecs so asyncpg returns Python dicts/lists.
 
@@ -44,56 +83,60 @@ async def _register_json_codecs(conn: asyncpg.Connection) -> None:
     )
 
 
-def _quote_ident(name: str) -> str:
-    """Safely quote a Postgres identifier.
-
-    Schema / table / role names reach us via env vars or caller kwargs,
-    so they must be quoted defensively before being spliced into DDL or
-    ``SET`` statements.  Mirrors ``psycopg2.extensions.quote_ident`` /
-    libpq ``PQescapeIdentifier`` — double-quote, and escape embedded
-    double quotes.
-    """
-    if not isinstance(name, str) or not name:
-        raise ValueError(f"invalid identifier: {name!r}")
-    return '"' + name.replace('"', '""') + '"'
-
-
 async def create_pg_pool(
-    dsn: str, schema: Optional[str] = None, **kwargs,
+    dsn: str,
+    schema: Optional[str] = None,
+    **kwargs,
 ) -> asyncpg.Pool:
     """Create an asyncpg pool with JSON/JSONB codecs pre-registered.
 
-    If ``schema`` is given, every new connection in the pool has its
-    ``search_path`` set to ``<schema>, public`` so unqualified
-    identifiers resolve inside that schema. This is how we isolate
-    testnet / mainnet on a shared cluster.
-
     All radar components should use this helper instead of
-    ``asyncpg.create_pool`` directly so JSONB decoding and schema
-    isolation stay consistent.
+    ``asyncpg.create_pool`` directly so JSONB columns are decoded to Python
+    objects consistently.
+
+    If ``schema`` is provided, every connection borrowed from the pool has
+    its ``search_path`` set to ``"<schema>", public`` before it's handed to
+    the caller — so every unqualified reference (``SELECT ... FROM
+    experiments``) transparently resolves inside that schema, with
+    ``public`` kept as a fallback for cross-schema utilities (e.g. built-in
+    functions). The schema name is validated at pool creation time and will
+    raise ``ValueError`` for anything outside the allowlist, so callers
+    fail fast rather than discovering a mis-set search_path mid-transaction.
+
+    Why ``setup`` and not ``init`` for search_path: asyncpg's pool runs
+    ``RESET ALL;`` on every connection release to scrub session state. That
+    wipes ``search_path`` (and any other SET parameter). ``init`` runs once
+    per physical connection — great for client-side things like codecs that
+    survive ``RESET ALL`` — but useless for SET parameters the pool will
+    reset right after. ``setup`` runs on every acquire, so the SET is
+    replayed each time the connection is handed out, which is what we need.
     """
     user_init = kwargs.pop("init", None)
-    quoted_schema = _quote_ident(schema) if schema else None
+    user_setup = kwargs.pop("setup", None)
+
+    validated_schema = _validate_schema_name(schema) if schema else None
 
     async def _init(conn: asyncpg.Connection) -> None:
+        # Runs once when the connection is first created. Used for things
+        # that survive ``RESET ALL`` (client-side codecs).
         await _register_json_codecs(conn)
-        if quoted_schema is not None:
-            # search_path is session-scoped, so every pooled connection
-            # must set it — including ones recycled after a reset.
-            await conn.execute(f"SET search_path TO {quoted_schema}, public")
         if user_init is not None:
             await user_init(conn)
 
-    return await asyncpg.create_pool(dsn, init=_init, **kwargs)
+    async def _setup(conn: asyncpg.Connection) -> None:
+        # Runs every time a connection is acquired from the pool. Must be
+        # used for any SET parameter the pool's RESET ALL would otherwise
+        # wipe on release (notably search_path).
+        if validated_schema is not None:
+            await conn.execute(
+                f'SET search_path TO "{validated_schema}", public'
+            )
+        if user_setup is not None:
+            await user_setup(conn)
 
-
-async def ensure_schema_exists(conn: asyncpg.Connection, schema: str) -> None:
-    """Idempotently create ``schema`` on the target database.
-
-    Must run on a connection whose role has ``CREATE ON DATABASE``
-    privilege. Safe to call on every startup.
-    """
-    await conn.execute(f"CREATE SCHEMA IF NOT EXISTS {_quote_ident(schema)}")
+    return await asyncpg.create_pool(
+        dsn, init=_init, setup=_setup, **kwargs,
+    )
 
 
 class PgExperimentStore:

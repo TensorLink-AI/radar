@@ -28,10 +28,14 @@ skip_no_pg = pytest.mark.skipif(not PG_DSN, reason="TEST_PG_DSN not set")
 async def _drop_schema(dsn: str, schema: str) -> None:
     """Drop a schema CASCADE on a one-shot connection."""
     import asyncpg
-    from shared.pg_store import _quote_ident
+    from shared.pg_store import _validate_schema_name
+    # Route the name through the same allowlist callers use, so a test
+    # that accidentally picks a name like "pg-catalog" blows up here
+    # instead of corrupting a real schema.
+    safe = _validate_schema_name(schema)
     conn = await asyncpg.connect(dsn)
     try:
-        await conn.execute(f"DROP SCHEMA IF EXISTS {_quote_ident(schema)} CASCADE")
+        await conn.execute(f'DROP SCHEMA IF EXISTS "{safe}" CASCADE')
     finally:
         await conn.close()
 
@@ -215,14 +219,36 @@ async def test_writes_isolated_between_schemas():
             await _drop_schema(PG_DSN, s)
 
 
-def test_quote_ident_rejects_bad_input():
-    """Unit-only guard on the identifier quoter used for SET search_path
-    and CREATE SCHEMA. No Postgres required."""
-    from shared.pg_store import _quote_ident
+def test_validate_schema_name_allowlist():
+    """Unit-only guard on the strict allowlist used for SET search_path
+    and CREATE SCHEMA DDL. No Postgres required.
 
-    assert _quote_ident("mainnet") == '"mainnet"'
-    assert _quote_ident('foo"bar') == '"foo""bar"'
+    Identifiers cannot be parameterised, so this allowlist is the only
+    barrier between a caller-supplied schema name and raw SQL DDL.
+    """
+    from shared.pg_store import _validate_schema_name
 
-    for bad in ("", None, 123):
+    # Accepts: lowercase start, lowercase/digit/underscore body, <=63 chars
+    assert _validate_schema_name("testnet") == "testnet"
+    assert _validate_schema_name("mainnet") == "mainnet"
+    assert _validate_schema_name("radar_test_1") == "radar_test_1"
+    assert _validate_schema_name("a") == "a"
+
+    # Rejects anything outside the allowlist — uppercase, hyphens, quotes,
+    # empties, SQL-injection shapes, overlong names.
+    too_long = "a" + ("b" * 63)  # 64 chars, exceeds Postgres NAMEDATALEN-1
+    bad_inputs = [
+        "",
+        "Mainnet",              # uppercase
+        "1testnet",             # leading digit
+        "test-net",             # hyphen
+        'foo"; DROP SCHEMA x',  # quote + statement break
+        "foo bar",              # whitespace
+        "public.testnet",       # dot
+        too_long,
+        None,
+        123,
+    ]
+    for bad in bad_inputs:
         with pytest.raises(ValueError):
-            _quote_ident(bad)  # type: ignore[arg-type]
+            _validate_schema_name(bad)  # type: ignore[arg-type]

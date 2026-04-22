@@ -1,21 +1,26 @@
 #!/usr/bin/env bash
-# Deploy the centralized Postgres DB server against a Crunchy Bridge cluster.
+# Deploy the centralized Postgres DB server against a managed Postgres
+# (Crunchy Bridge, Supabase, RDS, etc). No local Docker Postgres is started —
+# the DSN points at an external, already-provisioned database.
 #
 # What this does:
-#   1. Reads RADAR_PG_DSN + RADAR_NETWORK from env
-#   2. Runs a connectivity precheck (psql \conninfo) before launching
+#   1. Validates required env vars
+#   2. Runs a psql connectivity precheck (fails fast before uvicorn boots)
 #   3. Exec's database/neuron.py on the requested port / netuid
 #
 # Usage:
-#   RADAR_PG_DSN=postgresql://radar:PW@p.abc.db.postgresbridge.com:5432/radar?sslmode=require \
-#   RADAR_PG_SSL=verify \
-#   RADAR_NETWORK=testnet \
+#   export RADAR_PG_DSN='postgresql://radar:PW@p.abc.db.postgresbridge.com:5432/radar?sslmode=require'
+#   export RADAR_PG_SSL=verify
+#   export RADAR_NETWORK=testnet        # or mainnet
 #   ./scripts/deploy_db_crunchy.sh --netuid 279 --subtensor.network test
 #
 # Required env:
-#   RADAR_PG_DSN          Full Crunchy connection string (include ?sslmode=require)
-#   RADAR_NETWORK         Schema name: testnet | mainnet
+#   RADAR_PG_DSN          Full connection string (include ?sslmode=require)
 #   RADAR_PG_SSL          "verify" (recommended) or "require" (deprecated)
+#   RADAR_NETWORK         Postgres schema — "testnet" or "mainnet"
+#                         A single DB holds BOTH networks, isolated by
+#                         schema. DO NOT set this to "mainnet" unless
+#                         you really mean it.
 #
 # Optional env:
 #   RADAR_DB_API_PORT     API port (default: 8090)
@@ -24,8 +29,9 @@
 #
 # Exits non-zero if:
 #   - required env vars missing
+#   - RADAR_NETWORK isn't testnet/mainnet
 #   - Crunchy is unreachable (DNS, firewall, credentials)
-#   - psql is not installed
+#   - psql not installed
 
 set -euo pipefail
 
@@ -72,7 +78,7 @@ case "${RADAR_PG_SSL}" in
         warn "Prefer RADAR_PG_SSL=verify for Crunchy Bridge."
         ;;
     *)
-        error "RADAR_PG_SSL must be 'verify' or 'require' for Crunchy, got '${RADAR_PG_SSL}'"
+        error "RADAR_PG_SSL must be 'verify' or 'require' for managed Postgres, got '${RADAR_PG_SSL}'"
         exit 2
         ;;
 esac
@@ -82,28 +88,49 @@ if ! command -v psql >/dev/null 2>&1; then
     exit 2
 fi
 
-# ── 2. Connectivity precheck ─────────────────────────────
-info "Step 2/3: Probing Crunchy Bridge"
+# Strip credentials before logging. DSNs look like
+#   postgresql://user:pass@host:port/db
+# so we print everything after the '@'.
+DSN_SANITIZED="$(echo "${RADAR_PG_DSN}" | sed -E 's|://[^@]*@|://<redacted>@|')"
 
-# \conninfo is cheap and proves DNS, TLS, credentials, and role all work.
+# ── 2. Connectivity precheck ─────────────────────────────
+info "Step 2/3: Probing managed Postgres"
+
+# \conninfo proves DNS, TLS, credentials, and role all work.
 # Timeout prevents a hung socket from blocking service startup forever.
 if ! timeout 15 psql "${RADAR_PG_DSN}" -c '\conninfo' >/dev/null 2>&1; then
-    error "Cannot connect to Crunchy via RADAR_PG_DSN."
+    error "Cannot connect to managed Postgres via RADAR_PG_DSN (${DSN_SANITIZED})."
     error "Run this to see the actual error:"
     error "  psql \"\${RADAR_PG_DSN}\" -c '\\conninfo'"
-    error "Common causes: wrong password, IP not on Crunchy allowlist, DNS, expired cert."
+    error "Common causes: wrong password, IP not on cluster allowlist, DNS, expired cert."
     exit 3
 fi
 
 server_version=$(timeout 15 psql "${RADAR_PG_DSN}" -At -c 'SHOW server_version' 2>/dev/null || echo "unknown")
-info "Connected to Crunchy (PostgreSQL ${server_version})"
+info "Connected (PostgreSQL ${server_version})"
 
 # ── 3. Launch DB server ──────────────────────────────────
-info "Step 3/3: Starting database server"
-info "  RADAR_NETWORK=${RADAR_NETWORK}"
+info "Step 3/3: Starting database server on port ${API_PORT}"
+
+if [ "${RADAR_NETWORK}" = "mainnet" ]; then
+    warn "╔════════════════════════════════════════════════════╗"
+    warn "║  RADAR_NETWORK=mainnet — writing to MAINNET schema ║"
+    warn "╚════════════════════════════════════════════════════╝"
+else
+    info "╔════════════════════════════════════════════════════╗"
+    info "║  RADAR_NETWORK=${RADAR_NETWORK} — writing to ${RADAR_NETWORK} schema"
+    info "╚════════════════════════════════════════════════════╝"
+fi
+
+info "Config:"
+info "  RADAR_PG_DSN=${DSN_SANITIZED}"
 info "  RADAR_PG_SSL=${RADAR_PG_SSL}"
+info "  RADAR_NETWORK=${RADAR_NETWORK}"
 info "  RADAR_DB_API_PORT=${API_PORT}"
 info "  Forwarding args: $*"
+echo ""
+info "Validators should set:"
+info "  RADAR_DB_API_URL=http://<this-host>:${API_PORT}"
 echo ""
 
 cd "${PROJECT_DIR}"

@@ -23,7 +23,11 @@ from database.server import (
 )
 from shared.pareto import ParetoFront
 from shared.pg_access_logger import PgAccessLogger
-from shared.pg_store import PgExperimentStore, create_pg_pool, ensure_schema_exists
+from shared.pg_store import (
+    PgExperimentStore,
+    create_pg_pool,
+    ensure_schema_exists,
+)
 from shared.task import load_enabled_tasks
 
 logger = logging.getLogger(__name__)
@@ -67,6 +71,8 @@ class DatabaseNeuron:
         import ssl as _ssl
         import warnings
 
+        import asyncpg
+
         pg_dsn = getattr(self.config, "pg_dsn", None) or Config.PG_DSN
         network = Config.NETWORK
 
@@ -75,8 +81,10 @@ class DatabaseNeuron:
             "max_size": Config.PG_POOL_MAX,
         }
 
-        # TLS: "" → off, "verify" → full verification (recommended),
-        # "require" → TLS without verification (deprecated).
+        # TLS: "" → off, "verify" → full verification (recommended for
+        # managed Postgres / Crunchy Bridge), "require" → TLS without
+        # verification (deprecated, kept so operators relying on the
+        # legacy skip-verify behaviour aren't silently changed).
         if Config.PG_SSL == "verify":
             pool_kwargs["ssl"] = _ssl.create_default_context()
         elif Config.PG_SSL == "require":
@@ -100,27 +108,35 @@ class DatabaseNeuron:
 
         # Explicit opt-in to disable asyncpg's prepared-statement cache
         # (required by transaction-mode poolers like Supavisor / PgBouncer).
-        # Direct Crunchy / local connections should leave this unset.
+        # Direct Crunchy / local connections should leave this unset so
+        # asyncpg's normal cache is used.
         if Config.PG_STATEMENT_CACHE_SIZE != "":
             pool_kwargs["statement_cache_size"] = int(Config.PG_STATEMENT_CACHE_SIZE)
 
-        # Ensure the network's schema exists before opening the main pool.
-        # Done on a short-lived direct connection so we don't set
-        # search_path to a schema that may not exist yet on a fresh
-        # cluster.  Only ssl / statement_cache_size carry over.
-        import asyncpg as _asyncpg
-        conn_kwargs = {
+        # Bootstrap step: CREATE SCHEMA must run on a connection whose
+        # search_path is NOT already set to that schema (otherwise we're
+        # asking the schema to create itself). Use a bare asyncpg.connect
+        # so no pool init/setup hook runs.
+        logger.info(
+            "Bootstrapping Postgres schema %r (RADAR_NETWORK)", network,
+        )
+        bootstrap_kwargs = {
             k: pool_kwargs[k]
             for k in ("ssl", "statement_cache_size")
             if k in pool_kwargs
         }
-        bootstrap_conn = await _asyncpg.connect(pg_dsn, **conn_kwargs)
+        bootstrap_conn = await asyncpg.connect(pg_dsn, **bootstrap_kwargs)
         try:
             await ensure_schema_exists(bootstrap_conn, network)
         finally:
             await bootstrap_conn.close()
 
-        self.pool = await create_pg_pool(pg_dsn, schema=network, **pool_kwargs)
+        # Every connection borrowed from this pool will have its search_path
+        # pinned to `"<network>", public`, so all unqualified DDL/DML that
+        # follows resolves to tables inside this schema.
+        self.pool = await create_pg_pool(
+            pg_dsn, schema=network, **pool_kwargs,
+        )
         self.store = PgExperimentStore(self.pool)
         await self.store.init_schema()
 
@@ -199,7 +215,7 @@ class DatabaseNeuron:
                 logger.warning("Dashboard mount failed: %s", e)
 
         logger.info(
-            "Database initialized: schema=%s, pool_min=%d, pool_max=%d, ssl=%r",
+            "Database initialized: schema=%r pool_min=%d pool_max=%d ssl=%r",
             network, Config.PG_POOL_MIN, Config.PG_POOL_MAX, Config.PG_SSL or "off",
         )
 
@@ -280,8 +296,9 @@ class DatabaseNeuron:
 
         db_size = await self.store.get_size()
         logger.info(
-            "Database server starting on port %d. DB: %d experiments, tasks: %s",
-            self.port, db_size, list(self.tasks.keys()),
+            "Database server starting on port %d (network=%s). "
+            "DB: %d experiments, tasks: %s",
+            self.port, Config.NETWORK, db_size, list(self.tasks.keys()),
         )
 
         # Start uvicorn in background
