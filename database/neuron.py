@@ -211,11 +211,32 @@ class DatabaseNeuron:
         set_hotkey_map(hotkey_map)
         set_auth(self.metagraph)
 
+    def _refresh_round_id(self) -> int:
+        """Recompute the current round_id from chain height and push it to
+        the access logger so miner_access_log rows get the right tag.
+
+        Returns the round_id now in effect, or -1 if the subtensor read
+        failed.
+        """
+        from shared.challenge import round_id_from_block
+        try:
+            current_block = self.subtensor.block
+        except Exception as e:
+            logger.warning("Round refresh: subtensor read failed: %s", e)
+            return -1
+        round_id = round_id_from_block(
+            current_block, Config.ROUND_INTERVAL_BLOCKS,
+        )
+        if self.access_logger is not None:
+            self.access_logger.set_round(round_id)
+        return round_id
+
     async def run(self):
         """Main loop: init DB, start server, periodic metagraph sync."""
         await self._init_db()
         await self._rebuild_pareto()
         self._sync_metagraph()
+        self._refresh_round_id()
 
         db_size = await self.store.get_size()
         logger.info(
@@ -232,6 +253,19 @@ class DatabaseNeuron:
         server = uvicorn.Server(server_config)
         server_task = asyncio.create_task(server.serve())
 
+        # Round tracker — rounds are ~55 min (275 blocks × 12s), so a 30s
+        # poll keeps miner_access_log.round_id within one block of the
+        # actual round boundary.
+        async def _round_loop():
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    self._refresh_round_id()
+                except Exception as e:
+                    logger.warning("Round refresh loop: %s", e)
+
+        round_task = asyncio.create_task(_round_loop())
+
         # Periodic metagraph sync
         try:
             while True:
@@ -242,6 +276,7 @@ class DatabaseNeuron:
                 except Exception as e:
                     logger.warning("Metagraph sync failed: %s", e)
         except asyncio.CancelledError:
+            round_task.cancel()
             server.should_exit = True
             await server_task
 
