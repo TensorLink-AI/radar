@@ -41,6 +41,9 @@ class PgAccessLogger:
     ):
         """Append one access record."""
         import json
+        # Coerce to list so the JSONB column always stores an array — scalars
+        # would break `jsonb_array_elements_text` on the read side.
+        ids_list = list(experiment_ids) if experiment_ids else []
         now = time.time()
         await self.pool.execute(
             "INSERT INTO miner_access_log "
@@ -48,9 +51,9 @@ class PgAccessLogger:
             " timestamp, round_id) "
             "VALUES ($1, $2, $3, $4, $5, $6, $7)",
             hotkey, miner_uid, endpoint, method,
-            json.dumps(experiment_ids), now, self._round_id,
+            json.dumps(ids_list), now, self._round_id,
         )
-        self._current_round.setdefault(hotkey, set()).update(experiment_ids)
+        self._current_round.setdefault(hotkey, set()).update(ids_list)
 
     async def log_request(
         self,

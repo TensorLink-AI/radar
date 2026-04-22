@@ -123,7 +123,8 @@ class PgProvenanceQuery:
                 "jsonb_array_elements(a.experiment_ids) j "
                 "JOIN experiments e ON e.miner_hotkey = a.hotkey "
                 "  AND e.round_id = a.round_id "
-                "WHERE j::text::integer = $1 AND e.id > $1",
+                "WHERE jsonb_typeof(a.experiment_ids) = 'array' "
+                "  AND j::text::integer = $1 AND e.id > $1",
                 experiment_id,
             )
             for row in rows:
