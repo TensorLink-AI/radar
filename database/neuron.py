@@ -35,7 +35,11 @@ from database.server import (
 )
 from shared.pareto import ParetoFront
 from shared.pg_access_logger import PgAccessLogger
-from shared.pg_store import PgExperimentStore, create_pg_pool
+from shared.pg_store import (
+    PgExperimentStore,
+    create_pg_pool,
+    ensure_schema_exists,
+)
 from shared.task import load_enabled_tasks
 
 logger = logging.getLogger(__name__)
@@ -109,30 +113,55 @@ class DatabaseNeuron:
         can tighten dashboard-mode pressure independently.
         """
         import ssl as _ssl
+        import warnings
+
+        import asyncpg
 
         pg_dsn = getattr(self.config, "pg_dsn", None) or Config.PG_DSN
+        network = Config.NETWORK
 
         pool_kwargs: dict = {
             "min_size": Config.PG_POOL_MIN,
             "max_size": Config.PG_POOL_MAX,
         }
 
-        # SSL support (required for Supabase / managed Postgres)
-        if Config.PG_SSL:
+        # TLS: "" → off, "verify" → full verification (recommended for
+        # managed Postgres / Crunchy Bridge), "require" → TLS without
+        # verification (deprecated, kept so operators relying on the
+        # legacy skip-verify behaviour aren't silently changed).
+        if Config.PG_SSL == "verify":
+            pool_kwargs["ssl"] = _ssl.create_default_context()
+        elif Config.PG_SSL == "require":
+            warnings.warn(
+                "RADAR_PG_SSL=require establishes TLS but skips hostname / "
+                "certificate verification. This preserves pre-Crunchy "
+                "behaviour and will be removed in a future release. Set "
+                "RADAR_PG_SSL=verify for managed Postgres.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             ctx = _ssl.create_default_context()
-            if Config.PG_SSL == "require":
-                ctx.check_hostname = False
-                ctx.verify_mode = _ssl.CERT_NONE
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
             pool_kwargs["ssl"] = ctx
+        elif Config.PG_SSL:
+            raise ValueError(
+                f"Unknown RADAR_PG_SSL value: {Config.PG_SSL!r}. "
+                "Valid values: '' (off), 'require' (deprecated), 'verify'."
+            )
 
-        # Disable prepared-statement cache when using connection poolers
-        # (e.g. Supabase Supavisor in transaction mode).
-        if Config.PG_SSL or "supabase" in pg_dsn:
-            pool_kwargs["statement_cache_size"] = 0
+        # Explicit opt-in to disable asyncpg's prepared-statement cache
+        # (required by transaction-mode poolers like Supavisor / PgBouncer).
+        # Direct Crunchy / local connections should leave this unset so
+        # asyncpg's normal cache is used.
+        if Config.PG_STATEMENT_CACHE_SIZE != "":
+            pool_kwargs["statement_cache_size"] = int(Config.PG_STATEMENT_CACHE_SIZE)
 
-        # Apply statement_timeout when configured — lets dashboard-mode
-        # deployments cap slow public queries without affecting the
-        # validator pool.
+        # Apply statement_timeout per-connection when configured — lets
+        # dashboard-mode deployments cap slow public queries without
+        # affecting the validator pool. Runs in `init=` (once per physical
+        # connection) rather than `setup=` because statement_timeout
+        # survives RESET ALL on release.
         if Config.PG_STATEMENT_TIMEOUT_MS > 0:
             timeout_ms = int(Config.PG_STATEMENT_TIMEOUT_MS)
 
@@ -141,7 +170,33 @@ class DatabaseNeuron:
 
             pool_kwargs["init"] = _apply_timeout
 
-        self.pool = await create_pg_pool(pg_dsn, **pool_kwargs)
+        # Bootstrap step: CREATE SCHEMA must run on a connection whose
+        # search_path is NOT already set to that schema (otherwise we're
+        # asking the schema to create itself). Use a bare asyncpg.connect
+        # so no pool init/setup hook runs. Both validator and dashboard
+        # modes run this — dashboard mode starting before the validator
+        # needs the schema to exist too, and CREATE SCHEMA IF NOT EXISTS
+        # is idempotent.
+        logger.info(
+            "Bootstrapping Postgres schema %r (RADAR_NETWORK)", network,
+        )
+        bootstrap_kwargs = {
+            k: pool_kwargs[k]
+            for k in ("ssl", "statement_cache_size")
+            if k in pool_kwargs
+        }
+        bootstrap_conn = await asyncpg.connect(pg_dsn, **bootstrap_kwargs)
+        try:
+            await ensure_schema_exists(bootstrap_conn, network)
+        finally:
+            await bootstrap_conn.close()
+
+        # Every connection borrowed from this pool will have its search_path
+        # pinned to `"<network>", public`, so all unqualified DDL/DML that
+        # follows resolves to tables inside this schema.
+        self.pool = await create_pg_pool(
+            pg_dsn, schema=network, **pool_kwargs,
+        )
         self.store = PgExperimentStore(self.pool)
         await self.store.init_schema()
 
@@ -244,7 +299,9 @@ class DatabaseNeuron:
         self._maybe_mount_cors()
 
         logger.info(
-            "Database initialized (mode=%s), schemas created", self.mode,
+            "Database initialized: mode=%s schema=%r pool_min=%d pool_max=%d ssl=%r",
+            self.mode, Config.NETWORK,
+            Config.PG_POOL_MIN, Config.PG_POOL_MAX, Config.PG_SSL or "off",
         )
 
     def _maybe_mount_cors(self):
@@ -360,8 +417,10 @@ class DatabaseNeuron:
 
         db_size = await self.store.get_size()
         logger.info(
-            "DB server starting on port %d (mode=%s). DB: %d experiments, tasks: %s",
-            self.port, self.mode, db_size, list(self.tasks.keys()),
+            "DB server starting on port %d (mode=%s network=%s). "
+            "DB: %d experiments, tasks: %s",
+            self.port, self.mode, Config.NETWORK,
+            db_size, list(self.tasks.keys()),
         )
 
         # Start uvicorn in background

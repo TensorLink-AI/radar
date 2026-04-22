@@ -71,10 +71,20 @@ END;
 $$ LANGUAGE plpgsql;
 """
 
+# The IF NOT EXISTS guard must be scoped to the current schema's experiments
+# table because tgname is unique per-relation, not globally. Under multi-
+# network deployments (testnet + mainnet schemas in the same database) an
+# unqualified ``tgname = 'experiments_search_trigger'`` check matches the
+# OTHER schema's trigger and silently skips creation here, leaving this
+# schema's experiments without the FTS trigger. Casting ``'experiments'`` to
+# ``regclass`` resolves it via the session's search_path, so each schema
+# gets its own trigger.
 FTS_TRIGGER_DDL = """
 DO $$ BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM pg_trigger WHERE tgname = 'experiments_search_trigger'
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'experiments_search_trigger'
+          AND tgrelid = 'experiments'::regclass
     ) THEN
         CREATE TRIGGER experiments_search_trigger
             BEFORE INSERT OR UPDATE ON experiments

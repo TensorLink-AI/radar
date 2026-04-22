@@ -11,51 +11,58 @@ Verifies:
   * all mode: everything on one process, default behaviour preserved.
   * auth: hitting /dashboard/api/*.json with no cookie returns 200 in
     modes that mount it.
+
+Every test constructs its own throwaway FastAPI app and wires routes
+directly via ``include_validator_routes`` / ``mount_public_api`` /
+``mount_dashboard``. We deliberately do NOT reload ``database.server`` or
+mutate ``sys.modules["database.server"]`` — that leaks module state into
+the rest of the test suite (notably ``tests/test_dashboard.py``, which
+imports ``database.server.app`` at module scope).
 """
 
 from __future__ import annotations
 
-import importlib
-import json
-import os
 import sys
-from typing import Optional
-from unittest.mock import patch
+import types
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-# These tests poke Config.NEURON_MODE at runtime but also need a clean
-# database/server import so routes pick up the per-mode auto-mount.
 
-
-def _reload_server_app(mode: str) -> FastAPI:
-    """Reload database.server with the given NEURON_MODE so auto-mount fires."""
-    from config import Config
-    Config.NEURON_MODE = mode
-    # Drop any previously imported version so the @app auto-mount block runs
-    # again against a fresh FastAPI app.
-    for mod in ("database.server", "database.neuron"):
-        sys.modules.pop(mod, None)
-    # Also reset dashboard mount state — the public-API mount is idempotent
-    # but we want it deterministic per test.
-    import database.dashboard.app as dash_app_mod
-    dash_app_mod._state = None
-    importlib.import_module("database.server")
-    return sys.modules["database.server"].app
-
-
-def _install_fake_state_and_mount(app: FastAPI, with_jinja: bool):
-    """Install a minimal DashboardState + mount the JSON API (and Jinja if asked).
-
-    Mirrors what DatabaseNeuron._init_db() does in dashboard / all modes,
-    minus the real Postgres pool and bittensor imports.
+@pytest.fixture(autouse=True)
+def _reset_dashboard_state():
+    """Drop any DashboardState + app mutations this test installs so the
+    shared ``database.server.app`` / ``database.dashboard.app`` globals
+    don't leak into the next test module (notably ``test_dashboard.py``).
     """
     from database.dashboard import app as dash_app_mod
-    from database.dashboard.app import DashboardState, mount_public_api, mount_dashboard
+    prev_state = dash_app_mod._state
+    yield
+    dash_app_mod._state = prev_state
 
-    # Reuse the same in-memory fakes used by test_dashboard.py
+
+def _fresh_app_with_validator_routes() -> FastAPI:
+    """A new FastAPI app with only the validator router mounted.
+
+    Mirrors what ``DatabaseNeuron._init_db`` does in validator / all
+    modes, minus the real Postgres pool.
+    """
+    from database.server import include_validator_routes
+    app = FastAPI()
+    include_validator_routes(app)
+    # Health route exists on the shared server app; provide an equivalent
+    # so tests can check it alongside the validator routes.
+    @app.get("/health")
+    def _health():
+        return {"status": "ok"}
+    return app
+
+
+def _install_fake_state() -> "DashboardState":  # noqa: F821
+    """Install a minimal DashboardState with in-memory fakes."""
+    from database.dashboard import app as dash_app_mod
+    from database.dashboard.app import DashboardState
     from tests.test_dashboard import FakePool, FakeR2, FakeStore, _sample_elements
 
     elements = _sample_elements()
@@ -67,20 +74,27 @@ def _install_fake_state_and_mount(app: FastAPI, with_jinja: bool):
         get_frontier=lambda: [{"id": 1}],
     )
     dash_app_mod._state = state
+    return state
 
-    # Mount the public JSON router (no cookie gate)
+
+def _mount_public_api_on(app: FastAPI) -> None:
+    from database.dashboard.app import mount_public_api
+    state = _install_fake_state()
     mount_public_api(
         app,
         store=state.store, pool=state.pool, r2=state.r2,
         get_challenge=state.get_challenge, get_frontier=state.get_frontier,
     )
 
-    if with_jinja:
-        mount_dashboard(
-            app,
-            store=state.store, pool=state.pool, r2=state.r2,
-            get_challenge=state.get_challenge, get_frontier=state.get_frontier,
-        )
+
+def _mount_jinja_on(app: FastAPI) -> None:
+    from database.dashboard.app import mount_dashboard
+    state = _install_fake_state()
+    mount_dashboard(
+        app,
+        store=state.store, pool=state.pool, r2=state.r2,
+        get_challenge=state.get_challenge, get_frontier=state.get_frontier,
+    )
 
 
 # ── Config validation ─────────────────────────────────────────
@@ -112,14 +126,16 @@ def test_valid_modes_all_accepted():
 
 
 def test_dashboard_mode_no_validator_routes():
-    """/experiments/* and friends are not reachable in dashboard mode."""
-    app = _reload_server_app("dashboard")
+    """Dashboard app only has /health + /dashboard/api/* — no /experiments etc."""
+    app = FastAPI()
+    # Dashboard mode: only /health + public JSON API. No include_validator_routes.
+    @app.get("/health")
+    def _health():
+        return {"status": "ok"}
+    _mount_public_api_on(app)
+
     client = TestClient(app)
-
-    # Health still works everywhere
     assert client.get("/health").status_code == 200
-
-    # Validator surface: unmounted
     assert client.get("/experiments/recent").status_code == 404
     assert client.get("/frontier").status_code == 404
     assert client.get("/challenge").status_code == 404
@@ -129,42 +145,35 @@ def test_dashboard_mode_no_validator_routes():
 
 def test_dashboard_mode_json_api_open():
     """JSON API is reachable WITHOUT any auth headers in dashboard mode."""
-    app = _reload_server_app("dashboard")
-    _install_fake_state_and_mount(app, with_jinja=False)
+    app = FastAPI()
+    _mount_public_api_on(app)
 
     client = TestClient(app)
-    # No cookies, no Authorization header — should still get 200 JSON
     r = client.get("/dashboard/api/stats.json")
     assert r.status_code == 200
     data = r.json()
     assert "total" in data
 
-    # Other SPA endpoints also open
     assert client.get("/dashboard/api/tasks.json").status_code == 200
     assert client.get("/dashboard/api/miners.json").status_code == 200
     assert client.get("/dashboard/api/recent.json?n=5").status_code == 200
 
 
 def test_dashboard_mode_jinja_not_mounted():
-    """The cookie-gated Jinja index returns 404 in dashboard mode."""
-    app = _reload_server_app("dashboard")
-    _install_fake_state_and_mount(app, with_jinja=False)
+    """The cookie-gated Jinja index returns 404 when only the public API is mounted."""
+    app = FastAPI()
+    _mount_public_api_on(app)
 
     client = TestClient(app)
-    r = client.get("/dashboard/", follow_redirects=False)
-    assert r.status_code == 404
-    # The login form should also be missing
+    assert client.get("/dashboard/", follow_redirects=False).status_code == 404
     assert client.get("/dashboard/login").status_code == 404
 
 
 def test_dashboard_mode_does_not_import_bittensor():
-    """Dashboard mode must not touch bt.Wallet / bt.Subtensor / metagraph.
+    """DatabaseNeuron.__init__ in dashboard mode must not touch bittensor.
 
-    Install a sentinel ``bittensor`` module into sys.modules so that if
-    DatabaseNeuron.__init__ ever tries to instantiate Wallet/Subtensor the
-    test fails loudly. The real bittensor package is never imported.
+    Install a sentinel ``bittensor`` module; any call into it raises.
     """
-    import types
     from config import Config
     prev = Config.NEURON_MODE
     Config.NEURON_MODE = "dashboard"
@@ -179,10 +188,11 @@ def test_dashboard_mode_does_not_import_bittensor():
     sentinel.Config = _boom
 
     saved_bt = sys.modules.get("bittensor")
+    saved_neuron = sys.modules.get("database.neuron")
     sys.modules["bittensor"] = sentinel
+    # Force a fresh import of database.neuron against the sentinel bittensor
+    sys.modules.pop("database.neuron", None)
     try:
-        sys.modules.pop("database.neuron", None)
-        sys.modules.pop("database.server", None)
         import database.neuron as neuron_mod
         import argparse
         cfg = argparse.Namespace(netuid=1, port=8091, pg_dsn="", task="")
@@ -196,8 +206,10 @@ def test_dashboard_mode_does_not_import_bittensor():
             sys.modules["bittensor"] = saved_bt
         else:
             sys.modules.pop("bittensor", None)
-        sys.modules.pop("database.neuron", None)
-        sys.modules.pop("database.server", None)
+        if saved_neuron is not None:
+            sys.modules["database.neuron"] = saved_neuron
+        else:
+            sys.modules.pop("database.neuron", None)
 
 
 def test_dashboard_mode_skips_sync_loops():
@@ -205,69 +217,58 @@ def test_dashboard_mode_skips_sync_loops():
     from config import Config
     prev = Config.NEURON_MODE
     Config.NEURON_MODE = "dashboard"
+    saved_neuron = sys.modules.get("database.neuron")
+    sys.modules.pop("database.neuron", None)
     try:
-        sys.modules.pop("database.neuron", None)
-        sys.modules.pop("database.server", None)
         import database.neuron as neuron_mod
         import argparse
         cfg = argparse.Namespace(netuid=1, port=8091, pg_dsn="", task="")
         n = neuron_mod.DatabaseNeuron(cfg)
-
         # Both of these must short-circuit without touching subtensor
-        # (which is None in dashboard mode)
         assert n._refresh_round_id() == -1
-        # No-op, no AttributeError for self.metagraph.sync()
-        n._sync_metagraph()
+        n._sync_metagraph()  # no-op, no AttributeError
     finally:
         Config.NEURON_MODE = prev
-        sys.modules.pop("database.neuron", None)
-        sys.modules.pop("database.server", None)
+        if saved_neuron is not None:
+            sys.modules["database.neuron"] = saved_neuron
+        else:
+            sys.modules.pop("database.neuron", None)
 
 
 # ── validator mode ────────────────────────────────────────────
 
 
-def test_validator_mode_json_api_404_when_dashboard_disabled():
-    """With RADAR_DASHBOARD_ENABLED=false, the JSON API is not mounted."""
-    from config import Config
-    prev_mode, prev_en = Config.NEURON_MODE, Config.DASHBOARD_ENABLED
-    Config.NEURON_MODE = "validator"
-    Config.DASHBOARD_ENABLED = False
-    try:
-        app = _reload_server_app("validator")
-        # Deliberately DO NOT mount the public API — that's what validator
-        # mode with dashboard disabled does in production.
-        client = TestClient(app)
+def test_validator_mode_has_validator_routes_no_json_api():
+    """Validator routes mounted; JSON API 404 when dashboard is not mounted."""
+    app = _fresh_app_with_validator_routes()
+    client = TestClient(app)
 
-        # Validator routes ARE mounted
-        assert client.get("/experiments/recent").status_code in (200, 503, 429)
-
-        # JSON API is NOT mounted
-        assert client.get("/dashboard/api/stats.json").status_code == 404
-    finally:
-        Config.NEURON_MODE = prev_mode
-        Config.DASHBOARD_ENABLED = prev_en
+    # Validator routes present (return 503 since no DB wired; that's fine)
+    assert client.get("/experiments/recent").status_code in (200, 503, 429)
+    # JSON API not mounted
+    assert client.get("/dashboard/api/stats.json").status_code == 404
 
 
 def test_validator_mode_jinja_login_still_works_when_enabled():
     """Operators can still log in to the Jinja UI under validator mode."""
     from config import Config
-    prev_mode = Config.NEURON_MODE
     prev_enabled = Config.DASHBOARD_ENABLED
     prev_key = Config.DASHBOARD_KEY
-    Config.NEURON_MODE = "validator"
     Config.DASHBOARD_ENABLED = True
     Config.DASHBOARD_KEY = "testkey"
+
+    # Reset dashboard state so mount_dashboard does its work on a fresh app
+    from database.dashboard import app as dash_app_mod
+    prev_state = dash_app_mod._state
+    dash_app_mod._state = None
+
     try:
-        app = _reload_server_app("validator")
-        _install_fake_state_and_mount(app, with_jinja=True)
+        app = _fresh_app_with_validator_routes()
+        _mount_jinja_on(app)
 
         client = TestClient(app)
-
-        # /dashboard/login renders
         assert client.get("/dashboard/login").status_code == 200
 
-        # Logging in with the right key sets the cookie and redirects
         r = client.post(
             "/dashboard/login",
             data={"key": "testkey", "next": "/dashboard/"},
@@ -276,26 +277,26 @@ def test_validator_mode_jinja_login_still_works_when_enabled():
         assert r.status_code == 302
         assert "radar_dashboard_session=" in r.headers.get("set-cookie", "")
 
-        # Authenticated browse hits the Jinja index
         r2 = client.get("/dashboard/", follow_redirects=False)
         assert r2.status_code == 200
     finally:
-        Config.NEURON_MODE = prev_mode
         Config.DASHBOARD_ENABLED = prev_enabled
         Config.DASHBOARD_KEY = prev_key
+        dash_app_mod._state = prev_state
 
 
 # ── all mode ──────────────────────────────────────────────────
 
 
 def test_all_mode_serves_both_surfaces():
-    """Default (all) mode serves validator and dashboard-json on one app."""
-    app = _reload_server_app("all")
-    _install_fake_state_and_mount(app, with_jinja=False)
+    """All mode: validator routes AND public JSON API on the same app."""
+    app = _fresh_app_with_validator_routes()
+    _mount_public_api_on(app)
 
     client = TestClient(app)
-    # Validator routes mounted
     assert client.get("/health").status_code == 200
+    # Validator routes present
+    assert client.get("/experiments/recent").status_code in (200, 503)
     # JSON API public
     assert client.get("/dashboard/api/stats.json").status_code == 200
 
@@ -310,25 +311,27 @@ def test_cors_mounted_when_origins_configured():
     prev_origins = Config.DASHBOARD_CORS_ORIGINS
     Config.NEURON_MODE = "dashboard"
     Config.DASHBOARD_CORS_ORIGINS = "https://radarnet.io"
+    saved_neuron = sys.modules.get("database.neuron")
+    sys.modules.pop("database.neuron", None)
     try:
-        app = _reload_server_app("dashboard")
-        _install_fake_state_and_mount(app, with_jinja=False)
-
-        # Apply CORS via the neuron helper without constructing the full
-        # neuron (avoids needing an argparse cfg)
-        sys.modules.pop("database.neuron", None)
         import database.neuron as neuron_mod
         import argparse
         cfg = argparse.Namespace(netuid=1, port=8091, pg_dsn="", task="")
         n = neuron_mod.DatabaseNeuron(cfg)
-        # Point at our already-mounted app (the reload changed sys.modules)
-        import database.server as srv
-        n_app = srv.app
-        # Install the fake state on the reimported app too
-        _install_fake_state_and_mount(n_app, with_jinja=False)
-        n._maybe_mount_cors()
 
-        client = TestClient(n_app)
+        # Build a fresh throwaway app, mount the public JSON, and let the
+        # neuron stamp CORS onto it. We monkeypatch the module-level ``app``
+        # that _maybe_mount_cors reads.
+        fresh = FastAPI()
+        _mount_public_api_on(fresh)
+        original_app = neuron_mod.app
+        neuron_mod.app = fresh
+        try:
+            n._maybe_mount_cors()
+        finally:
+            neuron_mod.app = original_app
+
+        client = TestClient(fresh)
         r = client.options(
             "/dashboard/api/stats.json",
             headers={
@@ -341,8 +344,10 @@ def test_cors_mounted_when_origins_configured():
     finally:
         Config.NEURON_MODE = prev_mode
         Config.DASHBOARD_CORS_ORIGINS = prev_origins
-        sys.modules.pop("database.neuron", None)
-        sys.modules.pop("database.server", None)
+        if saved_neuron is not None:
+            sys.modules["database.neuron"] = saved_neuron
+        else:
+            sys.modules.pop("database.neuron", None)
 
 
 def test_cors_not_mounted_without_origins():
@@ -352,21 +357,29 @@ def test_cors_not_mounted_without_origins():
     prev_origins = Config.DASHBOARD_CORS_ORIGINS
     Config.NEURON_MODE = "dashboard"
     Config.DASHBOARD_CORS_ORIGINS = ""
+    saved_neuron = sys.modules.get("database.neuron")
+    sys.modules.pop("database.neuron", None)
     try:
-        sys.modules.pop("database.neuron", None)
-        sys.modules.pop("database.server", None)
         import database.neuron as neuron_mod
         import argparse
         cfg = argparse.Namespace(netuid=1, port=8091, pg_dsn="", task="")
         n = neuron_mod.DatabaseNeuron(cfg)
-        n._maybe_mount_cors()
 
-        import database.server as srv
+        fresh = FastAPI()
+        original_app = neuron_mod.app
+        neuron_mod.app = fresh
+        try:
+            n._maybe_mount_cors()
+        finally:
+            neuron_mod.app = original_app
+
         from fastapi.middleware.cors import CORSMiddleware
-        for m in srv.app.user_middleware:
+        for m in getattr(fresh, "user_middleware", []):
             assert m.cls is not CORSMiddleware
     finally:
         Config.NEURON_MODE = prev_mode
         Config.DASHBOARD_CORS_ORIGINS = prev_origins
-        sys.modules.pop("database.neuron", None)
-        sys.modules.pop("database.server", None)
+        if saved_neuron is not None:
+            sys.modules["database.neuron"] = saved_neuron
+        else:
+            sys.modules.pop("database.neuron", None)

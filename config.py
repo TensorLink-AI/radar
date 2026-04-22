@@ -189,16 +189,48 @@ class Config:
 
     # ── Postgres ──────────────────────────────────────────────
     PG_DSN: str = os.getenv("RADAR_PG_DSN", "postgresql://radar:radar@localhost:5432/radar")
-    # Set to "require" for Supabase/managed Postgres, "" for local
+    # TLS mode for the asyncpg pool:
+    #   ""        → no TLS (local Docker)
+    #   "require" → TLS without verification. DEPRECATED: preserves the
+    #               historical behaviour that skipped hostname/cert checks,
+    #               kept for operators who rely on it. Emits a runtime
+    #               warning.  Prefer "verify" for any managed Postgres.
+    #   "verify"  → TLS with full hostname + certificate verification.
+    #               Required for Crunchy Bridge / any production
+    #               managed-Postgres deployment.
     PG_SSL: str = os.getenv("RADAR_PG_SSL", "")
-    # Explicit pool sizing per mode, overridable per deployment. Validator mode
-    # typically wants larger pools (many concurrent writers). Dashboard mode
-    # wants smaller pools paired with a statement_timeout so a slow public
-    # query can't pressure the shared Crunchy cluster.
+    # asyncpg pool sizing. Total max across all DB-server processes
+    # should stay under the cluster's max_connections. Validator mode
+    # typically wants larger pools (many concurrent writers); dashboard
+    # mode wants smaller pools paired with a statement_timeout so a slow
+    # public query can't pressure the shared cluster.
     PG_POOL_MIN: int = int(os.getenv("RADAR_PG_POOL_MIN", "2"))
     PG_POOL_MAX: int = int(os.getenv("RADAR_PG_POOL_MAX", "10"))
+    # Set to 0 when the DSN points at a transaction-mode pooler
+    # (Supabase Supavisor, PgBouncer) that forbids server-side
+    # prepared statements. Leave unset for direct connections.
+    PG_STATEMENT_CACHE_SIZE: str = os.getenv("RADAR_PG_STATEMENT_CACHE_SIZE", "")
+    # `SET statement_timeout` applied on every pool connection. 0 = no
+    # timeout. Set to 5000 (5s) on dashboard-mode deploys so a slow
+    # public query can't pressure the shared Crunchy cluster.
     PG_STATEMENT_TIMEOUT_MS: int = int(os.getenv("RADAR_PG_STATEMENT_TIMEOUT_MS", "0"))
-    # 0 = no timeout. Set to 5000 (5s) in production for dashboard-mode deploys.
+
+    # ── Network / Schema Isolation ────────────────────────────
+    # Which Bittensor network this DB process serves: "testnet" or "mainnet".
+    # A single Postgres database holds BOTH networks; isolation is enforced by
+    # Postgres *schemas* (NOT a `network` tag column, NOT separate DBs).
+    #
+    # Why schemas, not a tag column:
+    #   - zero changes to existing SQL (search_path handles qualification)
+    #   - impossible to accidentally leak cross-network rows via a forgotten
+    #     WHERE clause — the other schema's tables are simply invisible
+    #   - per-network backup / drop / restore is trivial (pg_dump --schema=...)
+    #   - per-schema sequences keep experiment IDs independent per network
+    #
+    # The value is embedded in `SET search_path` at connection time, so the
+    # allowlist regex in shared/pg_store.py is the *only* thing preventing
+    # SQL injection via this variable. Defaults to "testnet" for safety.
+    NETWORK: str = os.getenv("RADAR_NETWORK", "testnet")
 
     # ── Neuron Mode ───────────────────────────────────────────
     # RADAR_NEURON_MODE controls which surface this process serves.
