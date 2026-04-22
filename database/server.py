@@ -14,14 +14,20 @@ import time
 from collections import defaultdict
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
+from config import Config
 from shared.access_logger import extract_ids_from_body
 from shared.pg_access_logger import PgAccessLogger
 
 app = FastAPI(title="RADAR Experiment DB (Centralized)")
+
+# Validator-surface routes (Epistula-authed): /experiments/*, /challenge,
+# /frontier, /provenance/*, /agent_code/*. Included in modes {validator, all}
+# via include_validator_routes(); dashboard-only processes never mount these.
+validator_router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +237,18 @@ def _check_nonce(nonce: str) -> bool:
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Epistula auth on protected routes with IP-level flood protection."""
+    """Epistula auth on protected routes with IP-level flood protection.
+
+    In ``dashboard`` mode the validator routes are not mounted at all, so
+    auth/rate-limit/nonce checks are skipped entirely — the dashboard
+    process only serves the public JSON API and never sees Epistula
+    traffic.
+    """
+    # Dashboard mode: no Epistula, no nonce cache, no IP rate limit.
+    # The public JSON API is open by design.
+    if Config.NEURON_MODE == "dashboard":
+        return await call_next(request)
+
     # ── IP-level rate limit (pre-auth, blocks unauthenticated floods) ──
     client_ip = request.client.host if request.client else "unknown"
     if not _check_ip_rate_limit(client_ip):
@@ -263,7 +280,6 @@ async def auth_middleware(request: Request, call_next):
             )
 
         # ── Validator API key: trusted proxy, skip Epistula ──
-        from config import Config
         proxy_authed = False
         if Config.DB_API_KEY:
             import secrets as _secrets
@@ -356,14 +372,14 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/challenge")
+@validator_router.get("/challenge")
 def get_challenge():
     if _current_challenge is None:
         raise HTTPException(status_code=404, detail="No active challenge")
     return _current_challenge
 
 
-@app.get("/frontier")
+@validator_router.get("/frontier")
 def get_frontier():
     if _current_frontier is None:
         raise HTTPException(status_code=404, detail="No frontier available")
@@ -372,7 +388,7 @@ def get_frontier():
 
 # ── Read endpoints (same paths as old db_server.py) ──────
 
-@app.get("/experiments/pareto")
+@validator_router.get("/experiments/pareto")
 async def get_pareto(request: Request, task: str = ""):
     d = _require_db()
     kw = {"task": task} if task else {}
@@ -384,47 +400,47 @@ async def get_pareto(request: Request, task: str = ""):
         raise
 
 
-@app.get("/experiments/recent")
+@validator_router.get("/experiments/recent")
 async def get_recent(request: Request, n: int = 20, task: str = ""):
     d = _require_db()
     kw = {"task": task} if task else {}
     return [e.to_api_dict() for e in await d.get_recent(n, **kw)]
 
 
-@app.get("/experiments/failures")
+@validator_router.get("/experiments/failures")
 async def get_failures(request: Request, n: int = 10, task: str = ""):
     d = _require_db()
     kw = {"task": task} if task else {}
     return [e.to_api_dict() for e in await d.get_failures(n, **kw)]
 
 
-@app.get("/experiments/stats")
+@validator_router.get("/experiments/stats")
 async def get_stats(task: str = ""):
     d = _require_db()
     kw = {"task": task} if task else {}
     return await d.stats(**kw)
 
 
-@app.get("/experiments/tasks")
+@validator_router.get("/experiments/tasks")
 async def get_tasks():
     d = _require_db()
     return {"tasks": await d.get_tasks()}
 
 
-@app.get("/experiments/stats/by_task")
+@validator_router.get("/experiments/stats/by_task")
 async def get_stats_by_task():
     d = _require_db()
     return await d.stats_by_task()
 
 
-@app.get("/experiments/families")
+@validator_router.get("/experiments/families")
 async def get_families(task: str = ""):
     d = _require_db()
     kw = {"task": task} if task else {}
     return await d.get_family_summary(**kw)
 
 
-@app.get("/experiments/diff/{index_a}/{index_b}")
+@validator_router.get("/experiments/diff/{index_a}/{index_b}")
 async def get_diff_between(index_a: int, index_b: int):
     d = _require_db()
     diff = await d.get_diff_between(index_a, index_b)
@@ -433,7 +449,7 @@ async def get_diff_between(index_a: int, index_b: int):
     return {"index_a": index_a, "index_b": index_b, "diff": diff}
 
 
-@app.get("/experiments/{index}/diff")
+@validator_router.get("/experiments/{index}/diff")
 async def get_diff(index: int):
     d = _require_db()
     diff = await d.get_diff(index)
@@ -442,7 +458,7 @@ async def get_diff(index: int):
     return {"index": index, "diff": diff}
 
 
-@app.get("/experiments/{index}/lineage_diffs")
+@validator_router.get("/experiments/{index}/lineage_diffs")
 async def get_lineage_diffs(index: int):
     d = _require_db()
     elem = await d.get(index)
@@ -451,7 +467,7 @@ async def get_lineage_diffs(index: int):
     return await d.get_lineage_diffs(index)
 
 
-@app.get("/experiments/lineage/{index}")
+@validator_router.get("/experiments/lineage/{index}")
 async def get_lineage(index: int):
     d = _require_db()
     elem = await d.get(index)
@@ -460,14 +476,14 @@ async def get_lineage(index: int):
     return [e.to_api_dict() for e in await d.get_lineage(index)]
 
 
-@app.post("/experiments/search")
+@validator_router.post("/experiments/search")
 async def search_experiments(request: Request, req: SearchRequest, task: str = ""):
     d = _require_db()
     kw = {"task": task} if task else {}
     return [e.to_api_dict() for e in await d.search(req.query, **kw)]
 
 
-@app.get("/experiments/{index}")
+@validator_router.get("/experiments/{index}")
 async def get_experiment(index: int):
     d = _require_db()
     elem = await d.get(index)
@@ -478,7 +494,7 @@ async def get_experiment(index: int):
 
 # ── Write endpoints (new — validators only) ──────────────
 
-@app.post("/experiments/add")
+@validator_router.post("/experiments/add")
 async def add_experiment(req: AddExperimentRequest):
     """Validator writes a DataElement after Phase C."""
     d = _require_db()
@@ -492,7 +508,7 @@ async def add_experiment(req: AddExperimentRequest):
     return {"index": idx}
 
 
-@app.post("/frontier/update")
+@validator_router.post("/frontier/update")
 async def update_frontier(req: UpdateFrontierRequest):
     """Validator pushes frontier data."""
     global _current_frontier
@@ -503,14 +519,14 @@ async def update_frontier(req: UpdateFrontierRequest):
 
 # ── Provenance endpoints ─────────────────────────────────
 
-@app.post("/provenance/record_components")
+@validator_router.post("/provenance/record_components")
 async def record_components(req: RecordComponentsRequest):
     prov = _require_provenance()
     await prov.record_components(req.experiment_id, req.components)
     return {"status": "ok"}
 
 
-@app.post("/provenance/record_context")
+@validator_router.post("/provenance/record_context")
 async def record_context(req: RecordContextRequest):
     prov = _require_provenance()
     await prov.record_round_context(
@@ -519,31 +535,31 @@ async def record_context(req: RecordContextRequest):
     return {"status": "ok"}
 
 
-@app.get("/provenance/{experiment_id}/influences")
+@validator_router.get("/provenance/{experiment_id}/influences")
 async def get_influences(experiment_id: int):
     prov = _require_provenance()
     return await prov.get_influences(experiment_id)
 
 
-@app.get("/provenance/{experiment_id}/impact")
+@validator_router.get("/provenance/{experiment_id}/impact")
 async def get_impact(experiment_id: int):
     prov = _require_provenance()
     return await prov.get_impact(experiment_id)
 
 
-@app.get("/provenance/{experiment_id}/similar")
+@validator_router.get("/provenance/{experiment_id}/similar")
 async def get_similar(experiment_id: int, top_k: int = 10):
     prov = _require_provenance()
     return await prov.get_similar(experiment_id, top_k=top_k)
 
 
-@app.get("/provenance/components")
+@validator_router.get("/provenance/components")
 async def get_component_experiments(component: str):
     prov = _require_provenance()
     return {"component": component, "experiment_ids": await prov.get_component_experiments(component)}
 
 
-@app.get("/provenance/component_stats")
+@validator_router.get("/provenance/component_stats")
 async def get_component_stats():
     prov = _require_provenance()
     try:
@@ -553,13 +569,13 @@ async def get_component_stats():
         raise HTTPException(status_code=500, detail="Component stats query failed")
 
 
-@app.get("/provenance/dead_ends")
+@validator_router.get("/provenance/dead_ends")
 async def get_dead_ends(task: str = ""):
     prov = _require_provenance()
     return {"dead_ends": await prov.get_dead_ends(task=task)}
 
 
-@app.get("/provenance/{experiment_id}/graph")
+@validator_router.get("/provenance/{experiment_id}/graph")
 async def get_experiment_graph(experiment_id: int, depth: int = 3):
     prov = _require_provenance()
     return await prov.get_experiment_graph(experiment_id, depth=depth)
@@ -574,7 +590,7 @@ class SubmitAgentCodeRequest(BaseModel):
     entry_point: str = "agent.py"  # which file has design_architecture()
 
 
-@app.post("/agent_code")
+@validator_router.post("/agent_code")
 async def submit_agent_code(request: Request, req: SubmitAgentCodeRequest):
     """Miner submits agent code. Validated, stored in R2, recorded in Postgres."""
     if _r2 is None:
@@ -683,7 +699,7 @@ async def submit_agent_code(request: Request, req: SubmitAgentCodeRequest):
     }
 
 
-@app.get("/agent_code/{hotkey}")
+@validator_router.get("/agent_code/{hotkey}")
 async def get_agent_code(hotkey: str):
     """Validator fetches a miner's latest agent code bundle."""
     if _r2 is None:
@@ -701,7 +717,7 @@ async def get_agent_code(hotkey: str):
     return bundle
 
 
-@app.get("/agent_code/{hotkey}/meta")
+@validator_router.get("/agent_code/{hotkey}/meta")
 async def get_agent_code_meta(hotkey: str):
     """Get metadata about a miner's agent submission (no code)."""
     if _pool is None:
@@ -722,7 +738,7 @@ async def get_agent_code_meta(hotkey: str):
     }
 
 
-@app.get("/agent_code/{hotkey}/history")
+@validator_router.get("/agent_code/{hotkey}/history")
 async def get_agent_code_history(hotkey: str, limit: int = 100):
     """Full submission timeline for a hotkey (most recent first)."""
     if _pool is None:
@@ -754,7 +770,7 @@ async def get_agent_code_history(hotkey: str, limit: int = 100):
     }
 
 
-@app.get("/agent_code/by_hash/{code_hash}")
+@validator_router.get("/agent_code/by_hash/{code_hash}")
 async def get_agent_code_by_hash(code_hash: str):
     """Fetch an immutable agent bundle by its content hash.
 
@@ -781,3 +797,27 @@ async def get_agent_code_by_hash(code_hash: str):
     if not bundle:
         raise HTTPException(status_code=404, detail="Bundle missing in R2")
     return bundle
+
+
+def include_validator_routes(target_app: FastAPI) -> None:
+    """Mount the Epistula-authed validator/miner surface onto ``target_app``.
+
+    Idempotent — safe to call multiple times. Called from ``database.neuron``
+    in modes ``validator`` and ``all``. Dashboard-only processes never call
+    this, so /experiments/*, /challenge, /frontier, /provenance/*, and
+    /agent_code/* return 404 there.
+    """
+    already_mounted = any(
+        getattr(r, "path", None) == "/challenge" for r in target_app.routes
+    )
+    if already_mounted:
+        return
+    target_app.include_router(validator_router)
+
+
+# Legacy auto-mount: keep the validator surface on ``app`` at import time
+# unless this process is running in ``dashboard`` mode. Preserves backward
+# compatibility for tests that import ``app`` directly and expect every
+# route to be reachable.
+if Config.NEURON_MODE != "dashboard":
+    include_validator_routes(app)

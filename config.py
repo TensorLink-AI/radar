@@ -191,6 +191,31 @@ class Config:
     PG_DSN: str = os.getenv("RADAR_PG_DSN", "postgresql://radar:radar@localhost:5432/radar")
     # Set to "require" for Supabase/managed Postgres, "" for local
     PG_SSL: str = os.getenv("RADAR_PG_SSL", "")
+    # Explicit pool sizing per mode, overridable per deployment. Validator mode
+    # typically wants larger pools (many concurrent writers). Dashboard mode
+    # wants smaller pools paired with a statement_timeout so a slow public
+    # query can't pressure the shared Crunchy cluster.
+    PG_POOL_MIN: int = int(os.getenv("RADAR_PG_POOL_MIN", "2"))
+    PG_POOL_MAX: int = int(os.getenv("RADAR_PG_POOL_MAX", "10"))
+    PG_STATEMENT_TIMEOUT_MS: int = int(os.getenv("RADAR_PG_STATEMENT_TIMEOUT_MS", "0"))
+    # 0 = no timeout. Set to 5000 (5s) in production for dashboard-mode deploys.
+
+    # ── Neuron Mode ───────────────────────────────────────────
+    # RADAR_NEURON_MODE controls which surface this process serves.
+    #   validator  — Epistula-authed write/read API for validators + miners,
+    #                plus desearch/LLM proxies. Runs metagraph sync + round
+    #                loop. Requires a Bittensor wallet. Optionally also mounts
+    #                the internal Jinja dashboard when RADAR_DASHBOARD_ENABLED=true.
+    #   dashboard  — Open public JSON API at /dashboard/api/*. No wallet, no
+    #                proxies, no metagraph sync, no Jinja, no Epistula.
+    #                This is what gets deployed to Railway behind radarnet.io.
+    #   all        — Everything on one process (legacy / dev default).
+    NEURON_MODE: str = os.getenv("RADAR_NEURON_MODE", "all").lower()
+
+    # CORS origins for the public JSON API. Comma-separated, empty = no CORS
+    # (safe default for validator mode, which doesn't speak to browsers).
+    # In production dashboard mode set this to "https://radarnet.io".
+    DASHBOARD_CORS_ORIGINS: str = os.getenv("RADAR_DASHBOARD_CORS_ORIGINS", "")
 
     # ── Database API ──────────────────────────────────────────
     DB_API_URL: str = os.getenv("RADAR_DB_API_URL", "")
@@ -223,3 +248,16 @@ class Config:
     # Max bytes of a log file streamed inline before falling back to presigned URL
     DASHBOARD_MAX_LOG_BYTES: int = int(os.getenv("RADAR_DASHBOARD_MAX_LOG_BYTES", "10485760"))
     DASHBOARD_PAGE_SIZE: int = int(os.getenv("RADAR_DASHBOARD_PAGE_SIZE", "50"))
+
+
+VALID_NEURON_MODES = frozenset({"validator", "dashboard", "all"})
+
+
+def validate_neuron_mode() -> None:
+    """Fail-fast check: RADAR_NEURON_MODE must be one of the known modes."""
+    mode = Config.NEURON_MODE
+    if mode not in VALID_NEURON_MODES:
+        raise ValueError(
+            f"Invalid RADAR_NEURON_MODE={mode!r}. "
+            f"Must be one of: {sorted(VALID_NEURON_MODES)}"
+        )

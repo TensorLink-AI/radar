@@ -94,6 +94,52 @@ class _LoginRedirect(Exception):
     """Internal signal to redirect to the login page."""
 
 
+def _ensure_state(
+    store,
+    pool,
+    r2,
+    get_challenge: Optional[Callable[[], dict]] = None,
+    get_frontier: Optional[Callable[[], list]] = None,
+) -> DashboardState:
+    """Install (or refresh) the module-level ``DashboardState`` singleton."""
+    global _state
+    _state = DashboardState(
+        store=store,
+        pool=pool,
+        r2=r2,
+        get_challenge=get_challenge,
+        get_frontier=get_frontier,
+    )
+    return _state
+
+
+def mount_public_api(
+    app: FastAPI,
+    store,
+    pool,
+    r2,
+    get_challenge: Optional[Callable[[], dict]] = None,
+    get_frontier: Optional[Callable[[], list]] = None,
+) -> None:
+    """Mount the **public** JSON API at ``/dashboard/api/*``.
+
+    No auth. Safe to call in dashboard mode (no Jinja, no wallet) and in
+    ``all`` mode (shares the app with validator routes). Idempotent.
+    """
+    _ensure_state(store, pool, r2, get_challenge, get_frontier)
+
+    already_mounted = any(
+        getattr(r, "path", "").startswith("/dashboard/api") for r in app.routes
+    )
+    if already_mounted:
+        return
+
+    from database.dashboard import api
+
+    app.include_router(api.router)
+    logger.info("Dashboard public JSON API mounted at /dashboard/api/*")
+
+
 def mount_dashboard(
     app: FastAPI,
     store,
@@ -104,8 +150,11 @@ def mount_dashboard(
 ) -> None:
     """Attach the dashboard router + static mount to an existing FastAPI app.
 
-    Called from ``database/neuron.py`` after ``set_db(...)``. No-op if the
-    dashboard is disabled so operators can turn it off in production.
+    Called from ``database/neuron.py`` after ``set_db(...)``. Mounts the
+    cookie-gated Jinja HTML operator UI plus the public JSON API on the
+    same app. No-op if the Jinja UI is disabled so operators can turn it
+    off in production without losing the public JSON API — that is now
+    the responsibility of ``mount_public_api``.
     """
     if not Config.DASHBOARD_ENABLED:
         logger.info("Dashboard disabled (RADAR_DASHBOARD_ENABLED != true)")
@@ -116,14 +165,7 @@ def mount_dashboard(
         )
         return
 
-    global _state
-    _state = DashboardState(
-        store=store,
-        pool=pool,
-        r2=r2,
-        get_challenge=get_challenge,
-        get_frontier=get_frontier,
-    )
+    _ensure_state(store, pool, r2, get_challenge, get_frontier)
 
     # Static assets (HTMX, Chart.js glue, CSS)
     _STATIC_DIR.mkdir(parents=True, exist_ok=True)
@@ -133,12 +175,15 @@ def mount_dashboard(
         name="dashboard_static",
     )
 
-    # Login/logout + session-protected HTML + JSON routes
+    # Login/logout + session-protected HTML + public JSON routes
     from database.dashboard import api, views
 
     app.include_router(_auth_router())
     app.include_router(views.router)
-    app.include_router(api.router)
+    # JSON router is public (no cookie dependency) — mount only if not
+    # already wired in by ``mount_public_api``.
+    if not any(getattr(r, "path", "").startswith("/dashboard/api") for r in app.routes):
+        app.include_router(api.router)
 
     # Convert _LoginRedirect into a 302 to the login page
     @app.exception_handler(_LoginRedirect)
@@ -209,5 +254,6 @@ __all__ = [
     "get_state",
     "get_templates",
     "mount_dashboard",
+    "mount_public_api",
     "require_session",
 ]

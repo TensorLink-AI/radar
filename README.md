@@ -169,6 +169,12 @@ python validator/neuron.py --netuid <N> --subtensor.network <network> --wallet.n
 * **R2 storage** for checkpoint storage and artifact sharing. Set `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` env vars.
 * **CPU for Phase C eval.** Checkpoint evaluation runs on CPU by default (override with `RADAR_EVAL_DEVICE`). Each eval takes seconds. No GPU required for validators.
 * **DB proxy.** The validator runs a reverse-proxy FastAPI on `RADAR_PROXY_PORT` (default 8080). It forwards `/experiments/*`, `/challenge`, `/frontier`, `/provenance/*` to the subnet owner's centralised DB server, and hosts `/desearch/*` and `/llm/v1/*` locally with per-miner rate limits. The DB itself (Postgres) is run by the subnet owner, not the validator.
+* **DB server deployable modes.** The subnet-owner `database/neuron.py` binary supports three modes via `RADAR_NEURON_MODE`:
+  * `validator` — Epistula-authed write/read API for validators and miners, plus `/desearch/*` and `/llm/*` proxies. Runs the metagraph sync + round loop and requires a Bittensor wallet. Optionally also mounts the internal Jinja operator dashboard when `RADAR_DASHBOARD_ENABLED=true` (cookie-gated via `RADAR_DASHBOARD_KEY`).
+  * `dashboard` — Open public JSON API at `/dashboard/api/*` for the website SPA (`radarnet.io/dashboard/`). No wallet, no Epistula, no chain sync, no Jinja. CORS is configured via `RADAR_DASHBOARD_CORS_ORIGINS` (set to `https://radarnet.io` in production).
+  * `all` (default, dev/legacy) — every surface on one process.
+  The `/dashboard/api/*` endpoints are public by design; anyone on the internet can read agent source code, stdout logs, and experiments. Do not add fields there that shouldn't be world-readable. The internal Jinja pages at `/dashboard/*` remain operator-gated.
+* **Two processes locally.** For dev work, run `RADAR_NEURON_MODE=validator python database/neuron.py --port 8090` alongside `RADAR_NEURON_MODE=dashboard python database/neuron.py --port 8091` pointing at the same Postgres (`RADAR_PG_DSN`). Pool sizing and statement timeouts are controlled per-process via `RADAR_PG_POOL_MIN`, `RADAR_PG_POOL_MAX`, and `RADAR_PG_STATEMENT_TIMEOUT_MS`.
 * **Agent pods** on the subnet's pluggable GPU backend. Validators dispatch agent runs to attested pods using the subnet's official `radar-agent` image. Phase A runs up to `RADAR_AGENT_CONCURRENCY` (default 8) pods concurrently; each runs a miner's injected `.py` bundle.
 * **Bandwidth.** Validators download checkpoints (safetensors per miner per round) from R2 during Phase C.
 

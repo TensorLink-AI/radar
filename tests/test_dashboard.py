@@ -472,6 +472,29 @@ def test_overview_requires_auth(dashboard_client):
     assert "/dashboard/login" in r.headers["location"]
 
 
+def test_json_api_reachable_without_cookie(dashboard_client):
+    """The JSON API is public — a fresh client with no cookie gets 200."""
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    for path in (
+        "/dashboard/api/stats.json",
+        "/dashboard/api/tasks.json",
+        "/dashboard/api/miners.json",
+        "/dashboard/api/recent.json?n=5",
+        "/dashboard/api/challenge.json",
+        "/dashboard/api/rounds.json",
+        "/dashboard/api/tasks_stats.json",
+    ):
+        r = fresh.get(path)
+        assert r.status_code == 200, f"expected 200 for {path}, got {r.status_code}"
+
+
+def test_json_api_reachable_with_cookie(logged_in):
+    """Cookie-holding operators hit the same JSON API without being blocked."""
+    r = logged_in.get("/dashboard/api/stats.json")
+    assert r.status_code == 200
+
+
 def test_login_next_open_redirect_guard(dashboard_client):
     """Login must only accept /dashboard-prefixed next URLs."""
     r = dashboard_client.post(
@@ -767,3 +790,139 @@ def test_logs_meta_includes_loss_history(logged_in):
     body = r.json()
     assert body["train_loss_history"][0] == {"step": 10, "loss": 22.19}
     assert body["val_loss_history"][1] == {"step": 20, "loss": 21.28}
+
+
+# ── Public JSON endpoints for the SPA ─────────────────────────
+
+
+def test_public_tasks_stats_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/tasks_stats.json")
+    assert r.status_code == 200
+    assert "ts" in r.json()
+
+
+def test_public_tasks_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/tasks.json")
+    assert r.status_code == 200
+    assert "ts" in r.json()
+
+
+def test_public_miners_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/miners.json")
+    assert r.status_code == 200
+    hks = {m["miner_hotkey"] for m in r.json()}
+    assert {"hk_a", "hk_b"} <= hks
+
+
+def test_public_recent_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/recent.json?n=10")
+    assert r.status_code == 200
+    payload = r.json()
+    assert isinstance(payload, list)
+    assert len(payload) == 3  # 3 sample elements
+
+
+def test_public_challenge_json_nests_frontier_size(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/challenge.json")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["round_id"] == 42
+    assert body["task"] == "ts"
+    assert body["frontier_size"] == 2
+
+
+def test_public_rounds_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/rounds.json")
+    assert r.status_code == 200
+    assert set(r.json()) == {7, 8}
+
+
+def test_public_browse_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/browse.json?page=0&page_size=10")
+    assert r.status_code == 200
+    body = r.json()
+    assert "rows" in body and "total" in body
+    assert "page" in body and "page_size" in body
+
+
+def test_public_experiment_by_index_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/experiments/1.json")
+    assert r.status_code == 200
+    assert r.json()["name"] == "child"
+
+    r2 = fresh.get("/dashboard/api/experiments/9999.json")
+    assert r2.status_code == 404
+
+
+def test_public_miner_submissions_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/miners/hk_a/submissions.json?limit=20")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["hotkey"] == "hk_a"
+    assert len(body["submissions"]) == 2
+    assert len(body["agent_history"]) == 2
+
+
+def test_public_experiment_lineage_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/experiments/1/lineage.json")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["root"]["index"] == 1
+    assert isinstance(body["diffs"], list)
+
+
+def test_public_logs_endpoints(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    meta = fresh.get("/dashboard/api/logs/7/hk_a/meta.json")
+    assert meta.status_code == 200
+    assert meta.json()["flops"] == 1234
+
+    stdout = fresh.get("/dashboard/api/logs/7/hk_a/stdout.json")
+    assert stdout.status_code == 200
+    assert "epoch 0" in stdout.json()["text"]
+
+    arch = fresh.get("/dashboard/api/logs/7/hk_a/architecture.json")
+    assert arch.status_code == 200
+    assert "unit-test-model" in arch.json()["text"]
+
+
+def test_public_agent_code_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    hash_v1 = "hash_v1" + ("0" * 50)
+    r = fresh.get(f"/dashboard/api/agent_code/{hash_v1}.json")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["entry_point"] == "agent.py"
+    assert "agent.py" in body["files"]
+    assert "v1" in body["files"]["agent.py"]
+    # history excludes the requested hash
+    assert all(h["code_hash"] != hash_v1 for h in body["history"])
+
+
+def test_public_agent_code_unknown_returns_404(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/agent_code/" + ("f" * 64) + ".json")
+    assert r.status_code == 404
