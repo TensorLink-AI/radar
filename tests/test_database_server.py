@@ -290,3 +290,86 @@ def test_agent_code_file_limits():
     """Agent code rejects too many files or oversized files."""
     assert _MAX_AGENT_FILES == 25
     assert _MAX_AGENT_FILE_BYTES == 100_000
+
+
+# ── Access log experiment-ID capture ───────────────────────────
+
+
+class _RecordingAccessLogger:
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def log_access(self, **kw):
+        self.calls.append(kw)
+
+
+def _install_access_logger():
+    from database import server as srv
+    logger = _RecordingAccessLogger()
+    srv._access_logger = logger
+    return logger
+
+
+def _uninstall_access_logger():
+    from database import server as srv
+    srv._access_logger = None
+
+
+def test_access_log_captures_ids_from_experiment_detail():
+    _setup()
+    logger = _install_access_logger()
+    try:
+        client = TestClient(app)
+        r = client.get("/experiments/0")
+        assert r.status_code == 200
+        # Body should still be delivered intact
+        assert r.json()["name"] == "exp_0"
+        # asyncio.create_task was scheduled — give it a tick to run
+        import asyncio as _asyncio
+        loop = _asyncio.new_event_loop()
+        loop.run_until_complete(_asyncio.sleep(0.05))
+        loop.close()
+        assert logger.calls, "middleware did not log the request"
+        call = logger.calls[-1]
+        assert 0 in call["experiment_ids"]
+        assert call["endpoint"] == "/experiments/0"
+    finally:
+        _uninstall_access_logger()
+
+
+def test_access_log_captures_ids_from_list_response():
+    _setup()
+    logger = _install_access_logger()
+    try:
+        client = TestClient(app)
+        r = client.get("/experiments/recent?n=2")
+        assert r.status_code == 200
+        assert len(r.json()) == 2
+        import asyncio as _asyncio
+        loop = _asyncio.new_event_loop()
+        loop.run_until_complete(_asyncio.sleep(0.05))
+        loop.close()
+        # Captured IDs match the response payload
+        payload_ids = {item["index"] for item in r.json()}
+        captured = set(logger.calls[-1]["experiment_ids"])
+        assert captured == payload_ids
+    finally:
+        _uninstall_access_logger()
+
+
+def test_access_log_skips_non_experiment_paths():
+    _setup()
+    logger = _install_access_logger()
+    try:
+        client = TestClient(app)
+        r = client.get("/provenance/component_stats")
+        assert r.status_code == 200
+        import asyncio as _asyncio
+        loop = _asyncio.new_event_loop()
+        loop.run_until_complete(_asyncio.sleep(0.05))
+        loop.close()
+        # Still logs the access, but with no experiment IDs extracted
+        assert logger.calls
+        assert logger.calls[-1]["experiment_ids"] == []
+    finally:
+        _uninstall_access_logger()
