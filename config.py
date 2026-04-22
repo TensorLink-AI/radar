@@ -192,6 +192,23 @@ class Config:
     # Set to "require" for Supabase/managed Postgres, "" for local
     PG_SSL: str = os.getenv("RADAR_PG_SSL", "")
 
+    # ── Network / Schema Isolation ────────────────────────────
+    # Which Bittensor network this DB process serves: "testnet" or "mainnet".
+    # A single Postgres database holds BOTH networks; isolation is enforced by
+    # Postgres *schemas* (NOT a `network` tag column, NOT separate DBs).
+    #
+    # Why schemas, not a tag column:
+    #   - zero changes to existing SQL (search_path handles qualification)
+    #   - impossible to accidentally leak cross-network rows via a forgotten
+    #     WHERE clause — the other schema's tables are simply invisible
+    #   - per-network backup / drop / restore is trivial (pg_dump --schema=...)
+    #   - per-schema sequences keep experiment IDs independent per network
+    #
+    # The value is embedded in `SET search_path` at connection time, so the
+    # allowlist regex in shared/pg_store.py is the *only* thing preventing
+    # SQL injection via this variable. Defaults to "testnet" for safety.
+    NETWORK: str = os.getenv("RADAR_NETWORK", "testnet")
+
     # ── Database API ──────────────────────────────────────────
     DB_API_URL: str = os.getenv("RADAR_DB_API_URL", "")
     DB_API_PORT: int = int(os.getenv("RADAR_DB_API_PORT", "8090"))
