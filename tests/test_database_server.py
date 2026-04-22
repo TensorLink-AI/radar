@@ -375,6 +375,46 @@ def test_access_log_skips_non_experiment_paths():
         _uninstall_access_logger()
 
 
+def test_access_log_runs_on_proxy_api_key_path():
+    """Agent traffic arrives via the validator proxy with X-Radar-API-Key.
+    The trusted-proxy branch must still fall through to the access-logger
+    so miner_access_log.experiment_ids gets populated (otherwise the
+    provenance dashboard stays empty).
+    """
+    from config import Config
+    from database import server as srv
+
+    _setup()
+    logger = _install_access_logger()
+    prev_key = Config.DB_API_KEY
+    Config.DB_API_KEY = "test-key"
+    # Avoid the IP-rate-limit window from other tests
+    srv._rate_window.clear()
+    try:
+        client = TestClient(app)
+        r = client.get(
+            "/experiments/0",
+            headers={
+                "X-Radar-API-Key": "test-key",
+                "X-Miner-Hotkey": "miner_hk_abc",
+                "X-Miner-UID": "7",
+            },
+        )
+        assert r.status_code == 200
+        import asyncio as _asyncio
+        loop = _asyncio.new_event_loop()
+        loop.run_until_complete(_asyncio.sleep(0.05))
+        loop.close()
+        assert logger.calls, "proxy path did not reach access logger"
+        call = logger.calls[-1]
+        assert call["hotkey"] == "miner_hk_abc"
+        assert call["miner_uid"] == 7
+        assert 0 in call["experiment_ids"]
+    finally:
+        Config.DB_API_KEY = prev_key
+        _uninstall_access_logger()
+
+
 # ── Agent code submission history ──────────────────────────────
 
 

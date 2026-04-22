@@ -264,6 +264,7 @@ async def auth_middleware(request: Request, call_next):
 
         # ── Validator API key: trusted proxy, skip Epistula ──
         from config import Config
+        proxy_authed = False
         if Config.DB_API_KEY:
             import secrets as _secrets
             provided = request.headers.get("X-Radar-API-Key", "")
@@ -271,11 +272,10 @@ async def auth_middleware(request: Request, call_next):
                 # Trusted validator proxy — rate-limit by IP instead of hotkey
                 if not _check_rate_limit(client_ip):
                     return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
-                response = await call_next(request)
-                return response
+                proxy_authed = True
 
         # ── Epistula auth: miners and validators without API key ──
-        if _metagraph:
+        if not proxy_authed and _metagraph:
             from shared.auth import verify_request
             ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
             if not ok:
