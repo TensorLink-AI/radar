@@ -115,6 +115,20 @@ def round_start_block(current_block: int, interval: int = 275) -> int:
     return (current_block // interval) * interval
 
 
+def round_id_from_block(current_block: int, interval: int = 275) -> int:
+    """Derive the current round_id from a block height.
+
+    Matches the round_id that ``generate_challenge`` would produce for the
+    same round_start, so any consumer that only knows the block height
+    (e.g. the DB server's access logger) can tag rows with the same
+    round_id validators use.
+    """
+    import hashlib
+    rs = round_start_block(current_block, interval)
+    block_hash = hashlib.sha256(str(rs).encode()).hexdigest()
+    return int(block_hash[:16], 16) % (2**32)
+
+
 def current_phase(
     current_block: int,
     round_start: int,
