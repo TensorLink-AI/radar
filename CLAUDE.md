@@ -244,6 +244,9 @@ frontier/latest.json                                        # Current Pareto fro
 | `RADAR_PG_POOL_MIN` | `2` | asyncpg pool min size. Dashboard deploys typically leave as-is; validator deploys can bump. |
 | `RADAR_PG_POOL_MAX` | `10` | asyncpg pool max size. |
 | `RADAR_PG_STATEMENT_TIMEOUT_MS` | `0` | `SET statement_timeout` for every pool connection. `0` disables. Set to `5000` on dashboard deploys so a slow public query can't pressure the shared cluster. |
+| `RADAR_PG_STARTUP_RETRIES` | `6` | Retries for the asyncpg bootstrap connect + pool create, so the container doesn't crash-loop while Postgres is still coming up. |
+| `RADAR_PG_STARTUP_BACKOFF_INITIAL_S` | `1.0` | Initial wait between startup retries (doubles each attempt). |
+| `RADAR_PG_STARTUP_BACKOFF_MAX_S` | `30.0` | Cap on the exponential backoff between startup retries. |
 | `RADAR_DASHBOARD_CORS_ORIGINS` | `""` | Comma-separated CORS origins for `/dashboard/api/*`. Empty disables CORS. Production dashboard sets this to `https://radarnet.io`. |
 | `RADAR_DASHBOARD_ENABLED` | `false` | Mounts the cookie-gated internal Jinja operator UI at `/dashboard/*` (validator / all modes only). |
 | `RADAR_DASHBOARD_KEY` | `""` | Shared key required to log into the Jinja UI. |
