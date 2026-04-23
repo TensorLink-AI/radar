@@ -203,11 +203,20 @@ class DesearchProxy:
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPStatusError as e:
-            logger.warning("SN22 returned error: %s", e.response.status_code)
-            raise HTTPException(status_code=502, detail="Desearch upstream error")
+            body = (e.response.text or "")[:500]
+            logger.warning(
+                "Desearch HTTP %d: %s", e.response.status_code, body,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Desearch upstream error: HTTP {e.response.status_code} — {body}".strip(),
+            )
         except (httpx.RequestError, httpx.TimeoutException) as e:
-            logger.warning("SN22 request failed: %s", e)
-            raise HTTPException(status_code=502, detail="Desearch upstream unreachable")
+            logger.warning("Desearch request failed: %s: %s", type(e).__name__, e)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Desearch upstream unreachable: {type(e).__name__}",
+            )
 
         results = _parse_sn22_response(data)
 
