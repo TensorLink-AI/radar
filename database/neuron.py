@@ -21,7 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-from typing import Optional
+from typing import Awaitable, Callable, Optional, TypeVar
 
 import uvicorn
 
@@ -43,6 +43,63 @@ from shared.pg_store import (
 from shared.task import load_enabled_tasks
 
 logger = logging.getLogger(__name__)
+
+
+T = TypeVar("T")
+
+
+# Errors worth retrying on Postgres startup. Everything here is a transient
+# "server not reachable yet" failure that goes away once the DB is ready or
+# DNS has propagated — OSError covers ECONNREFUSED from asyncpg's socket
+# connect, ConnectionError covers asyncpg-wrapped forms, and the named
+# asyncpg classes catch auth/timeout races when the server is coming up.
+def _is_retryable_pg_startup_error(exc: BaseException) -> bool:
+    import asyncpg
+
+    if isinstance(exc, (OSError, ConnectionError, asyncio.TimeoutError)):
+        return True
+    if isinstance(
+        exc,
+        (
+            asyncpg.exceptions.CannotConnectNowError,
+            asyncpg.exceptions.ConnectionFailureError,
+        ),
+    ):
+        return True
+    return False
+
+
+async def _with_startup_retry(
+    op: Callable[[], Awaitable[T]],
+    *,
+    what: str,
+    retries: int,
+    initial_backoff_s: float,
+    max_backoff_s: float,
+) -> T:
+    """Run ``op`` with exponential backoff on transient connection errors.
+
+    ``retries`` is the number of *retries* after the first attempt, so the
+    total number of attempts is ``retries + 1``. The default Config values
+    give roughly one minute of startup grace, which is plenty for a managed
+    Postgres (Crunchy Bridge / Supabase) to finish a rolling restart or for
+    a sidecar pg to come up behind the neuron container.
+    """
+    attempt = 0
+    wait = initial_backoff_s
+    while True:
+        try:
+            return await op()
+        except BaseException as exc:  # noqa: BLE001 — retry decision below
+            if attempt >= retries or not _is_retryable_pg_startup_error(exc):
+                raise
+            logger.warning(
+                "%s failed (attempt %d/%d): %s — retry in %.1fs",
+                what, attempt + 1, retries + 1, exc, wait,
+            )
+            await asyncio.sleep(wait)
+            attempt += 1
+            wait = min(wait * 2, max_backoff_s)
 
 
 def _mode_runs_validator_surface(mode: str) -> bool:
@@ -185,7 +242,17 @@ class DatabaseNeuron:
             for k in ("ssl", "statement_cache_size")
             if k in pool_kwargs
         }
-        bootstrap_conn = await asyncpg.connect(pg_dsn, **bootstrap_kwargs)
+        retries = Config.PG_STARTUP_RETRIES
+        initial_backoff = Config.PG_STARTUP_BACKOFF_INITIAL_S
+        max_backoff = Config.PG_STARTUP_BACKOFF_MAX_S
+
+        bootstrap_conn = await _with_startup_retry(
+            lambda: asyncpg.connect(pg_dsn, **bootstrap_kwargs),
+            what="Postgres bootstrap connect",
+            retries=retries,
+            initial_backoff_s=initial_backoff,
+            max_backoff_s=max_backoff,
+        )
         try:
             await ensure_schema_exists(bootstrap_conn, network)
         finally:
@@ -194,8 +261,12 @@ class DatabaseNeuron:
         # Every connection borrowed from this pool will have its search_path
         # pinned to `"<network>", public`, so all unqualified DDL/DML that
         # follows resolves to tables inside this schema.
-        self.pool = await create_pg_pool(
-            pg_dsn, schema=network, **pool_kwargs,
+        self.pool = await _with_startup_retry(
+            lambda: create_pg_pool(pg_dsn, schema=network, **pool_kwargs),
+            what="Postgres pool create",
+            retries=retries,
+            initial_backoff_s=initial_backoff,
+            max_backoff_s=max_backoff,
         )
         self.store = PgExperimentStore(self.pool)
         await self.store.init_schema()

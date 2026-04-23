@@ -383,3 +383,93 @@ def test_cors_not_mounted_without_origins():
             sys.modules["database.neuron"] = saved_neuron
         else:
             sys.modules.pop("database.neuron", None)
+
+
+# ── Startup retry ─────────────────────────────────────────────
+
+
+def test_with_startup_retry_recovers_from_transient_connection_refused():
+    """The asyncpg bootstrap connect retries ECONNREFUSED and eventually succeeds.
+
+    Regression for the crash-loop where the DB neuron container would
+    exit on the first ``OSError: [Errno 111] Connect call failed`` from
+    asyncpg, before Postgres was ready to accept connections.
+    """
+    import asyncio as _asyncio
+    from database.neuron import _with_startup_retry
+
+    attempts = {"n": 0}
+
+    async def flaky():
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise OSError(111, "Connect call failed ('127.0.0.1', 5432)")
+        return "connected"
+
+    result = _asyncio.run(_with_startup_retry(
+        flaky,
+        what="test bootstrap",
+        retries=5,
+        initial_backoff_s=0.0,
+        max_backoff_s=0.0,
+    ))
+    assert result == "connected"
+    assert attempts["n"] == 3
+
+
+def test_with_startup_retry_gives_up_after_budget_exhausted():
+    """Non-transient and budget-exhausted failures still propagate."""
+    import asyncio as _asyncio
+    from database.neuron import _with_startup_retry
+
+    async def always_broken():
+        raise OSError(111, "Connect call failed")
+
+    with pytest.raises(OSError):
+        _asyncio.run(_with_startup_retry(
+            always_broken,
+            what="test bootstrap",
+            retries=2,
+            initial_backoff_s=0.0,
+            max_backoff_s=0.0,
+        ))
+
+
+def test_with_startup_retry_does_not_retry_programmer_errors():
+    """Non-connection errors (e.g. ValueError) must not be swallowed by the retry loop."""
+    import asyncio as _asyncio
+    from database.neuron import _with_startup_retry
+
+    attempts = {"n": 0}
+
+    async def bad_dsn():
+        attempts["n"] += 1
+        raise ValueError("bad DSN")
+
+    with pytest.raises(ValueError):
+        _asyncio.run(_with_startup_retry(
+            bad_dsn,
+            what="test bootstrap",
+            retries=5,
+            initial_backoff_s=0.0,
+            max_backoff_s=0.0,
+        ))
+    assert attempts["n"] == 1
+
+
+def test_is_retryable_pg_startup_error_classifies_known_transient_errors():
+    """OSError / asyncpg.CannotConnectNowError are transient; ValueError isn't."""
+    import asyncpg
+    from database.neuron import _is_retryable_pg_startup_error
+
+    assert _is_retryable_pg_startup_error(
+        OSError(111, "Connect call failed")
+    )
+    assert _is_retryable_pg_startup_error(
+        ConnectionRefusedError("nope")
+    )
+    assert _is_retryable_pg_startup_error(
+        asyncpg.exceptions.CannotConnectNowError("starting up")
+    )
+    assert not _is_retryable_pg_startup_error(ValueError("bad config"))
+    assert not _is_retryable_pg_startup_error(RuntimeError("bug"))
