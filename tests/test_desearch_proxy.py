@@ -89,9 +89,9 @@ class TestDesearchProxy:
         assert kwargs["json"] == {
             "prompt": "attention",
             "tools": ["arxiv"],
-            "date_filter": "NONE",
+            "date_filter": "PAST_2_YEARS",
             "result_type": "LINKS_WITH_FINAL_SUMMARY",
-            "count": 7,
+            "count": 10,
         }
 
     @pytest.mark.asyncio
@@ -148,6 +148,31 @@ class TestDesearchProxy:
         with pytest.raises(HTTPException) as exc_info:
             await proxy.search(0, "x", date_filter="LAST_FRIDAY")
         assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_search_rejects_none_date_filter(self):
+        """Desearch rejects 'NONE'; the proxy must not forward it."""
+        proxy = DesearchProxy(max_queries=5)
+        with pytest.raises(HTTPException) as exc_info:
+            await proxy.search(0, "x", date_filter="NONE")
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_search_enforces_min_count(self):
+        """Desearch requires count >= 10, even when the miner asked for fewer.
+        Response is sliced back to max_results before returning."""
+        proxy = DesearchProxy(max_queries=5, api_key="dt_testkey")
+        upstream = [{"title": f"p{i}", "id": f"id{i}"} for i in range(10)]
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.json = lambda: upstream
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
+            resp = await proxy.search(0, "x", max_results=3)
+        _, kwargs = mock_client.post.call_args
+        assert kwargs["json"]["count"] == 10
+        assert len(resp.results) == 3
 
 
 # ── Unit tests for response parsing ─────────────────────────────────────────
