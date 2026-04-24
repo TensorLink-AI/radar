@@ -286,6 +286,8 @@ class FakePool:
                     meta = self.training_metas.get((e.round_id, e.miner_hotkey))
                     return {
                         "loss_curve": json.dumps(e.loss_curve),
+                        "round_id": e.round_id,
+                        "miner_hotkey": e.miner_hotkey,
                         "meta": json.dumps(meta) if meta is not None else None,
                     }
             return None
@@ -668,6 +670,28 @@ def test_loss_curve_api_falls_back_to_training_metas(logged_in):
     assert data["index"] == 2
     assert data["loss_curve"] == [3.3, 2.2]
     assert data["points"] == [3.3, 2.2]
+
+
+def test_extract_loss_series_covers_all_shapes():
+    from database.dashboard.api import _extract_loss_series
+
+    assert _extract_loss_series({}) == []
+    assert _extract_loss_series(None) == []
+    # train_loss_history wins over val_loss_history
+    assert _extract_loss_series({
+        "train_loss_history": [{"step": 1, "loss": 3.0}, {"step": 2, "loss": 2.0}],
+        "val_loss_history":   [{"step": 1, "loss": 9.9}],
+    }) == [3.0, 2.0]
+    # val history is the fallback when train is empty/missing
+    assert _extract_loss_series({
+        "val_loss_history": [{"step": 1, "loss": 1.1}, {"step": 2, "loss": 0.9}],
+    }) == [1.1, 0.9]
+    # legacy bare-array loss_curve still works
+    assert _extract_loss_series({"loss_curve": [2.5, 1.5, 0.5]}) == [2.5, 1.5, 0.5]
+    # malformed entries are dropped
+    assert _extract_loss_series({
+        "train_loss_history": [{"step": 1}, {"loss": "bad"}, {"step": 2, "loss": 1.0}],
+    }) == [1.0]
 
 
 def test_miners_list(logged_in):
