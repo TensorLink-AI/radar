@@ -216,6 +216,28 @@ CREATE INDEX IF NOT EXISTS idx_access_hotkey_round
     ON miner_access_log(hotkey, round_id);
 """
 
+# Append-only stream of validator log lines + scalar metrics. Backs the
+# wandb-style live tail at /dashboard/api/validators/{hotkey}/events. Rows
+# are written by validators via the /events ingest endpoint and exposed
+# read-only on the public JSON API after redaction.
+VALIDATOR_EVENTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS validator_events (
+    id BIGSERIAL PRIMARY KEY,
+    hotkey TEXT NOT NULL,
+    ts DOUBLE PRECISION NOT NULL,
+    round_id BIGINT NOT NULL DEFAULT -1,
+    kind TEXT NOT NULL,
+    level TEXT NOT NULL DEFAULT '',
+    payload JSONB NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_vevents_hotkey_id
+    ON validator_events(hotkey, id DESC);
+CREATE INDEX IF NOT EXISTS idx_vevents_round
+    ON validator_events(round_id);
+CREATE INDEX IF NOT EXISTS idx_vevents_kind
+    ON validator_events(hotkey, kind, id DESC);
+"""
+
 
 def _decode_jsonb(value, default):
     """Coerce a JSONB column value to a Python dict/list.

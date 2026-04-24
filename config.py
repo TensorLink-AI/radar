@@ -284,6 +284,33 @@ class Config:
     # Empty string = disabled (open access, Epistula-only).
     DB_API_KEY: str = os.getenv("RADAR_DB_API_KEY", "")
 
+    # ── Validator event stream (wandb-style log + metric tail) ────────
+    # Validators batch log lines + scalar metrics in-memory and flush to
+    # the centralized DB via /events. The dashboard SPA polls
+    # /dashboard/api/validators/{hotkey}/events for a live tail.
+    EVENTS_ENABLED: bool = os.getenv("RADAR_EVENTS_ENABLED", "true").lower() == "true"
+    # Seconds between flushes from the validator's in-memory buffer.
+    EVENTS_FLUSH_INTERVAL_S: float = float(os.getenv("RADAR_EVENTS_FLUSH_INTERVAL_S", "5"))
+    # Soft cap on how many events the validator buffers between flushes.
+    # Above this, the buffer drops the oldest events (so a stuck flush
+    # never grows the validator's RAM without bound).
+    EVENTS_BUFFER_MAX: int = int(os.getenv("RADAR_EVENTS_BUFFER_MAX", "2000"))
+    # Hard cap on a single POST batch — keeps each ingest insert under
+    # the DB server's 5 MB body limit even with verbose log lines.
+    EVENTS_BATCH_MAX: int = int(os.getenv("RADAR_EVENTS_BATCH_MAX", "500"))
+    # Drop events older than this. The pruner runs once per
+    # ``EVENTS_PRUNE_INTERVAL_S`` on the DB server. 0 disables pruning.
+    EVENTS_RETENTION_DAYS: int = int(os.getenv("RADAR_EVENTS_RETENTION_DAYS", "7"))
+    EVENTS_PRUNE_INTERVAL_S: int = int(os.getenv("RADAR_EVENTS_PRUNE_INTERVAL_S", "3600"))
+    # Loggers whose records are forwarded into the event stream. Empty
+    # string means "everything attached to the root logger". Comma-
+    # separated names match Python logging's hierarchy (e.g. "validator").
+    EVENTS_LOGGER_NAMES: str = os.getenv("RADAR_EVENTS_LOGGER_NAMES", "")
+    # Minimum log level captured by the handler (forwarded levels above
+    # this are written; below are dropped). Values: debug, info, warning,
+    # error, critical.
+    EVENTS_LOG_LEVEL: str = os.getenv("RADAR_EVENTS_LOG_LEVEL", "info").lower()
+
     # ── Dashboard (read-only web UI for inspecting experiments) ───────
     DASHBOARD_ENABLED: bool = os.getenv("RADAR_DASHBOARD_ENABLED", "false").lower() == "true"
     # Shared key used to log into the dashboard. Empty = dashboard refuses

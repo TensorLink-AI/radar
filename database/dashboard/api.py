@@ -447,6 +447,86 @@ async def logs_architecture_json(round_id: int, hotkey: str, direct: int = 0):
     return JSONResponse(payload)
 
 
+# ── Validator event stream (PUBLIC — redacted live tail of validator logs) ──
+
+_DEFAULT_VALIDATOR_EVENT_LIMIT = 200
+_MAX_VALIDATOR_EVENT_LIMIT = 500
+
+
+def _event_store():
+    """Lazy import so dashboard-mode processes don't pull server.py at boot."""
+    from database.server import get_event_store
+    return get_event_store()
+
+
+@router.get("/validators.json")
+async def validators_index(since_seconds: int = 86400, limit: int = 100) -> dict:
+    """List validator hotkeys with recent activity (powers the validators page)."""
+    es = _event_store()
+    if es is None:
+        return {"validators": []}
+    since_seconds = max(60, min(int(since_seconds), 7 * 86400))
+    limit = max(1, min(int(limit), 500))
+    rows = await es.hotkeys_with_recent_events(
+        since_seconds=since_seconds, limit=limit,
+    )
+    return {"validators": rows}
+
+
+@router.get("/validators/{hotkey}/events.json")
+async def validator_events_tail(
+    hotkey: str,
+    since_id: int = 0,
+    limit: int = _DEFAULT_VALIDATOR_EVENT_LIMIT,
+    kind: str = "",
+) -> dict:
+    """Cursor-paginated tail of validator log/metric events.
+
+    Public — every event is redacted before it goes out. SPA polls with
+    ``?since_id=<last_id>`` every 2-5s; ``since_id=0`` returns the most
+    recent ``limit`` events in chronological order.
+    """
+    from shared.event_redact import redact_event
+
+    es = _event_store()
+    if es is None:
+        raise HTTPException(status_code=503, detail="Event store not available")
+    limit = max(1, min(int(limit), _MAX_VALIDATOR_EVENT_LIMIT))
+    rows = await es.tail(
+        hotkey=hotkey,
+        since_id=max(0, int(since_id)),
+        limit=limit,
+        kind=kind or None,
+    )
+    next_cursor = rows[-1]["id"] if rows else int(since_id)
+    return {
+        "hotkey": hotkey,
+        "events": [redact_event(r) for r in rows],
+        "next_cursor": next_cursor,
+    }
+
+
+@router.get("/validators/{hotkey}/metrics.json")
+async def validator_metric_series(
+    hotkey: str,
+    metric: str,
+    round_id: int | None = None,
+    limit: int = 1000,
+) -> dict:
+    """Scalar metric series for charting (e.g. weights, scores per step)."""
+    es = _event_store()
+    if es is None:
+        raise HTTPException(status_code=503, detail="Event store not available")
+    if not metric:
+        raise HTTPException(status_code=400, detail="metric query param required")
+    limit = max(1, min(int(limit), 5000))
+    points = await es.metrics(
+        hotkey=hotkey, metric=metric,
+        round_id=round_id, limit=limit,
+    )
+    return {"hotkey": hotkey, "metric": metric, "points": points}
+
+
 # ── Agent code bundles (public JSON mirror of the cookie-gated Jinja view) ──
 
 @router.get("/agent_code/{code_hash}.json")

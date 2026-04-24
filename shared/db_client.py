@@ -181,6 +181,19 @@ class DatabaseClient:
             "files": files, "entry_point": entry_point,
         })
 
+    async def post_events(self, events: list[dict]) -> bool:
+        """POST a batch of validator log/metric events to the central DB.
+
+        ``events`` is a list of dicts each carrying ``kind``, ``payload``,
+        and optionally ``ts``, ``round_id``, ``level``. The server stamps
+        ``hotkey`` from the Epistula signature, so callers don't need to
+        include it. Returns ``True`` on a successful flush.
+        """
+        if not events:
+            return True
+        result = await self._post("/events", {"events": events})
+        return result is not None
+
     async def submit_training_meta(
         self, round_id: int, hotkey: str, meta: dict,
     ) -> bool:

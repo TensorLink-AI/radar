@@ -43,6 +43,7 @@ from validator.db_proxy import (
     app as proxy_app, set_config as set_proxy_config, set_metagraph,
     set_hotkey_map, rotate_agent_token,
 )
+from validator.event_stream import install_event_capture
 from validator.evaluator import evaluate_all_checkpoints
 from validator.pod_manager import pre_validate_code
 
@@ -147,6 +148,15 @@ class Validator:
         self.db_client = DatabaseClient(
             db_url=Config.DB_API_URL, wallet=self.wallet,
             api_key=Config.DB_API_KEY,
+        )
+
+        # Wandb-style log/metric capture. The buffer + handler are
+        # installed here so every ``logger.info(...)`` call below is
+        # forwarded to the central DB. The flush task is started later
+        # from ``run()`` once we're inside the asyncio loop.
+        self._event_capture = install_event_capture(
+            db_client=self.db_client,
+            hotkey=self.wallet.hotkey.ss58_address,
         )
 
         # EMA scores per UID
@@ -894,6 +904,9 @@ class Validator:
     async def run(self):
         """Main validator loop."""
         self.start_proxy_server()
+        if self._event_capture is not None:
+            buffer, _handler, _attached = self._event_capture
+            buffer.start()
         while True:
             try:
                 current_block = self.subtensor.block
@@ -926,6 +939,13 @@ class Validator:
                     )
                     await self._wait_until_block(next_round)
                     continue
+                if self._event_capture is not None:
+                    self._event_capture[0].set_round(int(round_start))
+                    self._event_capture[0].phase(
+                        "round_start",
+                        round_id=int(round_start),
+                        block=int(current_block),
+                    )
                 await self.run_round()
                 self._last_completed_round = round_start
             except Exception:
