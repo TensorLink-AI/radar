@@ -870,6 +870,42 @@ def test_public_rounds_json(dashboard_client):
     assert set(r.json()) == {7, 8}
 
 
+def test_public_benchmark_json(dashboard_client):
+    """Public benchmark endpoint mirrors the Jinja /dashboard/benchmark view."""
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/benchmark.json?task=ts&limit=100")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["task"] == "ts"
+    assert "ts" in body["tasks"]
+    by_round = {row["round_id"]: row for row in body["rows"]}
+    assert set(by_round) == {7, 8}
+    assert by_round[8]["best_metric"] == 0.9
+    assert by_round[7]["best_metric"] == 1.2
+
+
+def test_public_benchmark_json_defaults_to_first_task(dashboard_client):
+    """Omitting ``task`` falls back to the first known task (matches Jinja)."""
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/benchmark.json")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["task"] == "ts"
+    assert body["rows"]
+
+
+def test_public_benchmark_json_unknown_task(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/benchmark.json?task=nope")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["task"] == "nope"
+    assert body["rows"] == []
+
+
 def test_public_browse_json(dashboard_client):
     from fastapi.testclient import TestClient
     fresh = TestClient(app)

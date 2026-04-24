@@ -193,6 +193,25 @@ async def rounds_json(limit: int = 30) -> list[int]:
     return await q.distinct_rounds(state.pool, limit=limit)
 
 
+@router.get("/benchmark.json")
+async def benchmark_json(task: str = "", limit: int = 100) -> dict:
+    """Per-round eval-score summary for a task — newest round first.
+
+    Mirrors the data the Jinja ``/dashboard/benchmark`` view renders so the
+    public SPA can chart eval scores over time. Defaults to the first known
+    task when ``task`` is omitted, matching the Jinja behaviour.
+    """
+    from database.dashboard import queries as q
+
+    state = get_state()
+    tasks = await state.store.get_tasks()
+    if not task and tasks:
+        task = tasks[0]
+    limit = max(1, min(int(limit), 500))
+    rows = await q.benchmark_by_round(state.pool, task=task, limit=limit) if task else []
+    return {"task": task, "tasks": tasks, "rows": rows}
+
+
 def _parse_bool(s: str) -> Optional[bool]:
     if s in ("", None):
         return None
