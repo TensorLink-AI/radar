@@ -51,12 +51,33 @@ def _downsample(points: list[float], limit: int = _MAX_LOSS_POINTS) -> list[floa
     return [float(p) for p in sampled if p is not None]
 
 
+def _extract_loss_series(meta: dict) -> list[float]:
+    """Pull a ``list[float]`` loss series out of a training_meta blob.
+
+    Validators write ``train_loss_history`` and ``val_loss_history`` as
+    ``[{step, loss}, …]``. Legacy blobs just carry a bare ``loss_curve``.
+    """
+    if not isinstance(meta, dict):
+        return []
+    for key in ("train_loss_history", "val_loss_history"):
+        hist = meta.get(key)
+        if isinstance(hist, list) and hist:
+            series = [p["loss"] for p in hist
+                      if isinstance(p, dict) and isinstance(p.get("loss"), (int, float))]
+            if series:
+                return series
+    legacy = meta.get("loss_curve")
+    if isinstance(legacy, list):
+        return [float(v) for v in legacy if isinstance(v, (int, float))]
+    return []
+
+
 @router.get("/loss_curve/{index}.json")
 async def loss_curve(index: int) -> dict:
     state = get_state()
     row = await state.pool.fetchrow(
         """
-        SELECT e.loss_curve, tm.meta
+        SELECT e.loss_curve, e.round_id, e.miner_hotkey, tm.meta
         FROM experiments e
         LEFT JOIN training_metas tm
                ON tm.round_id = e.round_id
@@ -70,22 +91,19 @@ async def loss_curve(index: int) -> dict:
 
     from shared.pg_schema import _decode_jsonb
     curve = _decode_jsonb(row["loss_curve"], [])
-    # Pre-training_metas rounds left experiments.loss_curve empty. The richer
-    # meta rows carry {step, loss} per step under train_/val_loss_history —
-    # extract the series so historical experiments still render.
+    # Pre-training_metas rounds left experiments.loss_curve empty. Try the
+    # Postgres cache next, then fall back to R2 (matches the Jinja
+    # /dashboard/logs/{round}/{hk}/meta route — the only reason that page
+    # renders a curve when this endpoint doesn't).
     if not curve:
         meta = _decode_jsonb(row["meta"], {}) or {}
-        for key in ("train_loss_history", "val_loss_history"):
-            hist = meta.get(key)
-            if isinstance(hist, list) and hist:
-                curve = [p["loss"] for p in hist
-                         if isinstance(p, dict) and isinstance(p.get("loss"), (int, float))]
-                if curve:
-                    break
-        if not curve:
-            legacy = meta.get("loss_curve")
-            if isinstance(legacy, list):
-                curve = legacy
+        curve = _extract_loss_series(meta)
+    if not curve and row["round_id"] is not None and row["miner_hotkey"]:
+        r2_meta = log_helpers.fetch_meta(
+            state.r2, int(row["round_id"]), row["miner_hotkey"],
+        )
+        if r2_meta:
+            curve = _extract_loss_series(r2_meta)
 
     points = _downsample(curve)
     # ``loss_curve`` matches the radarnet.io SPA contract; ``points`` is kept
