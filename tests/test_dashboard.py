@@ -280,6 +280,15 @@ class FakePool:
 
     async def fetchrow(self, sql: str, *params):
         sql_l = sql.lower()
+        if "loss_curve" in sql_l and "where e.id" in sql_l:
+            for e in self.elements:
+                if e.index == params[0]:
+                    meta = self.training_metas.get((e.round_id, e.miner_hotkey))
+                    return {
+                        "loss_curve": json.dumps(e.loss_curve),
+                        "meta": json.dumps(meta) if meta is not None else None,
+                    }
+            return None
         if "loss_curve" in sql_l and "where id" in sql_l:
             for e in self.elements:
                 if e.index == params[0]:
@@ -431,7 +440,17 @@ def dashboard_client():
         access_log=access_log,
         agent_history=agent_history,
         agent_bundles={bundle_v1["code_hash"]: bundle_v1},
-        training_metas={(7, "hk_a"): cached_meta_round7},
+        training_metas={
+            (7, "hk_a"): cached_meta_round7,
+            # Element 2 (round 8, hk_b) has an empty experiments.loss_curve —
+            # this meta exercises the training_metas fallback in loss_curve.json.
+            (8, "hk_b"): {
+                "round_id": 8, "miner_hotkey": "hk_b",
+                "train_loss_history": [
+                    {"step": 1, "loss": 3.3}, {"step": 2, "loss": 2.2},
+                ],
+            },
+        },
     )
     r2 = FakeR2()
     r2.upload_json("agents/hk_a/hash_v1.json", bundle_v1)
@@ -637,6 +656,18 @@ def test_loss_curve_api(logged_in):
     assert data["index"] == 0
     assert data["points"] == [2.0, 1.5, 1.2]
     assert data["loss_curve"] == [2.0, 1.5, 1.2]
+
+
+def test_loss_curve_api_falls_back_to_training_metas(logged_in):
+    # Element 2 has empty experiments.loss_curve but a training_metas row
+    # keyed on (round_id, miner_hotkey) — the endpoint extracts the loss
+    # series from train_loss_history so historical rounds still render.
+    r = logged_in.get("/dashboard/api/loss_curve/2.json")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["index"] == 2
+    assert data["loss_curve"] == [3.3, 2.2]
+    assert data["points"] == [3.3, 2.2]
 
 
 def test_miners_list(logged_in):
