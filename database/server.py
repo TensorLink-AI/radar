@@ -650,8 +650,13 @@ async def submit_agent_code(request: Request, req: SubmitAgentCodeRequest):
         except (TypeError, ValueError):
             round_submitted = -1
 
-    # Upsert into registry + append to history in one transaction so we never
-    # end up with a live registry row that has no matching audit entry.
+    # Upsert into registry + append to history + cache the bundle JSON in one
+    # transaction so we never end up with a live registry row that has no
+    # matching audit entry, and the public dashboard can serve the bundle
+    # straight from Postgres without reaching back into R2.
+    import json as _json
+
+    bundle_json = _json.dumps(bundle)
     try:
         async with _pool.acquire() as conn:
             async with conn.transaction():
@@ -681,6 +686,16 @@ async def submit_agent_code(request: Request, req: SubmitAgentCodeRequest):
                     """,
                     hotkey, miner_uid, code_hash, req.entry_point,
                     immutable_key, round_submitted,
+                )
+                # Content-addressed; ON CONFLICT DO NOTHING because identical
+                # bytes always hash to the same code_hash.
+                await conn.execute(
+                    """
+                    INSERT INTO agent_bundles (code_hash, bundle)
+                    VALUES ($1, $2::jsonb)
+                    ON CONFLICT (code_hash) DO NOTHING
+                    """,
+                    code_hash, bundle_json,
                 )
     except Exception as e:
         logger.error("Postgres write failed for agent code %s: %s", hotkey[:16], e)

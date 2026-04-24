@@ -103,10 +103,13 @@ class FakePool:
         elements: list[DataElement],
         access_log: Optional[list[dict]] = None,
         agent_history: Optional[list[dict]] = None,
+        agent_bundles: Optional[dict[str, dict]] = None,
     ):
         self.elements = elements
         self.access_log = access_log or []
         self.agent_history = agent_history or []
+        # code_hash -> bundle dict (mirrors the agent_bundles Postgres table)
+        self.agent_bundles = agent_bundles or {}
 
     def _rows(self):
         return [self._row(e) for e in self.elements]
@@ -286,6 +289,12 @@ class FakePool:
                 return None
             matches.sort(key=lambda h: h["timestamp"], reverse=True)
             return matches[0]
+        if "from agent_bundles" in sql_l and "code_hash = $1" in sql_l:
+            target = params[0]
+            bundle = self.agent_bundles.get(target)
+            if bundle is None:
+                return None
+            return {"bundle": json.dumps(bundle)}
         return None
 
 
@@ -372,16 +381,28 @@ def dashboard_client():
             "round_submitted": 8, "timestamp": 2500.0,
         },
     ]
-    pool = FakePool(elements, access_log=access_log, agent_history=agent_history)
-    r2 = FakeR2()
-    r2.upload_json("agents/hk_a/hash_v1.json", {
+    # Bundle cache (Postgres ``agent_bundles`` table) — v1 lives here so the
+    # dashboard serves it from Postgres alone. v2 is intentionally absent so
+    # the R2 fallback path stays covered.
+    bundle_v1 = {
         "files": {"agent.py": "def design_architecture():\n    return 'v1'\n"},
-        "entry_point": "agent.py", "code_hash": "hash_v1" + ("0" * 50),
-    })
-    r2.upload_json("agents/hk_a/hash_v2.json", {
+        "entry_point": "agent.py",
+        "code_hash": "hash_v1" + ("0" * 50),
+    }
+    bundle_v2 = {
         "files": {"agent.py": "def design_architecture():\n    return 'v2'\n"},
-        "entry_point": "agent.py", "code_hash": "hash_v2" + ("0" * 50),
-    })
+        "entry_point": "agent.py",
+        "code_hash": "hash_v2" + ("0" * 50),
+    }
+    pool = FakePool(
+        elements,
+        access_log=access_log,
+        agent_history=agent_history,
+        agent_bundles={bundle_v1["code_hash"]: bundle_v1},
+    )
+    r2 = FakeR2()
+    r2.upload_json("agents/hk_a/hash_v1.json", bundle_v1)
+    r2.upload_json("agents/hk_a/hash_v2.json", bundle_v2)
     # Seed a training log file so the log route has something to read.
     r2.upload_text("round_7/miner_hk_a/stdout.log", "epoch 0 loss=2.0\nepoch 1 loss=1.5\n")
     r2.upload_json("round_7/miner_hk_a/training_meta.json", {
@@ -926,3 +947,31 @@ def test_public_agent_code_unknown_returns_404(dashboard_client):
     fresh = TestClient(app)
     r = fresh.get("/dashboard/api/agent_code/" + ("f" * 64) + ".json")
     assert r.status_code == 404
+
+
+def test_public_agent_code_json_works_without_r2(dashboard_client):
+    """Dashboard-mode deploys without R2 still serve bundles cached in Postgres.
+
+    Reproduces the original 503: drops the R2 client and confirms the cached
+    v1 bundle is served from the ``agent_bundles`` Postgres table alone.
+    """
+    from fastapi.testclient import TestClient
+    from database.dashboard import app as dash_app
+
+    saved_r2 = dash_app._state.r2
+    dash_app._state.r2 = None
+    try:
+        fresh = TestClient(app)
+        hash_v1 = "hash_v1" + ("0" * 50)
+        r = fresh.get(f"/dashboard/api/agent_code/{hash_v1}.json")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["files"]["agent.py"].endswith("'v1'\n")
+
+        # v2 isn't in the Postgres cache and there's no R2 fallback either —
+        # this should 404 rather than the legacy 503.
+        hash_v2 = "hash_v2" + ("0" * 50)
+        r2 = fresh.get(f"/dashboard/api/agent_code/{hash_v2}.json")
+        assert r2.status_code == 404
+    finally:
+        dash_app._state.r2 = saved_r2

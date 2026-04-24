@@ -171,6 +171,18 @@ CREATE INDEX IF NOT EXISTS idx_ash_hash ON agent_submission_history(code_hash);
 CREATE INDEX IF NOT EXISTS idx_ash_round ON agent_submission_history(round_submitted);
 CREATE INDEX IF NOT EXISTS idx_ash_hotkey_round
     ON agent_submission_history(hotkey, round_submitted DESC);
+
+-- Content-addressed cache of agent bundle bytes. Keyed by code_hash so
+-- repeated submissions of the same bundle (common when a miner re-submits
+-- the same code across rounds) share a single row. Lets the public
+-- dashboard JSON API serve bundles without an R2 round-trip — and, more
+-- importantly, without R2 credentials at all, so dashboard-mode deploys
+-- (Railway) don't need write access to the bucket.
+CREATE TABLE IF NOT EXISTS agent_bundles (
+    code_hash TEXT PRIMARY KEY,
+    bundle JSONB NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL DEFAULT extract(epoch from now())
+);
 """
 
 ACCESS_LOG_SCHEMA = """

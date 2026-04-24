@@ -340,6 +340,11 @@ async def agent_code_json(code_hash: str) -> dict:
 
     Matches the data the Jinja ``/dashboard/agent_code/{hash}`` view renders,
     but returns JSON so the public SPA can display bundles without cookies.
+
+    Bundle bytes come from the ``agent_bundles`` cache in Postgres (populated
+    on submission). R2 is only consulted as a fallback for rows submitted
+    before the cache existed, so dashboard-mode deploys without R2
+    credentials still serve the bundle.
     """
     from database.dashboard import queries as q
 
@@ -347,14 +352,15 @@ async def agent_code_json(code_hash: str) -> dict:
     record = await q.agent_bundle_record(state.pool, code_hash)
     if record is None:
         raise HTTPException(status_code=404, detail="Unknown code_hash")
-    if state.r2 is None:
-        raise HTTPException(status_code=503, detail="R2 not configured")
-    try:
-        bundle = state.r2.download_json(record["r2_key"])
-    except Exception:
-        bundle = None
+
+    bundle = await q.agent_bundle_blob(state.pool, code_hash)
+    if bundle is None and state.r2 is not None:
+        try:
+            bundle = state.r2.download_json(record["r2_key"])
+        except Exception:
+            bundle = None
     if not bundle:
-        raise HTTPException(status_code=404, detail="Bundle missing in R2")
+        raise HTTPException(status_code=404, detail="Bundle not found")
     history = await q.miner_agent_history(state.pool, record["hotkey"], limit=50)
     return {
         "record": record,
