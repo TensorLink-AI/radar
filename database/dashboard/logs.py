@@ -38,6 +38,41 @@ def fetch_meta(r2, round_id: int, hotkey: str) -> Optional[dict]:
         return None
 
 
+async def cached_meta(pool, round_id: int, hotkey: str) -> Optional[dict]:
+    """Return the Postgres-cached training_meta blob, or None if absent.
+
+    Validators write here after Phase B so dashboard-mode deploys without
+    R2 credentials can still serve loss curves.
+    """
+    if pool is None:
+        return None
+    try:
+        row = await pool.fetchrow(
+            "SELECT meta FROM training_metas WHERE round_id = $1 AND hotkey = $2",
+            int(round_id), hotkey,
+        )
+    except Exception:
+        logger.exception(
+            "cached_meta query failed: round=%s hotkey=%s", round_id, hotkey[:16],
+        )
+        return None
+    if row is None:
+        return None
+    from shared.pg_schema import _decode_jsonb
+    meta = _decode_jsonb(row["meta"], None)
+    return meta if isinstance(meta, dict) else None
+
+
+async def fetch_meta_cached_or_r2(
+    pool, r2, round_id: int, hotkey: str,
+) -> Optional[dict]:
+    """Postgres cache first, R2 fallback. None if neither has it."""
+    meta = await cached_meta(pool, round_id, hotkey)
+    if meta is not None:
+        return meta
+    return fetch_meta(r2, round_id, hotkey)
+
+
 def fetch_stdout(
     r2,
     round_id: int,
@@ -124,9 +159,11 @@ def presigned_architecture_url(r2, round_id: int, hotkey: str, ttl: int = 900) -
 
 
 __all__ = [
-    "fetch_meta",
-    "fetch_stdout",
+    "cached_meta",
     "fetch_architecture",
-    "presigned_stdout_url",
+    "fetch_meta",
+    "fetch_meta_cached_or_r2",
+    "fetch_stdout",
     "presigned_architecture_url",
+    "presigned_stdout_url",
 ]

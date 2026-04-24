@@ -317,9 +317,11 @@ async def experiment_lineage_json(index: int) -> dict:
 @router.get("/logs/{round_id}/{hotkey}/meta.json")
 async def logs_meta_json(round_id: int, hotkey: str):
     state = get_state()
-    meta = log_helpers.fetch_meta(state.r2, round_id, hotkey)
+    meta = await log_helpers.fetch_meta_cached_or_r2(
+        state.pool, state.r2, round_id, hotkey,
+    )
     if meta is None:
-        raise HTTPException(status_code=404, detail="No training_meta.json in R2")
+        raise HTTPException(status_code=404, detail="training_meta not found")
     return JSONResponse(meta)
 
 

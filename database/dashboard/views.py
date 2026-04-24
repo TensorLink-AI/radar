@@ -305,7 +305,9 @@ async def provenance_view(request: Request):
 @router.get("/logs/{round_id}/{hotkey}", response_class=HTMLResponse)
 async def logs_view(request: Request, round_id: int, hotkey: str):
     state = get_state()
-    meta = log_helpers.fetch_meta(state.r2, round_id, hotkey)
+    meta = await log_helpers.fetch_meta_cached_or_r2(
+        state.pool, state.r2, round_id, hotkey,
+    )
     stdout = log_helpers.fetch_stdout(state.r2, round_id, hotkey)
     architecture = log_helpers.fetch_architecture(state.r2, round_id, hotkey)
     return _html(
@@ -322,9 +324,11 @@ async def logs_view(request: Request, round_id: int, hotkey: str):
 @router.get("/logs/{round_id}/{hotkey}/meta")
 async def logs_meta(round_id: int, hotkey: str):
     state = get_state()
-    meta = log_helpers.fetch_meta(state.r2, round_id, hotkey)
+    meta = await log_helpers.fetch_meta_cached_or_r2(
+        state.pool, state.r2, round_id, hotkey,
+    )
     if meta is None:
-        raise HTTPException(status_code=404, detail="No training_meta.json in R2")
+        raise HTTPException(status_code=404, detail="training_meta not found")
     return JSONResponse(meta)
 
 

@@ -104,12 +104,15 @@ class FakePool:
         access_log: Optional[list[dict]] = None,
         agent_history: Optional[list[dict]] = None,
         agent_bundles: Optional[dict[str, dict]] = None,
+        training_metas: Optional[dict[tuple[int, str], dict]] = None,
     ):
         self.elements = elements
         self.access_log = access_log or []
         self.agent_history = agent_history or []
         # code_hash -> bundle dict (mirrors the agent_bundles Postgres table)
         self.agent_bundles = agent_bundles or {}
+        # (round_id, hotkey) -> meta dict (mirrors training_metas table)
+        self.training_metas = training_metas or {}
 
     def _rows(self):
         return [self._row(e) for e in self.elements]
@@ -295,6 +298,12 @@ class FakePool:
             if bundle is None:
                 return None
             return {"bundle": json.dumps(bundle)}
+        if "from training_metas" in sql_l and "round_id = $1" in sql_l:
+            key = (int(params[0]), params[1])
+            meta = self.training_metas.get(key)
+            if meta is None:
+                return None
+            return {"meta": json.dumps(meta)}
         return None
 
 
@@ -394,18 +403,10 @@ def dashboard_client():
         "entry_point": "agent.py",
         "code_hash": "hash_v2" + ("0" * 50),
     }
-    pool = FakePool(
-        elements,
-        access_log=access_log,
-        agent_history=agent_history,
-        agent_bundles={bundle_v1["code_hash"]: bundle_v1},
-    )
-    r2 = FakeR2()
-    r2.upload_json("agents/hk_a/hash_v1.json", bundle_v1)
-    r2.upload_json("agents/hk_a/hash_v2.json", bundle_v2)
-    # Seed a training log file so the log route has something to read.
-    r2.upload_text("round_7/miner_hk_a/stdout.log", "epoch 0 loss=2.0\nepoch 1 loss=1.5\n")
-    r2.upload_json("round_7/miner_hk_a/training_meta.json", {
+    # Round 7's meta lives in the Postgres cache; round 8's only in R2 — this
+    # keeps the R2 fallback path covered while round 7 exercises the cache.
+    cached_meta_round7 = {
+        "round_id": 7, "miner_hotkey": "hk_a",
         "flops": 1234, "ok": True,
         "train_loss_history": [
             {"step": 10, "loss": 22.19}, {"step": 20, "loss": 14.71},
@@ -413,7 +414,27 @@ def dashboard_client():
         "val_loss_history": [
             {"step": 10, "loss": 27.20}, {"step": 20, "loss": 21.28},
         ],
-    })
+    }
+    r2_meta_round8 = {
+        "round_id": 8, "miner_hotkey": "hk_a",
+        "flops": 5678, "ok": True,
+    }
+    pool = FakePool(
+        elements,
+        access_log=access_log,
+        agent_history=agent_history,
+        agent_bundles={bundle_v1["code_hash"]: bundle_v1},
+        training_metas={(7, "hk_a"): cached_meta_round7},
+    )
+    r2 = FakeR2()
+    r2.upload_json("agents/hk_a/hash_v1.json", bundle_v1)
+    r2.upload_json("agents/hk_a/hash_v2.json", bundle_v2)
+    # Seed a training log file so the log route has something to read.
+    r2.upload_text("round_7/miner_hk_a/stdout.log", "epoch 0 loss=2.0\nepoch 1 loss=1.5\n")
+    # Round 7 meta also goes to R2 so existing tests keep working — the cache
+    # is preferred when both exist.
+    r2.upload_json("round_7/miner_hk_a/training_meta.json", cached_meta_round7)
+    r2.upload_json("round_8/miner_hk_a/training_meta.json", r2_meta_round8)
     r2.upload_text(
         "round_7/miner_hk_a/architecture.py",
         "class Model:\n    def __init__(self):\n        self.name = 'unit-test-model'\n",
@@ -983,6 +1004,41 @@ def test_public_agent_code_unknown_returns_404(dashboard_client):
     fresh = TestClient(app)
     r = fresh.get("/dashboard/api/agent_code/" + ("f" * 64) + ".json")
     assert r.status_code == 404
+
+
+def test_public_logs_meta_serves_from_postgres_cache_without_r2(dashboard_client):
+    """training_meta cached in Postgres is served even when R2 is unavailable.
+
+    Reproduces "training loss missing on the new dashboard": dashboard-mode
+    deploys (no R2) used to 404 the meta endpoint, hiding the loss curves.
+    """
+    from fastapi.testclient import TestClient
+    from database.dashboard import app as dash_app
+
+    saved_r2 = dash_app._state.r2
+    dash_app._state.r2 = None
+    try:
+        fresh = TestClient(app)
+        r = fresh.get("/dashboard/api/logs/7/hk_a/meta.json")
+        assert r.status_code == 200
+        meta = r.json()
+        assert meta["train_loss_history"][0]["loss"] == 22.19
+        assert meta["val_loss_history"][-1]["loss"] == 21.28
+
+        # Round 8 only lives in R2, so without R2 it's a clean 404.
+        miss = fresh.get("/dashboard/api/logs/8/hk_a/meta.json")
+        assert miss.status_code == 404
+    finally:
+        dash_app._state.r2 = saved_r2
+
+
+def test_public_logs_meta_falls_back_to_r2(dashboard_client):
+    """Rows that predate the cache are still served from R2."""
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/logs/8/hk_a/meta.json")
+    assert r.status_code == 200
+    assert r.json()["flops"] == 5678
 
 
 def test_public_agent_code_json_works_without_r2(dashboard_client):

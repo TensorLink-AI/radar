@@ -183,6 +183,19 @@ CREATE TABLE IF NOT EXISTS agent_bundles (
     bundle JSONB NOT NULL,
     created_at DOUBLE PRECISION NOT NULL DEFAULT extract(epoch from now())
 );
+
+-- Cache of training_meta.json (loss histories, status, flops, …) keyed by
+-- (round_id, hotkey). Validators write this after Phase B so the public
+-- dashboard JSON API can serve training-loss curves without R2 access.
+CREATE TABLE IF NOT EXISTS training_metas (
+    round_id BIGINT NOT NULL,
+    hotkey TEXT NOT NULL,
+    meta JSONB NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL DEFAULT extract(epoch from now()),
+    PRIMARY KEY (round_id, hotkey)
+);
+CREATE INDEX IF NOT EXISTS idx_tm_round ON training_metas(round_id);
+CREATE INDEX IF NOT EXISTS idx_tm_hotkey ON training_metas(hotkey);
 """
 
 ACCESS_LOG_SCHEMA = """

@@ -213,8 +213,19 @@ class UpdateFrontierRequest(BaseModel):
     task: str = ""
 
 
+class SubmitTrainingMetaRequest(BaseModel):
+    """Validator caches a training_meta.json blob in Postgres so the public
+    dashboard can render loss curves without R2 credentials."""
+    round_id: int
+    hotkey: str
+    meta: dict
+
+
 # Routes that only validators (hotkeys with permit) may call
-_VALIDATOR_ONLY_PREFIXES = ("/experiments/add", "/frontier/update", "/provenance/record")
+_VALIDATOR_ONLY_PREFIXES = (
+    "/experiments/add", "/frontier/update", "/provenance/record",
+    "/training_metas",
+)
 
 
 def _check_nonce(nonce: str) -> bool:
@@ -506,6 +517,41 @@ async def add_experiment(req: AddExperimentRequest):
         logger.error("add_experiment failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"DB insert failed: {e}")
     return {"index": idx}
+
+
+@validator_router.post("/training_metas")
+async def submit_training_meta(req: SubmitTrainingMetaRequest):
+    """Validator caches a training_meta.json blob keyed by (round_id, hotkey).
+
+    Idempotent — repeated submissions for the same key overwrite, which is
+    fine since fallback dispatchers may produce a fresher meta after the
+    primary trainer timed out.
+    """
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="DB pool not configured")
+    if not isinstance(req.meta, dict) or not req.meta:
+        raise HTTPException(status_code=400, detail="meta must be a non-empty object")
+
+    import json as _json
+
+    try:
+        await _pool.execute(
+            """
+            INSERT INTO training_metas (round_id, hotkey, meta)
+            VALUES ($1, $2, $3::jsonb)
+            ON CONFLICT (round_id, hotkey) DO UPDATE SET
+                meta = EXCLUDED.meta,
+                created_at = extract(epoch from now())
+            """,
+            int(req.round_id), req.hotkey, _json.dumps(req.meta),
+        )
+    except Exception as e:
+        logger.error(
+            "training_meta cache failed: round=%s hotkey=%s err=%s",
+            req.round_id, req.hotkey[:16], e,
+        )
+        raise HTTPException(status_code=500, detail="Failed to cache training meta")
+    return {"status": "ok"}
 
 
 @validator_router.post("/frontier/update")
