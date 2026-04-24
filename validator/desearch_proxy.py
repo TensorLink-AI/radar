@@ -33,9 +33,9 @@ DESEARCH_TOOL_ARXIV = "arxiv"
 DESEARCH_TOOL_WEB = "web"
 ALLOWED_TOOLS = {DESEARCH_TOOL_ARXIV, DESEARCH_TOOL_WEB}
 
-# Allowed values for the Desearch `date_filter` field.
+# Allowed values for the Desearch `date_filter` field. Desearch does not
+# accept "NONE"; PAST_2_YEARS is the broadest supported window.
 ALLOWED_DATE_FILTERS = {
-    "NONE",
     "PAST_24_HOURS",
     "PAST_2_DAYS",
     "PAST_WEEK",
@@ -45,10 +45,15 @@ ALLOWED_DATE_FILTERS = {
     "PAST_YEAR",
     "PAST_2_YEARS",
 }
+DEFAULT_DATE_FILTER = "PAST_2_YEARS"
 
 # Desearch response shape we request. Gives us a list of link objects plus
 # a final summary string.
 DESEARCH_RESULT_TYPE = "LINKS_WITH_FINAL_SUMMARY"
+
+# Desearch requires `count >= 10` on /desearch/ai/search. We still let miners
+# ask for fewer results — the response is sliced to max_results before return.
+DESEARCH_MIN_COUNT = 10
 
 # Rate limit: max queries per miner per tempo
 MAX_QUERIES_PER_TEMPO = 20
@@ -63,7 +68,7 @@ class SearchQuery(BaseModel):
     query: str = Field(..., min_length=1, max_length=500)
     max_results: int = Field(default=5, ge=1, le=20)
     tool: str = Field(default=DESEARCH_TOOL_ARXIV)
-    date_filter: str = Field(default="NONE")
+    date_filter: str = Field(default=DEFAULT_DATE_FILTER)
 
 
 class SearchResult(BaseModel):
@@ -155,7 +160,7 @@ class DesearchProxy:
     async def search(
         self, miner_uid: int, query: str, max_results: int = 5,
         miner_hotkey: str = "", tool: str = DESEARCH_TOOL_ARXIV,
-        date_filter: str = "NONE",
+        date_filter: str = DEFAULT_DATE_FILTER,
     ) -> SearchResponse:
         """
         Search via the Desearch /desearch/ai/search endpoint.
@@ -184,12 +189,15 @@ class DesearchProxy:
         remaining -= 1
 
         headers = {"Authorization": self.api_key} if self.api_key else {}
+        # Desearch requires count >= DESEARCH_MIN_COUNT; we slice the response
+        # back down to max_results before returning to the miner.
+        upstream_count = max(DESEARCH_MIN_COUNT, max_results)
         body = {
             "prompt": query,
             "tools": [tool],
             "date_filter": date_filter,
             "result_type": DESEARCH_RESULT_TYPE,
-            "count": max_results,
+            "count": upstream_count,
         }
 
         try:
