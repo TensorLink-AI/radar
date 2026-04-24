@@ -55,13 +55,38 @@ def _downsample(points: list[float], limit: int = _MAX_LOSS_POINTS) -> list[floa
 async def loss_curve(index: int) -> dict:
     state = get_state()
     row = await state.pool.fetchrow(
-        "SELECT loss_curve FROM experiments WHERE id = $1", index,
+        """
+        SELECT e.loss_curve, tm.meta
+        FROM experiments e
+        LEFT JOIN training_metas tm
+               ON tm.round_id = e.round_id
+              AND tm.hotkey   = e.miner_hotkey
+        WHERE e.id = $1
+        """,
+        index,
     )
     if row is None:
         raise HTTPException(status_code=404, detail="experiment not found")
 
     from shared.pg_schema import _decode_jsonb
     curve = _decode_jsonb(row["loss_curve"], [])
+    # Pre-training_metas rounds left experiments.loss_curve empty. The richer
+    # meta rows carry {step, loss} per step under train_/val_loss_history —
+    # extract the series so historical experiments still render.
+    if not curve:
+        meta = _decode_jsonb(row["meta"], {}) or {}
+        for key in ("train_loss_history", "val_loss_history"):
+            hist = meta.get(key)
+            if isinstance(hist, list) and hist:
+                curve = [p["loss"] for p in hist
+                         if isinstance(p, dict) and isinstance(p.get("loss"), (int, float))]
+                if curve:
+                    break
+        if not curve:
+            legacy = meta.get("loss_curve")
+            if isinstance(legacy, list):
+                curve = legacy
+
     points = _downsample(curve)
     # ``loss_curve`` matches the radarnet.io SPA contract; ``points`` is kept
     # for the internal Jinja dashboard.js which reads data.points.
