@@ -62,7 +62,10 @@ async def loss_curve(index: int) -> dict:
 
     from shared.pg_schema import _decode_jsonb
     curve = _decode_jsonb(row["loss_curve"], [])
-    return {"index": index, "points": _downsample(curve)}
+    points = _downsample(curve)
+    # ``loss_curve`` matches the radarnet.io SPA contract; ``points`` is kept
+    # for the internal Jinja dashboard.js which reads data.points.
+    return {"index": index, "loss_curve": points, "points": points}
 
 
 @router.get("/pareto.json")

@@ -636,6 +636,7 @@ def test_loss_curve_api(logged_in):
     data = r.json()
     assert data["index"] == 0
     assert data["points"] == [2.0, 1.5, 1.2]
+    assert data["loss_curve"] == [2.0, 1.5, 1.2]
 
 
 def test_miners_list(logged_in):
