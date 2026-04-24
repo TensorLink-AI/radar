@@ -38,12 +38,23 @@ class DashboardState:
         r2,
         get_challenge: Optional[Callable[[], dict]] = None,
         get_frontier: Optional[Callable[[], list]] = None,
+        get_task_buckets: Optional[Callable[[str], list[tuple[int, int]]]] = None,
     ):
         self.store = store
         self.pool = pool
         self.r2 = r2
         self.get_challenge = get_challenge or (lambda: None)
         self.get_frontier = get_frontier or (lambda: None)
+        # Resolve a task name to its (min, max) FLOPs bucket list. Tasks may
+        # override the global SIZE_BUCKETS in YAML, so the dashboard must ask
+        # the host process rather than hardcoding the default. Falls back to
+        # the global SIZE_BUCKETS when no resolver is wired in (legacy /
+        # test contexts) or the task is unknown.
+        from shared.challenge import SIZE_BUCKETS as _DEFAULT_BUCKETS
+        self._default_buckets = list(_DEFAULT_BUCKETS)
+        self.get_task_buckets = get_task_buckets or (
+            lambda _task: list(self._default_buckets)
+        )
         # HMAC-signed cookie serializer. Key rotates per-process by default.
         key = Config.DASHBOARD_KEY or secrets.token_urlsafe(32)
         self.serializer = URLSafeTimedSerializer(key, salt="radar-dashboard-v1")
@@ -100,6 +111,7 @@ def _ensure_state(
     r2,
     get_challenge: Optional[Callable[[], dict]] = None,
     get_frontier: Optional[Callable[[], list]] = None,
+    get_task_buckets: Optional[Callable[[str], list[tuple[int, int]]]] = None,
 ) -> DashboardState:
     """Install (or refresh) the module-level ``DashboardState`` singleton."""
     global _state
@@ -109,6 +121,7 @@ def _ensure_state(
         r2=r2,
         get_challenge=get_challenge,
         get_frontier=get_frontier,
+        get_task_buckets=get_task_buckets,
     )
     return _state
 
@@ -120,13 +133,14 @@ def mount_public_api(
     r2,
     get_challenge: Optional[Callable[[], dict]] = None,
     get_frontier: Optional[Callable[[], list]] = None,
+    get_task_buckets: Optional[Callable[[str], list[tuple[int, int]]]] = None,
 ) -> None:
     """Mount the **public** JSON API at ``/dashboard/api/*``.
 
     No auth. Safe to call in dashboard mode (no Jinja, no wallet) and in
     ``all`` mode (shares the app with validator routes). Idempotent.
     """
-    _ensure_state(store, pool, r2, get_challenge, get_frontier)
+    _ensure_state(store, pool, r2, get_challenge, get_frontier, get_task_buckets)
 
     already_mounted = any(
         getattr(r, "path", "").startswith("/dashboard/api") for r in app.routes
@@ -147,6 +161,7 @@ def mount_dashboard(
     r2,
     get_challenge: Optional[Callable[[], dict]] = None,
     get_frontier: Optional[Callable[[], list]] = None,
+    get_task_buckets: Optional[Callable[[str], list[tuple[int, int]]]] = None,
 ) -> None:
     """Attach the dashboard router + static mount to an existing FastAPI app.
 
@@ -165,7 +180,7 @@ def mount_dashboard(
         )
         return
 
-    _ensure_state(store, pool, r2, get_challenge, get_frontier)
+    _ensure_state(store, pool, r2, get_challenge, get_frontier, get_task_buckets)
 
     # Static assets (HTMX, Chart.js glue, CSS)
     _STATIC_DIR.mkdir(parents=True, exist_ok=True)

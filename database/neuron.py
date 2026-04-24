@@ -40,6 +40,7 @@ from shared.pg_store import (
     create_pg_pool,
     ensure_schema_exists,
 )
+from shared.challenge import SIZE_BUCKETS as _DEFAULT_SIZE_BUCKETS
 from shared.task import load_enabled_tasks
 
 logger = logging.getLogger(__name__)
@@ -143,6 +144,13 @@ class DatabaseNeuron:
         # Tasks
         self.tasks = load_enabled_tasks(Config.ENABLED_TASKS)
 
+        # Cache the dashboard's bucket resolver so it survives reloads of
+        # ``self.tasks`` later. Tasks may declare their own size_buckets in
+        # YAML; unknown task names fall back to the global default so the
+        # dashboard still shows a sensible bucket layout for historical
+        # experiments belonging to tasks no longer enabled here.
+        self._get_task_buckets = self._build_task_bucket_resolver()
+
         # Per-task Pareto fronts (only populated in modes that run chain logic)
         self.pareto_fronts: dict[str, ParetoFront] = {}
 
@@ -160,6 +168,23 @@ class DatabaseNeuron:
         self.pool = None
         self.store = None
         self.access_logger = None
+
+    def _build_task_bucket_resolver(self) -> Callable[[str], list[tuple[int, int]]]:
+        """Closure that maps a task name to its FLOPs-equivalent bucket list.
+
+        Mirrors ``shared.challenge._resolve_task_buckets`` so the dashboard
+        chart bins experiments into the same buckets that scoring uses, even
+        when a task has overridden the global SIZE_BUCKETS in YAML.
+        """
+        default_buckets = list(_DEFAULT_SIZE_BUCKETS)
+
+        def resolve(task_name: str) -> list[tuple[int, int]]:
+            spec = self.tasks.get(task_name) if task_name else None
+            if spec is None or not spec.size_buckets:
+                return list(default_buckets)
+            return [(int(lo), int(hi)) for lo, hi in spec.size_buckets]
+
+        return resolve
 
     async def _init_db(self):
         """Create the asyncpg pool + ensure schemas exist.
@@ -347,6 +372,7 @@ class DatabaseNeuron:
                         r2=self.r2,
                         get_challenge=get_current_challenge,
                         get_frontier=get_current_frontier,
+                        get_task_buckets=self._get_task_buckets,
                     )
                 except Exception as e:
                     logger.warning("Dashboard mount failed: %s", e)
@@ -362,6 +388,7 @@ class DatabaseNeuron:
                     r2=self.r2,
                     get_challenge=get_current_challenge,
                     get_frontier=get_current_frontier,
+                    get_task_buckets=self._get_task_buckets,
                 )
             except Exception as e:
                 logger.warning("Public JSON API mount failed: %s", e)

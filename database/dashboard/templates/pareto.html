@@ -12,11 +12,25 @@
             {% endfor %}
         </select>
     </label>
+    <label>Bucket
+        <select name="bucket" onchange="this.form.submit()" {% if not buckets %}disabled{% endif %}>
+            <option value="" {% if not selected_bucket %}selected{% endif %}>All buckets</option>
+            {% for b in buckets %}
+            <option value="{{ b.index }}" {% if selected_bucket == b.index|string %}selected{% endif %}>
+                {{ b.label }}
+            </option>
+            {% endfor %}
+        </select>
+    </label>
 </form>
 
 <p class="muted">Lower-is-better metric on Y. FLOPs-equivalent size on X (log scale).
-Frontier members are highlighted; dominated points are greyed.</p>
+Frontier members are highlighted; dominated points are greyed. Each FLOPs bucket
+has its own frontier — scoring never compares models across buckets, and the
+chart reflects that.</p>
 
-<canvas id="pareto-scatter" height="420" data-task="{{ task }}"></canvas>
+<canvas id="pareto-scatter" height="420"
+        data-task="{{ task }}"
+        data-bucket="{{ selected_bucket }}"></canvas>
 <div id="pareto-legend" class="muted"></div>
 {% endblock %}
