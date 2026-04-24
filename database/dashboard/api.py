@@ -244,7 +244,7 @@ async def browse_json(
     page_size = max(1, min(int(page_size), 200))
     result = await q.browse(state.pool, filters, page=max(0, int(page)), page_size=page_size)
     return {
-        "rows": [e.to_api_dict() for e in result["items"]],
+        "items": [e.to_api_dict() for e in result["items"]],
         "total": int(result["total"]),
         "page": int(result["page"]),
         "page_size": int(result["page_size"]),

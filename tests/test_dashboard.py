@@ -855,7 +855,7 @@ def test_public_browse_json(dashboard_client):
     r = fresh.get("/dashboard/api/browse.json?page=0&page_size=10")
     assert r.status_code == 200
     body = r.json()
-    assert "rows" in body and "total" in body
+    assert "items" in body and "total" in body
     assert "page" in body and "page_size" in body
 
 
