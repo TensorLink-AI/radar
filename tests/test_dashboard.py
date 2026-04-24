@@ -285,6 +285,13 @@ class FakePool:
                 if e.index == params[0]:
                     return {"loss_curve": json.dumps(e.loss_curve)}
             return None
+        if "max(round_id)" in sql_l and "max(timestamp)" in sql_l:
+            rounds = [e.round_id for e in self.elements if e.round_id >= 0]
+            stamps = [e.timestamp for e in self.elements if e.timestamp]
+            return {
+                "last_round": max(rounds) if rounds else None,
+                "last_at": max(stamps) if stamps else None,
+            }
         if "from agent_submission_history" in sql_l and "code_hash = $1" in sql_l:
             target = params[0]
             matches = [h for h in self.agent_history if h["code_hash"] == target]
@@ -889,6 +896,39 @@ def test_public_rounds_json(dashboard_client):
     r = fresh.get("/dashboard/api/rounds.json")
     assert r.status_code == 200
     assert set(r.json()) == {7, 8}
+
+
+def test_public_heartbeat_json(dashboard_client):
+    """Heartbeat exposes ``now``, ``last_submission_at``, and ``last_round_id``."""
+    from fastapi.testclient import TestClient
+    from database.dashboard import api as dash_api
+
+    # Reset the in-process cache so a previous test doesn't shadow this one.
+    dash_api._heartbeat_cache = None
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/heartbeat.json")
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"now", "last_submission_at", "last_round_id"}
+    assert body["last_round_id"] == 8
+    assert body["last_submission_at"] == 3000.0
+    assert body["now"] > 0
+
+
+def test_public_heartbeat_caches_in_process(dashboard_client):
+    """Repeated polls within the TTL share one cached payload."""
+    from fastapi.testclient import TestClient
+    from database.dashboard import api as dash_api
+
+    dash_api._heartbeat_cache = None
+    fresh = TestClient(app)
+    a = fresh.get("/dashboard/api/heartbeat.json").json()
+    b = fresh.get("/dashboard/api/heartbeat.json").json()
+    # ``now`` advances on every request, but the cached fields stay stable
+    # (and pinned to whatever was in the DB at the first call).
+    assert a["last_round_id"] == b["last_round_id"]
+    assert a["last_submission_at"] == b["last_submission_at"]
+    assert b["now"] >= a["now"]
 
 
 def test_public_benchmark_json(dashboard_client):

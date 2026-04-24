@@ -13,6 +13,7 @@ entire internet.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -29,6 +30,12 @@ router = APIRouter(prefix="/dashboard/api")
 # Max points sent to the browser for a loss curve — Chart.js starts
 # struggling past a few thousand points.
 _MAX_LOSS_POINTS = 500
+
+# In-process TTL cache for /heartbeat.json. Polled every 2–5s by the SPA;
+# capping at 1.5s means each browser tab triggers at most one DB read per
+# poll regardless of how many tabs are open across the world.
+_HEARTBEAT_TTL_S = 1.5
+_heartbeat_cache: Optional[tuple[float, dict]] = None
 
 
 def _downsample(points: list[float], limit: int = _MAX_LOSS_POINTS) -> list[float]:
@@ -171,6 +178,47 @@ async def miners_json(limit: int = 200) -> list[dict]:
     state = get_state()
     limit = max(1, min(int(limit), 500))
     return await q.miner_stats(state.pool, limit=limit)
+
+
+@router.get("/heartbeat.json")
+async def heartbeat_json() -> dict:
+    """Cheap liveness ping — returns the latest activity timestamps + round.
+
+    Designed for 2–5s SPA polling so the UI can render "last event Ns ago"
+    instead of just an "alive" dot. Result is cached in-process for ~1.5s
+    so tight polling never floods Postgres.
+    """
+    global _heartbeat_cache
+    now = time.time()
+    if _heartbeat_cache is not None:
+        cached_at, cached = _heartbeat_cache
+        if now - cached_at < _HEARTBEAT_TTL_S:
+            return {**cached, "now": now}
+
+    state = get_state()
+    last_round_id: Optional[int] = None
+    last_submission_at: Optional[float] = None
+    try:
+        row = await state.pool.fetchrow(
+            "SELECT MAX(round_id) AS last_round, MAX(timestamp) AS last_at "
+            "FROM experiments",
+        )
+        if row is not None:
+            last_round_id = (
+                int(row["last_round"]) if row["last_round"] is not None else None
+            )
+            last_submission_at = (
+                float(row["last_at"]) if row["last_at"] is not None else None
+            )
+    except Exception:
+        logger.exception("heartbeat query failed")
+
+    payload = {
+        "last_round_id": last_round_id,
+        "last_submission_at": last_submission_at,
+    }
+    _heartbeat_cache = (now, payload)
+    return {**payload, "now": now}
 
 
 @router.get("/challenge.json")
