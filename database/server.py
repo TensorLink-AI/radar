@@ -213,8 +213,19 @@ class UpdateFrontierRequest(BaseModel):
     task: str = ""
 
 
+class SubmitTrainingMetaRequest(BaseModel):
+    """Validator caches a training_meta.json blob in Postgres so the public
+    dashboard can render loss curves without R2 credentials."""
+    round_id: int
+    hotkey: str
+    meta: dict
+
+
 # Routes that only validators (hotkeys with permit) may call
-_VALIDATOR_ONLY_PREFIXES = ("/experiments/add", "/frontier/update", "/provenance/record")
+_VALIDATOR_ONLY_PREFIXES = (
+    "/experiments/add", "/frontier/update", "/provenance/record",
+    "/training_metas",
+)
 
 
 def _check_nonce(nonce: str) -> bool:
@@ -508,6 +519,41 @@ async def add_experiment(req: AddExperimentRequest):
     return {"index": idx}
 
 
+@validator_router.post("/training_metas")
+async def submit_training_meta(req: SubmitTrainingMetaRequest):
+    """Validator caches a training_meta.json blob keyed by (round_id, hotkey).
+
+    Idempotent — repeated submissions for the same key overwrite, which is
+    fine since fallback dispatchers may produce a fresher meta after the
+    primary trainer timed out.
+    """
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="DB pool not configured")
+    if not isinstance(req.meta, dict) or not req.meta:
+        raise HTTPException(status_code=400, detail="meta must be a non-empty object")
+
+    import json as _json
+
+    try:
+        await _pool.execute(
+            """
+            INSERT INTO training_metas (round_id, hotkey, meta)
+            VALUES ($1, $2, $3::jsonb)
+            ON CONFLICT (round_id, hotkey) DO UPDATE SET
+                meta = EXCLUDED.meta,
+                created_at = extract(epoch from now())
+            """,
+            int(req.round_id), req.hotkey, _json.dumps(req.meta),
+        )
+    except Exception as e:
+        logger.error(
+            "training_meta cache failed: round=%s hotkey=%s err=%s",
+            req.round_id, req.hotkey[:16], e,
+        )
+        raise HTTPException(status_code=500, detail="Failed to cache training meta")
+    return {"status": "ok"}
+
+
 @validator_router.post("/frontier/update")
 async def update_frontier(req: UpdateFrontierRequest):
     """Validator pushes frontier data."""
@@ -650,8 +696,13 @@ async def submit_agent_code(request: Request, req: SubmitAgentCodeRequest):
         except (TypeError, ValueError):
             round_submitted = -1
 
-    # Upsert into registry + append to history in one transaction so we never
-    # end up with a live registry row that has no matching audit entry.
+    # Upsert into registry + append to history + cache the bundle JSON in one
+    # transaction so we never end up with a live registry row that has no
+    # matching audit entry, and the public dashboard can serve the bundle
+    # straight from Postgres without reaching back into R2.
+    import json as _json
+
+    bundle_json = _json.dumps(bundle)
     try:
         async with _pool.acquire() as conn:
             async with conn.transaction():
@@ -681,6 +732,16 @@ async def submit_agent_code(request: Request, req: SubmitAgentCodeRequest):
                     """,
                     hotkey, miner_uid, code_hash, req.entry_point,
                     immutable_key, round_submitted,
+                )
+                # Content-addressed; ON CONFLICT DO NOTHING because identical
+                # bytes always hash to the same code_hash.
+                await conn.execute(
+                    """
+                    INSERT INTO agent_bundles (code_hash, bundle)
+                    VALUES ($1, $2::jsonb)
+                    ON CONFLICT (code_hash) DO NOTHING
+                    """,
+                    code_hash, bundle_json,
                 )
     except Exception as e:
         logger.error("Postgres write failed for agent code %s: %s", hotkey[:16], e)

@@ -13,6 +13,7 @@ entire internet.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -29,6 +30,12 @@ router = APIRouter(prefix="/dashboard/api")
 # Max points sent to the browser for a loss curve — Chart.js starts
 # struggling past a few thousand points.
 _MAX_LOSS_POINTS = 500
+
+# In-process TTL cache for /heartbeat.json. Polled every 2–5s by the SPA;
+# capping at 1.5s means each browser tab triggers at most one DB read per
+# poll regardless of how many tabs are open across the world.
+_HEARTBEAT_TTL_S = 1.5
+_heartbeat_cache: Optional[tuple[float, dict]] = None
 
 
 def _downsample(points: list[float], limit: int = _MAX_LOSS_POINTS) -> list[float]:
@@ -173,6 +180,47 @@ async def miners_json(limit: int = 200) -> list[dict]:
     return await q.miner_stats(state.pool, limit=limit)
 
 
+@router.get("/heartbeat.json")
+async def heartbeat_json() -> dict:
+    """Cheap liveness ping — returns the latest activity timestamps + round.
+
+    Designed for 2–5s SPA polling so the UI can render "last event Ns ago"
+    instead of just an "alive" dot. Result is cached in-process for ~1.5s
+    so tight polling never floods Postgres.
+    """
+    global _heartbeat_cache
+    now = time.time()
+    if _heartbeat_cache is not None:
+        cached_at, cached = _heartbeat_cache
+        if now - cached_at < _HEARTBEAT_TTL_S:
+            return {**cached, "now": now}
+
+    state = get_state()
+    last_round_id: Optional[int] = None
+    last_submission_at: Optional[float] = None
+    try:
+        row = await state.pool.fetchrow(
+            "SELECT MAX(round_id) AS last_round, MAX(timestamp) AS last_at "
+            "FROM experiments",
+        )
+        if row is not None:
+            last_round_id = (
+                int(row["last_round"]) if row["last_round"] is not None else None
+            )
+            last_submission_at = (
+                float(row["last_at"]) if row["last_at"] is not None else None
+            )
+    except Exception:
+        logger.exception("heartbeat query failed")
+
+    payload = {
+        "last_round_id": last_round_id,
+        "last_submission_at": last_submission_at,
+    }
+    _heartbeat_cache = (now, payload)
+    return {**payload, "now": now}
+
+
 @router.get("/challenge.json")
 async def challenge_json() -> dict:
     """Active challenge + current frontier size (SPA reads both at once)."""
@@ -191,6 +239,25 @@ async def rounds_json(limit: int = 30) -> list[int]:
     state = get_state()
     limit = max(1, min(int(limit), 200))
     return await q.distinct_rounds(state.pool, limit=limit)
+
+
+@router.get("/benchmark.json")
+async def benchmark_json(task: str = "", limit: int = 100) -> dict:
+    """Per-round eval-score summary for a task — newest round first.
+
+    Mirrors the data the Jinja ``/dashboard/benchmark`` view renders so the
+    public SPA can chart eval scores over time. Defaults to the first known
+    task when ``task`` is omitted, matching the Jinja behaviour.
+    """
+    from database.dashboard import queries as q
+
+    state = get_state()
+    tasks = await state.store.get_tasks()
+    if not task and tasks:
+        task = tasks[0]
+    limit = max(1, min(int(limit), 500))
+    rows = await q.benchmark_by_round(state.pool, task=task, limit=limit) if task else []
+    return {"task": task, "tasks": tasks, "rows": rows}
 
 
 def _parse_bool(s: str) -> Optional[bool]:
@@ -298,9 +365,11 @@ async def experiment_lineage_json(index: int) -> dict:
 @router.get("/logs/{round_id}/{hotkey}/meta.json")
 async def logs_meta_json(round_id: int, hotkey: str):
     state = get_state()
-    meta = log_helpers.fetch_meta(state.r2, round_id, hotkey)
+    meta = await log_helpers.fetch_meta_cached_or_r2(
+        state.pool, state.r2, round_id, hotkey,
+    )
     if meta is None:
-        raise HTTPException(status_code=404, detail="No training_meta.json in R2")
+        raise HTTPException(status_code=404, detail="training_meta not found")
     return JSONResponse(meta)
 
 
@@ -340,6 +409,11 @@ async def agent_code_json(code_hash: str) -> dict:
 
     Matches the data the Jinja ``/dashboard/agent_code/{hash}`` view renders,
     but returns JSON so the public SPA can display bundles without cookies.
+
+    Bundle bytes come from the ``agent_bundles`` cache in Postgres (populated
+    on submission). R2 is only consulted as a fallback for rows submitted
+    before the cache existed, so dashboard-mode deploys without R2
+    credentials still serve the bundle.
     """
     from database.dashboard import queries as q
 
@@ -347,14 +421,15 @@ async def agent_code_json(code_hash: str) -> dict:
     record = await q.agent_bundle_record(state.pool, code_hash)
     if record is None:
         raise HTTPException(status_code=404, detail="Unknown code_hash")
-    if state.r2 is None:
-        raise HTTPException(status_code=503, detail="R2 not configured")
-    try:
-        bundle = state.r2.download_json(record["r2_key"])
-    except Exception:
-        bundle = None
+
+    bundle = await q.agent_bundle_blob(state.pool, code_hash)
+    if bundle is None and state.r2 is not None:
+        try:
+            bundle = state.r2.download_json(record["r2_key"])
+        except Exception:
+            bundle = None
     if not bundle:
-        raise HTTPException(status_code=404, detail="Bundle missing in R2")
+        raise HTTPException(status_code=404, detail="Bundle not found")
     history = await q.miner_agent_history(state.pool, record["hotkey"], limit=50)
     return {
         "record": record,

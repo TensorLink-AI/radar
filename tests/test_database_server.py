@@ -360,6 +360,11 @@ def test_access_log_captures_ids_from_list_response():
 def test_access_log_skips_non_experiment_paths():
     _setup()
     logger = _install_access_logger()
+    # Other tests in the suite exercise the same global ``app`` from the
+    # TestClient ('testclient' IP), so the per-IP rate window can be near
+    # the threshold by the time we get here.
+    with _ip_rate_lock:
+        _ip_rate_window.pop("testclient", None)
     try:
         client = TestClient(app)
         r = client.get("/provenance/component_stats")
@@ -388,8 +393,10 @@ def test_access_log_runs_on_proxy_api_key_path():
     logger = _install_access_logger()
     prev_key = Config.DB_API_KEY
     Config.DB_API_KEY = "test-key"
-    # Avoid the IP-rate-limit window from other tests
+    # Avoid both per-hotkey and per-IP rate-limit windows from other tests
     srv._rate_window.clear()
+    with _ip_rate_lock:
+        _ip_rate_window.pop("testclient", None)
     try:
         client = TestClient(app)
         r = client.get(

@@ -419,8 +419,29 @@ async def agent_bundle_record(pool, code_hash: str) -> Optional[dict]:
     }
 
 
+async def agent_bundle_blob(pool, code_hash: str) -> Optional[dict]:
+    """Cached bundle bytes for ``code_hash`` from ``agent_bundles``.
+
+    Returns ``None`` if the row predates the cache (e.g. submitted before
+    this column existed) — callers should fall back to R2.
+    """
+    from shared.pg_schema import _decode_jsonb
+
+    row = await pool.fetchrow(
+        "SELECT bundle FROM agent_bundles WHERE code_hash = $1",
+        code_hash,
+    )
+    if row is None:
+        return None
+    bundle = _decode_jsonb(row["bundle"], None)
+    if not isinstance(bundle, dict):
+        return None
+    return bundle
+
+
 __all__ = [
     "BrowseFilters",
+    "agent_bundle_blob",
     "agent_bundle_record",
     "benchmark_by_round",
     "browse",

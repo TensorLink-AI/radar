@@ -274,7 +274,7 @@ class DatabaseNeuron:
         self.access_logger = PgAccessLogger(self.pool)
         await self.access_logger.init_schema()
 
-        # Init agent_submissions table
+        # Init agent_submissions + agent_bundles + training_metas tables
         from shared.pg_schema import AGENT_CODE_SCHEMA
         async with self.pool.acquire() as conn:
             await conn.execute(AGENT_CODE_SCHEMA)

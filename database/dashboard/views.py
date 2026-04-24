@@ -221,20 +221,28 @@ async def miner_detail(request: Request, hotkey: str):
 
 # ── Agent code bundle viewer + diff ───────────────────────────
 
+async def _load_bundle(state, record: dict) -> Optional[dict]:
+    """Resolve bundle bytes for ``record`` — Postgres cache first, R2 fallback."""
+    bundle = await q.agent_bundle_blob(state.pool, record["code_hash"])
+    if bundle is not None:
+        return bundle
+    if state.r2 is None:
+        return None
+    try:
+        return state.r2.download_json(record["r2_key"])
+    except Exception:
+        return None
+
+
 @router.get("/agent_code/{code_hash}", response_class=HTMLResponse)
 async def agent_bundle_view(request: Request, code_hash: str):
     state = get_state()
     record = await q.agent_bundle_record(state.pool, code_hash)
     if record is None:
         raise HTTPException(status_code=404, detail="Unknown code_hash")
-    if state.r2 is None:
-        raise HTTPException(status_code=503, detail="R2 not configured")
-    try:
-        bundle = state.r2.download_json(record["r2_key"])
-    except Exception:
-        bundle = None
+    bundle = await _load_bundle(state, record)
     if not bundle:
-        raise HTTPException(status_code=404, detail="Bundle missing in R2")
+        raise HTTPException(status_code=404, detail="Bundle not found")
     # History for the same hotkey powers the "compare to" picker
     history = await q.miner_agent_history(state.pool, record["hotkey"], limit=50)
     files = sorted((bundle.get("files") or {}).items())
@@ -258,15 +266,10 @@ async def agent_bundle_diff(request: Request, code_hash: str, other_hash: str):
     rec_b = await q.agent_bundle_record(state.pool, code_hash)
     if rec_a is None or rec_b is None:
         raise HTTPException(status_code=404, detail="Unknown code_hash")
-    if state.r2 is None:
-        raise HTTPException(status_code=503, detail="R2 not configured")
-    try:
-        bundle_a = state.r2.download_json(rec_a["r2_key"])
-        bundle_b = state.r2.download_json(rec_b["r2_key"])
-    except Exception:
-        bundle_a = bundle_b = None
+    bundle_a = await _load_bundle(state, rec_a)
+    bundle_b = await _load_bundle(state, rec_b)
     if not bundle_a or not bundle_b:
-        raise HTTPException(status_code=404, detail="Bundle missing in R2")
+        raise HTTPException(status_code=404, detail="Bundle not found")
 
     files_a = bundle_a.get("files") or {}
     files_b = bundle_b.get("files") or {}
@@ -302,7 +305,9 @@ async def provenance_view(request: Request):
 @router.get("/logs/{round_id}/{hotkey}", response_class=HTMLResponse)
 async def logs_view(request: Request, round_id: int, hotkey: str):
     state = get_state()
-    meta = log_helpers.fetch_meta(state.r2, round_id, hotkey)
+    meta = await log_helpers.fetch_meta_cached_or_r2(
+        state.pool, state.r2, round_id, hotkey,
+    )
     stdout = log_helpers.fetch_stdout(state.r2, round_id, hotkey)
     architecture = log_helpers.fetch_architecture(state.r2, round_id, hotkey)
     return _html(
@@ -319,9 +324,11 @@ async def logs_view(request: Request, round_id: int, hotkey: str):
 @router.get("/logs/{round_id}/{hotkey}/meta")
 async def logs_meta(round_id: int, hotkey: str):
     state = get_state()
-    meta = log_helpers.fetch_meta(state.r2, round_id, hotkey)
+    meta = await log_helpers.fetch_meta_cached_or_r2(
+        state.pool, state.r2, round_id, hotkey,
+    )
     if meta is None:
-        raise HTTPException(status_code=404, detail="No training_meta.json in R2")
+        raise HTTPException(status_code=404, detail="training_meta not found")
     return JSONResponse(meta)
 
 
