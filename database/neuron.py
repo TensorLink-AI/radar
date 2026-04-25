@@ -33,6 +33,7 @@ from database.server import (
     set_r2, set_pool,
     get_current_challenge, get_current_frontier,
 )
+from shared.migrations import apply_migrations
 from shared.pareto import ParetoFront
 from shared.pg_access_logger import PgAccessLogger
 from shared.pg_store import (
@@ -308,6 +309,30 @@ class DatabaseNeuron:
         from shared.pg_schema import PROXY_QUERY_LOG_SCHEMA
         async with self.pool.acquire() as conn:
             await conn.execute(PROXY_QUERY_LOG_SCHEMA)
+
+        # Apply any pending SQL deltas layered on top of the base schema.
+        # Ordering rationale: ``ensure_schema_exists`` created the
+        # namespace; ``init_schema`` already ran the idempotent
+        # ``CREATE TABLE IF NOT EXISTS`` bootstrap for the tables declared
+        # in ``pg_schema.py``; migrations now apply forward-only deltas
+        # (ALTER TABLE, backfills, new indexes). On a fresh DB both paths
+        # are no-ops for already-declared objects; on a restored DB the
+        # bootstrap is the no-op and migrations do the real work. Fail
+        # fast — if a migration errors, we let the exception propagate
+        # and crash the DB server at startup so Railway keeps the
+        # previous deploy live.
+        async with self.pool.acquire() as conn:
+            applied = await apply_migrations(conn, Config.NETWORK)
+        if applied:
+            logger.info(
+                "Applied %d migrations to schema %r: %s",
+                len(applied), Config.NETWORK, applied,
+            )
+        else:
+            logger.info(
+                "Applied 0 migrations to schema %r (already up to date)",
+                Config.NETWORK,
+            )
 
         # ── Shared wiring (both surfaces need DB access) ──
         set_db(self.store)

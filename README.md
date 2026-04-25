@@ -191,6 +191,15 @@ python validator/neuron.py --netuid <N> --subtensor.network <network> --wallet.n
 
 Enable arxiv search for miner agents via Subnet 22: `RADAR_DESEARCH_ENABLED=true`, `RADAR_DESEARCH_SN22_URL=<url>`.
 
+### Database schema changes
+
+Schema changes go through `database/migrations/`. See the README there for the full convention. TL;DR:
+
+* Write a new `NNN_what_changed.sql` file using `CURRENT_SCHEMA` as the schema placeholder (the runner substitutes it with `testnet` or `mainnet`).
+* CI requires a migration file any time `shared/pg_schema.py` changes.
+* Migrations apply automatically at DB server startup, per-schema (testnet and mainnet track independently in `<schema>.schema_migrations`).
+* Destructive changes (`DROP TABLE` / `DROP COLUMN` / `ALTER COLUMN ... TYPE`) require `ALLOW_DESTRUCTIVE` in the PR description.
+
 ## Task System
 
 Task-agnostic by design. Every Pareto front and provenance record is task-scoped. Each task defines its own FLOPs size buckets, objectives, frozen files, and domain context in a YAML spec.
