@@ -316,6 +316,11 @@ class FakePool:
             if bundle is None:
                 return None
             return {"bundle": json.dumps(bundle)}
+        if "select trace from experiments" in sql_l:
+            for e in self.elements:
+                if e.index == params[0]:
+                    return {"trace": e.trace}
+            return None
         if "from training_metas" in sql_l and "round_id = $1" in sql_l:
             key = (int(params[0]), params[1])
             meta = self.training_metas.get(key)
@@ -371,6 +376,7 @@ def _sample_elements() -> list[DataElement]:
             round_id=8, timestamp=2000.0,
             objectives={"flops_equivalent_size": 800_000},
             loss_curve=[1.5, 1.1, 0.9],
+            trace="agent: designing\nagent: done\n",
         ),
         DataElement(
             index=2, name="other", code="print(2)", success=False,
@@ -1164,6 +1170,26 @@ def test_public_miner_submissions_json(dashboard_client):
     assert body["hotkey"] == "hk_a"
     assert len(body["submissions"]) == 2
     assert len(body["agent_history"]) == 2
+
+
+def test_public_experiment_trace_txt(dashboard_client):
+    from fastapi.testclient import TestClient
+    from database import server as db_server
+    db_server._ip_rate_window.clear()
+    fresh = TestClient(app)
+
+    r = fresh.get("/dashboard/api/experiments/1/trace.txt")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert "immutable" in r.headers.get("cache-control", "")
+    assert "agent: designing" in r.text
+
+    # Element with empty trace -> 404 (don't conflate "missing" with "empty")
+    empty = fresh.get("/dashboard/api/experiments/0/trace.txt")
+    assert empty.status_code == 404
+
+    missing = fresh.get("/dashboard/api/experiments/9999/trace.txt")
+    assert missing.status_code == 404
 
 
 def test_public_experiment_lineage_json(dashboard_client):
