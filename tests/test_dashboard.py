@@ -1229,14 +1229,65 @@ def test_public_logs_meta_serves_from_postgres_cache_without_r2(dashboard_client
         r = fresh.get("/dashboard/api/logs/7/hk_a/meta.json")
         assert r.status_code == 200
         meta = r.json()
-        assert meta["train_loss_history"][0]["loss"] == 22.19
-        assert meta["val_loss_history"][-1]["loss"] == 21.28
+        # Public endpoint exposes index-aligned bare-number arrays so the
+        # radarnet.io chart can render train + val on a shared step axis.
+        assert meta["train_loss_history"] == [22.19, 14.71]
+        assert meta["val_loss_history"] == [27.20, 21.28]
+        assert meta["train_loss_final"] == 14.71
+        assert meta["val_loss_final"] == 21.28
 
         # Round 8 only lives in R2, so without R2 it's a clean 404.
         miss = fresh.get("/dashboard/api/logs/8/hk_a/meta.json")
         assert miss.status_code == 404
     finally:
         dash_app._state.r2 = saved_r2
+
+
+def test_meta_for_public_aligns_train_and_val_on_step_union():
+    """Val that ran at a subset of train steps must appear at the right index
+    with ``None`` filling the slots where val didn't run — so the renderer
+    can draw a continuous train line and a sparse dashed val line on a
+    shared step axis."""
+    from database.dashboard.api import _meta_for_public
+
+    sparse = {
+        "round_id": 9, "miner_hotkey": "hk_a",
+        "train_loss_history": [
+            {"step": 10, "loss": 5.0},
+            {"step": 20, "loss": 4.0},
+            {"step": 40, "loss": 3.0},
+            {"step": 80, "loss": 2.0},
+        ],
+        "val_loss_history": [
+            {"step": 10, "loss": 6.0},
+            {"step": 80, "loss": 2.5},
+        ],
+    }
+    out = _meta_for_public(sparse)
+    assert out["train_loss_history"] == [5.0, 4.0, 3.0, 2.0]
+    assert out["val_loss_history"] == [6.0, None, None, 2.5]
+    assert out["train_loss_final"] == 2.0
+    assert out["val_loss_final"] == 2.5
+
+    # Val-only steps still show up in the union, with train null at those
+    # indices — ensures we don't silently drop late-stage val checks.
+    val_late = {
+        "train_loss_history": [{"step": 10, "loss": 5.0}],
+        "val_loss_history":   [{"step": 10, "loss": 6.0}, {"step": 100, "loss": 1.0}],
+    }
+    out = _meta_for_public(val_late)
+    assert out["train_loss_history"] == [5.0, None]
+    assert out["val_loss_history"] == [6.0, 1.0]
+    assert out["val_loss_final"] == 1.0
+    assert "train_loss_final" in out and out["train_loss_final"] == 5.0
+
+    # Empty histories: leave the field absent so the SPA falls through to
+    # ``loss_curve`` legacy rendering instead of drawing an empty chart.
+    legacy = {"loss_curve": [3.0, 2.0, 1.0]}
+    out = _meta_for_public(legacy)
+    assert "train_loss_history" not in out
+    assert "val_loss_final" not in out
+    assert out["loss_curve"] == [3.0, 2.0, 1.0]
 
 
 def test_public_logs_meta_falls_back_to_r2(dashboard_client):

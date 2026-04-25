@@ -51,6 +51,28 @@ def _downsample(points: list[float], limit: int = _MAX_LOSS_POINTS) -> list[floa
     return [float(p) for p in sampled if p is not None]
 
 
+def _step_loss_pairs(hist) -> list[tuple[int, float]]:
+    """Coerce a ``[{step, loss}, …]`` history to ``[(step, loss), …]`` sorted by step.
+
+    Drops malformed entries so a single bad row can't break the chart.
+    """
+    if not isinstance(hist, list):
+        return []
+    pairs: list[tuple[int, float]] = []
+    for entry in hist:
+        if not isinstance(entry, dict):
+            continue
+        step = entry.get("step")
+        loss = entry.get("loss")
+        if isinstance(step, bool) or not isinstance(step, int):
+            continue
+        if not isinstance(loss, (int, float)) or isinstance(loss, bool):
+            continue
+        pairs.append((step, float(loss)))
+    pairs.sort(key=lambda p: p[0])
+    return pairs
+
+
 def _extract_loss_series(meta: dict) -> list[float]:
     """Pull a ``list[float]`` loss series out of a training_meta blob.
 
@@ -61,15 +83,48 @@ def _extract_loss_series(meta: dict) -> list[float]:
         return []
     for key in ("train_loss_history", "val_loss_history"):
         hist = meta.get(key)
-        if isinstance(hist, list) and hist:
-            series = [p["loss"] for p in hist
-                      if isinstance(p, dict) and isinstance(p.get("loss"), (int, float))]
-            if series:
-                return series
+        pairs = _step_loss_pairs(hist)
+        if pairs:
+            return [loss for _, loss in pairs]
     legacy = meta.get("loss_curve")
     if isinstance(legacy, list):
         return [float(v) for v in legacy if isinstance(v, (int, float))]
     return []
+
+
+def _meta_for_public(meta: dict) -> dict:
+    """Reshape a TrainingMeta blob into the form the public SPA renders.
+
+    The dataclass writes ``train_loss_history`` / ``val_loss_history`` as
+    ``[{step, loss}, …]`` (preserved for the cookie-gated Jinja UI), but the
+    radarnet.io chart wants index-aligned bare-number arrays plus scalar
+    ``train_loss_final`` / ``val_loss_final`` cells. Translate at the API
+    boundary so old R2 blobs stay valid without a backfill.
+
+    Train / val are aligned on the union of their step indices — slots where
+    val didn't run carry ``None`` so the renderer skips them but the train
+    line stays continuous.
+    """
+    if not isinstance(meta, dict):
+        return meta
+
+    out = dict(meta)
+    train_pts = _step_loss_pairs(meta.get("train_loss_history"))
+    val_pts = _step_loss_pairs(meta.get("val_loss_history"))
+
+    if train_pts or val_pts:
+        train_map = dict(train_pts)
+        val_map = dict(val_pts)
+        steps = sorted(set(train_map) | set(val_map))
+        out["train_loss_history"] = [train_map.get(s) for s in steps]
+        out["val_loss_history"] = [val_map.get(s) for s in steps]
+
+    if train_pts:
+        out["train_loss_final"] = train_pts[-1][1]
+    if val_pts:
+        out["val_loss_final"] = val_pts[-1][1]
+
+    return out
 
 
 @router.get("/loss_curve/{index}.json")
@@ -537,7 +592,7 @@ async def logs_meta_json(round_id: int, hotkey: str):
     )
     if meta is None:
         raise HTTPException(status_code=404, detail="training_meta not found")
-    return JSONResponse(meta)
+    return JSONResponse(_meta_for_public(meta))
 
 
 @router.get("/logs/{round_id}/{hotkey}/stdout.json")
