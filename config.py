@@ -215,6 +215,20 @@ class Config:
     # public query can't pressure the shared Crunchy cluster.
     PG_STATEMENT_TIMEOUT_MS: int = int(os.getenv("RADAR_PG_STATEMENT_TIMEOUT_MS", "0"))
 
+    # Startup retry budget for the asyncpg bootstrap connect + pool
+    # create. Covers containers that come up before Postgres is ready
+    # (Railway / k8s sidecar cold start, Crunchy Bridge rolling restart,
+    # DNS propagation) so a transient ECONNREFUSED doesn't crash-loop
+    # the process. Defaults to 6 retries with 1s initial backoff doubling
+    # up to 30s, for roughly one minute of total grace before giving up.
+    PG_STARTUP_RETRIES: int = int(os.getenv("RADAR_PG_STARTUP_RETRIES", "6"))
+    PG_STARTUP_BACKOFF_INITIAL_S: float = float(
+        os.getenv("RADAR_PG_STARTUP_BACKOFF_INITIAL_S", "1.0")
+    )
+    PG_STARTUP_BACKOFF_MAX_S: float = float(
+        os.getenv("RADAR_PG_STARTUP_BACKOFF_MAX_S", "30.0")
+    )
+
     # ── Network / Schema Isolation ────────────────────────────
     # Which Bittensor network this DB process serves: "testnet" or "mainnet".
     # A single Postgres database holds BOTH networks; isolation is enforced by

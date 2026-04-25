@@ -13,6 +13,7 @@ entire internet.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -30,6 +31,12 @@ router = APIRouter(prefix="/dashboard/api")
 # struggling past a few thousand points.
 _MAX_LOSS_POINTS = 500
 
+# In-process TTL cache for /heartbeat.json. Polled every 2–5s by the SPA;
+# capping at 1.5s means each browser tab triggers at most one DB read per
+# poll regardless of how many tabs are open across the world.
+_HEARTBEAT_TTL_S = 1.5
+_heartbeat_cache: Optional[tuple[float, dict]] = None
+
 
 def _downsample(points: list[float], limit: int = _MAX_LOSS_POINTS) -> list[float]:
     if not points:
@@ -44,70 +51,237 @@ def _downsample(points: list[float], limit: int = _MAX_LOSS_POINTS) -> list[floa
     return [float(p) for p in sampled if p is not None]
 
 
+def _extract_loss_series(meta: dict) -> list[float]:
+    """Pull a ``list[float]`` loss series out of a training_meta blob.
+
+    Validators write ``train_loss_history`` and ``val_loss_history`` as
+    ``[{step, loss}, …]``. Legacy blobs just carry a bare ``loss_curve``.
+    """
+    if not isinstance(meta, dict):
+        return []
+    for key in ("train_loss_history", "val_loss_history"):
+        hist = meta.get(key)
+        if isinstance(hist, list) and hist:
+            series = [p["loss"] for p in hist
+                      if isinstance(p, dict) and isinstance(p.get("loss"), (int, float))]
+            if series:
+                return series
+    legacy = meta.get("loss_curve")
+    if isinstance(legacy, list):
+        return [float(v) for v in legacy if isinstance(v, (int, float))]
+    return []
+
+
 @router.get("/loss_curve/{index}.json")
 async def loss_curve(index: int) -> dict:
     state = get_state()
     row = await state.pool.fetchrow(
-        "SELECT loss_curve FROM experiments WHERE id = $1", index,
+        """
+        SELECT e.loss_curve, e.round_id, e.miner_hotkey, tm.meta
+        FROM experiments e
+        LEFT JOIN training_metas tm
+               ON tm.round_id = e.round_id
+              AND tm.hotkey   = e.miner_hotkey
+        WHERE e.id = $1
+        """,
+        index,
     )
     if row is None:
         raise HTTPException(status_code=404, detail="experiment not found")
 
     from shared.pg_schema import _decode_jsonb
     curve = _decode_jsonb(row["loss_curve"], [])
-    return {"index": index, "points": _downsample(curve)}
+    # Pre-training_metas rounds left experiments.loss_curve empty. Try the
+    # Postgres cache next, then fall back to R2 (matches the Jinja
+    # /dashboard/logs/{round}/{hk}/meta route — the only reason that page
+    # renders a curve when this endpoint doesn't).
+    if not curve:
+        meta = _decode_jsonb(row["meta"], {}) or {}
+        curve = _extract_loss_series(meta)
+    if not curve and row["round_id"] is not None and row["miner_hotkey"]:
+        r2_meta = log_helpers.fetch_meta(
+            state.r2, int(row["round_id"]), row["miner_hotkey"],
+        )
+        if r2_meta:
+            curve = _extract_loss_series(r2_meta)
+
+    points = _downsample(curve)
+    # ``loss_curve`` matches the radarnet.io SPA contract; ``points`` is kept
+    # for the internal Jinja dashboard.js which reads data.points.
+    return {"index": index, "loss_curve": points, "points": points}
+
+
+def _bucket_label(min_flops: int, max_flops: int) -> str:
+    """Human-friendly label for a (min, max) FLOPs bucket — e.g. "500K – 2M"."""
+
+    def fmt(n: int) -> str:
+        if n >= 1_000_000_000_000:
+            v = n / 1_000_000_000_000
+            return f"{v:g}T"
+        if n >= 1_000_000_000:
+            v = n / 1_000_000_000
+            return f"{v:g}B"
+        if n >= 1_000_000:
+            v = n / 1_000_000
+            return f"{v:g}M"
+        if n >= 1_000:
+            v = n / 1_000
+            return f"{v:g}K"
+        return str(int(n))
+
+    return f"{fmt(min_flops)} – {fmt(max_flops)}"
+
+
+def _resolve_buckets(task: str) -> list[dict]:
+    """Resolve the bucket list for ``task`` into the API's serializable shape."""
+    state = get_state()
+    raw = state.get_task_buckets(task) or []
+    out: list[dict] = []
+    for i, entry in enumerate(raw):
+        if not entry or len(entry) != 2:
+            continue
+        lo, hi = int(entry[0]), int(entry[1])
+        if lo <= 0 or hi <= lo:
+            continue
+        out.append({
+            "index": i,
+            "min_flops": lo,
+            "max_flops": hi,
+            "label": _bucket_label(lo, hi),
+        })
+    return out
+
+
+def _bucket_index_for_flops(flops: int, buckets: list[dict]) -> int:
+    """Return the index of the smallest bucket containing ``flops`` (-1 if none)."""
+    for b in buckets:
+        if b["min_flops"] <= flops <= b["max_flops"]:
+            return int(b["index"])
+    return -1
+
+
+@router.get("/buckets.json")
+async def buckets_json(task: str = "") -> dict:
+    """FLOPs-equivalent size buckets defined for ``task``.
+
+    Tasks may override the global ``SIZE_BUCKETS`` in their YAML, so the
+    dashboard SPA fetches this list per task to render a bucket selector
+    that matches what the validator scorer actually enforces.
+    """
+    return {"task": task, "buckets": _resolve_buckets(task)}
 
 
 @router.get("/pareto.json")
 async def pareto_json(
     task: str = "",
+    bucket: str = "",
     min_flops: int | None = None,
     max_flops: int | None = None,
 ) -> dict:
-    """Scatter data — every successful experiment with a flops+metric, flagged
-    as dominated vs on-frontier via ``shared.pareto.ParetoFront``.
+    """Scatter data tagged per FLOPs bucket.
+
+    Phase C scores each experiment only against the frontier members feasible
+    for its round's bucket (see ``shared.scoring.passes_size_gate``). This
+    endpoint mirrors that: every point carries a ``bucket_index`` and an
+    ``on_frontier`` flag computed against that bucket's frontier — never the
+    global one — so the dashboard never claims a point dominates models in a
+    different size class.
+
+    Query params:
+      task        – filter to one task name. Buckets vary by task.
+      bucket      – integer index into the task's bucket list, or ``""``/
+                    ``"all"`` for every bucket. ``"active"`` resolves to the
+                    current challenge's bucket (when a challenge is live).
+      min_flops / max_flops – optional manual override that bypasses the
+                    bucket selection. Useful for ad-hoc inspection.
     """
     state = get_state()
     kw = {"task": task} if task else {}
     elements = await state.store.get_pareto_elements(**kw)
 
-    # Apply optional FLOPs window
     def _flops(e):
         return int(e.objectives.get("flops_equivalent_size") or 0)
 
+    buckets = _resolve_buckets(task)
+
+    # Resolve bucket selection. ``"active"`` only works when both a challenge
+    # is live and that challenge's bounds line up with one of the task's
+    # buckets — otherwise it degrades to "all" rather than silently filtering
+    # against the global default.
+    selected_idx: Optional[int] = None
+    if bucket and bucket.lower() not in ("all", ""):
+        if bucket.lower() == "active":
+            ch = state.get_challenge() or {}
+            ch_lo = int(ch.get("min_flops_equivalent") or 0)
+            ch_hi = int(ch.get("max_flops_equivalent") or 0)
+            for b in buckets:
+                if b["min_flops"] == ch_lo and b["max_flops"] == ch_hi:
+                    selected_idx = int(b["index"])
+                    break
+        else:
+            try:
+                idx = int(bucket)
+            except ValueError:
+                idx = -1
+            if any(b["index"] == idx for b in buckets):
+                selected_idx = idx
+
+    if selected_idx is not None:
+        sel = next(b for b in buckets if b["index"] == selected_idx)
+        elements = [e for e in elements if sel["min_flops"] <= _flops(e) <= sel["max_flops"]]
+
+    # Manual override stacks on top — keeps the historical query shape working.
     if min_flops is not None:
         elements = [e for e in elements if _flops(e) >= min_flops]
     if max_flops is not None:
         elements = [e for e in elements if _flops(e) <= max_flops]
 
-    # Build a Pareto front to identify frontier members
+    # Bin elements per bucket so we can build one ParetoFront per bucket. Points
+    # whose FLOPs fall outside every bucket land in bin ``-1`` and never join a
+    # frontier — they shouldn't have passed scoring's size gate anyway.
     from shared.pareto import ParetoFront
+
+    bins: dict[int, list] = {}
+    for e in elements:
+        f = _flops(e)
+        if not f or e.metric is None:
+            continue
+        b_idx = _bucket_index_for_flops(f, buckets)
+        bins.setdefault(b_idx, []).append(e)
 
     def _objective(elem):
         metric = elem.metric if elem.metric is not None else float("inf")
-        flops = _flops(elem) or float("inf")
+        flops = int(elem.objectives.get("flops_equivalent_size") or 0) or float("inf")
         return (metric, flops)
 
-    pf = ParetoFront(max_size=len(elements) + 1, objective_fn=_objective)
-    for e in elements:
-        pf.update(e)
-    frontier_ids = {c.element.index for c in pf.candidates}
+    frontier_ids: set = set()
+    for b_idx, items in bins.items():
+        if b_idx < 0 or not items:
+            continue
+        pf = ParetoFront(max_size=len(items) + 1, objective_fn=_objective)
+        for e in items:
+            pf.update(e)
+        frontier_ids.update(c.element.index for c in pf.candidates)
 
     points = []
-    for e in elements:
-        flops = _flops(e)
-        if not flops or e.metric is None:
-            continue
-        points.append({
-            "id": e.index,
-            "name": e.name,
-            "task": e.task,
-            "flops": flops,
-            "metric": float(e.metric),
-            "miner_hotkey": e.miner_hotkey,
-            "on_frontier": e.index in frontier_ids,
-        })
-    return {"task": task, "points": points}
+    for b_idx, items in bins.items():
+        for e in items:
+            points.append({
+                "id": e.index,
+                "name": e.name,
+                "task": e.task,
+                "flops": _flops(e),
+                "metric": float(e.metric),
+                "miner_hotkey": e.miner_hotkey,
+                "bucket_index": b_idx,
+                "on_frontier": e.index in frontier_ids,
+            })
+    return {
+        "task": task,
+        "buckets": buckets,
+        "selected_bucket": selected_idx,
+        "points": points,
+    }
 
 
 @router.get("/stats.json")
@@ -173,6 +347,47 @@ async def miners_json(limit: int = 200) -> list[dict]:
     return await q.miner_stats(state.pool, limit=limit)
 
 
+@router.get("/heartbeat.json")
+async def heartbeat_json() -> dict:
+    """Cheap liveness ping — returns the latest activity timestamps + round.
+
+    Designed for 2–5s SPA polling so the UI can render "last event Ns ago"
+    instead of just an "alive" dot. Result is cached in-process for ~1.5s
+    so tight polling never floods Postgres.
+    """
+    global _heartbeat_cache
+    now = time.time()
+    if _heartbeat_cache is not None:
+        cached_at, cached = _heartbeat_cache
+        if now - cached_at < _HEARTBEAT_TTL_S:
+            return {**cached, "now": now}
+
+    state = get_state()
+    last_round_id: Optional[int] = None
+    last_submission_at: Optional[float] = None
+    try:
+        row = await state.pool.fetchrow(
+            "SELECT MAX(round_id) AS last_round, MAX(timestamp) AS last_at "
+            "FROM experiments",
+        )
+        if row is not None:
+            last_round_id = (
+                int(row["last_round"]) if row["last_round"] is not None else None
+            )
+            last_submission_at = (
+                float(row["last_at"]) if row["last_at"] is not None else None
+            )
+    except Exception:
+        logger.exception("heartbeat query failed")
+
+    payload = {
+        "last_round_id": last_round_id,
+        "last_submission_at": last_submission_at,
+    }
+    _heartbeat_cache = (now, payload)
+    return {**payload, "now": now}
+
+
 @router.get("/challenge.json")
 async def challenge_json() -> dict:
     """Active challenge + current frontier size (SPA reads both at once)."""
@@ -191,6 +406,25 @@ async def rounds_json(limit: int = 30) -> list[int]:
     state = get_state()
     limit = max(1, min(int(limit), 200))
     return await q.distinct_rounds(state.pool, limit=limit)
+
+
+@router.get("/benchmark.json")
+async def benchmark_json(task: str = "", limit: int = 100) -> dict:
+    """Per-round eval-score summary for a task — newest round first.
+
+    Mirrors the data the Jinja ``/dashboard/benchmark`` view renders so the
+    public SPA can chart eval scores over time. Defaults to the first known
+    task when ``task`` is omitted, matching the Jinja behaviour.
+    """
+    from database.dashboard import queries as q
+
+    state = get_state()
+    tasks = await state.store.get_tasks()
+    if not task and tasks:
+        task = tasks[0]
+    limit = max(1, min(int(limit), 500))
+    rows = await q.benchmark_by_round(state.pool, task=task, limit=limit) if task else []
+    return {"task": task, "tasks": tasks, "rows": rows}
 
 
 def _parse_bool(s: str) -> Optional[bool]:
@@ -244,7 +478,7 @@ async def browse_json(
     page_size = max(1, min(int(page_size), 200))
     result = await q.browse(state.pool, filters, page=max(0, int(page)), page_size=page_size)
     return {
-        "rows": [e.to_api_dict() for e in result["items"]],
+        "items": [e.to_api_dict() for e in result["items"]],
         "total": int(result["total"]),
         "page": int(result["page"]),
         "page_size": int(result["page_size"]),
@@ -298,9 +532,11 @@ async def experiment_lineage_json(index: int) -> dict:
 @router.get("/logs/{round_id}/{hotkey}/meta.json")
 async def logs_meta_json(round_id: int, hotkey: str):
     state = get_state()
-    meta = log_helpers.fetch_meta(state.r2, round_id, hotkey)
+    meta = await log_helpers.fetch_meta_cached_or_r2(
+        state.pool, state.r2, round_id, hotkey,
+    )
     if meta is None:
-        raise HTTPException(status_code=404, detail="No training_meta.json in R2")
+        raise HTTPException(status_code=404, detail="training_meta not found")
     return JSONResponse(meta)
 
 
@@ -340,6 +576,11 @@ async def agent_code_json(code_hash: str) -> dict:
 
     Matches the data the Jinja ``/dashboard/agent_code/{hash}`` view renders,
     but returns JSON so the public SPA can display bundles without cookies.
+
+    Bundle bytes come from the ``agent_bundles`` cache in Postgres (populated
+    on submission). R2 is only consulted as a fallback for rows submitted
+    before the cache existed, so dashboard-mode deploys without R2
+    credentials still serve the bundle.
     """
     from database.dashboard import queries as q
 
@@ -347,14 +588,15 @@ async def agent_code_json(code_hash: str) -> dict:
     record = await q.agent_bundle_record(state.pool, code_hash)
     if record is None:
         raise HTTPException(status_code=404, detail="Unknown code_hash")
-    if state.r2 is None:
-        raise HTTPException(status_code=503, detail="R2 not configured")
-    try:
-        bundle = state.r2.download_json(record["r2_key"])
-    except Exception:
-        bundle = None
+
+    bundle = await q.agent_bundle_blob(state.pool, code_hash)
+    if bundle is None and state.r2 is not None:
+        try:
+            bundle = state.r2.download_json(record["r2_key"])
+        except Exception:
+            bundle = None
     if not bundle:
-        raise HTTPException(status_code=404, detail="Bundle missing in R2")
+        raise HTTPException(status_code=404, detail="Bundle not found")
     history = await q.miner_agent_history(state.pool, record["hotkey"], limit=50)
     return {
         "record": record,

@@ -181,6 +181,18 @@ class DatabaseClient:
             "files": files, "entry_point": entry_point,
         })
 
+    async def submit_training_meta(
+        self, round_id: int, hotkey: str, meta: dict,
+    ) -> bool:
+        """POST a training_meta.json blob so the public dashboard can render
+        loss curves without R2 access. Idempotent on (round_id, hotkey)."""
+        result = await self._post("/training_metas", {
+            "round_id": int(round_id),
+            "hotkey": hotkey,
+            "meta": meta,
+        })
+        return result is not None
+
     async def close(self):
         """Close the underlying HTTP client."""
         if self._client and not self._client.is_closed:

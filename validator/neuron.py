@@ -338,6 +338,40 @@ class Validator:
             remaining = (target_block - current) * 12
             await asyncio.sleep(min(remaining, 30))
 
+    async def _cache_training_metas(
+        self, round_id: int, metas: dict[int, dict],
+    ) -> None:
+        """Push training_meta blobs to the centralized DB so the public
+        dashboard can render loss curves without R2 access. Best-effort —
+        errors are logged but never raised, since scoring must proceed even
+        if the cache write fails."""
+        if not metas:
+            return
+        hotkeys = self.metagraph.hotkeys if hasattr(self.metagraph, "hotkeys") else []
+        cached = 0
+        for uid, meta in metas.items():
+            if not isinstance(meta, dict):
+                continue
+            hk = (
+                meta.get("miner_hotkey")
+                or (hotkeys[uid] if uid < len(hotkeys) else "")
+            )
+            if not hk:
+                continue
+            try:
+                ok = await self.db_client.submit_training_meta(round_id, hk, meta)
+                if ok:
+                    cached += 1
+            except Exception as e:
+                logger.warning(
+                    "training_meta cache failed: round=%d uid=%d err=%s",
+                    round_id, uid, e,
+                )
+        if cached:
+            logger.info(
+                "Cached %d training_meta blobs for round %d", cached, round_id,
+            )
+
     async def run_round(self):
         """Execute one full 3-phase round."""
         # ── SETUP ──────────────────────────────────────────────
@@ -600,6 +634,11 @@ class Validator:
         if missing_trainers:
             logger.info("Missing checkpoints from %d miners: %s", len(missing_trainers), missing_trainers)
 
+        # Cache training metas in Postgres so the public dashboard can render
+        # loss curves without R2 access. Best-effort: a failed cache write
+        # must not block scoring.
+        await self._cache_training_metas(challenge.round_id, training_metas)
+
         if Config.FALLBACK_ENABLED and missing_trainers:
             logger.info("Fallback enabled — reassigning %d missing jobs", len(missing_trainers))
             missing_dispatchers = list({
@@ -635,6 +674,7 @@ class Validator:
                     timeout=Config.FALLBACK_WINDOW_BLOCKS * 12,
                 )
                 training_metas.update(fb_metas)
+                await self._cache_training_metas(challenge.round_id, fb_metas)
 
         # ── Pre-cache GIFT-Eval data for Phase C ────────────────
         if self.gift_r2:

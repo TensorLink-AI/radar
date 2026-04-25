@@ -45,35 +45,106 @@
             .catch((err) => console.warn("loss curve fetch failed:", err));
     }
 
-    // ── Pareto scatter ──
+    // ── Pareto scatter (per-bucket frontiers) ──
     const scatter = document.getElementById("pareto-scatter");
     if (scatter) {
         const task = scatter.dataset.task || "";
-        const qs = task ? `?task=${encodeURIComponent(task)}` : "";
-        fetch(`/dashboard/api/pareto.json${qs}`)
+        const bucket = scatter.dataset.bucket || "";
+        const qs = new URLSearchParams();
+        if (task) qs.set("task", task);
+        if (bucket !== "" && bucket !== "None") qs.set("bucket", bucket);
+        const url = `/dashboard/api/pareto.json${qs.toString() ? "?" + qs.toString() : ""}`;
+
+        // One color per bucket index — cycle through if a task declares more
+        // than 6 buckets. Distinct hues so the chart legend doubles as the
+        // bucket key.
+        const BUCKET_COLORS = [
+            "#6ea8fe", // tiny     (blue)
+            "#48c78e", // small    (green)
+            "#f0b429", // mid-low  (amber)
+            "#f78da7", // mid-high (rose)
+            "#b18cf0", // large    (purple)
+            "#5fd2c5", // xl       (teal)
+        ];
+        const colorFor = (i) => BUCKET_COLORS[((i % BUCKET_COLORS.length) + BUCKET_COLORS.length) % BUCKET_COLORS.length];
+
+        fetch(url)
             .then((r) => r.json())
             .then((data) => {
                 const pts = data.points || [];
-                const frontier = pts.filter((p) => p.on_frontier);
-                const dominated = pts.filter((p) => !p.on_frontier);
+                const buckets = data.buckets || [];
+
+                // Group points by bucket; out-of-range points (bucket -1) get
+                // their own muted dataset so operators can still see them.
+                const byBucket = new Map();
+                for (const p of pts) {
+                    const k = (p.bucket_index === undefined || p.bucket_index === null) ? -1 : p.bucket_index;
+                    if (!byBucket.has(k)) byBucket.set(k, []);
+                    byBucket.get(k).push(p);
+                }
+
+                const datasets = [];
+                const fmt = (n) => {
+                    if (n >= 1e12) return (n / 1e12) + "T";
+                    if (n >= 1e9)  return (n / 1e9)  + "B";
+                    if (n >= 1e6)  return (n / 1e6)  + "M";
+                    if (n >= 1e3)  return (n / 1e3)  + "K";
+                    return String(n);
+                };
+
+                for (const b of buckets) {
+                    const items = byBucket.get(b.index) || [];
+                    if (!items.length) continue;
+                    const color = colorFor(b.index);
+                    const frontier = items.filter((p) => p.on_frontier)
+                        .sort((a, b) => a.flops - b.flops);
+                    const dominated = items.filter((p) => !p.on_frontier);
+                    if (dominated.length) {
+                        datasets.push({
+                            label: `${b.label} dominated (${dominated.length})`,
+                            data: dominated.map((p) => ({x: p.flops, y: p.metric, id: p.id, name: p.name})),
+                            backgroundColor: color + "55", // ~33% alpha
+                            borderColor: color + "55",
+                            pointRadius: 3,
+                            showLine: false,
+                        });
+                    }
+                    if (frontier.length) {
+                        datasets.push({
+                            label: `${b.label} frontier (${frontier.length})`,
+                            data: frontier.map((p) => ({x: p.flops, y: p.metric, id: p.id, name: p.name})),
+                            backgroundColor: color,
+                            borderColor: color,
+                            pointRadius: 5,
+                            showLine: frontier.length > 1,
+                            borderWidth: 2,
+                            tension: 0,
+                        });
+                    }
+                }
+
+                const outOfRange = byBucket.get(-1) || [];
+                if (outOfRange.length) {
+                    datasets.push({
+                        label: `outside any bucket (${outOfRange.length})`,
+                        data: outOfRange.map((p) => ({x: p.flops, y: p.metric, id: p.id, name: p.name})),
+                        backgroundColor: "rgba(138,143,153,0.4)",
+                        pointRadius: 3,
+                        showLine: false,
+                    });
+                }
+
+                if (!datasets.length) {
+                    scatter.replaceWith(Object.assign(document.createElement("p"), {
+                        className: "muted",
+                        textContent: "No experiments with FLOPs + metric in this view.",
+                    }));
+                    return;
+                }
+
                 new Chart(scatter, {
                     type: "scatter",
-                    data: {
-                        datasets: [
-                            {
-                                label: `frontier (${frontier.length})`,
-                                data: frontier.map((p) => ({x: p.flops, y: p.metric, id: p.id, name: p.name})),
-                                backgroundColor: "#6ea8fe",
-                                pointRadius: 5,
-                            },
-                            {
-                                label: `dominated (${dominated.length})`,
-                                data: dominated.map((p) => ({x: p.flops, y: p.metric, id: p.id, name: p.name})),
-                                backgroundColor: "rgba(138,143,153,0.5)",
-                                pointRadius: 3,
-                            },
-                        ],
-                    },
+                    data: {datasets},
                     options: {
                         scales: {
                             x: {
@@ -92,7 +163,7 @@
                                 callbacks: {
                                     label: (ctx) => {
                                         const p = ctx.raw;
-                                        return `#${p.id} ${p.name || ""} — ${p.y.toFixed(4)} @ ${p.x}`;
+                                        return `#${p.id} ${p.name || ""} — ${p.y.toFixed(4)} @ ${fmt(p.x)} FLOPs`;
                                     },
                                 },
                             },
@@ -106,6 +177,19 @@
                         },
                     },
                 });
+
+                const legend = document.getElementById("pareto-legend");
+                if (legend) {
+                    if (buckets.length) {
+                        const sel = data.selected_bucket;
+                        const note = (sel === null || sel === undefined)
+                            ? `Showing all ${buckets.length} buckets — each frontier is computed independently.`
+                            : `Showing one bucket: ${(buckets.find((b) => b.index === sel) || {}).label || sel}.`;
+                        legend.textContent = note;
+                    } else {
+                        legend.textContent = "No buckets defined for this task — using global defaults.";
+                    }
+                }
             })
             .catch((err) => console.warn("pareto fetch failed:", err));
     }
