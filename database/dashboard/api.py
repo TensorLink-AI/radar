@@ -111,56 +111,177 @@ async def loss_curve(index: int) -> dict:
     return {"index": index, "loss_curve": points, "points": points}
 
 
+def _bucket_label(min_flops: int, max_flops: int) -> str:
+    """Human-friendly label for a (min, max) FLOPs bucket — e.g. "500K – 2M"."""
+
+    def fmt(n: int) -> str:
+        if n >= 1_000_000_000_000:
+            v = n / 1_000_000_000_000
+            return f"{v:g}T"
+        if n >= 1_000_000_000:
+            v = n / 1_000_000_000
+            return f"{v:g}B"
+        if n >= 1_000_000:
+            v = n / 1_000_000
+            return f"{v:g}M"
+        if n >= 1_000:
+            v = n / 1_000
+            return f"{v:g}K"
+        return str(int(n))
+
+    return f"{fmt(min_flops)} – {fmt(max_flops)}"
+
+
+def _resolve_buckets(task: str) -> list[dict]:
+    """Resolve the bucket list for ``task`` into the API's serializable shape."""
+    state = get_state()
+    raw = state.get_task_buckets(task) or []
+    out: list[dict] = []
+    for i, entry in enumerate(raw):
+        if not entry or len(entry) != 2:
+            continue
+        lo, hi = int(entry[0]), int(entry[1])
+        if lo <= 0 or hi <= lo:
+            continue
+        out.append({
+            "index": i,
+            "min_flops": lo,
+            "max_flops": hi,
+            "label": _bucket_label(lo, hi),
+        })
+    return out
+
+
+def _bucket_index_for_flops(flops: int, buckets: list[dict]) -> int:
+    """Return the index of the smallest bucket containing ``flops`` (-1 if none)."""
+    for b in buckets:
+        if b["min_flops"] <= flops <= b["max_flops"]:
+            return int(b["index"])
+    return -1
+
+
+@router.get("/buckets.json")
+async def buckets_json(task: str = "") -> dict:
+    """FLOPs-equivalent size buckets defined for ``task``.
+
+    Tasks may override the global ``SIZE_BUCKETS`` in their YAML, so the
+    dashboard SPA fetches this list per task to render a bucket selector
+    that matches what the validator scorer actually enforces.
+    """
+    return {"task": task, "buckets": _resolve_buckets(task)}
+
+
 @router.get("/pareto.json")
 async def pareto_json(
     task: str = "",
+    bucket: str = "",
     min_flops: int | None = None,
     max_flops: int | None = None,
 ) -> dict:
-    """Scatter data — every successful experiment with a flops+metric, flagged
-    as dominated vs on-frontier via ``shared.pareto.ParetoFront``.
+    """Scatter data tagged per FLOPs bucket.
+
+    Phase C scores each experiment only against the frontier members feasible
+    for its round's bucket (see ``shared.scoring.passes_size_gate``). This
+    endpoint mirrors that: every point carries a ``bucket_index`` and an
+    ``on_frontier`` flag computed against that bucket's frontier — never the
+    global one — so the dashboard never claims a point dominates models in a
+    different size class.
+
+    Query params:
+      task        – filter to one task name. Buckets vary by task.
+      bucket      – integer index into the task's bucket list, or ``""``/
+                    ``"all"`` for every bucket. ``"active"`` resolves to the
+                    current challenge's bucket (when a challenge is live).
+      min_flops / max_flops – optional manual override that bypasses the
+                    bucket selection. Useful for ad-hoc inspection.
     """
     state = get_state()
     kw = {"task": task} if task else {}
     elements = await state.store.get_pareto_elements(**kw)
 
-    # Apply optional FLOPs window
     def _flops(e):
         return int(e.objectives.get("flops_equivalent_size") or 0)
 
+    buckets = _resolve_buckets(task)
+
+    # Resolve bucket selection. ``"active"`` only works when both a challenge
+    # is live and that challenge's bounds line up with one of the task's
+    # buckets — otherwise it degrades to "all" rather than silently filtering
+    # against the global default.
+    selected_idx: Optional[int] = None
+    if bucket and bucket.lower() not in ("all", ""):
+        if bucket.lower() == "active":
+            ch = state.get_challenge() or {}
+            ch_lo = int(ch.get("min_flops_equivalent") or 0)
+            ch_hi = int(ch.get("max_flops_equivalent") or 0)
+            for b in buckets:
+                if b["min_flops"] == ch_lo and b["max_flops"] == ch_hi:
+                    selected_idx = int(b["index"])
+                    break
+        else:
+            try:
+                idx = int(bucket)
+            except ValueError:
+                idx = -1
+            if any(b["index"] == idx for b in buckets):
+                selected_idx = idx
+
+    if selected_idx is not None:
+        sel = next(b for b in buckets if b["index"] == selected_idx)
+        elements = [e for e in elements if sel["min_flops"] <= _flops(e) <= sel["max_flops"]]
+
+    # Manual override stacks on top — keeps the historical query shape working.
     if min_flops is not None:
         elements = [e for e in elements if _flops(e) >= min_flops]
     if max_flops is not None:
         elements = [e for e in elements if _flops(e) <= max_flops]
 
-    # Build a Pareto front to identify frontier members
+    # Bin elements per bucket so we can build one ParetoFront per bucket. Points
+    # whose FLOPs fall outside every bucket land in bin ``-1`` and never join a
+    # frontier — they shouldn't have passed scoring's size gate anyway.
     from shared.pareto import ParetoFront
+
+    bins: dict[int, list] = {}
+    for e in elements:
+        f = _flops(e)
+        if not f or e.metric is None:
+            continue
+        b_idx = _bucket_index_for_flops(f, buckets)
+        bins.setdefault(b_idx, []).append(e)
 
     def _objective(elem):
         metric = elem.metric if elem.metric is not None else float("inf")
-        flops = _flops(elem) or float("inf")
+        flops = int(elem.objectives.get("flops_equivalent_size") or 0) or float("inf")
         return (metric, flops)
 
-    pf = ParetoFront(max_size=len(elements) + 1, objective_fn=_objective)
-    for e in elements:
-        pf.update(e)
-    frontier_ids = {c.element.index for c in pf.candidates}
+    frontier_ids: set = set()
+    for b_idx, items in bins.items():
+        if b_idx < 0 or not items:
+            continue
+        pf = ParetoFront(max_size=len(items) + 1, objective_fn=_objective)
+        for e in items:
+            pf.update(e)
+        frontier_ids.update(c.element.index for c in pf.candidates)
 
     points = []
-    for e in elements:
-        flops = _flops(e)
-        if not flops or e.metric is None:
-            continue
-        points.append({
-            "id": e.index,
-            "name": e.name,
-            "task": e.task,
-            "flops": flops,
-            "metric": float(e.metric),
-            "miner_hotkey": e.miner_hotkey,
-            "on_frontier": e.index in frontier_ids,
-        })
-    return {"task": task, "points": points}
+    for b_idx, items in bins.items():
+        for e in items:
+            points.append({
+                "id": e.index,
+                "name": e.name,
+                "task": e.task,
+                "flops": _flops(e),
+                "metric": float(e.metric),
+                "miner_hotkey": e.miner_hotkey,
+                "bucket_index": b_idx,
+                "on_frontier": e.index in frontier_ids,
+            })
+    return {
+        "task": task,
+        "buckets": buckets,
+        "selected_bucket": selected_idx,
+        "points": points,
+    }
 
 
 @router.get("/stats.json")

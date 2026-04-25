@@ -473,21 +473,34 @@ def dashboard_client():
     # Mount dashboard — idempotent guard in case a previous module already did it.
     from database.dashboard import mount_dashboard
     from database.dashboard import app as dash_app
+    # Custom buckets for the synthetic "ts" task: one tiny (≤500K), one small
+    # (500K–2M) so the test elements (flops 500K and 800K) fall into different
+    # buckets, exercising per-bucket frontier construction.
+    ts_buckets = [(100_000, 500_000), (500_001, 2_000_000)]
+    fake_get_challenge = lambda: {
+        "round_id": 42, "task": "ts", "size_bucket": "small",
+        "min_flops_equivalent": 500_001, "max_flops_equivalent": 2_000_000,
+    }
+    # Mirror the real resolver: known task → its YAML buckets, unknown/empty
+    # task → fall back to the global default so the dashboard always renders
+    # a sensible bucket layout.
+    from shared.challenge import SIZE_BUCKETS as _DEFAULT_SIZE_BUCKETS
+    fake_get_buckets = lambda task: ts_buckets if task == "ts" else list(_DEFAULT_SIZE_BUCKETS)
     if dash_app._state is None:
         mount_dashboard(
             app, store=store, pool=pool, r2=r2,
-            get_challenge=lambda: {"round_id": 42, "task": "ts", "size_bucket": "small"},
+            get_challenge=fake_get_challenge,
             get_frontier=lambda: [{"id": 1}, {"id": 0}],
+            get_task_buckets=fake_get_buckets,
         )
     else:
         # Refresh state for this test module
         dash_app._state.store = store
         dash_app._state.pool = pool
         dash_app._state.r2 = r2
-        dash_app._state.get_challenge = lambda: {
-            "round_id": 42, "task": "ts", "size_bucket": "small",
-        }
+        dash_app._state.get_challenge = fake_get_challenge
         dash_app._state.get_frontier = lambda: [{"id": 1}, {"id": 0}]
+        dash_app._state.get_task_buckets = fake_get_buckets
 
     return TestClient(app)
 
@@ -643,12 +656,110 @@ def test_pareto_json_flags_dominated(logged_in):
     assert r.status_code == 200
     data = r.json()
     assert {p["id"] for p in data["points"]} == {0, 1}
-    # Index 1 dominates index 0 (lower metric, higher flops doesn't dominate
-    # — actually index 0 is smaller in FLOPs but has worse metric, so both
-    # should be on-frontier). Index 1 has better metric but higher flops,
-    # so neither dominates the other. Both should be on_frontier.
+    # No task selected → falls back to global SIZE_BUCKETS. Both elements land
+    # in different buckets (index 0 in the tiny [100K, 500K] bucket because
+    # flops=500K hits the upper edge first; index 1 in the small [500K, 2M]
+    # bucket). Each is sole member of its bucket frontier.
     frontier_ids = {p["id"] for p in data["points"] if p["on_frontier"]}
     assert frontier_ids == {0, 1}
+    by_id = {p["id"]: p for p in data["points"]}
+    assert by_id[0]["bucket_index"] != by_id[1]["bucket_index"]
+    assert data["selected_bucket"] is None
+    assert any(b.get("label") for b in data["buckets"])
+
+
+def test_pareto_json_per_bucket_frontier(logged_in):
+    """Two points in the same bucket: only the dominating one is on-frontier.
+
+    Lower metric **and** lower FLOPs → strict domination, so the worse point
+    must drop off its bucket's frontier even though it would have shown up as
+    "on_frontier" under the old global-frontier semantics (where it sits on
+    a different x).
+    """
+    from shared.database import DataElement
+    from database.dashboard import app as dash_app
+
+    elements = [
+        DataElement(
+            index=10, name="dominator", code="", success=True, metric=0.5,
+            task="ts", miner_hotkey="hk", miner_uid=1,
+            objectives={"flops_equivalent_size": 700_000},
+        ),
+        DataElement(
+            index=11, name="dominated", code="", success=True, metric=1.0,
+            task="ts", miner_hotkey="hk", miner_uid=1,
+            objectives={"flops_equivalent_size": 900_000},
+        ),
+    ]
+    original = dash_app._state.store
+    dash_app._state.store = FakeStore(elements)
+    try:
+        r = logged_in.get("/dashboard/api/pareto.json?task=ts")
+    finally:
+        dash_app._state.store = original
+    assert r.status_code == 200
+    data = r.json()
+    by_id = {p["id"]: p for p in data["points"]}
+    # Both share the same bucket (small) under ts_buckets.
+    assert by_id[10]["bucket_index"] == by_id[11]["bucket_index"]
+    assert by_id[10]["on_frontier"] is True
+    assert by_id[11]["on_frontier"] is False
+
+
+def test_pareto_json_filter_by_bucket(logged_in):
+    r = logged_in.get("/dashboard/api/pareto.json?task=ts&bucket=0")
+    assert r.status_code == 200
+    data = r.json()
+    # Only the tiny-bucket element (index 0, flops=500K) survives the filter.
+    assert {p["id"] for p in data["points"]} == {0}
+    assert data["selected_bucket"] == 0
+
+
+def test_pareto_json_active_bucket_resolves_from_challenge(logged_in):
+    r = logged_in.get("/dashboard/api/pareto.json?task=ts&bucket=active")
+    assert r.status_code == 200
+    data = r.json()
+    # Active challenge bounds (500_001, 2_000_000) match bucket index 1.
+    assert data["selected_bucket"] == 1
+    assert {p["id"] for p in data["points"]} == {1}
+
+
+def test_pareto_json_unknown_bucket_id_falls_back_to_all(logged_in):
+    r = logged_in.get("/dashboard/api/pareto.json?task=ts&bucket=999")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["selected_bucket"] is None
+    assert {p["id"] for p in data["points"]} == {0, 1}
+
+
+def test_buckets_json_returns_per_task_buckets(logged_in):
+    r = logged_in.get("/dashboard/api/buckets.json?task=ts")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["task"] == "ts"
+    assert [(b["min_flops"], b["max_flops"]) for b in data["buckets"]] == [
+        (100_000, 500_000), (500_001, 2_000_000),
+    ]
+    # Labels are human-friendly and round to K/M/B/T.
+    assert data["buckets"][0]["label"] == "100K – 500K"
+    assert data["buckets"][1]["label"] == "500.001K – 2M"
+
+
+def test_buckets_json_unknown_task_uses_default(logged_in):
+    r = logged_in.get("/dashboard/api/buckets.json?task=nope")
+    assert r.status_code == 200
+    data = r.json()
+    # Unknown task → global SIZE_BUCKETS (5 entries).
+    assert len(data["buckets"]) == 5
+
+
+def test_pareto_view_renders_bucket_selector(logged_in):
+    r = logged_in.get("/dashboard/pareto?task=ts")
+    assert r.status_code == 200
+    assert "Bucket" in r.text
+    assert "All buckets" in r.text
+    # The two ts buckets render as <option> labels.
+    assert "100K – 500K" in r.text
 
 
 def test_loss_curve_api(logged_in):

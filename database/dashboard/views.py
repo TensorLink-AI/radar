@@ -169,10 +169,23 @@ async def experiment_lineage(request: Request, index: int):
 # ── Pareto ───────────────────────────────────────────────────
 
 @router.get("/pareto", response_class=HTMLResponse)
-async def pareto_view(request: Request, task: str = ""):
+async def pareto_view(request: Request, task: str = "", bucket: str = ""):
     state = get_state()
     tasks = await state.store.get_tasks()
-    return _html("pareto.html", request, task=task, tasks=tasks)
+    # Default to the first known task — the bucket selector is meaningless
+    # without one because tasks declare their own size_buckets in YAML.
+    if not task and tasks:
+        task = tasks[0]
+    from database.dashboard.api import _resolve_buckets
+    buckets = _resolve_buckets(task)
+    return _html(
+        "pareto.html",
+        request,
+        task=task,
+        tasks=tasks,
+        buckets=buckets,
+        selected_bucket=bucket,
+    )
 
 
 # ── Benchmark (eval score over time per task) ────────────────
