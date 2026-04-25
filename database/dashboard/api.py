@@ -17,7 +17,7 @@ import time
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from config import Config
 from database.dashboard import logs as log_helpers
@@ -566,6 +566,31 @@ async def miner_submissions_json(hotkey: str, limit: int = 100) -> dict:
         "submissions": [e.to_api_dict() for e in submissions],
         "agent_history": agent_history,
     }
+
+
+@router.get("/experiments/{index}/trace.txt")
+async def experiment_trace_txt(index: int):
+    """Phase-A agent stdout/stderr for an experiment, served as text/plain.
+
+    Kept off ``to_api_dict`` so list endpoints stay small — traces can run to
+    hundreds of KB. Logs are write-once, so the response is marked immutable
+    and aggressively cacheable.
+    """
+    state = get_state()
+    row = await state.pool.fetchrow(
+        "SELECT trace FROM experiments WHERE id = $1",
+        index,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    trace = row["trace"] or ""
+    if not trace:
+        raise HTTPException(status_code=404, detail="no trace recorded")
+    return Response(
+        content=trace,
+        media_type="text/plain; charset=utf-8",
+        headers={"Cache-Control": "public, max-age=86400, immutable"},
+    )
 
 
 @router.get("/experiments/{index}/lineage.json")
