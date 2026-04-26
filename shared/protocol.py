@@ -44,6 +44,11 @@ class Challenge:
     scratchpad_put_url: str = ""   # presigned PUT URL for scratchpad.tar.gz
     scratchpad_max_mb: int = 10    # size limit enforced by agent
 
+    # Per-task cognition-wiki tarball — presigned GET to a markdown corpus
+    # the agent can fetch and read while designing an architecture.
+    # Empty string = no wiki configured for this round.
+    cognition_wiki_url: str = ""
+
     def to_json(self) -> str:
         return json.dumps({
             "challenge_id": self.challenge_id,
@@ -62,6 +67,7 @@ class Challenge:
             "scratchpad_get_url": self.scratchpad_get_url,
             "scratchpad_put_url": self.scratchpad_put_url,
             "scratchpad_max_mb": self.scratchpad_max_mb,
+            "cognition_wiki_url": self.cognition_wiki_url,
         })
 
     @classmethod

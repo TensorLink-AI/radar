@@ -56,7 +56,10 @@ def _build_allowed_urls(challenge_json: str) -> str:
     """Build the allowed URL prefix string for agent pods.
 
     Combines the static config allowlist with dynamic URLs derived
-    from the challenge (validator proxy, desearch proxy).
+    from the challenge (validator proxy, desearch proxy, cognition wiki).
+    The wiki URL is a per-object presigned URL, so the full URL is added
+    rather than a base prefix; harness.py uses the same trick for
+    scratchpad URLs.
     """
     prefixes: list[str] = parse_allowed_urls(Config.AGENT_ALLOWED_URLS)
     try:
@@ -67,6 +70,9 @@ def _build_allowed_urls(challenge_json: str) -> str:
                 base = url.rstrip("/") + "/"
                 if base not in prefixes:
                     prefixes.append(base)
+        wiki_url = data.get("cognition_wiki_url", "")
+        if wiki_url and not any(wiki_url.startswith(p) for p in prefixes):
+            prefixes.append(wiki_url)
     except (json.JSONDecodeError, TypeError):
         pass
     return ",".join(prefixes)
