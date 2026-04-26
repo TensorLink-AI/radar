@@ -342,7 +342,12 @@ async def logs_meta(round_id: int, hotkey: str):
     )
     if meta is None:
         raise HTTPException(status_code=404, detail="training_meta not found")
-    return JSONResponse(meta)
+    # Reshape to the same bare-number arrays + scalar finals the public API
+    # returns (see _meta_for_public). Some SPA builds wired the loss-history
+    # panel against this cookie-gated URL — keeping the two routes in sync
+    # means val renders regardless of which one a deploy ends up hitting.
+    from database.dashboard.api import _meta_for_public
+    return JSONResponse(_meta_for_public(meta))
 
 
 @router.get("/logs/{round_id}/{hotkey}/stdout")
