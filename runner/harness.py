@@ -170,8 +170,9 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
 
     # 7. Save checkpoint — prefer best-val state if we tracked one, else current.
     state_to_save = best_state if best_state is not None else model.state_dict()
-    checkpoint_path = "/workspace/checkpoints/model.safetensors"
-    os.makedirs("/workspace/checkpoints", exist_ok=True)
+    checkpoint_dir = os.environ.get("CHECKPOINT_DIR", "/workspace/checkpoints")
+    checkpoint_path = os.path.join(checkpoint_dir, "model.safetensors")
+    os.makedirs(checkpoint_dir, exist_ok=True)
     from safetensors.torch import save_file
     save_file(state_to_save, checkpoint_path)
 

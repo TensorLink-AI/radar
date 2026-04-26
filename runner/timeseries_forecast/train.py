@@ -17,6 +17,20 @@ from runner.harness import TaskRunner, TrainingConfig, run_training as generic_r
 logger = logging.getLogger(__name__)
 
 
+def _decode_json_list(raw: str) -> list[str] | None:
+    """Decode a JSON list from an env var. Returns None when unset/invalid/empty."""
+    import json
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(value, list) or not value:
+        return None
+    return value
+
+
 class TSForecastingRunner:
     """TaskRunner implementation for time-series forecasting."""
 
@@ -46,41 +60,49 @@ class TSForecastingRunner:
         import json
         import os
         from prepare import get_dataloader
+
         data_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "")
-        # Pretrain shard URLs passed via env var (JSON list of presigned URLs)
-        pretrain_urls_raw = os.environ.get("RADAR_PRETRAIN_SHARD_URLS", "")
+
+        # Local paths win — set by sandbox_runner.py from prefetched shards.
+        pretrain_shard_paths = _decode_json_list(
+            os.environ.get("RADAR_PRETRAIN_LOCAL_PATHS", ""),
+        )
+        # URLs are only consulted when local paths are absent (legacy /
+        # in-process path used by tests).
         pretrain_shard_urls = None
-        if pretrain_urls_raw:
-            try:
-                pretrain_shard_urls = json.loads(pretrain_urls_raw)
-            except (json.JSONDecodeError, TypeError):
-                pass
+        if not pretrain_shard_paths:
+            pretrain_shard_urls = _decode_json_list(
+                os.environ.get("RADAR_PRETRAIN_SHARD_URLS", ""),
+            )
+
         return get_dataloader(
             batch_size=batch_size,
             data_dir=data_dir if data_dir else None,
             pretrain_shard_urls=pretrain_shard_urls,
+            pretrain_shard_paths=pretrain_shard_paths,
         )
 
     def get_val_dataloader(self, batch_size: int):
         """Yield val batches from the reserved pretrain val shard.
 
-        Reads RADAR_PRETRAIN_VAL_SHARD_URLS (JSON list). Returns None if unset.
-        Val batches come from a shard that is fixed across rounds (the
-        coordinator presigns the same shard URL every round for val).
+        Reads ``RADAR_PRETRAIN_VAL_LOCAL_PATHS`` (set by the sandbox after
+        prefetch) or, as a fallback for direct in-process callers,
+        ``RADAR_PRETRAIN_VAL_SHARD_URLS``.  Returns None if neither is set.
+        Val batches come from a shard that is fixed across rounds.
 
         Contract: finite + deterministic — same batches in same order every call.
         """
-        import json
         import os
 
-        urls_raw = os.environ.get("RADAR_PRETRAIN_VAL_SHARD_URLS", "")
-        if not urls_raw:
-            return None
-        try:
-            shard_urls = json.loads(urls_raw)
-        except (json.JSONDecodeError, TypeError):
-            return None
-        if not shard_urls:
+        shard_paths = _decode_json_list(
+            os.environ.get("RADAR_PRETRAIN_VAL_LOCAL_PATHS", ""),
+        )
+        shard_urls = None
+        if not shard_paths:
+            shard_urls = _decode_json_list(
+                os.environ.get("RADAR_PRETRAIN_VAL_SHARD_URLS", ""),
+            )
+        if not (shard_paths or shard_urls):
             return None
 
         from pretrain_loader import pretrain_dataloader
@@ -94,6 +116,7 @@ class TSForecastingRunner:
             # function yields the same batches.
             loader = pretrain_dataloader(
                 shard_urls=shard_urls,
+                shard_paths=shard_paths,
                 batch_size=batch_size,
                 context_len=CONTEXT_LEN,
                 shuffle_buffer_size=1,

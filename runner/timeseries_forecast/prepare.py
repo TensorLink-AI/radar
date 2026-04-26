@@ -30,18 +30,22 @@ def get_dataloader(
     data_dir: str | None = None,
     dataset_names: list[str] | None = None,
     pretrain_shard_urls: list[str] | None = None,
+    pretrain_shard_paths: list[str] | None = None,
 ):
     """Yield training batches.
 
-    Priority: pretrain shards (if URLs provided) → GIFT-Eval Arrow → random.
+    Priority: pretrain shards (local paths or URLs) → GIFT-Eval Arrow → random.
+    Local paths win when both are provided so the sandbox can use prefetched
+    files without ever opening a socket.
     """
-    # Pretrain mode: streaming parquet shards
-    if pretrain_shard_urls:
+    # Pretrain mode: streaming parquet shards (local files or presigned URLs)
+    if pretrain_shard_paths or pretrain_shard_urls:
         try:
             from pretrain_loader import pretrain_dataloader
             shuffle_buf = int(os.environ.get("RADAR_PRETRAIN_SHUFFLE_BUFFER", "10000"))
             yield from pretrain_dataloader(
                 shard_urls=pretrain_shard_urls,
+                shard_paths=pretrain_shard_paths,
                 batch_size=batch_size,
                 context_len=CONTEXT_LEN,
                 shuffle_buffer_size=shuffle_buf,

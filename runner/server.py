@@ -2,23 +2,37 @@
 
 Routes to task-specific runners based on task_name in the dispatch payload.
 Miners deploy this unmodified on Basilica. Validators dispatch via POST /train.
+
+Untrusted miner training code never runs in this process.  Each /train
+request prefetches data with the parent's network credentials, then
+spawns ``runner/sandbox_runner.py`` in a separate, network-isolated
+subprocess via ``runner/sandbox.py::run_sandbox``.  The sandbox child
+inherits no R2 / wallet / Basilica secrets and cannot import any
+high-level HTTP client.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import io
 import json
 import logging
 import os
-import sys
 import threading
 import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+from runner.sandbox import (
+    GIFT_EVAL_DIR,
+    SHARD_DIR,
+    VAL_SHARD_DIR,
+    prefetch_gift_eval,
+    prefetch_shards,
+    run_sandbox,
+)
+from runner.uploads import upload_artifacts, upload_failure_meta
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +53,6 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(title="Radar Trainer", lifespan=_lifespan)
 
-# R2 client (initialized on first use, only for localnet fallback)
-_r2 = None
-
 # ── Metagraph cache ──────────────────────────────────────────────────
 _metagraph_cache = None
 _metagraph_lock = threading.Lock()
@@ -54,26 +65,11 @@ _hotkey_last_request: dict[str, float] = {}
 _hotkey_lock = threading.Lock()
 HOTKEY_COOLDOWN_SECONDS = float(os.getenv("TRAINER_HOTKEY_COOLDOWN", "60"))
 
-# ── Runner registry ─────────────────────────────────────────────────
-# Maps task_name -> run_training callable
-_RUNNERS: dict[str, object] = {}
-
-
-def _register_runners():
-    """Lazy-load and register all task runners."""
-    if _RUNNERS:
-        return
-    from runner.timeseries_forecast.train import run_training as ts_train
-    _RUNNERS["ts_forecasting"] = ts_train
-    _RUNNERS["ml_training"] = ts_train  # alias
-
-
-def _get_r2():
-    global _r2
-    if _r2 is None:
-        from shared.r2_audit import R2AuditLog
-        _r2 = R2AuditLog()
-    return _r2
+# ── Task registry ───────────────────────────────────────────────────
+# Names accepted on the wire.  The sandbox dispatches to the matching
+# task runner module — we do NOT import task runners here so the parent
+# server stays minimal and dispatch is data-driven.
+_KNOWN_TASKS = frozenset({"ts_forecasting", "ml_training"})
 
 
 @app.post("/train")
@@ -132,18 +128,11 @@ async def train(request: Request):
     if not architecture_code:
         return JSONResponse(status_code=400, content={"error": "Missing architecture code"})
 
-    # 4. Route to task runner
-    try:
-        _register_runners()
-    except Exception as e:
-        logger.error("Failed to register task runners: %s", e)
-        return JSONResponse(status_code=500, content={
-            "error": f"Runner initialization failed: {e}",
-        })
+    # 4. Validate task name (the sandbox child does the real dispatch)
     task_name = data.get("task_name", "ts_forecasting")
-    if task_name not in _RUNNERS:
+    if task_name not in _KNOWN_TASKS:
         return JSONResponse(status_code=400, content={
-            "error": f"Unknown task '{task_name}'. Supported: {sorted(_RUNNERS.keys())}",
+            "error": f"Unknown task '{task_name}'. Supported: {sorted(_KNOWN_TASKS)}",
         })
 
     # 5. Acquire semaphore synchronously to guarantee 429 on overlap,
@@ -171,16 +160,16 @@ async def train(request: Request):
         "max_flops": data.get("max_flops_equivalent", 0),
         "miner_hotkey": data.get("miner_hotkey", "unknown"),
         "time_budget": data.get("time_budget", 300),
+        "task_name": task_name,
     }
 
-    runner_fn = _RUNNERS[task_name]
     upload_urls = data.get("upload_urls", {})
     gift_eval_urls = data.get("gift_eval_urls", {})
     pretrain_shard_urls = data.get("pretrain_shard_urls", [])
     pretrain_val_shard_urls = data.get("pretrain_val_shard_urls", [])
 
     asyncio.create_task(_train_and_upload(
-        runner_fn, architecture_code, training_config,
+        architecture_code, training_config,
         upload_urls, gift_eval_urls, pretrain_shard_urls,
         pretrain_val_shard_urls,
     ))
@@ -198,59 +187,7 @@ async def train(request: Request):
 _LOG_CAPTURE_CAP = 10 * 1024 * 1024  # 10 MB
 
 
-class _TeeStream(io.TextIOBase):
-    """Mirror writes to an original stream AND a capped buffer."""
-
-    def __init__(self, original, buffer: io.StringIO, cap: int):
-        self._original = original
-        self._buffer = buffer
-        self._cap = cap
-
-    def write(self, s):
-        try:
-            self._original.write(s)
-        except Exception:
-            pass
-        if self._buffer.tell() < self._cap:
-            self._buffer.write(s)
-        return len(s)
-
-    def flush(self):
-        try:
-            self._original.flush()
-        except Exception:
-            pass
-
-
-@contextlib.contextmanager
-def _capture_training_logs():
-    """Capture stdout + root-logger output during a training run.
-
-    Yields a getter that returns the captured text. The original stdout
-    keeps receiving output (so pod logs still show live progress).
-    """
-    buf = io.StringIO()
-    handler = logging.StreamHandler(buf)
-    handler.setLevel(logging.INFO)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    root = logging.getLogger()
-    prev_level = root.level
-    if prev_level > logging.INFO:
-        root.setLevel(logging.INFO)
-    root.addHandler(handler)
-
-    original_stdout = sys.stdout
-    sys.stdout = _TeeStream(original_stdout, buf, _LOG_CAPTURE_CAP)
-    try:
-        yield buf.getvalue  # callable so caller reads final value
-    finally:
-        sys.stdout = original_stdout
-        root.removeHandler(handler)
-        root.setLevel(prev_level)
-
-
 async def _train_and_upload(
-    runner_fn,
     architecture_code: str,
     training_config: dict,
     upload_urls: dict,
@@ -258,7 +195,13 @@ async def _train_and_upload(
     pretrain_shard_urls: list[str] | None = None,
     pretrain_val_shard_urls: list[str] | None = None,
 ):
-    """Background task: download data, train, upload artifacts, release semaphore."""
+    """Background task: prefetch data, sandbox train, upload artifacts.
+
+    Network-touching steps (prefetch + R2 upload) run in *this* process,
+    which has the deployment's secrets.  The miner's training code runs
+    in a separate ``sandbox_runner.py`` subprocess with no R2 / wallet
+    credentials and no network-capable Python imports.
+    """
     round_id = training_config["round_id"]
     miner_hotkey = training_config["miner_hotkey"]
     logger.info(
@@ -266,53 +209,60 @@ async def _train_and_upload(
         round_id, miner_hotkey, sorted(upload_urls.keys()) if upload_urls else "(none)",
     )
     try:
-        # Download GIFT-Eval data if provided (still needed for validation)
+        # ── Prefetch data with the parent's network credentials ──
+        gift_dir = ""
         if gift_eval_urls:
-            _download_gift_eval_from_urls(gift_eval_urls)
+            gift_dir = await prefetch_gift_eval(gift_eval_urls, dest_dir=GIFT_EVAL_DIR) or ""
 
-        # Pass pretrain shard URLs via env var for the training harness
+        train_paths: list[str] = []
         if pretrain_shard_urls:
-            os.environ["RADAR_PRETRAIN_SHARD_URLS"] = json.dumps(pretrain_shard_urls)
-            logger.info("Set %d pretrain shard URLs for training", len(pretrain_shard_urls))
-        else:
-            os.environ.pop("RADAR_PRETRAIN_SHARD_URLS", None)
+            train_paths = await prefetch_shards(
+                pretrain_shard_urls, dest_dir=SHARD_DIR,
+            )
 
+        val_paths: list[str] = []
         if pretrain_val_shard_urls:
-            os.environ["RADAR_PRETRAIN_VAL_SHARD_URLS"] = json.dumps(pretrain_val_shard_urls)
-            logger.info("Set %d pretrain val shard URLs", len(pretrain_val_shard_urls))
-        else:
-            os.environ.pop("RADAR_PRETRAIN_VAL_SHARD_URLS", None)
+            val_paths = await prefetch_shards(
+                pretrain_val_shard_urls, dest_dir=VAL_SHARD_DIR,
+            )
 
-        # Run training with stdout + root-logger capture so artifacts carry
-        # the harness trace (print() + logger output) instead of empty logs.
+        # ── Build the sandbox config and spawn the child ──
+        sandbox_config = {
+            **training_config,
+            "architecture_code": architecture_code,
+            "pretrain_shard_paths": train_paths,
+            "pretrain_val_shard_paths": val_paths,
+            "gift_eval_dir": gift_dir,
+        }
+
         t0 = time.time()
-        with _capture_training_logs() as get_log:
-            result = await asyncio.to_thread(runner_fn, architecture_code, training_config)
-        result["stdout_log"] = get_log()
+        result, sandbox_log = await run_sandbox(sandbox_config)
         elapsed = time.time() - t0
+        result["stdout_log"] = sandbox_log[-_LOG_CAPTURE_CAP:]
+
         logger.info(
             "Training complete: round=%d miner=%s status=%s elapsed=%.1fs",
             round_id, miner_hotkey, result.get("status", "?"), elapsed,
         )
 
-        if result.get("status") in ("build_failed", "size_violation", "failed"):
+        if result.get("status") in ("build_failed", "size_violation", "failed", "timeout"):
             logger.warning(
                 "Training failed for round %d miner %s: %s — %s",
                 round_id, miner_hotkey, result.get("status"), result.get("error", ""),
             )
             # Upload a failure meta so the validator knows what happened
-            _upload_failure_meta(round_id, miner_hotkey, upload_urls, result)
+            upload_failure_meta(round_id, miner_hotkey, upload_urls, result)
             return
 
         # Upload artifacts to R2
-        _upload_artifacts(result, architecture_code, round_id, miner_hotkey, upload_urls)
+        upload_artifacts(result, architecture_code, round_id, miner_hotkey, upload_urls)
     except Exception as e:
         logger.error(
             "Background train+upload failed for round %d miner %s: %s",
             round_id, miner_hotkey, e, exc_info=True,
         )
         try:
-            _upload_failure_meta(round_id, miner_hotkey, upload_urls, {
+            upload_failure_meta(round_id, miner_hotkey, upload_urls, {
                 "status": "failed",
                 "error": f"Unhandled exception: {e}",
             })
@@ -323,128 +273,9 @@ async def _train_and_upload(
         logger.info("Training semaphore released (round %d miner %s)", round_id, miner_hotkey)
 
 
-def _upload_failure_meta(
-    round_id: int, miner_hotkey: str, upload_urls: dict, result: dict,
-):
-    """Upload a training_meta.json for a failed run so the validator can see it."""
-    from shared.artifacts import TrainingMeta
-    meta = TrainingMeta(
-        round_id=round_id,
-        miner_hotkey=miner_hotkey,
-        status=result.get("status", "failed"),
-        error=result.get("error", ""),
-        flops_equivalent_size=result.get("flops_equivalent_size", 0),
-        training_time_seconds=result.get("training_time_seconds", 0),
-    )
-    if upload_urls.get("meta"):
-        try:
-            import httpx
-            body = json.dumps(meta.to_dict(), indent=2).encode()
-            resp = httpx.put(upload_urls["meta"], content=body, timeout=30)
-            resp.raise_for_status()
-            logger.info("Uploaded failure meta for round %d miner %s", round_id, miner_hotkey)
-        except Exception as e:
-            logger.error("Failed to upload failure meta: %s", e)
-
-
-def _upload_artifacts(
-    result: dict, architecture_code: str,
-    round_id: int, miner_hotkey: str, upload_urls: dict,
-) -> dict:
-    """Upload checkpoint + architecture to R2, return updated result."""
-    from shared.artifacts import (
-        TrainingMeta, checkpoint_key as ck_fn, architecture_key as ak_fn,
-    )
-
-    checkpoint_path = result.get("checkpoint_path", "")
-    stdout_log = result.get("stdout_log", "")
-    ck_str = ck_fn(round_id, miner_hotkey)
-    ak_str = ak_fn(round_id, miner_hotkey)
-
-    meta = TrainingMeta(
-        round_id=round_id,
-        miner_hotkey=miner_hotkey,
-        status="success",
-        flops_equivalent_size=result.get("flops_equivalent_size", 0),
-        training_time_seconds=result.get("training_time_seconds", 0),
-        num_steps=result.get("num_steps", 0),
-        num_params_M=result.get("num_params_M", 0),
-        peak_vram_mb=result.get("peak_vram_mb", 0),
-        train_loss_history=result.get("train_loss_history", []),
-        val_loss_history=result.get("val_loss_history", []),
-        best_val_loss=result.get("best_val_loss"),
-        best_val_step=result.get("best_val_step", -1),
-    )
-
-    upload_ok = True
-    try:
-        if upload_urls:
-            from shared.artifacts import upload_training_artifacts_presigned
-            upload_ok = upload_training_artifacts_presigned(
-                presigned_urls=upload_urls,
-                checkpoint_path=checkpoint_path,
-                architecture_code=architecture_code,
-                stdout_log=stdout_log, meta=meta,
-            )
-        else:
-            from shared.artifacts import upload_training_artifacts
-            upload_ok = upload_training_artifacts(
-                r2=_get_r2(), round_id=round_id, miner_hotkey=miner_hotkey,
-                checkpoint_path=checkpoint_path,
-                architecture_code=architecture_code,
-                stdout_log=stdout_log, meta=meta,
-            )
-    except Exception as e:
-        logger.error("R2 upload failed: %s", e)
-        upload_ok = False
-
-    status = "success" if upload_ok else "upload_failed"
-    if not upload_ok:
-        logger.error("Artifact upload incomplete for round %d miner %s", round_id, miner_hotkey)
-
-    # Remove internal-only fields, add R2 keys
-    result.pop("checkpoint_path", None)
-    result.pop("stdout_log", None)
-    result["status"] = status
-    result["checkpoint_key"] = ck_str
-    result["architecture_key"] = ak_str
-    return result
-
-
-# ── GIFT-Eval data cache ────────────────────────────────────────────
-_gift_eval_cache_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "/tmp/radar_gift_eval")
-_gift_eval_ready = False
-
-
-def _download_gift_eval_from_urls(urls: dict[str, str]):
-    """Download GIFT-Eval data from presigned GET URLs."""
-    global _gift_eval_ready
-    import httpx
-    from pathlib import Path
-
-    cache = Path(_gift_eval_cache_dir)
-    downloaded = 0
-    for name, url in urls.items():
-        local_dir = cache / name
-        local_path = local_dir / "data-00000-of-00001.arrow"
-        if local_path.exists() and local_path.stat().st_size > 0:
-            continue
-        try:
-            local_dir.mkdir(parents=True, exist_ok=True)
-            resp = httpx.get(url, timeout=120)
-            resp.raise_for_status()
-            local_path.write_bytes(resp.content)
-            downloaded += 1
-        except Exception as e:
-            logger.warning("Failed to download GIFT-Eval %s: %s", name, e)
-    if downloaded:
-        logger.info("Downloaded %d GIFT-Eval datasets from presigned URLs", downloaded)
-    _gift_eval_ready = True
-
-
 @app.get("/health")
 async def health():
-    return {"status": "ok", "gift_eval_ready": _gift_eval_ready}
+    return {"status": "ok"}
 
 
 def _load_metagraph():
