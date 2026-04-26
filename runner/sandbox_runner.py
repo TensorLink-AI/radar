@@ -92,13 +92,30 @@ def _block_network_imports() -> None:
             sys.modules.pop(name, None)
 
 
-def _redirect_stdout_to_stderr() -> None:
-    """Mirror miner stdout to stderr so it can't corrupt the JSON result.
+_RESULT_FD: int | None = None
 
-    The final JSON result is written via ``sys.__stdout__`` after training
-    completes, so it lands on the *real* stdout regardless of what the
-    miner does with the redirected ``sys.stdout``.
+
+def _seal_stdout() -> None:
+    """Hand the parent's stdout pipe to a private fd, then redirect fd 1 to /dev/null.
+
+    After this runs, the only handle that still reaches the parent is
+    ``_RESULT_FD``, which lives only in this module.  Miner code can
+    ``print()``, hit ``sys.__stdout__``, or ``os.write(1, …)`` all it
+    wants — those bytes go to /dev/null (or stderr, for ``print()`` via
+    the ``_Tee`` redirect) and cannot spoof the JSON result envelope.
     """
+    global _RESULT_FD
+    real_stdout_fd = sys.__stdout__.fileno() if sys.__stdout__ is not None else 1
+    _RESULT_FD = os.dup(real_stdout_fd)
+
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, real_stdout_fd)
+    os.close(devnull)
+
+    # Drop the Python-side reference so a miner ``sys.__stdout__.write(...)``
+    # can't even reach the (now redirected to /dev/null) fd object.
+    sys.__stdout__ = None  # type: ignore[assignment]
+
     class _Tee(io.TextIOBase):
         def write(self, s):  # type: ignore[override]
             try:
@@ -146,12 +163,23 @@ def _apply_env(config: dict) -> None:
 
 
 def _emit(result: dict) -> None:
-    """Write the final JSON result envelope on the real stdout."""
-    sys.__stdout__.write(json.dumps(result) + "\n")
+    """Write the final JSON result envelope on the private result fd.
+
+    Falls back to fd 1 only when ``_seal_stdout`` hasn't run yet (very
+    early failures before the harness is loaded).  Miner code never
+    reaches this path because the seal happens before any miner code
+    executes.
+    """
+    payload = (json.dumps(result) + "\n").encode()
+    fd = _RESULT_FD if _RESULT_FD is not None else 1
     try:
-        sys.__stdout__.flush()
-    except Exception:
-        pass
+        os.write(fd, payload)
+    except OSError:
+        # Last-ditch: try the original stdout fd.
+        try:
+            os.write(1, payload)
+        except OSError:
+            pass
 
 
 def main() -> int:
@@ -167,7 +195,7 @@ def main() -> int:
         return 2
 
     _apply_env(config)
-    _redirect_stdout_to_stderr()
+    _seal_stdout()
 
     # Import the harness BEFORE installing the blocker so torch / pandas /
     # asyncio (which transitively touch ``urllib`` at import) succeed.

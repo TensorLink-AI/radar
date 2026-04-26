@@ -208,14 +208,21 @@ async def run_sandbox(
     config: dict,
     *,
     timeout_buffer: int = 180,
+    stdout_cap_bytes: int = 10 * 1024 * 1024,
+    stderr_cap_bytes: int = 10 * 1024 * 1024,
 ) -> tuple[dict, str]:
     """Spawn ``sandbox_runner.py`` and return ``(result, stderr_log)``.
 
     ``timeout_buffer`` is added to ``config['time_budget']`` so the
     sandbox can finish saving the checkpoint before we kill it.  The
-    returned ``stderr_log`` is the last 10 MB of the child's stderr —
-    that includes harness logs and miner ``print()`` calls (sandbox
-    redirects miner stdout → stderr).
+    returned ``stderr_log`` is the last ``stderr_cap_bytes`` of the
+    child's stderr (harness logs + miner ``print()``).
+
+    Stdout and stderr are read incrementally and capped — a miner that
+    spews unbounded output gets killed at the cap so it can't OOM the
+    trainer or stall the parent on a stuck pipe.  The result envelope
+    is written via a private fd from inside the sandbox; only the JSON
+    on that channel is treated as authoritative.
     """
     os.makedirs(SANDBOX_ROOT, exist_ok=True)
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -247,17 +254,58 @@ async def run_sandbox(
             "",
         )
 
-    stdout_b = stderr_b = b""
+    overflow: dict[str, str] = {}
+
+    async def _drain(stream, cap: int, label: str) -> bytes:
+        buf = bytearray()
+        while True:
+            chunk = await stream.read(64 * 1024)
+            if not chunk:
+                return bytes(buf)
+            buf.extend(chunk)
+            if len(buf) > cap:
+                overflow.setdefault(label, f"{label} exceeded {cap} bytes")
+                # Drop the connection so the writer hits EPIPE next syscall,
+                # then kill the process.  Keep ``buf`` truncated to the cap.
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                # Drain remaining bytes silently to release the pipe.
+                while True:
+                    extra = await stream.read(64 * 1024)
+                    if not extra:
+                        break
+                return bytes(buf[:cap])
+
     try:
         stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout,
+            asyncio.gather(
+                _drain(proc.stdout, stdout_cap_bytes, "stdout"),
+                _drain(proc.stderr, stderr_cap_bytes, "stderr"),
+            ),
+            timeout=timeout,
         )
+        await proc.wait()
+        timed_out = False
     except asyncio.TimeoutError:
         proc.kill()
         try:
-            stdout_b, stderr_b = await proc.communicate()
+            stdout_b, stderr_b = await asyncio.wait_for(
+                asyncio.gather(
+                    _drain(proc.stdout, stdout_cap_bytes, "stdout"),
+                    _drain(proc.stderr, stderr_cap_bytes, "stderr"),
+                ),
+                timeout=10,
+            )
         except Exception:
-            pass
+            stdout_b = stderr_b = b""
+        timed_out = True
+
+    stderr = stderr_b.decode("utf-8", "replace")[-stderr_cap_bytes:]
+
+    if timed_out:
         return (
             {
                 "round_id": config.get("round_id", 0),
@@ -265,12 +313,21 @@ async def run_sandbox(
                 "status": "failed",
                 "error": f"sandbox timed out after {timeout}s",
             },
-            stderr_b.decode("utf-8", "replace")[-10 * 1024 * 1024:],
+            stderr,
+        )
+
+    if overflow:
+        return (
+            {
+                "round_id": config.get("round_id", 0),
+                "miner_hotkey": config.get("miner_hotkey", "unknown"),
+                "status": "failed",
+                "error": "sandbox killed: " + ", ".join(sorted(overflow.values())),
+            },
+            stderr,
         )
 
     stdout = stdout_b.decode("utf-8", "replace")
-    stderr = stderr_b.decode("utf-8", "replace")[-10 * 1024 * 1024:]
-
     result = _last_json_line(stdout)
     if result is None:
         return (

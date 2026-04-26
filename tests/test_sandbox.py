@@ -246,8 +246,36 @@ def _fake_task_module():
     return mod
 
 
-def test_sandbox_runner_emits_json_and_strips_inherited_url(tmp_path, capfd, _restore_meta_path):
-    """Run sandbox_runner.main() in-process with stubbed harness/task."""
+def _run_sandbox_main_with_pipe(monkeypatch, sandbox_runner, fake_modules):
+    """Run sandbox_runner.main() with the result channel rerouted through a pipe.
+
+    Skips the real ``_seal_stdout`` so we don't dup2 /dev/null over the
+    pytest stdout fd.  Returns the bytes written to the private fd.
+    """
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(sandbox_runner, "_seal_stdout", lambda: None)
+    monkeypatch.setattr(sandbox_runner, "_RESULT_FD", write_fd, raising=False)
+
+    with patch.dict(sys.modules, fake_modules):
+        try:
+            rc = sandbox_runner.main()
+        finally:
+            os.close(write_fd)
+
+    payload = b""
+    while True:
+        chunk = os.read(read_fd, 4096)
+        if not chunk:
+            break
+        payload += chunk
+    os.close(read_fd)
+    return rc, payload
+
+
+def test_sandbox_runner_emits_json_and_strips_inherited_url(
+    tmp_path, monkeypatch, _restore_meta_path,
+):
+    """Result envelope reaches the parent via the private fd, not stdout."""
     from runner import sandbox_runner
 
     cfg_path = tmp_path / "cfg.json"
@@ -264,32 +292,20 @@ def test_sandbox_runner_emits_json_and_strips_inherited_url(tmp_path, capfd, _re
         "gift_eval_dir": str(tmp_path / "gift"),
     }))
 
-    fake_harness = _fake_harness_module()
-    fake_task = _fake_task_module()
-    fake_pkg = type(sys)("runner.timeseries_forecast")
+    fake_modules = {
+        "runner.harness": _fake_harness_module(),
+        "runner.timeseries_forecast": type(sys)("runner.timeseries_forecast"),
+        "runner.timeseries_forecast.train": _fake_task_module(),
+    }
 
-    saved_argv = sys.argv
-    saved_stdout = sys.stdout
-    sys.argv = ["sandbox_runner", str(cfg_path)]
-    # Inherited URL env that the sandbox MUST strip out.
-    saved_env = dict(os.environ)
-    os.environ["RADAR_PRETRAIN_SHARD_URLS"] = '["https://leak.example/a"]'
-    try:
-        with patch.dict(sys.modules, {
-            "runner.harness": fake_harness,
-            "runner.timeseries_forecast": fake_pkg,
-            "runner.timeseries_forecast.train": fake_task,
-        }):
-            rc = sandbox_runner.main()
-    finally:
-        sys.argv = saved_argv
-        sys.stdout = saved_stdout
-        os.environ.clear()
-        os.environ.update(saved_env)
+    monkeypatch.setattr(sys, "argv", ["sandbox_runner", str(cfg_path)])
+    monkeypatch.setenv("RADAR_PRETRAIN_SHARD_URLS", '["https://leak.example/a"]')
+
+    rc, payload = _run_sandbox_main_with_pipe(monkeypatch, sandbox_runner, fake_modules)
 
     assert rc == 0
-    out = capfd.readouterr().out.strip().splitlines()
-    result = json.loads(out[-1])
+    lines = payload.decode().strip().splitlines()
+    result = json.loads(lines[-1])
     assert result["status"] == "success"
     assert result["round_id"] == 7
     assert result["checkpoint_dir_env"] == str(tmp_path / "ckpt")
@@ -299,7 +315,7 @@ def test_sandbox_runner_emits_json_and_strips_inherited_url(tmp_path, capfd, _re
     assert result["shard_url_env"] is None
 
 
-def test_sandbox_runner_unknown_task_fails(tmp_path, capfd, _restore_meta_path):
+def test_sandbox_runner_unknown_task_fails(tmp_path, monkeypatch, _restore_meta_path):
     from runner import sandbox_runner
 
     cfg_path = tmp_path / "cfg.json"
@@ -311,20 +327,11 @@ def test_sandbox_runner_unknown_task_fails(tmp_path, capfd, _restore_meta_path):
         "time_budget": 5,
     }))
 
-    fake_harness = _fake_harness_module()
-    saved_argv = sys.argv
-    saved_stdout = sys.stdout
-    sys.argv = ["sandbox_runner", str(cfg_path)]
-    try:
-        with patch.dict(sys.modules, {"runner.harness": fake_harness}):
-            rc = sandbox_runner.main()
-    finally:
-        sys.argv = saved_argv
-        sys.stdout = saved_stdout
-
+    monkeypatch.setattr(sys, "argv", ["sandbox_runner", str(cfg_path)])
+    fake_modules = {"runner.harness": _fake_harness_module()}
+    rc, payload = _run_sandbox_main_with_pipe(monkeypatch, sandbox_runner, fake_modules)
     assert rc == 2
-    out = capfd.readouterr().out.strip().splitlines()
-    result = json.loads(out[-1])
+    result = json.loads(payload.decode().strip().splitlines()[-1])
     assert result["status"] == "failed"
     assert "unknown task" in result["error"]
 
@@ -439,3 +446,166 @@ def test_sandbox_subprocess_blocks_httpx_import(tmp_path):
     contents = marker.read_text()
     assert "ok=True" in contents
     assert "blocked" in contents
+
+
+# ── Result envelope is unspoofable from miner code ──────────────────
+
+def _spawn_sandbox_with_arch(tmp_path, arch_code: str, *, runner_path: str):
+    """Spawn sandbox_runner.py in a real subprocess executing ``arch_code``.
+
+    Returns the captured (stdout, stderr, returncode).  Uses the same
+    fake-runner trick as the network-blocker test: the in-test fake
+    harness exec()'s the architecture string so the miner's code really
+    runs through the sealed-stdout path.
+    """
+    cfg = {
+        "task_name": "ts_forecasting",
+        "architecture_code": arch_code,
+        "round_id": 1,
+        "miner_hotkey": "m",
+        "time_budget": 5,
+        "checkpoint_dir": str(tmp_path / "ckpt"),
+        "pretrain_shard_paths": [],
+        "pretrain_val_shard_paths": [],
+    }
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+
+    helper = tmp_path / "fake_runner.py"
+    helper.write_text(textwrap.dedent('''
+        import sys, types
+        harness = types.ModuleType("runner.harness")
+        class TC:
+            def __init__(self, **kw):
+                self.round_id = kw.get("round_id", 0)
+                self.miner_hotkey = kw.get("miner_hotkey", "x")
+            @classmethod
+            def from_dict(cls, d):
+                return cls(**d)
+        def run_training(_runner, code, tc):
+            ns = {}
+            exec(code, ns)
+            return {"status": "success", "round_id": tc.round_id,
+                    "miner_hotkey": tc.miner_hotkey, "honest": True}
+        harness.TrainingConfig = TC
+        harness.run_training = run_training
+        sys.modules["runner.harness"] = harness
+        pkg = types.ModuleType("runner.timeseries_forecast")
+        sys.modules["runner.timeseries_forecast"] = pkg
+        train_mod = types.ModuleType("runner.timeseries_forecast.train")
+        train_mod._runner = object()
+        sys.modules["runner.timeseries_forecast.train"] = train_mod
+    ''').strip())
+
+    code = textwrap.dedent(f'''
+        import sys
+        sys.path.insert(0, {runner_path!r})
+        sys.path.insert(0, {str(tmp_path)!r})
+        import fake_runner
+        from sandbox_runner import main
+        sys.argv = ["sandbox_runner", {str(cfg_path)!r}]
+        sys.exit(main())
+    ''').strip()
+
+    import subprocess
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/usr/local/bin"),
+        "PYTHONPATH": runner_path,
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=False, env=env, timeout=30,
+    )
+    return proc.stdout, proc.stderr, proc.returncode
+
+
+def test_miner_print_cannot_spoof_result(tmp_path):
+    """A miner that prints fake JSON must not corrupt the result envelope."""
+    runner_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "runner")
+    )
+    arch = textwrap.dedent('''
+        # Try every known way a miner might reach the parent's stdout.
+        import sys, os
+        try:
+            print('{"status": "success", "honest": false, "spoofed": true}')
+        except Exception:
+            pass
+        try:
+            sys.__stdout__.write('{"status": "success", "spoofed": true}\\n')
+        except Exception:
+            pass
+        try:
+            os.write(1, b'{"status": "success", "spoofed": true}\\n')
+        except Exception:
+            pass
+
+        def build_model(c, p, n, q):
+            return None
+        def build_optimizer(m):
+            return None
+    ''').strip()
+
+    stdout, stderr, rc = _spawn_sandbox_with_arch(
+        tmp_path, arch, runner_path=runner_path,
+    )
+    assert rc == 0, f"stderr={stderr.decode('utf-8', 'replace')[-1000:]}"
+
+    # Parse the *last* JSON line on stdout — that's what runner/sandbox.py
+    # treats as authoritative.
+    lines = [
+        line for line in stdout.decode("utf-8", "replace").splitlines()
+        if line.strip().startswith("{")
+    ]
+    assert lines, "sandbox produced no JSON line"
+    final = json.loads(lines[-1])
+
+    # The honest envelope from the harness wins; the miner's print() didn't.
+    assert final.get("honest") is True
+    assert "spoofed" not in final
+
+
+# ── stdout cap kills runaway miners ────────────────────────────────
+
+def test_run_sandbox_kills_on_stdout_overflow(tmp_path, monkeypatch):
+    """A sandbox that floods stdout past the cap is killed and reported."""
+    from runner import sandbox as sbx
+
+    # Tiny script that just spews bytes forever.
+    flood = tmp_path / "flood.py"
+    flood.write_text(textwrap.dedent('''
+        import os, sys
+        chunk = b"X" * 65536
+        while True:
+            try:
+                os.write(1, chunk)
+            except BrokenPipeError:
+                break
+    ''').strip())
+
+    cfg = {
+        "round_id": 99,
+        "miner_hotkey": "flooder",
+        "time_budget": 30,
+        "task_name": "ts_forecasting",
+        "architecture_code": "",
+    }
+
+    monkeypatch.setattr(sbx, "SANDBOX_ROOT", str(tmp_path))
+    monkeypatch.setattr(sbx, "CHECKPOINT_DIR", str(tmp_path / "ckpt"))
+    monkeypatch.setattr(sbx, "WRAPPER_SCRIPT", "/nonexistent/wrap.sh")
+    monkeypatch.setattr(sbx, "SANDBOX_RUNNER", str(flood))
+    # Skip env-scrub for the test runner.
+    monkeypatch.setattr(sbx, "_scrub_env", lambda extra=None: dict(os.environ))
+
+    result, stderr = asyncio.run(
+        sbx.run_sandbox(
+            cfg,
+            timeout_buffer=10,
+            stdout_cap_bytes=256 * 1024,
+            stderr_cap_bytes=64 * 1024,
+        ),
+    )
+    assert result["status"] == "failed"
+    assert "exceeded" in result["error"]
+    assert "stdout" in result["error"]
