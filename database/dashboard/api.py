@@ -51,6 +51,39 @@ def _downsample(points: list[float], limit: int = _MAX_LOSS_POINTS) -> list[floa
     return [float(p) for p in sampled if p is not None]
 
 
+def _downsample_pair(
+    train: list, val: list, limit: int = _MAX_LOSS_POINTS,
+) -> tuple[list, list]:
+    """Downsample two index-aligned arrays with a shared stride.
+
+    Preserves ``None`` placeholders so train and val stay aligned on a shared
+    x-axis after downsampling — callers that need filtered arrays should use
+    ``_downsample`` instead.
+    """
+    n = max(len(train), len(val))
+    if n == 0:
+        return [], []
+
+    def _cast(v):
+        return None if v is None else float(v)
+
+    train = list(train) + [None] * (n - len(train))
+    val = list(val) + [None] * (n - len(val))
+
+    if n <= limit:
+        return [_cast(v) for v in train], [_cast(v) for v in val]
+
+    step = max(1, n // limit)
+    train_s = [_cast(v) for v in train[::step]]
+    val_s = [_cast(v) for v in val[::step]]
+    # Always keep the last index so the chart endpoints stay anchored.
+    if _cast(train[-1]) != (train_s[-1] if train_s else None) or \
+       _cast(val[-1]) != (val_s[-1] if val_s else None):
+        train_s.append(_cast(train[-1]))
+        val_s.append(_cast(val[-1]))
+    return train_s, val_s
+
+
 def _step_loss_pairs(hist) -> list[tuple[int, float]]:
     """Coerce a ``[{step, loss}, …]`` history to ``[(step, loss), …]`` sorted by step.
 
@@ -71,6 +104,29 @@ def _step_loss_pairs(hist) -> list[tuple[int, float]]:
         pairs.append((step, float(loss)))
     pairs.sort(key=lambda p: p[0])
     return pairs
+
+
+def _aligned_train_val(meta: dict) -> tuple[list, list]:
+    """Align ``train_loss_history`` and ``val_loss_history`` on their step union.
+
+    Returns ``(train, val)`` where each is a list of floats with ``None`` at
+    the slots where that series didn't sample at the corresponding step.
+    Returns ``([], [])`` when neither history is present, so callers can fall
+    back to the legacy bare-array ``loss_curve``.
+    """
+    if not isinstance(meta, dict):
+        return [], []
+    train_pts = _step_loss_pairs(meta.get("train_loss_history"))
+    val_pts = _step_loss_pairs(meta.get("val_loss_history"))
+    if not train_pts and not val_pts:
+        return [], []
+    train_map = dict(train_pts)
+    val_map = dict(val_pts)
+    steps = sorted(set(train_map) | set(val_map))
+    return (
+        [train_map.get(s) for s in steps],
+        [val_map.get(s) for s in steps],
+    )
 
 
 def _extract_loss_series(meta: dict) -> list[float]:
@@ -109,20 +165,17 @@ def _meta_for_public(meta: dict) -> dict:
         return meta
 
     out = dict(meta)
-    train_pts = _step_loss_pairs(meta.get("train_loss_history"))
-    val_pts = _step_loss_pairs(meta.get("val_loss_history"))
+    train, val = _aligned_train_val(meta)
 
-    if train_pts or val_pts:
-        train_map = dict(train_pts)
-        val_map = dict(val_pts)
-        steps = sorted(set(train_map) | set(val_map))
-        out["train_loss_history"] = [train_map.get(s) for s in steps]
-        out["val_loss_history"] = [val_map.get(s) for s in steps]
-
-    if train_pts:
-        out["train_loss_final"] = train_pts[-1][1]
-    if val_pts:
-        out["val_loss_final"] = val_pts[-1][1]
+    if train or val:
+        out["train_loss_history"] = train
+        out["val_loss_history"] = val
+        train_finals = [v for v in train if v is not None]
+        val_finals = [v for v in val if v is not None]
+        if train_finals:
+            out["train_loss_final"] = train_finals[-1]
+        if val_finals:
+            out["val_loss_final"] = val_finals[-1]
 
     return out
 
@@ -145,25 +198,43 @@ async def loss_curve(index: int) -> dict:
         raise HTTPException(status_code=404, detail="experiment not found")
 
     from shared.pg_schema import _decode_jsonb
-    curve = _decode_jsonb(row["loss_curve"], [])
-    # Pre-training_metas rounds left experiments.loss_curve empty. Try the
-    # Postgres cache next, then fall back to R2 (matches the Jinja
-    # /dashboard/logs/{round}/{hk}/meta route — the only reason that page
-    # renders a curve when this endpoint doesn't).
-    if not curve:
-        meta = _decode_jsonb(row["meta"], {}) or {}
-        curve = _extract_loss_series(meta)
-    if not curve and row["round_id"] is not None and row["miner_hotkey"]:
+
+    # Prefer training_metas (and the R2 fallback) over the bare
+    # experiments.loss_curve column because only the meta carries val. The
+    # column is a train-only series surviving from pre-training_metas rounds.
+    train, val = [], []
+    meta = _decode_jsonb(row["meta"], {}) or {}
+    train, val = _aligned_train_val(meta)
+    if not train and not val and row["round_id"] is not None and row["miner_hotkey"]:
         r2_meta = log_helpers.fetch_meta(
             state.r2, int(row["round_id"]), row["miner_hotkey"],
         )
         if r2_meta:
-            curve = _extract_loss_series(r2_meta)
+            train, val = _aligned_train_val(r2_meta)
+    if not train and not val:
+        curve = _decode_jsonb(row["loss_curve"], [])
+        if isinstance(curve, list):
+            train = [float(v) for v in curve if isinstance(v, (int, float))]
 
-    points = _downsample(curve)
+    has_val = any(v is not None for v in val)
+    if has_val:
+        points, val_points = _downsample_pair(train, val)
+    else:
+        # Train-only path: drop None placeholders so legacy SPA charts that
+        # don't know how to skip nulls keep working.
+        points = _downsample([v for v in train if v is not None])
+        val_points = []
+
     # ``loss_curve`` matches the radarnet.io SPA contract; ``points`` is kept
     # for the internal Jinja dashboard.js which reads data.points.
-    return {"index": index, "loss_curve": points, "points": points}
+    # ``val_points`` is the validation-loss series aligned to ``points`` on a
+    # shared step axis — slots where val didn't run carry ``None``.
+    return {
+        "index": index,
+        "loss_curve": points,
+        "points": points,
+        "val_points": val_points,
+    }
 
 
 def _bucket_label(min_flops: int, max_flops: int) -> str:
