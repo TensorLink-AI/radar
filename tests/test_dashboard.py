@@ -769,24 +769,70 @@ def test_pareto_view_renders_bucket_selector(logged_in):
 
 
 def test_loss_curve_api(logged_in):
+    # Element 0 (round 7, hk_a) has both a legacy experiments.loss_curve and
+    # a training_metas row carrying train + val histories. We prefer the meta
+    # because only it carries the val series — emitting val_points here is
+    # what lets the experiment-detail "Training loss" tab render val.
     r = logged_in.get("/dashboard/api/loss_curve/0.json")
     assert r.status_code == 200
     data = r.json()
     assert data["index"] == 0
-    assert data["points"] == [2.0, 1.5, 1.2]
-    assert data["loss_curve"] == [2.0, 1.5, 1.2]
+    assert data["points"] == [22.19, 14.71]
+    assert data["loss_curve"] == [22.19, 14.71]
+    assert data["val_points"] == [27.20, 21.28]
 
 
 def test_loss_curve_api_falls_back_to_training_metas(logged_in):
     # Element 2 has empty experiments.loss_curve but a training_metas row
     # keyed on (round_id, miner_hotkey) — the endpoint extracts the loss
     # series from train_loss_history so historical rounds still render.
+    # No val_loss_history in this row, so val_points is empty.
     r = logged_in.get("/dashboard/api/loss_curve/2.json")
     assert r.status_code == 200
     data = r.json()
     assert data["index"] == 2
     assert data["loss_curve"] == [3.3, 2.2]
     assert data["points"] == [3.3, 2.2]
+    assert data["val_points"] == []
+
+
+def test_loss_curve_api_aligns_train_and_val_on_step_union():
+    """When val ran at a subset of train steps, the response keeps train and
+    val on a shared x-axis with ``None`` filling the slots where val didn't
+    run. Mirrors the alignment the public meta endpoint already does."""
+    from database.dashboard.api import _aligned_train_val, _downsample_pair
+
+    sparse = {
+        "train_loss_history": [
+            {"step": 10, "loss": 5.0},
+            {"step": 20, "loss": 4.0},
+            {"step": 40, "loss": 3.0},
+            {"step": 80, "loss": 2.0},
+        ],
+        "val_loss_history": [
+            {"step": 10, "loss": 6.0},
+            {"step": 80, "loss": 2.5},
+        ],
+    }
+    train, val = _aligned_train_val(sparse)
+    assert train == [5.0, 4.0, 3.0, 2.0]
+    assert val == [6.0, None, None, 2.5]
+
+    # _downsample_pair preserves the None placeholders so the SPA can render
+    # a continuous train line and a sparse dashed val line on a shared axis.
+    train_s, val_s = _downsample_pair(train, val)
+    assert train_s == [5.0, 4.0, 3.0, 2.0]
+    assert val_s == [6.0, None, None, 2.5]
+
+
+def test_aligned_train_val_handles_empty_and_legacy():
+    """No histories → empty arrays so callers fall through to legacy
+    ``loss_curve``; non-dict input is also tolerated."""
+    from database.dashboard.api import _aligned_train_val
+
+    assert _aligned_train_val({}) == ([], [])
+    assert _aligned_train_val(None) == ([], [])
+    assert _aligned_train_val({"loss_curve": [1.0, 2.0]}) == ([], [])
 
 
 def test_extract_loss_series_covers_all_shapes():
