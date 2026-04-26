@@ -202,9 +202,15 @@
         fetch(`/dashboard/logs/${round}/${encodeURIComponent(hk)}/meta`)
             .then((r) => r.json())
             .then((meta) => {
+                // Accepts both shapes the route may return: the raw
+                // [{step, loss}, ...] form and the reshaped bare-number /
+                // null arrays (see _meta_for_public). Bare numbers fall back
+                // to using the array index as x, which matches how the
+                // public SPA charts the same payload.
                 const toXY = (arr) => (arr || [])
-                    .map((p) => {
-                        if (typeof p === "number") return null;
+                    .map((p, i) => {
+                        if (p == null) return null;
+                        if (typeof p === "number") return {x: i, y: p};
                         return {x: p.step, y: p.loss};
                     })
                     .filter((p) => p && Number.isFinite(p.x) && Number.isFinite(p.y));

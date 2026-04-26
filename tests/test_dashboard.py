@@ -1053,11 +1053,17 @@ def test_logs_architecture_missing(logged_in):
 
 
 def test_logs_meta_includes_loss_history(logged_in):
+    # Cookie-gated route now reshapes to bare-number arrays + scalar finals
+    # to match the public API. Some SPA builds wired the loss-history panel
+    # against this URL — keeping the two routes in sync means val renders
+    # regardless of which one a deploy ends up hitting.
     r = logged_in.get("/dashboard/logs/7/hk_a/meta")
     assert r.status_code == 200
     body = r.json()
-    assert body["train_loss_history"][0] == {"step": 10, "loss": 22.19}
-    assert body["val_loss_history"][1] == {"step": 20, "loss": 21.28}
+    assert body["train_loss_history"] == [22.19, 14.71]
+    assert body["val_loss_history"] == [27.20, 21.28]
+    assert body["train_loss_final"] == 14.71
+    assert body["val_loss_final"] == 21.28
 
 
 # ── Public JSON endpoints for the SPA ─────────────────────────
