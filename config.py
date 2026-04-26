@@ -187,6 +187,16 @@ class Config:
     PRETRAIN_SHARDS_PER_ROUND: int = int(os.getenv("RADAR_PRETRAIN_SHARDS", "8"))
     PRETRAIN_SHUFFLE_BUFFER: int = int(os.getenv("RADAR_PRETRAIN_SHUFFLE_BUFFER", "10000"))
 
+    # ── Cognition Wiki (Phase A agent reference corpus) ──────────
+    # Per-task markdown corpus packaged as a single tar.gz at
+    # <PREFIX>/<task_name>/wiki.tar.gz. The validator presigns that key
+    # each round and attaches the URL to challenge.cognition_wiki_url so
+    # the agent can pull and read pages while designing an architecture.
+    # Empty bucket disables the feature.
+    COGNITION_WIKI_R2_BUCKET: str = os.getenv("RADAR_COGNITION_WIKI_BUCKET", "")
+    COGNITION_WIKI_R2_PREFIX: str = os.getenv("RADAR_COGNITION_WIKI_PREFIX", "cognition_wiki/v1")
+    COGNITION_WIKI_TTL: int = int(os.getenv("RADAR_COGNITION_WIKI_TTL", "5400"))
+
     # ── Postgres ──────────────────────────────────────────────
     PG_DSN: str = os.getenv("RADAR_PG_DSN", "postgresql://radar:radar@localhost:5432/radar")
     # TLS mode for the asyncpg pool:

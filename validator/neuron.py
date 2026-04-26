@@ -190,6 +190,22 @@ class Validator:
             except Exception as e:
                 logger.warning("Pretrain R2 unavailable: %s", e)
 
+        # Cognition-wiki R2 client (separate bucket for per-task markdown corpus)
+        self.cognition_wiki_r2 = None
+        if Config.COGNITION_WIKI_R2_BUCKET:
+            try:
+                from shared.cognition_wiki import build_wiki_r2
+                self.cognition_wiki_r2 = build_wiki_r2(
+                    bucket=Config.COGNITION_WIKI_R2_BUCKET,
+                )
+                if self.cognition_wiki_r2:
+                    logger.info(
+                        "Cognition-wiki R2 client initialized for bucket=%s prefix=%s",
+                        Config.COGNITION_WIKI_R2_BUCKET, Config.COGNITION_WIKI_R2_PREFIX,
+                    )
+            except Exception as e:
+                logger.warning("Cognition-wiki R2 unavailable: %s", e)
+
         # Training coordinator
         my_uid = self._my_uid()
         if self.r2:
@@ -428,6 +444,21 @@ class Validator:
 
         # Rotate agent token for this round — agents use it to auth proxy requests
         challenge.agent_token = rotate_agent_token()
+
+        # Per-task cognition wiki tarball (skipped silently if not configured
+        # or if the task has no wiki uploaded).
+        if self.cognition_wiki_r2 is not None:
+            try:
+                from shared.cognition_wiki import presign_wiki_url
+                challenge.cognition_wiki_url = presign_wiki_url(
+                    self.cognition_wiki_r2,
+                    task_name,
+                    prefix=Config.COGNITION_WIKI_R2_PREFIX,
+                    ttl=Config.COGNITION_WIKI_TTL,
+                )
+            except Exception as e:
+                logger.warning("Cognition-wiki URL generation failed: %s", e)
+                challenge.cognition_wiki_url = ""
 
         logger.info(
             "Round %d: size bucket [%d, %d], frontier points in range: %d",
