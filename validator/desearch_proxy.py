@@ -18,7 +18,7 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +63,32 @@ TEMPO_DURATION_SECONDS = 360 * 12
 
 
 class SearchQuery(BaseModel):
-    """Search request from a miner."""
+    """Search request from a miner.
+
+    Invalid `tool` / `date_filter` values are silently coerced to safe
+    defaults instead of failing — older miner agents that send "NONE"
+    or other unsupported values still get a usable response rather than
+    a 400/502 chain.
+    """
 
     query: str = Field(..., min_length=1, max_length=500)
     max_results: int = Field(default=5, ge=1, le=20)
     tool: str = Field(default=DESEARCH_TOOL_ARXIV)
     date_filter: str = Field(default=DEFAULT_DATE_FILTER)
+
+    @field_validator("tool", mode="before")
+    @classmethod
+    def _coerce_tool(cls, v):
+        if not isinstance(v, str) or v not in ALLOWED_TOOLS:
+            return DESEARCH_TOOL_ARXIV
+        return v
+
+    @field_validator("date_filter", mode="before")
+    @classmethod
+    def _coerce_date_filter(cls, v):
+        if not isinstance(v, str) or v not in ALLOWED_DATE_FILTERS:
+            return DEFAULT_DATE_FILTER
+        return v
 
 
 class SearchResult(BaseModel):
@@ -167,16 +187,17 @@ class DesearchProxy:
 
         Raises HTTPException(429) if the miner has exhausted their quota.
         """
+        # Silently coerce invalid values — legacy miner agents send
+        # tool="" or date_filter="NONE" and we don't want a 400/502 chain.
         if tool not in ALLOWED_TOOLS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported tool '{tool}'. Allowed: {sorted(ALLOWED_TOOLS)}.",
-            )
+            logger.debug("Coercing unsupported tool %r -> %s", tool, DESEARCH_TOOL_ARXIV)
+            tool = DESEARCH_TOOL_ARXIV
         if date_filter not in ALLOWED_DATE_FILTERS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported date_filter '{date_filter}'.",
+            logger.debug(
+                "Coercing unsupported date_filter %r -> %s",
+                date_filter, DEFAULT_DATE_FILTER,
             )
+            date_filter = DEFAULT_DATE_FILTER
 
         remaining = self.remaining_queries(miner_uid)
         if remaining <= 0:

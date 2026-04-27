@@ -136,26 +136,52 @@ class TestDesearchProxy:
         assert kwargs["json"]["date_filter"] == "PAST_2_MONTHS"
 
     @pytest.mark.asyncio
-    async def test_search_rejects_unknown_tool(self):
-        proxy = DesearchProxy(max_queries=5)
-        with pytest.raises(HTTPException) as exc_info:
+    async def test_search_coerces_unknown_tool(self):
+        """Unsupported tool values are silently coerced to arxiv."""
+        proxy = DesearchProxy(max_queries=5, api_key="dt_testkey")
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.json = lambda: []
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
             await proxy.search(0, "x", tool="twitter")
-        assert exc_info.value.status_code == 400
+        _, kwargs = mock_client.post.call_args
+        assert kwargs["json"]["tools"] == ["arxiv"]
 
     @pytest.mark.asyncio
-    async def test_search_rejects_unknown_date_filter(self):
-        proxy = DesearchProxy(max_queries=5)
-        with pytest.raises(HTTPException) as exc_info:
+    async def test_search_coerces_unknown_date_filter(self):
+        """Unsupported date_filter values are silently coerced to default."""
+        proxy = DesearchProxy(max_queries=5, api_key="dt_testkey")
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.json = lambda: []
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
             await proxy.search(0, "x", date_filter="LAST_FRIDAY")
-        assert exc_info.value.status_code == 400
+        _, kwargs = mock_client.post.call_args
+        assert kwargs["json"]["date_filter"] == "PAST_2_YEARS"
 
     @pytest.mark.asyncio
-    async def test_search_rejects_none_date_filter(self):
-        """Desearch rejects 'NONE'; the proxy must not forward it."""
-        proxy = DesearchProxy(max_queries=5)
-        with pytest.raises(HTTPException) as exc_info:
+    async def test_search_coerces_none_date_filter(self):
+        """Desearch rejects 'NONE'; the proxy coerces it to the default."""
+        proxy = DesearchProxy(max_queries=5, api_key="dt_testkey")
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.json = lambda: []
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
             await proxy.search(0, "x", date_filter="NONE")
-        assert exc_info.value.status_code == 400
+        _, kwargs = mock_client.post.call_args
+        assert kwargs["json"]["date_filter"] == "PAST_2_YEARS"
+
+    def test_search_query_coerces_invalid_inputs(self):
+        """SearchQuery silently rewrites legacy / bogus inputs at parse time."""
+        q = SearchQuery(query="x", tool="twitter", date_filter="NONE")
+        assert q.tool == "arxiv"
+        assert q.date_filter == "PAST_2_YEARS"
 
     @pytest.mark.asyncio
     async def test_search_enforces_min_count(self):
