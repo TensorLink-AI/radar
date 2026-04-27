@@ -38,11 +38,6 @@ CREATE TABLE IF NOT EXISTS experiments (
 -- ``shared.challenge.generate_challenge`` and can exceed INT32's 2.1B max.
 -- Widen existing deployments to BIGINT; no-op if already BIGINT.
 ALTER TABLE experiments ALTER COLUMN round_id TYPE BIGINT;
--- Migration: agent reasoning + tool_calls + validator-observed agent
--- behaviour. Older rows default to empty values via ADD COLUMN DEFAULT.
-ALTER TABLE experiments ADD COLUMN IF NOT EXISTS reasoning TEXT NOT NULL DEFAULT '';
-ALTER TABLE experiments ADD COLUMN IF NOT EXISTS tool_calls JSONB NOT NULL DEFAULT '[]';
-ALTER TABLE experiments ADD COLUMN IF NOT EXISTS agent_behavior JSONB NOT NULL DEFAULT '{}';
 """
 
 SCHEMA_INDEX_DDL = """
