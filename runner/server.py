@@ -240,6 +240,16 @@ async def _train_and_upload(
         elapsed = time.time() - t0
         result["stdout_log"] = sandbox_log[-_LOG_CAPTURE_CAP:]
 
+        # Echo the tail of the sandbox stderr to the trainer's own log so
+        # operators can see miner traces / security probes in ``docker
+        # logs`` without having to wait for the R2 artifact upload.
+        if sandbox_log:
+            tail = sandbox_log[-4096:]
+            logger.info(
+                "Sandbox stderr tail (round %d miner %s):\n%s",
+                round_id, miner_hotkey, tail,
+            )
+
         logger.info(
             "Training complete: round=%d miner=%s status=%s elapsed=%.1fs",
             round_id, miner_hotkey, result.get("status", "?"), elapsed,
