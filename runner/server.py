@@ -317,5 +317,13 @@ def _load_metagraph():
 
 if __name__ == "__main__":
     import uvicorn
+    # Configure the application root logger so INFO messages from
+    # ``runner.sandbox`` / ``runner.server`` / ``shared.*`` show up in
+    # ``docker logs``.  Without this, only WARNING+ surfaces — making the
+    # sandbox dispatch + miner stderr echo invisible to operators.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     port = int(os.getenv("TRAINER_PORT", "8081"))
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
