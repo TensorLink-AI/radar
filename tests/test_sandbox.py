@@ -39,15 +39,28 @@ def test_blocker_rejects_high_level_clients():
     from runner.sandbox_runner import _NetworkBlocker, _BLOCKED_MODULES
 
     blocker = _NetworkBlocker()
-    for name in ("httpx", "requests", "boto3", "aiohttp", "urllib.request"):
+    # Top-level third-party HTTP / RPC clients are blocked outright.
+    for name in ("httpx", "requests", "boto3", "aiohttp", "urllib3"):
         spec = blocker.find_spec(name)
         assert spec is not None, f"{name} should be blocked"
         assert spec.loader is blocker
-    # Stdlib primitives stay importable so torch / pandas / asyncio work.
-    for name in ("socket", "ssl", "json", "time"):
+    # Stdlib leaf modules that actually open sockets are blocked too.
+    for name in ("urllib.request", "http.client", "xmlrpc.client"):
+        spec = blocker.find_spec(name)
+        assert spec is not None, f"{name} should be blocked"
+    # Stdlib primitives + harmless siblings stay importable so torch /
+    # pandas / urllib3-compat shims work.
+    for name in (
+        "socket", "ssl", "json", "time",
+        "urllib", "urllib.parse", "urllib.error",
+        "http", "http.cookies", "http.HTTPStatus",
+        "xmlrpc",
+    ):
         assert blocker.find_spec(name) is None, f"{name} must NOT be blocked"
-    # Sanity: blocker keyed by frozenset.
+    # Sanity: combined alias keeps both shapes.
     assert "httpx" in _BLOCKED_MODULES
+    assert "urllib.request" in _BLOCKED_MODULES
+    assert "urllib" not in _BLOCKED_MODULES
     assert "socket" not in _BLOCKED_MODULES
 
 

@@ -30,19 +30,29 @@ import os
 import sys
 
 
-# High-level network modules we refuse to load inside the sandbox.  We
-# deliberately exclude low-level primitives (``socket``, ``ssl``) because
-# torch / pandas / asyncio touch them at import time — the network
-# namespace is the right tool to block raw sockets when available.  The
-# import blocker is here to stop the obvious exfiltration paths a miner
-# would actually use.
-_BLOCKED_MODULES = frozenset({
+# High-level network modules we refuse to load inside the sandbox.
+#
+# Two block lists, keyed differently:
+#
+# - ``_BLOCKED_TOPS``: third-party HTTP / RPC clients.  Match by top-level
+#   package name so ``import httpx`` and ``from httpx import x`` both fail.
+#
+# - ``_BLOCKED_EXACT``: stdlib leaf modules that actually open sockets.
+#   Match by full dotted name so harmless siblings (``urllib.parse``,
+#   ``http.cookies``, ``http.HTTPStatus``) keep working — they're pure
+#   parsing helpers that lots of unrelated packages pull in.
+#
+# We deliberately exclude low-level primitives (``socket``, ``ssl``)
+# because torch / pandas / asyncio touch them at import time — the
+# network namespace is the right tool to block raw sockets when
+# available.  The import blocker is here to stop the obvious
+# exfiltration paths a miner would actually use.
+_BLOCKED_TOPS = frozenset({
     "aiohttp",
     "boto3",
     "botocore",
     "ftplib",
     "grpc",
-    "http",
     "httpcore",
     "httpx",
     "imaplib",
@@ -52,12 +62,19 @@ _BLOCKED_MODULES = frozenset({
     "requests",
     "smtplib",
     "telnetlib",
-    "urllib",
     "urllib3",
     "websocket",
     "websockets",
-    "xmlrpc",
 })
+
+_BLOCKED_EXACT = frozenset({
+    "http.client",
+    "urllib.request",
+    "xmlrpc.client",
+})
+
+# Backwards-compat alias used by the unit tests.
+_BLOCKED_MODULES = _BLOCKED_TOPS | _BLOCKED_EXACT
 
 
 class _NetworkBlocker(importlib.abc.MetaPathFinder, importlib.abc.Loader):
@@ -65,7 +82,7 @@ class _NetworkBlocker(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 
     def find_spec(self, fullname, path=None, target=None):
         top = fullname.partition(".")[0]
-        if top in _BLOCKED_MODULES or fullname in _BLOCKED_MODULES:
+        if top in _BLOCKED_TOPS or fullname in _BLOCKED_EXACT:
             return importlib.machinery.ModuleSpec(fullname, self)
         return None
 
@@ -88,7 +105,7 @@ def _block_network_imports() -> None:
     sys.meta_path.insert(0, _NetworkBlocker())
     for name in list(sys.modules):
         top = name.partition(".")[0]
-        if top in _BLOCKED_MODULES or name in _BLOCKED_MODULES:
+        if top in _BLOCKED_TOPS or name in _BLOCKED_EXACT:
             sys.modules.pop(name, None)
 
 
