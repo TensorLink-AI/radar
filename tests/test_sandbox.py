@@ -35,32 +35,33 @@ def _restore_meta_path():
 
 # ── Network-import blocker ─────────────────────────────────────────
 
-def test_blocker_rejects_high_level_clients():
+def test_blocker_rejects_third_party_clients():
     from runner.sandbox_runner import _NetworkBlocker, _BLOCKED_MODULES
 
     blocker = _NetworkBlocker()
-    # Top-level third-party HTTP / RPC clients are blocked outright.
-    for name in ("httpx", "requests", "boto3", "aiohttp", "urllib3"):
+    # Third-party HTTP / RPC clients are blocked at the package root.
+    for name in (
+        "httpx", "requests", "boto3", "aiohttp", "urllib3",
+        "botocore", "websockets",
+    ):
         spec = blocker.find_spec(name)
         assert spec is not None, f"{name} should be blocked"
         assert spec.loader is blocker
-    # Stdlib leaf modules that actually open sockets are blocked too.
-    for name in ("urllib.request", "http.client", "xmlrpc.client"):
-        spec = blocker.find_spec(name)
-        assert spec is not None, f"{name} should be blocked"
-    # Stdlib primitives + harmless siblings stay importable so torch /
-    # pandas / urllib3-compat shims work.
+    # Stdlib (network or otherwise) stays importable — torch / pandas /
+    # transformers / fsspec all depend on these transitively, and the
+    # network namespace is the proper barrier for raw sockets.
     for name in (
         "socket", "ssl", "json", "time",
-        "urllib", "urllib.parse", "urllib.error",
-        "http", "http.cookies", "http.HTTPStatus",
-        "xmlrpc",
+        "urllib", "urllib.parse", "urllib.error", "urllib.request",
+        "http", "http.cookies", "http.HTTPStatus", "http.client",
+        "xmlrpc", "xmlrpc.client",
     ):
         assert blocker.find_spec(name) is None, f"{name} must NOT be blocked"
-    # Sanity: combined alias keeps both shapes.
+    # Sanity: only third-party clients in the alias.
     assert "httpx" in _BLOCKED_MODULES
-    assert "urllib.request" in _BLOCKED_MODULES
     assert "urllib" not in _BLOCKED_MODULES
+    assert "urllib.request" not in _BLOCKED_MODULES
+    assert "http.client" not in _BLOCKED_MODULES
     assert "socket" not in _BLOCKED_MODULES
 
 

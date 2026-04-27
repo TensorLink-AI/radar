@@ -30,23 +30,25 @@ import os
 import sys
 
 
-# High-level network modules we refuse to load inside the sandbox.
+# Third-party HTTP / RPC clients we refuse to load inside the sandbox.
 #
-# Two block lists, keyed differently:
+# This is defence-in-depth, not the primary network barrier — the
+# network namespace from ``sandbox_wrap.sh`` blocks any actual
+# ``socket.connect()`` regardless of which Python module wraps it.
+# What this blocker buys us is making the *easy* exfil paths fail
+# loudly: ``import requests; requests.post(...)`` is what a casual
+# miner reaches for, and we want that to error at import time so the
+# attempt shows up clearly in the artifact log.
 #
-# - ``_BLOCKED_TOPS``: third-party HTTP / RPC clients.  Match by top-level
-#   package name so ``import httpx`` and ``from httpx import x`` both fail.
+# We deliberately do NOT block stdlib leaves like ``urllib.request``,
+# ``http.client``, or ``xmlrpc.client``: torch / pandas / fsspec /
+# transformers all touch them transitively at import time, and
+# blocking them broke legitimate model loading without buying any
+# real security beyond what the netns already provides.
 #
-# - ``_BLOCKED_EXACT``: stdlib leaf modules that actually open sockets.
-#   Match by full dotted name so harmless siblings (``urllib.parse``,
-#   ``http.cookies``, ``http.HTTPStatus``) keep working — they're pure
-#   parsing helpers that lots of unrelated packages pull in.
-#
-# We deliberately exclude low-level primitives (``socket``, ``ssl``)
-# because torch / pandas / asyncio touch them at import time — the
-# network namespace is the right tool to block raw sockets when
-# available.  The import blocker is here to stop the obvious
-# exfiltration paths a miner would actually use.
+# We also do NOT block low-level primitives (``socket``, ``ssl``):
+# torch and asyncio depend on them, and the netns layer is the right
+# tool to neutralise raw sockets when available.
 _BLOCKED_TOPS = frozenset({
     "aiohttp",
     "boto3",
@@ -67,22 +69,16 @@ _BLOCKED_TOPS = frozenset({
     "websockets",
 })
 
-_BLOCKED_EXACT = frozenset({
-    "http.client",
-    "urllib.request",
-    "xmlrpc.client",
-})
-
 # Backwards-compat alias used by the unit tests.
-_BLOCKED_MODULES = _BLOCKED_TOPS | _BLOCKED_EXACT
+_BLOCKED_MODULES = _BLOCKED_TOPS
 
 
 class _NetworkBlocker(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-    """Refuse to load network-capable modules from miner code paths."""
+    """Refuse to load network-capable third-party clients from miner code."""
 
     def find_spec(self, fullname, path=None, target=None):
         top = fullname.partition(".")[0]
-        if top in _BLOCKED_TOPS or fullname in _BLOCKED_EXACT:
+        if top in _BLOCKED_TOPS:
             return importlib.machinery.ModuleSpec(fullname, self)
         return None
 
@@ -97,15 +93,15 @@ class _NetworkBlocker(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 
 
 def _block_network_imports() -> None:
-    """Install the import blocker and evict already-loaded network modules.
+    """Install the import blocker and evict already-loaded clients.
 
-    Must run AFTER harness / task imports (those touch ``urllib`` etc. at
-    import time) but BEFORE any miner code executes.
+    Must run AFTER harness / task imports (those touch stdlib network
+    leaves at import time) but BEFORE any miner code executes.
     """
     sys.meta_path.insert(0, _NetworkBlocker())
     for name in list(sys.modules):
         top = name.partition(".")[0]
-        if top in _BLOCKED_TOPS or name in _BLOCKED_EXACT:
+        if top in _BLOCKED_TOPS:
             sys.modules.pop(name, None)
 
 
