@@ -205,3 +205,55 @@ def test_to_api_dict_malformed_objectives():
     assert set(d["results"].keys()) == {"success", "metric", "loss_curve"}
 
 
+def test_to_api_dict_provenance_grouping():
+    """to_api_dict groups fields by trust tier in a `provenance` block."""
+    elem = DataElement(
+        name="x", code="y",
+        motivation="testing the provenance API",
+        reasoning="step 1\nstep 2",
+        tool_calls=[{"tool": "llm", "prompt": "hi"}],
+        trace="agent stderr",
+        agent_behavior={
+            "wall_clock_s": 4.2,
+            "proxy": {"calls": {"db": 1, "llm": 2}},
+        },
+        manifest_sha256="abc123",
+        success=True, metric=0.42, score=0.8,
+    )
+    d = elem.to_api_dict()
+    prov = d["provenance"]
+
+    # Self-reported (miner-authored): motivation, reasoning, tool_calls, trace
+    assert prov["self_reported"]["motivation"] == "testing the provenance API"
+    assert prov["self_reported"]["reasoning"] == "step 1\nstep 2"
+    assert prov["self_reported"]["tool_calls"] == [
+        {"tool": "llm", "prompt": "hi"},
+    ]
+    assert prov["self_reported"]["trace"] == "agent stderr"
+
+    # Observed (validator-measured): agent_behavior
+    assert prov["observed"]["agent_behavior"]["wall_clock_s"] == 4.2
+    assert prov["observed"]["agent_behavior"]["proxy"]["calls"]["llm"] == 2
+
+    # Verified (Phase C trust anchor): results, score, manifest_sha256
+    assert prov["verified"]["manifest_sha256"] == "abc123"
+    assert prov["verified"]["score"] == 0.8
+    assert prov["verified"]["results"]["metric"] == 0.42
+
+    # Backwards-compat top-level keys still present
+    assert d["motivation"] == "testing the provenance API"
+    assert d["results"]["metric"] == 0.42
+
+
+def test_to_api_dict_string_tool_calls_and_behavior():
+    """Defensive: tool_calls / agent_behavior arriving as JSON strings decode."""
+    elem = DataElement(
+        name="x", code="y",
+        tool_calls='[{"tool":"llm"}]',
+        agent_behavior='{"wall_clock_s":1.0}',
+    )
+    d = elem.to_api_dict()
+    assert d["provenance"]["self_reported"]["tool_calls"] == [{"tool": "llm"}]
+    assert d["provenance"]["observed"]["agent_behavior"] == {"wall_clock_s": 1.0}
+
+

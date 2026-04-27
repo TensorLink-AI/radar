@@ -78,17 +78,31 @@ class Challenge:
 
 @dataclass
 class Proposal:
-    """Returned by a miner in response to a Challenge."""
+    """Returned by a miner in response to a Challenge.
+
+    ``reasoning`` and ``tool_calls`` are *self-reported* — the agent author
+    populates them. They are useful for explainability but trivially
+    fakeable; pair with validator-observed signals (proxy access logs,
+    pod wall-clock) for adversarial use.
+    """
 
     code: str = ""
     name: str = ""
     motivation: str = ""
+    # Free-form prose the agent emits to explain its design choice.
+    reasoning: str = ""
+    # List of dicts the agent self-reports about external calls it made
+    # (e.g. {"tool": "llm", "prompt": "...", "summary": "..."}). Schema is
+    # intentionally open so different agents can use different shapes.
+    tool_calls: list = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps({
             "code": self.code,
             "name": self.name,
             "motivation": self.motivation,
+            "reasoning": self.reasoning,
+            "tool_calls": self.tool_calls,
         })
 
     @classmethod

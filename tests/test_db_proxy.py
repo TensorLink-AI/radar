@@ -9,6 +9,7 @@ from validator.db_proxy import (
     app, set_config, set_metagraph, rotate_agent_token, get_agent_token,
     get_ready_trainers, clear_ready_trainers, _trainer_ready,
     _check_rate_limit, _rate_window, _rate_lock,
+    get_agent_behavior, reset_agent_behavior, _bump_agent_behavior,
 )
 
 
@@ -143,3 +144,80 @@ async def test_proxy_llm_no_retry():
     assert resp.status_code == 503
     assert sign_call_count == 1
     assert mock_client.post.call_count == 1
+
+
+def test_agent_behavior_counters_track_per_category():
+    """`_bump_agent_behavior` records calls + errors keyed by miner UID."""
+    reset_agent_behavior()
+    _bump_agent_behavior("7", "db", 200)
+    _bump_agent_behavior("7", "db", 200)
+    _bump_agent_behavior("7", "llm", 200)
+    _bump_agent_behavior("7", "llm", 500)  # error
+    _bump_agent_behavior("7", "desearch", 429)  # rate-limited
+
+    snap = get_agent_behavior(7)
+    assert snap["calls"]["db"] == 2
+    assert snap["calls"]["llm"] == 2
+    assert snap["calls"]["desearch"] == 1
+    # 5xx + 429 both count as errors
+    assert snap["errors"]["llm"] == 1
+    assert snap["errors"]["desearch"] == 1
+    assert snap["errors"]["db"] == 0
+    assert snap["first_call_ts"] is not None
+    assert snap["last_call_ts"] >= snap["first_call_ts"]
+
+
+def test_agent_behavior_reset_on_token_rotate():
+    """Rotating the agent token clears prior round counters."""
+    reset_agent_behavior()
+    _bump_agent_behavior("3", "db", 200)
+    assert get_agent_behavior(3)["calls"]["db"] == 1
+    rotate_agent_token()
+    # New round = fresh slate
+    assert get_agent_behavior(3) == {}
+
+
+def test_agent_behavior_unknown_uid_returns_empty():
+    reset_agent_behavior()
+    assert get_agent_behavior(99) == {}
+    # Bad UIDs are silently ignored, never raise
+    _bump_agent_behavior("not-an-int", "db", 200)
+    _bump_agent_behavior("-1", "db", 200)
+    assert get_agent_behavior(-1) == {}
+
+
+def test_agent_behavior_unknown_category_falls_back_to_other():
+    reset_agent_behavior()
+    _bump_agent_behavior("5", "unknown_route", 200)
+    snap = get_agent_behavior(5)
+    assert snap["calls"]["other"] == 1
+    assert snap["calls"]["db"] == 0
+
+
+def test_agent_proxy_increments_counters_on_request():
+    """A successful agent-token request increments the counter for its UID."""
+    _setup_proxy()
+    reset_agent_behavior()
+
+    from validator import db_proxy
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.headers = {"content-type": "application/json"}
+    fake_resp.content = b'{"ok": true}'
+
+    mock_client = AsyncMock()
+    mock_client.is_closed = False
+    mock_client.get = AsyncMock(return_value=fake_resp)
+
+    with patch.object(db_proxy, "_client", mock_client), \
+         patch("validator.db_proxy.sign_request", return_value={}):
+        client = TestClient(app)
+        r = client.get(
+            "/experiments/recent",
+            headers={**_auth_headers(), "X-Miner-UID": "42"},
+        )
+    assert r.status_code == 200
+    snap = get_agent_behavior(42)
+    assert snap["calls"]["db"] == 1
+    assert snap["errors"]["db"] == 0

@@ -14,6 +14,9 @@ CREATE TABLE IF NOT EXISTS experiments (
     code TEXT NOT NULL DEFAULT '',
     motivation TEXT NOT NULL DEFAULT '',
     trace TEXT NOT NULL DEFAULT '',
+    reasoning TEXT NOT NULL DEFAULT '',
+    tool_calls JSONB NOT NULL DEFAULT '[]',
+    agent_behavior JSONB NOT NULL DEFAULT '{}',
     metric DOUBLE PRECISION,
     success BOOLEAN NOT NULL DEFAULT FALSE,
     analysis TEXT NOT NULL DEFAULT '',
@@ -35,6 +38,11 @@ CREATE TABLE IF NOT EXISTS experiments (
 -- ``shared.challenge.generate_challenge`` and can exceed INT32's 2.1B max.
 -- Widen existing deployments to BIGINT; no-op if already BIGINT.
 ALTER TABLE experiments ALTER COLUMN round_id TYPE BIGINT;
+-- Migration: agent reasoning + tool_calls + validator-observed agent
+-- behaviour. Older rows default to empty values via ADD COLUMN DEFAULT.
+ALTER TABLE experiments ADD COLUMN IF NOT EXISTS reasoning TEXT NOT NULL DEFAULT '';
+ALTER TABLE experiments ADD COLUMN IF NOT EXISTS tool_calls JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE experiments ADD COLUMN IF NOT EXISTS agent_behavior JSONB NOT NULL DEFAULT '{}';
 """
 
 SCHEMA_INDEX_DDL = """
@@ -266,12 +274,29 @@ def row_to_element(row) -> DataElement:
     ``_decode_jsonb`` so callers always get dict/list regardless of whether
     the asyncpg connection has a JSONB codec registered.
     """
+    # New columns may be missing on rows produced by older schemas (e.g. a
+    # query against a yet-to-migrate replica). asyncpg Records raise on
+    # ``row[name]`` for missing keys, so probe via ``keys()``.
+    row_keys = set(row.keys()) if hasattr(row, "keys") else set()
+    reasoning = row["reasoning"] if "reasoning" in row_keys else ""
+    tool_calls = (
+        _decode_jsonb(row["tool_calls"], [])
+        if "tool_calls" in row_keys else []
+    )
+    agent_behavior = (
+        _decode_jsonb(row["agent_behavior"], {})
+        if "agent_behavior" in row_keys else {}
+    )
+
     return DataElement(
         index=row["id"],
         name=row["name"],
         code=row["code"],
         motivation=row["motivation"],
         trace=row["trace"],
+        reasoning=reasoning,
+        tool_calls=tool_calls,
+        agent_behavior=agent_behavior,
         metric=_finite_or(row["metric"], None),
         success=bool(row["success"]),
         analysis=row["analysis"],
@@ -313,12 +338,13 @@ def _jsonb(value) -> str:
 
 
 def element_to_params(element: DataElement, next_id: int) -> tuple:
-    """Convert a DataElement to a positional tuple for INSERT ($1..$20).
+    """Convert a DataElement to a positional tuple for INSERT ($1..$23).
 
-    JSONB columns (loss_curve, generated_samples, objectives) are explicitly
-    serialised with ``json.dumps`` so asyncpg sends a valid JSON string
-    regardless of statement-cache or connection-pooler settings.  Float
-    ``inf``/``nan`` are replaced with ``null`` to keep PostgreSQL happy.
+    JSONB columns (loss_curve, generated_samples, objectives, tool_calls,
+    agent_behavior) are explicitly serialised with ``json.dumps`` so
+    asyncpg sends a valid JSON string regardless of statement-cache or
+    connection-pooler settings.  Float ``inf``/``nan`` are replaced with
+    ``null`` to keep PostgreSQL happy.
     """
     round_id = element.round_id if element.round_id >= 0 else None
     return (
@@ -342,6 +368,9 @@ def element_to_params(element: DataElement, next_id: int) -> tuple:
         element.timestamp,
         round_id,
         element.task,
+        element.reasoning,
+        _jsonb(element.tool_calls),
+        _jsonb(element.agent_behavior),
     )
 
 
@@ -350,12 +379,14 @@ INSERT INTO experiments (
     id, name, code, motivation, trace, metric, success, analysis,
     parent_index, generation, score, miner_uid, miner_hotkey,
     loss_curve, manifest_sha256, generated_samples, objectives,
-    timestamp, round_id, task
+    timestamp, round_id, task,
+    reasoning, tool_calls, agent_behavior
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8,
     $9, $10, $11, $12, $13,
     $14, $15, $16, $17,
-    $18, $19, $20
+    $18, $19, $20,
+    $21, $22, $23
 )
 """
 
