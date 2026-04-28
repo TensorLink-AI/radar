@@ -286,3 +286,55 @@ class TestDesearchRoutes:
             headers={"X-Miner-UID": "0"},
         )
         assert r.status_code == 422  # Pydantic validation error
+
+    def test_search_route_rejects_none_date_filter(self):
+        """Posting date_filter='NONE' is rejected at the Pydantic boundary
+        (422), so the proxy never forwards it to Desearch."""
+        app, proxy = _make_app()
+        client = TestClient(app)
+        with patch.object(proxy, "_get_client", AsyncMock()) as mock_get:
+            r = client.post(
+                "/desearch/search",
+                json={"query": "x", "date_filter": "NONE"},
+                headers={"X-Miner-UID": "0"},
+            )
+        assert r.status_code == 422
+        mock_get.assert_not_called()
+
+    def test_search_route_rejects_unknown_tool(self):
+        """tool='twitter' is rejected at the Pydantic boundary (422)."""
+        app, proxy = _make_app()
+        client = TestClient(app)
+        with patch.object(proxy, "_get_client", AsyncMock()) as mock_get:
+            r = client.post(
+                "/desearch/search",
+                json={"query": "x", "tool": "twitter"},
+                headers={"X-Miner-UID": "0"},
+            )
+        assert r.status_code == 422
+        mock_get.assert_not_called()
+
+    def test_search_route_clamps_count_to_min(self):
+        """Even with max_results=1, the upstream POST carries count=10
+        (Desearch's hard minimum)."""
+        app, proxy = _make_app()
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.json = lambda: [{"title": f"p{i}"} for i in range(10)]
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        client = TestClient(app)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
+            r = client.post(
+                "/desearch/search",
+                json={"query": "x", "max_results": 1},
+                headers={"X-Miner-UID": "0"},
+            )
+        assert r.status_code == 200
+        _, kwargs = mock_client.post.call_args
+        assert kwargs["json"]["count"] == 10
+        assert kwargs["json"]["date_filter"] in {
+            "PAST_24_HOURS", "PAST_2_DAYS", "PAST_WEEK", "PAST_2_WEEKS",
+            "PAST_MONTH", "PAST_2_MONTHS", "PAST_YEAR", "PAST_2_YEARS",
+        }
+        assert len(r.json()["results"]) == 1
