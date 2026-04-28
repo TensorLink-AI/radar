@@ -158,6 +158,29 @@ class TestDesearchProxy:
         assert exc_info.value.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_search_non_json_body_returns_502(self):
+        """Desearch sometimes returns 2xx with a non-JSON body (empty,
+        HTML error page, etc.). The proxy must convert that to a 502
+        instead of leaking a JSONDecodeError as a 500."""
+        import json as _json
+        proxy = DesearchProxy(max_queries=5, api_key="dt_testkey")
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.status_code = 200
+        mock_resp.text = ""
+
+        def _bad_json():
+            raise _json.JSONDecodeError("Expecting value", "", 0)
+
+        mock_resp.json = _bad_json
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
+            with pytest.raises(HTTPException) as exc_info:
+                await proxy.search(0, "x")
+        assert exc_info.value.status_code == 502
+
+    @pytest.mark.asyncio
     async def test_search_enforces_min_count(self):
         """Desearch requires count >= 10, even when the miner asked for fewer.
         Response is sliced back to max_results before returning."""

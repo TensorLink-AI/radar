@@ -11,6 +11,7 @@ Rate-limited to RADAR_DESEARCH_MAX_QUERIES per miner per tempo.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections import defaultdict
@@ -226,6 +227,16 @@ class DesearchProxy:
             raise HTTPException(
                 status_code=502,
                 detail=f"Desearch upstream unreachable: {type(e).__name__}",
+            )
+        except json.JSONDecodeError as e:
+            preview = (resp.text or "")[:500]
+            logger.warning(
+                "Desearch returned %d with non-JSON body (%s): %s",
+                resp.status_code, e, preview,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Desearch upstream returned non-JSON body (HTTP {resp.status_code})",
             )
 
         results = _parse_sn22_response(data)
