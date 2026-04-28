@@ -1,7 +1,14 @@
-"""R2-compatible storage for experiment artifacts.
+"""S3-compatible storage for experiment artifacts.
 
-Stores experiment data (code, checkpoints, proposals, dispatch records) in
-S3-compatible storage (Cloudflare R2) for cross-validator sharing.
+Primary backend is **Hippius** (Substrate-based decentralized object storage,
+S3-compatible at ``https://s3.hippius.com``). Cloudflare R2 is supported as a
+legacy backend during the migration: if no ``HIPPIUS_*`` env vars are set the
+client falls back to the historical ``R2_*`` env vars and the per-account R2
+endpoint URL.
+
+The class name ``R2AuditLog`` is preserved as a stable alias so the rest of the
+codebase doesn't need a sweeping rename. New code should prefer
+``HippiusStorage`` (same class, friendlier name).
 """
 
 from __future__ import annotations
@@ -16,43 +23,103 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 
 
-class R2AuditLog:
-    """S3-compatible experiment storage (Cloudflare R2)."""
+# Hippius S3 endpoint (Substrate-backed decentralized storage).
+# See https://docs.hippius.com/storage/s3/integration for details.
+HIPPIUS_DEFAULT_ENDPOINT = "https://s3.hippius.com"
+HIPPIUS_DEFAULT_REGION = "decentralized"
+
+
+def _first_set(*values: str) -> str:
+    """Return the first truthy value, or ``""``."""
+    for v in values:
+        if v:
+            return v
+    return ""
+
+
+class HippiusStorage:
+    """S3-compatible artifact storage (Hippius primary, R2 legacy fallback)."""
 
     def __init__(
         self,
-        account_id: str = "",
         access_key_id: str = "",
         secret_access_key: str = "",
         bucket: str = "",
+        endpoint_url: str = "",
+        region: str = "",
+        # Legacy: R2 used a per-account endpoint derived from account_id.
+        # Kept for backwards compatibility with callers that still pass it.
+        account_id: str = "",
     ):
-        self.bucket = bucket or os.getenv("R2_BUCKET", "radar-experiments")
-        account_id = account_id or os.getenv("R2_ACCOUNT_ID", "")
-        access_key_id = access_key_id or os.getenv("R2_ACCESS_KEY_ID", "")
-        secret_access_key = secret_access_key or os.getenv("R2_SECRET_ACCESS_KEY", "")
+        self.bucket = bucket or _first_set(
+            os.getenv("HIPPIUS_BUCKET", ""),
+            os.getenv("R2_BUCKET", ""),
+        ) or "radar-experiments"
 
-        # Allow overriding the endpoint for testing (e.g. local mock S3 server)
-        endpoint_override = os.getenv("MOCK_R2_ENDPOINT", "")
-        if endpoint_override:
-            endpoint_url = endpoint_override
-        elif account_id:
-            endpoint_url = f"https://{account_id}.r2.cloudflarestorage.com"
+        access_key_id = access_key_id or _first_set(
+            os.getenv("HIPPIUS_ACCESS_KEY_ID", ""),
+            os.getenv("R2_ACCESS_KEY_ID", ""),
+        )
+        secret_access_key = secret_access_key or _first_set(
+            os.getenv("HIPPIUS_SECRET_ACCESS_KEY", ""),
+            os.getenv("R2_SECRET_ACCESS_KEY", ""),
+        )
+        region = region or _first_set(
+            os.getenv("HIPPIUS_REGION", ""),
+            os.getenv("R2_REGION", ""),
+            HIPPIUS_DEFAULT_REGION,
+        )
+
+        # Endpoint resolution order:
+        #   1. Explicit constructor arg
+        #   2. MOCK_S3_ENDPOINT / MOCK_R2_ENDPOINT (test override)
+        #   3. HIPPIUS_ENDPOINT_URL (production override / private gateway)
+        #   4. Legacy R2 per-account endpoint (only if R2_ACCOUNT_ID is set
+        #      and no Hippius endpoint is otherwise configured)
+        #   5. HIPPIUS_DEFAULT_ENDPOINT (https://s3.hippius.com)
+        mock_endpoint = _first_set(
+            os.getenv("MOCK_S3_ENDPOINT", ""),
+            os.getenv("MOCK_R2_ENDPOINT", ""),
+        )
+        legacy_account_id = account_id or os.getenv("R2_ACCOUNT_ID", "")
+        if endpoint_url:
+            resolved_endpoint = endpoint_url
+        elif mock_endpoint:
+            resolved_endpoint = mock_endpoint
+        elif os.getenv("HIPPIUS_ENDPOINT_URL", ""):
+            resolved_endpoint = os.getenv("HIPPIUS_ENDPOINT_URL", "")
+        elif legacy_account_id and not (
+            os.getenv("HIPPIUS_ACCESS_KEY_ID")
+            or os.getenv("HIPPIUS_BUCKET")
+        ):
+            # Only fall back to R2's per-account endpoint when the operator
+            # has actively configured R2 (set R2_ACCOUNT_ID) and not begun
+            # the Hippius migration. Removes the "I set HIPPIUS_* but it
+            # still hits R2" footgun.
+            resolved_endpoint = f"https://{legacy_account_id}.r2.cloudflarestorage.com"
         else:
-            endpoint_url = None
+            resolved_endpoint = HIPPIUS_DEFAULT_ENDPOINT
 
         import boto3
         from botocore.config import Config as BotoConfig
 
+        # Hippius requires path-style addressing (it does not host buckets at
+        # virtual subdomains the way AWS does). R2 also accepts path-style,
+        # so this is safe for the legacy backend too.
         self._s3 = boto3.client(
             "s3",
-            endpoint_url=endpoint_url,
+            endpoint_url=resolved_endpoint,
             aws_access_key_id=access_key_id,
             aws_secret_access_key=secret_access_key,
-            config=BotoConfig(signature_version="s3v4"),
+            region_name=region,
+            config=BotoConfig(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"},
+            ),
         )
 
     def upload_json(self, key: str, data: dict) -> bool:
-        """Upload a JSON object to R2."""
+        """Upload a JSON object."""
         try:
             body = json.dumps(data, indent=2).encode()
             self._s3.put_object(Bucket=self.bucket, Key=key, Body=body)
@@ -62,13 +129,13 @@ class R2AuditLog:
             return False
 
     def download_json(self, key: str) -> Optional[dict]:
-        """Download and parse a JSON object from R2."""
+        """Download and parse a JSON object."""
         try:
             resp = self._s3.get_object(Bucket=self.bucket, Key=key)
             return json.loads(resp["Body"].read())
         except ClientError as e:
             if e.response["Error"]["Code"] == "NoSuchKey":
-                logger.debug("Key not found in R2: %s", key)
+                logger.debug("Key not found: %s", key)
             else:
                 logger.error("Failed to download JSON %s: %s", key, e)
             return None
@@ -81,7 +148,6 @@ class R2AuditLog:
         try:
             resp = self._s3.list_objects_v2(Bucket=self.bucket, Prefix=prefix)
             keys = [obj["Key"] for obj in resp.get("Contents", [])]
-            # Extract experiment IDs from bundle paths
             experiments = set()
             for key in keys:
                 parts = key.split("/")
@@ -102,7 +168,7 @@ class R2AuditLog:
             return []
 
     def upload_file_from_disk(self, local_path: str, key: str) -> bool:
-        """Upload a file from local disk to R2."""
+        """Upload a file from local disk."""
         try:
             self._s3.upload_file(local_path, self.bucket, key)
             logger.info("Uploaded file: %s", key)
@@ -112,7 +178,7 @@ class R2AuditLog:
             return False
 
     def download_file_to_disk(self, key: str, local_path: str) -> bool:
-        """Download a file from R2 to local disk."""
+        """Download a file to local disk."""
         try:
             resp = self._s3.get_object(Bucket=self.bucket, Key=key)
             with open(local_path, "wb") as f:
@@ -123,7 +189,7 @@ class R2AuditLog:
             return False
 
     def upload_text(self, key: str, text: str) -> bool:
-        """Upload a text string to R2."""
+        """Upload a text string."""
         try:
             self._s3.put_object(Bucket=self.bucket, Key=key, Body=text.encode())
             return True
@@ -132,7 +198,7 @@ class R2AuditLog:
             return False
 
     def download_text(self, key: str) -> Optional[str]:
-        """Download a text string from R2."""
+        """Download a text string."""
         try:
             resp = self._s3.get_object(Bucket=self.bucket, Key=key)
             return resp["Body"].read().decode()
@@ -146,17 +212,7 @@ class R2AuditLog:
         ttl: int = 3600,
         max_content_length: int = 0,
     ) -> str:
-        """Generate a pre-signed PUT URL for uploading to a specific key.
-
-        Args:
-            key: The S3 key to generate the URL for.
-            ttl: Time-to-live in seconds (default 1 hour).
-            max_content_length: If > 0, add Content-Length condition to limit
-                upload size. S3-compatible stores enforce this server-side.
-
-        Returns:
-            Pre-signed URL string, or empty string on failure.
-        """
+        """Generate a pre-signed PUT URL for uploading to a specific key."""
         try:
             params: dict = {"Bucket": self.bucket, "Key": key}
             if max_content_length > 0:
@@ -172,7 +228,7 @@ class R2AuditLog:
             return ""
 
     def generate_presigned_get_url(self, key: str, ttl: int = 900) -> str:
-        """Generate a presigned GET URL for downloading from R2."""
+        """Generate a presigned GET URL for downloading."""
         try:
             return self._s3.generate_presigned_url(
                 "get_object",
@@ -190,3 +246,12 @@ class R2AuditLog:
             return True
         except Exception:
             return False
+
+
+# Backwards-compatible alias. Existing callers import ``R2AuditLog``; we keep
+# the name so the migration doesn't fan out across every module. New code
+# should prefer ``HippiusStorage``.
+R2AuditLog = HippiusStorage
+
+
+__all__ = ["HippiusStorage", "R2AuditLog"]

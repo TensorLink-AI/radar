@@ -54,11 +54,31 @@ class Config:
     # Comma-separated list of enabled task names. Empty or "all" = all built-in tasks.
     ENABLED_TASKS: str = os.getenv("RADAR_ENABLED_TASKS", "ts_forecasting")
 
-    # ── R2 Audit Log ────────────────────────────────────────────────
+    # ── Artifact Storage (Hippius primary, R2 legacy fallback) ──────
+    # Primary backend is Hippius — the Substrate-based decentralized object
+    # store at https://s3.hippius.com. Cloudflare R2 stays supported as a
+    # legacy fallback during the migration: any unset HIPPIUS_* var falls
+    # back to its R2_* counterpart so existing deployments keep working
+    # without an env-var change.
+    HIPPIUS_ACCESS_KEY_ID: str = os.getenv("HIPPIUS_ACCESS_KEY_ID", "") \
+        or os.getenv("R2_ACCESS_KEY_ID", "")
+    HIPPIUS_SECRET_ACCESS_KEY: str = os.getenv("HIPPIUS_SECRET_ACCESS_KEY", "") \
+        or os.getenv("R2_SECRET_ACCESS_KEY", "")
+    HIPPIUS_BUCKET: str = os.getenv("HIPPIUS_BUCKET", "") \
+        or os.getenv("R2_BUCKET", "")
+    HIPPIUS_ENDPOINT_URL: str = os.getenv("HIPPIUS_ENDPOINT_URL", "")
+    HIPPIUS_REGION: str = os.getenv("HIPPIUS_REGION", "decentralized")
+    PRESIGNED_TTL: int = int(os.getenv("RADAR_PRESIGNED_TTL", "5400"))
+
+    # Legacy R2 names — read directly from env so an operator who has only
+    # set HIPPIUS_* vars sees these as empty (and code that gates on them
+    # behaves correctly). Code that needs "is artifact storage configured?"
+    # should consult HIPPIUS_BUCKET instead, since that's already the
+    # resolved value.
     R2_ACCOUNT_ID: str = os.getenv("R2_ACCOUNT_ID", "")
     R2_ACCESS_KEY_ID: str = os.getenv("R2_ACCESS_KEY_ID", "")
     R2_SECRET_ACCESS_KEY: str = os.getenv("R2_SECRET_ACCESS_KEY", "")
-    R2_BUCKET: str = os.getenv("R2_BUCKET", "")
+    R2_BUCKET: str = os.getenv("R2_BUCKET", "") or os.getenv("HIPPIUS_BUCKET", "")
     R2_PRESIGNED_TTL: int = int(os.getenv("RADAR_PRESIGNED_TTL", "5400"))
 
     # ── Round Timing ───────────────────────────────────────────────

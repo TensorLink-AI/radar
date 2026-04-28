@@ -111,7 +111,7 @@ def _build_agent_env_vars(allowed_urls: str = "") -> dict[str, str]:
     if allowed_urls:
         env_vars["AGENT_ALLOWED_URLS"] = allowed_urls
         env_vars["RADAR_ALLOWED_URLS"] = allowed_urls
-    # Note: NO Basilica token, NO R2 credentials, NO RADAR_BASILICA_ENV
+    # Note: NO Basilica token, NO Hippius/R2 credentials, NO RADAR_BASILICA_ENV
     return env_vars
 
 
