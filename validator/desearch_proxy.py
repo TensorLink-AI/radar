@@ -14,7 +14,7 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
-from typing import Optional
+from typing import Literal, Optional, get_args
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -31,11 +31,12 @@ DESEARCH_SEARCH_PATH = "/desearch/ai/search"
 # choose other tools (twitter, etc.) through this proxy.
 DESEARCH_TOOL_ARXIV = "arxiv"
 DESEARCH_TOOL_WEB = "web"
-ALLOWED_TOOLS = {DESEARCH_TOOL_ARXIV, DESEARCH_TOOL_WEB}
+ToolT = Literal["arxiv", "web"]
+ALLOWED_TOOLS = frozenset(get_args(ToolT))
 
 # Allowed values for the Desearch `date_filter` field. Desearch does not
 # accept "NONE"; PAST_2_YEARS is the broadest supported window.
-ALLOWED_DATE_FILTERS = {
+DateFilterT = Literal[
     "PAST_24_HOURS",
     "PAST_2_DAYS",
     "PAST_WEEK",
@@ -44,8 +45,9 @@ ALLOWED_DATE_FILTERS = {
     "PAST_2_MONTHS",
     "PAST_YEAR",
     "PAST_2_YEARS",
-}
-DEFAULT_DATE_FILTER = "PAST_2_YEARS"
+]
+ALLOWED_DATE_FILTERS = frozenset(get_args(DateFilterT))
+DEFAULT_DATE_FILTER: DateFilterT = "PAST_2_YEARS"
 
 # Desearch response shape we request. Gives us a list of link objects plus
 # a final summary string.
@@ -67,8 +69,8 @@ class SearchQuery(BaseModel):
 
     query: str = Field(..., min_length=1, max_length=500)
     max_results: int = Field(default=5, ge=1, le=20)
-    tool: str = Field(default=DESEARCH_TOOL_ARXIV)
-    date_filter: str = Field(default=DEFAULT_DATE_FILTER)
+    tool: ToolT = Field(default=DESEARCH_TOOL_ARXIV)
+    date_filter: DateFilterT = Field(default=DEFAULT_DATE_FILTER)
 
 
 class SearchResult(BaseModel):
