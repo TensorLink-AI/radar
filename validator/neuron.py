@@ -510,7 +510,7 @@ class Validator:
             get_my_assignments_fn=get_my_assignments,
         )
 
-        dynamic_endpoints, (submissions, agent_logs) = await asyncio.gather(
+        dynamic_endpoints, (submissions, agent_meta) = await asyncio.gather(
             prepare_coro, collect_coro,
         )
 
@@ -818,6 +818,7 @@ class Validator:
                 proposal = filtered.get(uid, Proposal())
 
                 miner_hk = self.metagraph.hotkeys[uid] if uid < len(self.metagraph.hotkeys) else ""
+                meta = agent_meta.get(uid, {})
                 element = DataElement(
                     name=f"round_{challenge.round_id}_miner_{uid}",
                     code=proposal.code,
@@ -827,7 +828,10 @@ class Validator:
                     miner_uid=uid,
                     miner_hotkey=miner_hk,
                     motivation=proposal.motivation,
-                    trace=agent_logs.get(uid, ""),
+                    trace=meta.get("agent_log", ""),
+                    reasoning=meta.get("reasoning", "") or proposal.reasoning,
+                    tool_calls=meta.get("tool_calls", []) or proposal.tool_calls,
+                    agent_behavior=meta.get("agent_behavior", {}),
                     task=task_name,
                     round_id=challenge.round_id,
                 )

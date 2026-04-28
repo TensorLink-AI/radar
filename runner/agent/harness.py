@@ -225,10 +225,22 @@ def main():
         print(json.dumps({"error": "design_architecture() must return dict with 'code' key"}))
         sys.exit(1)
 
+    # Pass through optional self-reported reasoning trace and tool-call log
+    # if the agent populated them. Both are open-schema; the harness does
+    # not validate or normalise contents — that's the validator's job.
+    reasoning = result.get("reasoning", "")
+    tool_calls = result.get("tool_calls", [])
+    if not isinstance(reasoning, str):
+        reasoning = str(reasoning)
+    if not isinstance(tool_calls, list):
+        tool_calls = []
+
     proposal = {
         "code": result.get("code", ""),
         "name": result.get("name", ""),
         "motivation": result.get("motivation", ""),
+        "reasoning": reasoning,
+        "tool_calls": tool_calls,
     }
     print(json.dumps(proposal))
 

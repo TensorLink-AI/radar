@@ -17,7 +17,17 @@ from typing import Optional
 
 @dataclass
 class DataElement:
-    """One experiment in the database."""
+    """One experiment in the database.
+
+    Fields fall into three trust tiers (see ``to_api_dict`` for the public
+    grouping):
+
+    * Self-reported (miner-authored, trivially fakeable):
+      ``motivation``, ``reasoning``, ``tool_calls``, ``trace``.
+    * Observed (validator-authored, hard to fake): ``agent_behavior``.
+    * Verified (Phase C trust anchor): ``metric``, ``success``,
+      ``objectives``, ``loss_curve``, ``score``, ``manifest_sha256``.
+    """
 
     index: int = -1
     timestamp: float = 0.0
@@ -25,6 +35,9 @@ class DataElement:
     code: str = ""
     motivation: str = ""
     trace: str = ""
+    reasoning: str = ""
+    tool_calls: list = field(default_factory=list)
+    agent_behavior: dict = field(default_factory=dict)
     metric: Optional[float] = None
     success: bool = False
     analysis: str = ""
@@ -54,6 +67,19 @@ class DataElement:
         strings — this happens when a DataElement is built from a row whose
         JSONB columns weren't decoded by asyncpg (pools without a codec). The
         handler must never raise on well-formed DB rows.
+
+        Adds a ``provenance`` block so consumers can decide which fields to
+        trust:
+
+        * ``self_reported`` — written by the miner's agent code (motivation,
+          reasoning, tool_calls, trace). Fakeable; treat as explanation only.
+        * ``observed`` — measured by the validator at boundaries the agent
+          can't forge (proxy access counts, pod wall-clock, exit code).
+        * ``verified`` — Phase C trust anchor (results, score,
+          manifest_sha256).
+
+        The legacy flat keys (``motivation``, ``results``, ``analysis``,
+        ``score``) remain at the top level for backward compatibility.
         """
         objectives = self.objectives
         if isinstance(objectives, str):
@@ -72,6 +98,24 @@ class DataElement:
         if not isinstance(loss_curve, list):
             loss_curve = []
 
+        tool_calls = self.tool_calls
+        if isinstance(tool_calls, str):
+            try:
+                tool_calls = json.loads(tool_calls)
+            except (ValueError, TypeError):
+                tool_calls = []
+        if not isinstance(tool_calls, list):
+            tool_calls = []
+
+        agent_behavior = self.agent_behavior
+        if isinstance(agent_behavior, str):
+            try:
+                agent_behavior = json.loads(agent_behavior)
+            except (ValueError, TypeError):
+                agent_behavior = {}
+        if not isinstance(agent_behavior, dict):
+            agent_behavior = {}
+
         def _safe(v):
             """Replace inf/nan floats with None for JSON compliance."""
             if isinstance(v, float) and (math.isinf(v) or math.isnan(v)):
@@ -82,6 +126,13 @@ class DataElement:
         score = _safe(self.score)
         safe_obj = {k: _safe(v) for k, v in objectives.items()}
         safe_lc = [_safe(v) for v in loss_curve]
+
+        results = {
+            "success": self.success,
+            "metric": metric,
+            **safe_obj,
+            "loss_curve": safe_lc,
+        }
 
         return {
             "index": self.index,
@@ -94,15 +145,26 @@ class DataElement:
             "parent_index": self.parent,
             "code": self.code,
             "motivation": self.motivation,
-            "results": {
-                "success": self.success,
-                "metric": metric,
-                **safe_obj,
-                "loss_curve": safe_lc,
-            },
+            "results": results,
             "analysis": self.analysis,
             "score": score,
             "round_id": self.round_id,
+            "provenance": {
+                "self_reported": {
+                    "motivation": self.motivation,
+                    "reasoning": self.reasoning,
+                    "tool_calls": tool_calls,
+                    "trace": self.trace,
+                },
+                "observed": {
+                    "agent_behavior": agent_behavior,
+                },
+                "verified": {
+                    "results": results,
+                    "score": score,
+                    "manifest_sha256": self.manifest_sha256,
+                },
+            },
         }
 
     def summary(self) -> str:

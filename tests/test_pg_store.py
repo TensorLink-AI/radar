@@ -186,6 +186,41 @@ async def test_jsonb_columns_decoded(store):
 
 @skip_no_pg
 @pytest.mark.asyncio
+async def test_reasoning_tool_calls_agent_behavior_roundtrip(store):
+    """New self-reported + observed columns survive INSERT/SELECT."""
+    await store.add(DataElement(
+        name="agent_reasoning_test",
+        code="def build_model(): ...",
+        success=True,
+        metric=0.5,
+        reasoning="step 1\nstep 2\nstep 3",
+        tool_calls=[
+            {"tool": "llm", "prompt": "ideas?", "summary": "Mamba"},
+            {"tool": "desearch", "query": "linear attention"},
+        ],
+        agent_behavior={
+            "wall_clock_s": 12.34,
+            "exit_status": "ok",
+            "proxy": {"calls": {"db": 3, "llm": 1, "desearch": 2}},
+        },
+    ))
+    got = await store.get(0)
+    assert got.reasoning == "step 1\nstep 2\nstep 3"
+    assert isinstance(got.tool_calls, list)
+    assert got.tool_calls[0]["tool"] == "llm"
+    assert got.tool_calls[1]["tool"] == "desearch"
+    assert isinstance(got.agent_behavior, dict)
+    assert got.agent_behavior["wall_clock_s"] == 12.34
+    assert got.agent_behavior["proxy"]["calls"]["llm"] == 1
+
+    # Provenance grouping is exposed via to_api_dict
+    api = got.to_api_dict()
+    assert api["provenance"]["self_reported"]["reasoning"] == got.reasoning
+    assert api["provenance"]["observed"]["agent_behavior"]["wall_clock_s"] == 12.34
+
+
+@skip_no_pg
+@pytest.mark.asyncio
 async def test_add_batch(store):
     elems = [
         DataElement(name=f"batch_{i}", code=f"v{i}", success=True, metric=float(i))

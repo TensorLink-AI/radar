@@ -42,10 +42,12 @@ _agent_token: str = ""
 def rotate_agent_token() -> str:
     """Generate a new agent token for the current round.
 
+    Resets the per-agent behaviour metrics so each round starts from zero.
     Returns the new token (caller injects it into the challenge JSON).
     """
     global _agent_token
     _agent_token = secrets.token_urlsafe(32)
+    reset_agent_behavior()
     logger.info("Agent token rotated (token=%s...)", _agent_token[:8])
     return _agent_token
 
@@ -53,6 +55,73 @@ def rotate_agent_token() -> str:
 def get_agent_token() -> str:
     """Return the current agent token."""
     return _agent_token
+
+
+# ── Per-agent behaviour counters ───────────────────────────────────
+# Bumped inside ``auth_middleware`` when a request authenticates with the
+# round's agent token. Keyed by miner UID (from the X-Miner-UID header).
+# These are *validator-observed* — the miner's agent code can't forge them
+# because the increments happen on the validator side of the network. The
+# round loop snapshots these via ``get_agent_behavior(uid)`` after running
+# each agent and persists them as ``DataElement.agent_behavior``.
+_agent_behavior: dict[int, dict] = {}
+_agent_behavior_lock = threading.Lock()
+
+
+def _new_agent_behavior_entry() -> dict:
+    return {
+        "calls": {"db": 0, "desearch": 0, "llm": 0, "other": 0},
+        "errors": {"db": 0, "desearch": 0, "llm": 0, "other": 0},
+        "first_call_ts": None,
+        "last_call_ts": None,
+    }
+
+
+def _bump_agent_behavior(uid_str: str, category: str, status_code: int) -> None:
+    """Record one authenticated agent request for a miner UID."""
+    try:
+        uid = int(uid_str)
+    except (TypeError, ValueError):
+        return
+    if uid < 0:
+        return
+    now = time.time()
+    cat = category if category in ("db", "desearch", "llm") else "other"
+    with _agent_behavior_lock:
+        entry = _agent_behavior.get(uid)
+        if entry is None:
+            entry = _new_agent_behavior_entry()
+            _agent_behavior[uid] = entry
+        entry["calls"][cat] += 1
+        if status_code >= 400:
+            entry["errors"][cat] += 1
+        if entry["first_call_ts"] is None:
+            entry["first_call_ts"] = now
+        entry["last_call_ts"] = now
+
+
+def get_agent_behavior(uid: int) -> dict:
+    """Snapshot the proxy-observed behaviour for one miner UID.
+
+    Returns a fresh dict (callers may mutate freely). Empty dict if the
+    agent never authenticated with the proxy this round.
+    """
+    with _agent_behavior_lock:
+        entry = _agent_behavior.get(uid)
+        if entry is None:
+            return {}
+        return {
+            "calls": dict(entry["calls"]),
+            "errors": dict(entry["errors"]),
+            "first_call_ts": entry["first_call_ts"],
+            "last_call_ts": entry["last_call_ts"],
+        }
+
+
+def reset_agent_behavior() -> None:
+    """Clear all per-agent counters. Called on round start via rotate."""
+    with _agent_behavior_lock:
+        _agent_behavior.clear()
 
 
 def get_ready_trainers(round_id: int) -> dict:
@@ -196,10 +265,14 @@ async def auth_middleware(request: Request, call_next):
     if _verify_agent_token(request):
         rate_key = request.headers.get("X-Miner-UID", "agent-shared")
         if not _check_rate_limit(f"agent:{rate_key}", category):
+            # Rate-limit rejection still counts as a request the agent made
+            # for behaviour tracking — bump before returning.
+            _bump_agent_behavior(rate_key, category, 429)
             return JSONResponse(status_code=429, content={
                 "error": f"Rate limit exceeded for {category}",
             })
         response = await call_next(request)
+        _bump_agent_behavior(rate_key, category, response.status_code)
         logger.info(
             "Agent proxy: miner=%s %s %s -> %d",
             rate_key, request.method, path, response.status_code,
