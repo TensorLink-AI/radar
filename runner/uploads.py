@@ -84,6 +84,12 @@ def upload_artifacts(
         val_loss_history=result.get("val_loss_history", []),
         best_val_loss=result.get("best_val_loss"),
         best_val_step=result.get("best_val_step", -1),
+        val_cadence_unit=result.get("val_cadence_unit", "step"),
+        val_base=result.get("val_base", 0.0),
+        val_growth=result.get("val_growth", 0.0),
+        val_eval_tokens=result.get("val_eval_tokens", 0),
+        flops_per_step_estimate=result.get("flops_per_step_estimate", 0.0),
+        reference_eval_loss_history=result.get("reference_eval_loss_history", []),
     )
 
     upload_ok = True

@@ -248,6 +248,7 @@ def test_val_selects_best_checkpoint_minimum():
         "log_every_n_steps": 100,  # don't pollute train history
         "val_schedule": "fixed",
         "val_base_step": 1,
+        "val_cadence_unit": "step",
     })
 
     model = runner.build_model(sub, "cpu")
@@ -275,6 +276,7 @@ def test_val_dataloader_exception_does_not_kill_training():
     runner = _FakeRunner(raise_on_val_fetch=True)
     sub = _make_submission(training_config={
         "batch_size": 2, "log_every_n_steps": 100, "val_base_step": 1,
+        "val_cadence_unit": "step",
     })
 
     import time
@@ -298,6 +300,7 @@ def test_val_nan_losses_yield_no_history():
     sub = _make_submission(training_config={
         "batch_size": 2, "log_every_n_steps": 100,
         "val_schedule": "fixed", "val_base_step": 1,
+        "val_cadence_unit": "step",
     })
 
     import time
@@ -327,6 +330,7 @@ def test_val_uses_default_loss_not_submission_compute_loss():
         training_config={
             "batch_size": 2, "log_every_n_steps": 100,
             "val_schedule": "fixed", "val_base_step": 1,
+            "val_cadence_unit": "step",
         },
         compute_loss=degenerate_compute_loss,
     )
@@ -358,6 +362,7 @@ def test_on_step_end_does_not_receive_val_loss():
         training_config={
             "batch_size": 2, "log_every_n_steps": 100,
             "val_schedule": "fixed", "val_base_step": 1,
+            "val_cadence_unit": "step",
         },
         on_step_end=on_step_end,
     )
@@ -479,3 +484,204 @@ def test_read_config_invalid_val_schedule_falls_back():
     sub.training_config = lambda: {"val_schedule": "made_up"}
     cfg = _read_config(sub)
     assert cfg["val_schedule"] == "logarithmic"
+
+
+def test_read_config_default_val_cadence_unit_is_flops():
+    """The new default keys flips val cadence onto a FLOPs axis."""
+    sub = types.ModuleType("s")
+    cfg = _read_config(sub)
+    assert cfg["val_cadence_unit"] == "flops"
+    assert cfg["val_base_flops"] == 1e15
+    # Step-based defaults are unchanged so mixed-cadence runs stay comparable.
+    assert cfg["val_base_step"] == 10
+    assert cfg["val_growth"] == 2.0
+
+
+def test_read_config_picks_up_flops_cadence_keys():
+    sub = types.ModuleType("s")
+    sub.training_config = lambda: {
+        "val_cadence_unit": "flops",
+        "val_base_flops": 5e15,
+    }
+    cfg = _read_config(sub)
+    assert cfg["val_cadence_unit"] == "flops"
+    assert cfg["val_base_flops"] == 5e15
+
+
+def test_read_config_invalid_val_cadence_unit_falls_back():
+    sub = types.ModuleType("s")
+    sub.training_config = lambda: {"val_cadence_unit": "iterations"}
+    cfg = _read_config(sub)
+    assert cfg["val_cadence_unit"] == "flops"  # the default
+
+
+def test_read_config_clamps_val_base_flops():
+    sub = types.ModuleType("s")
+    sub.training_config = lambda: {"val_base_flops": 1.0}  # well below 1e12
+    cfg = _read_config(sub)
+    assert cfg["val_base_flops"] == 1e12
+
+
+# ── FLOPs-keyed val cadence ───────────────────────────────────────
+
+
+def test_val_history_carries_flops_when_estimate_is_known():
+    """Whenever flops_per_optim_step > 0, every val_history entry carries flops."""
+    runner = _FakeRunner(
+        train_batches=[_make_batch() for _ in range(20)],
+        val_batches=[_make_batch() for _ in range(2)],
+        default_loss_fn=lambda p, t, _i: torch.tensor(1.0),
+    )
+    sub = _make_submission(training_config={
+        "batch_size": 2, "log_every_n_steps": 100,
+        "val_schedule": "fixed", "val_base_step": 1,
+        "val_cadence_unit": "step",
+    })
+
+    import time
+    model = runner.build_model(sub, "cpu")
+    out = _training_loop(runner, sub, model, "cpu", time_budget=10, start=time.time())
+
+    assert out["val_history"], "expected at least one val entry"
+    for entry in out["val_history"]:
+        assert "step" in entry and "loss" in entry
+        # flops key is present because the TinyModel/batch supports the 6N formula
+        assert "flops" in entry, f"missing flops key in {entry}"
+        assert entry["flops"] > 0
+    # Cumulative flops must be non-decreasing.
+    flops_seq = [e["flops"] for e in out["val_history"]]
+    assert flops_seq == sorted(flops_seq)
+
+
+def test_val_history_omits_flops_when_estimate_fails():
+    """When flops_per_optim_step can't be estimated, the flops key is omitted."""
+    class _OneParamModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, x):
+            return x * self.scale
+
+    class _BlindRunner(_FakeRunner):
+        def measure_flops(self, model, device):
+            return 0  # disables the fallback formula
+
+        def get_dataloader(self, batch_size):
+            # 1D inputs → seq_len isn't inferrable from shape[1].
+            for _ in range(20):
+                yield {"input": torch.randn(2), "target": torch.randn(2)}
+
+        def get_val_dataloader(self, batch_size):
+            return iter([{"input": torch.randn(2), "target": torch.randn(2)}])
+
+        def build_model(self, sub, device):
+            return _OneParamModel().to(device)
+
+        def default_loss(self, predictions, targets):
+            return ((predictions - targets) ** 2).mean()
+
+    runner = _BlindRunner()
+    sub = _make_submission(training_config={
+        "batch_size": 2, "log_every_n_steps": 100,
+        "val_schedule": "fixed", "val_base_step": 1,
+        "val_cadence_unit": "step",
+    })
+
+    import time
+    model = runner.build_model(sub, "cpu")
+    out = _training_loop(runner, sub, model, "cpu", time_budget=10, start=time.time())
+
+    # No flops key on any entry — better an absent key than a meaningless 0.
+    for entry in out["val_history"] + out["train_history"]:
+        assert "flops" not in entry, f"unexpected flops key in {entry}"
+    # Loop still reports a 0 estimate so callers can see we fell back.
+    assert out["flops_per_step_estimate"] == 0.0
+
+
+def test_val_history_flops_cadence_grows_by_growth(monkeypatch):
+    """With FLOPs cadence, consecutive val flops grow by ~val_growth."""
+    runner = _FakeRunner(
+        train_batches=[_make_batch() for _ in range(400)],
+        val_batches=[_make_batch() for _ in range(1)],
+        default_loss_fn=lambda p, t, _i: torch.tensor(1.0),
+    )
+    sub = _make_submission()
+
+    # Bypass clamps so we can set val_base_flops to a tiny number and watch
+    # the cadence advance many times within a few hundred optim steps.
+    def fake_cfg(_sub):
+        return {
+            "batch_size": 2,
+            "grad_accum_steps": 1,
+            "grad_clip": 1.0,
+            "log_every_n_steps": 1000,
+            "val_base_step": 10,
+            "val_base_flops": 1500.0,
+            "val_growth": 2.0,
+            "val_schedule": "logarithmic",
+            "val_cadence_unit": "flops",
+        }
+    monkeypatch.setattr("runner.harness._read_config", fake_cfg)
+
+    import time
+    model = runner.build_model(sub, "cpu")
+    out = _training_loop(runner, sub, model, "cpu", time_budget=60, start=time.time())
+
+    history = out["val_history"]
+    assert len(history) >= 4, f"expected ≥4 val entries, got {history}"
+    # Drop the synthetic final-step val if it falls inside the same threshold
+    # window as the previous entry (it's appended unconditionally and breaks
+    # the doubling pattern).
+    if len(history) >= 2 and history[-1]["flops"] < 1.5 * history[-2]["flops"]:
+        history = history[:-1]
+
+    flops_seq = [e["flops"] for e in history]
+    assert all(f > 0 for f in flops_seq)
+    for prev, cur in zip(flops_seq, flops_seq[1:]):
+        ratio = cur / prev
+        # Crossings happen one optim step *past* the threshold, so the
+        # observed ratio sits in [growth, 2·growth) — allow generous bounds.
+        assert 1.5 < ratio < 3.5, f"ratio {ratio:.2f} out of range ({prev}→{cur})"
+
+    # The persisted policy reflects the FLOPs cadence used.
+    assert out["val_cadence_unit"] == "flops"
+    assert out["val_base"] == 1500.0
+    assert out["flops_per_step_estimate"] > 0
+
+
+def test_val_history_step_cadence_backward_compat():
+    """Step cadence fires val at the same indices it always did."""
+    val_losses = iter([5.0, 4.0, 3.0, 2.5, 2.0, 1.5, 1.0])
+
+    def loss_fn(preds, targets, _idx):
+        try:
+            return torch.tensor(next(val_losses))
+        except StopIteration:
+            return torch.tensor(1.0)
+
+    runner = _FakeRunner(
+        train_batches=[_make_batch() for _ in range(40)],
+        val_batches=[_make_batch() for _ in range(1)],
+        default_loss_fn=loss_fn,
+    )
+    sub = _make_submission(training_config={
+        "batch_size": 2,
+        "log_every_n_steps": 100,
+        "val_schedule": "logarithmic",
+        "val_base_step": 1,
+        "val_growth": 2.0,
+        "val_cadence_unit": "step",
+    })
+
+    import time
+    model = runner.build_model(sub, "cpu")
+    out = _training_loop(runner, sub, model, "cpu", time_budget=10, start=time.time())
+
+    # Logarithmic schedule with base=1, growth=2 → vals at 1, 2, 4, 8, 16, 32.
+    steps = [e["step"] for e in out["val_history"]]
+    expected_steps = [1, 2, 4, 8, 16, 32]
+    # Allow a trailing synthetic final-step val.
+    relevant = [s for s in steps if s in expected_steps]
+    assert relevant == expected_steps, f"got steps {steps}"
+    assert out["val_cadence_unit"] == "step"
