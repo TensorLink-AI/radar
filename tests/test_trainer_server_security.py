@@ -9,7 +9,7 @@ import asyncio
 import json
 import os
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -26,7 +26,6 @@ def _reset_server_state():
     srv._hotkey_last_request.clear()
     # Reset semaphore to unlocked
     srv._train_semaphore = asyncio.Semaphore(1)
-    srv._RUNNERS.clear()
     yield
 
 
@@ -52,7 +51,6 @@ class TestFailClosed:
         from fastapi.testclient import TestClient
 
         srv._metagraph_cache = None
-        srv._RUNNERS["ts_forecasting"] = MagicMock()
 
         with patch.dict(os.environ, {"RADAR_LOCALNET": ""}), \
              patch.object(srv, "_load_metagraph", return_value=None):
@@ -67,25 +65,24 @@ class TestFailClosed:
         import runner.server as srv
         from fastapi.testclient import TestClient
 
-        mock_runner = MagicMock(return_value={
+        mock_sandbox = AsyncMock(return_value=({
             "status": "success", "round_id": 1, "miner_hotkey": "miner_abc",
             "checkpoint_path": "/tmp/ckpt",
-        })
-        srv._RUNNERS["ts_forecasting"] = mock_runner
+        }, ""))
 
         with patch.dict(os.environ, {"RADAR_LOCALNET": "true"}), \
-             patch("runner.server._upload_artifacts", return_value={"status": "success"}):
+             patch("runner.server.run_sandbox", mock_sandbox), \
+             patch("runner.server.upload_artifacts", return_value={"status": "success"}):
             client = TestClient(srv.app)
             resp = client.post("/train", content=_make_body())
 
-        assert resp.status_code == 200
+        assert resp.status_code == 202
 
     def test_rejects_invalid_auth(self):
         """Bad Epistula headers should return 403."""
         import runner.server as srv
         from fastapi.testclient import TestClient
 
-        srv._RUNNERS["ts_forecasting"] = MagicMock()
         fake_mg = MagicMock()
         mock_verify = MagicMock(return_value=(False, "Invalid signature", ""))
         with patch.dict(os.environ, {"RADAR_LOCALNET": ""}):
@@ -105,14 +102,14 @@ class TestRateLimiting:
         import runner.server as srv
         from fastapi.testclient import TestClient
 
-        mock_runner = MagicMock(return_value={
+        mock_sandbox = AsyncMock(return_value=({
             "status": "success", "round_id": 1, "miner_hotkey": "miner_abc",
             "checkpoint_path": "/tmp/ckpt",
-        })
-        srv._RUNNERS["ts_forecasting"] = mock_runner
+        }, ""))
 
         with patch.dict(os.environ, {"RADAR_LOCALNET": "true"}), \
-             patch("runner.server._upload_artifacts", return_value={"status": "success"}):
+             patch("runner.server.run_sandbox", mock_sandbox), \
+             patch("runner.server.upload_artifacts", return_value={"status": "success"}):
             client = TestClient(srv.app)
             # First request — will get past rate limit
             resp1 = client.post("/train", content=_make_body())
@@ -131,7 +128,6 @@ class TestConcurrencyGate:
         import runner.server as srv
         from fastapi.testclient import TestClient
 
-        srv._RUNNERS["ts_forecasting"] = MagicMock()
         # Pre-lock the semaphore
         loop = asyncio.new_event_loop()
         loop.run_until_complete(srv._train_semaphore.acquire())

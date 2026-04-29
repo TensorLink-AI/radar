@@ -34,25 +34,34 @@ MAX_SERIES_LEN = 8192
 # ── Shard iteration ─────────────────────────────────────────────────
 
 def iter_series(
-    shard_urls: list[str],
+    shard_urls: list[str] | None = None,
     seed: int = 42,
+    shard_paths: list[str] | None = None,
 ) -> Iterator[list[float]]:
-    """Download shards one at a time, yield raw value arrays.
+    """Yield raw value arrays from parquet shards.
 
-    Each shard is a parquet file with at least a 'target' column (list[float]).
-    Shards are shuffled, then rows within each shard are shuffled.
+    Reads either prefetched local files (``shard_paths``, preferred when
+    set — used by the sandboxed trainer) or presigned URLs that get
+    downloaded on-the-fly.  Shards are shuffled, then rows within each
+    shard are shuffled.
     """
     import pandas as pd
 
+    sources: list[str] = list(shard_paths or shard_urls or [])
+    use_local = bool(shard_paths)
+
     rng = random.Random(seed)
-    order = list(range(len(shard_urls)))
+    order = list(range(len(sources)))
     rng.shuffle(order)
 
     for shard_idx in order:
-        url = shard_urls[shard_idx]
+        source = sources[shard_idx]
         try:
-            raw = download_shard(url)
-            df = pd.read_parquet(io.BytesIO(raw))
+            if use_local:
+                df = pd.read_parquet(source)
+            else:
+                raw = download_shard(source)
+                df = pd.read_parquet(io.BytesIO(raw))
         except Exception as e:
             logger.warning("Failed to load shard %d: %s", shard_idx, e)
             continue
@@ -78,7 +87,7 @@ def iter_series(
 
             yield values
 
-        del df, raw  # free memory before next shard
+        del df  # free memory before next shard
 
 
 # ── Window cutting ──────────────────────────────────────────────────
@@ -109,18 +118,19 @@ def cut_windows(
 # ── Dataloader ──────────────────────────────────────────────────────
 
 def pretrain_dataloader(
-    shard_urls: list[str],
+    shard_urls: list[str] | None = None,
     batch_size: int = 64,
     context_len: int = CONTEXT_LEN,
     prediction_len: int = PREDICTION_LEN,
     stride: int = DEFAULT_STRIDE,
     shuffle_buffer_size: int = 10_000,
     seed: int = 42,
+    shard_paths: list[str] | None = None,
 ) -> Iterator[dict[str, torch.Tensor]]:
     """Streaming pretrain dataloader for time-series forecasting.
 
-    Downloads parquet shards one at a time, extracts series, cuts
-    fixed-size windows, shuffles, and yields batches of
+    Reads parquet shards (from local paths or presigned URLs), extracts
+    series, cuts fixed-size windows, shuffles, and yields batches of
     {"context": (B, context_len, 1), "target": (B, prediction_len, 1)}.
 
     All batches have the same target shape (matching PREDICTION_LEN=96)
@@ -142,7 +152,9 @@ def pretrain_dataloader(
             ).unsqueeze(-1)  # (B, prediction_len, 1)
             yield {"context": ctx, "target": tgt}
 
-    for values in iter_series(shard_urls, seed=seed):
+    for values in iter_series(
+        shard_urls=shard_urls, seed=seed, shard_paths=shard_paths,
+    ):
         for window in cut_windows(values, context_len, prediction_len, stride):
             evicted = buf.add(window)
             if evicted is not None:
