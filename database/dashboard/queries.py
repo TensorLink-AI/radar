@@ -192,6 +192,9 @@ async def miner_round_activity(
     ``max_miners``; the round axis is the most recent ``rounds`` rounds
     present in ``miner_access_log``.
     """
+    # Validator self-polling and unattributed traffic both land in
+    # miner_access_log with hotkey='validator' / ''. Filter them so the
+    # heatmap only shows real miner agents.
     rows = await pool.fetch(
         """
         SELECT hotkey, round_id,
@@ -202,6 +205,8 @@ async def miner_round_activity(
             FROM miner_access_log
             WHERE round_id >= 0
               AND jsonb_typeof(experiment_ids) = 'array'
+              AND hotkey <> ''
+              AND hotkey <> 'validator'
         ) t
         WHERE round_id IN (
             SELECT DISTINCT round_id FROM miner_access_log
@@ -252,6 +257,8 @@ async def top_experiments_activity(
             SELECT (jsonb_array_elements_text(experiment_ids))::int AS exp_id
             FROM miner_access_log
             WHERE jsonb_typeof(experiment_ids) = 'array'
+              AND hotkey <> ''
+              AND hotkey <> 'validator'
         )
         SELECT exp_id, COUNT(*) AS cnt
         FROM refs
@@ -280,6 +287,8 @@ async def top_experiments_activity(
                    (jsonb_array_elements_text(experiment_ids))::int AS exp_id
             FROM miner_access_log
             WHERE jsonb_typeof(experiment_ids) = 'array'
+              AND hotkey <> ''
+              AND hotkey <> 'validator'
         )
         SELECT hotkey, exp_id, COUNT(*) AS cnt
         FROM refs
