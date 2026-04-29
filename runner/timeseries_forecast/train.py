@@ -155,6 +155,68 @@ class TSForecastingRunner:
         q = torch.tensor(quantiles, device=predictions.device)
         return torch.max(q * errors, (q - 1) * errors).mean()
 
+    def compute_val_metrics(
+        self, predictions: Any, targets: Any, inputs: Any,
+    ) -> dict[str, tuple[float, float]]:
+        """CRPS (weighted quantile loss) and MASE on the pretrain val shard.
+
+        Per-batch components ``(num_sum, den_sum)`` are returned; the harness
+        sums them across the val pass and reports ``num/den`` per metric.
+        Pretrain shards mix frequencies, so MASE uses season=1 (1-step naive
+        baseline scale).
+        """
+        import torch
+
+        c = self._load_constants()
+        quantiles = c["quantiles"]
+        median_idx = len(quantiles) // 2
+        predictions, targets = self._align_pred_target(predictions, targets)
+
+        finite = (
+            torch.isfinite(predictions).flatten(1).all(dim=1)
+            & torch.isfinite(targets).flatten(1).all(dim=1)
+        )
+        if not finite.any():
+            return {}
+        predictions = predictions[finite]
+        targets = targets[finite]
+        if inputs.shape[0] == finite.shape[0]:
+            inputs = inputs[finite]
+
+        device = predictions.device
+        quantiles_t = torch.tensor(quantiles, device=device)
+
+        # CRPS components (gluonts mean_weighted_sum_quantile_loss axis=None):
+        # num = (2/Q) Σ pinball(y, q_pred), den = Σ |y|.
+        target_expanded = targets.unsqueeze(-1)
+        errors = target_expanded - predictions
+        q_view = quantiles_t.view(1, 1, 1, -1)
+        pinball = torch.max(q_view * errors, (q_view - 1) * errors)
+        crps_num = float(((2.0 / quantiles_t.numel()) * pinball).sum().item())
+        crps_den = float(targets.abs().sum().item())
+
+        # MASE components, season=1 (mixed-freq pretrain windows have no
+        # known seasonality — fall back to the 1-step naive baseline).
+        median_pred = predictions[..., median_idx]              # (B, H, V)
+        H = targets.shape[1]
+        err = (targets - median_pred).abs().sum(dim=1)          # (B, V)
+        if inputs.shape[1] >= 2:
+            diffs = (inputs[:, 1:] - inputs[:, :-1]).abs()      # (B, ctx-1, V)
+            scale = diffs.mean(dim=1)                           # (B, V)
+        else:
+            scale = torch.ones_like(err)
+        valid = torch.isfinite(scale) & (scale > 0)
+        if valid.any():
+            mase_err = float(err[valid].sum().item())
+            mase_scale = float((H * scale[valid]).sum().item())
+        else:
+            mase_err, mase_scale = 0.0, 0.0
+
+        return {
+            "crps": (crps_num, crps_den),
+            "mase": (mase_err, mase_scale),
+        }
+
     def wrap_loss(self, sub_loss_fn):
         """Wrap miner's compute_loss for backward compat.
 
