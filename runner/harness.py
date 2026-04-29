@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -66,6 +67,18 @@ class TaskRunner(Protocol):
         Must be deterministic — same batches in same order on every call.
         """
         return None
+
+    def compute_val_metrics(
+        self, predictions: Any, targets: Any, inputs: Any,
+    ) -> dict[str, tuple[float, float]]:
+        """Optional: extra val metrics aggregated gluonts-style across batches.
+
+        Return ``{metric_name: (numerator_sum, denominator_sum)}`` for the
+        batch. The harness sums num/den across all val batches and reports
+        ``num_sum / den_sum`` per metric in each ``val_loss_history`` entry.
+        Default: no extra metrics.
+        """
+        return {}
 
 
 @dataclass
@@ -463,11 +476,12 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
             flops_trigger = next_val_flops > 0 and cumulative_flops >= next_val_flops
             step_trigger = next_val > 0 and optim_step >= next_val
             if flops_trigger or step_trigger:
-                val_loss, tokens_seen = _run_val(
+                val_result, tokens_seen = _run_val(
                     runner, model, val_loader_factory, device, amp_dtype, amp_enabled,
                 )
-                if val_loss is not None:
-                    entry = {"step": optim_step, "loss": val_loss}
+                if val_result is not None:
+                    val_loss = val_result["loss"]
+                    entry = {"step": optim_step, **val_result}
                     if flops_per_optim_step > 0:
                         entry["flops"] = cumulative_flops
                     val_history.append(entry)
@@ -514,11 +528,12 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
     # at least one optimizer step), so the best_state captures end-of-run.
     if val_loader_factory and cfg["val_schedule"] != "none" and optim_step > 0:
         if not val_history or val_history[-1]["step"] != optim_step:
-            val_loss, tokens_seen = _run_val(
+            val_result, tokens_seen = _run_val(
                 runner, model, val_loader_factory, device, amp_dtype, amp_enabled,
             )
-            if val_loss is not None:
-                entry = {"step": optim_step, "loss": val_loss}
+            if val_result is not None:
+                val_loss = val_result["loss"]
+                entry = {"step": optim_step, **val_result}
                 if flops_per_optim_step > 0:
                     entry["flops"] = cumulative_flops
                 val_history.append(entry)
@@ -550,18 +565,25 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
 
 
 def _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled):
-    """Compute mean val loss over the full val dataloader using task's default_loss.
+    """Run val: returns ``(val_dict | None, tokens_seen)``.
 
-    Returns ``(mean_loss, tokens_seen)``. ``mean_loss`` is None on any failure
-    (so val failure doesn't kill training). ``tokens_seen`` is best-effort
-    ``sum(batch_size * seq_len)`` across val batches; 0 when seq_len isn't
-    inferrable from the input shape.
+    ``val_dict`` is ``{"loss": float, **extra_metrics}`` where ``extra_metrics``
+    come from the runner's ``compute_val_metrics`` hook, aggregated
+    gluonts-style (sum num + den across batches, then divide). Returns None
+    in the first slot when the loop produced no usable losses (so val failure
+    doesn't kill training — caller treats None as "skip this round").
+
+    ``tokens_seen`` is best-effort ``sum(batch_size * seq_len)`` across val
+    batches; 0 when seq_len isn't inferrable from the input shape.
     """
     import torch
+    metric_fn = getattr(runner, "compute_val_metrics", None)
     try:
         model.eval()
-        losses = []
+        losses: list[float] = []
         tokens_seen = 0
+        # name -> [num_sum, den_sum]
+        metric_sums: dict[str, list[float]] = {}
         with torch.no_grad():
             for batch in val_loader_factory():
                 inputs = batch["input"].to(device) if "input" in batch else batch["context"].to(device)
@@ -575,9 +597,33 @@ def _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled):
                     loss = runner.default_loss(predictions, targets)
                 if torch.isfinite(loss):
                     losses.append(float(loss.item()))
+                if metric_fn is not None:
+                    try:
+                        components = metric_fn(predictions, targets, inputs)
+                    except Exception as e:
+                        logger.warning("compute_val_metrics() failed: %s", e)
+                        components = None
+                    if isinstance(components, dict):
+                        for name, val in components.items():
+                            if not isinstance(val, tuple) or len(val) != 2:
+                                continue
+                            try:
+                                num = float(val[0])
+                                den = float(val[1])
+                            except (TypeError, ValueError):
+                                continue
+                            if not (math.isfinite(num) and math.isfinite(den)):
+                                continue
+                            bucket = metric_sums.setdefault(name, [0.0, 0.0])
+                            bucket[0] += num
+                            bucket[1] += den
         if not losses:
             return None, tokens_seen
-        return sum(losses) / len(losses), tokens_seen
+        result: dict[str, float] = {"loss": sum(losses) / len(losses)}
+        for name, (num_sum, den_sum) in metric_sums.items():
+            if den_sum > 0 and math.isfinite(num_sum) and math.isfinite(den_sum):
+                result[name] = num_sum / den_sum
+        return result, tokens_seen
     except Exception as e:
         logger.warning("val failed: %s", e)
         return None, 0
