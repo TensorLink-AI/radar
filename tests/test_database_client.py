@@ -85,6 +85,48 @@ async def test_record_components(client):
 
 
 @pytest.mark.asyncio
+async def test_post_events_success(client):
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"status": "ok", "inserted": 2}
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch.object(client, "_get_client") as mock_get:
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_get.return_value = mock_client
+        ok = await client.post_events([
+            {"kind": "log", "payload": {"message": "hi"}},
+            {"kind": "metric", "payload": {"name": "x", "value": 1}},
+        ])
+        assert ok is True
+        # Body should be {"events": [...]}, signed and posted to /events.
+        call_kwargs = mock_client.post.call_args.kwargs
+        sent = json.loads(call_kwargs["content"].decode())
+        assert "events" in sent and len(sent["events"]) == 2
+        assert mock_client.post.call_args.args[0].endswith("/events")
+
+
+@pytest.mark.asyncio
+async def test_post_events_empty_short_circuits(client):
+    # Empty batch returns True without an HTTP call.
+    with patch.object(client, "_get_client") as mock_get:
+        ok = await client.post_events([])
+        assert ok is True
+        mock_get.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_events_failure_returns_false(client):
+    with patch.object(client, "_get_client") as mock_get:
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=Exception("net down"))
+        mock_get.return_value = mock_client
+        ok = await client.post_events([{"kind": "log", "payload": {}}])
+        assert ok is False
+
+
+@pytest.mark.asyncio
 async def test_post_failure_returns_none(client):
     with patch.object(client, "_get_client") as mock_get:
         mock_client = AsyncMock()

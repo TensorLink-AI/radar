@@ -29,13 +29,14 @@ from config import Config, validate_neuron_mode
 from database.server import (
     app, include_validator_routes,
     set_db, set_auth, set_challenge, set_frontier,
-    set_access_logger, set_hotkey_map, set_rate_limit,
+    set_access_logger, set_event_store, set_hotkey_map, set_rate_limit,
     set_r2, set_pool,
     get_current_challenge, get_current_frontier,
 )
 from shared.migrations import apply_migrations
 from shared.pareto import ParetoFront
 from shared.pg_access_logger import PgAccessLogger
+from shared.pg_events import PgEventStore
 from shared.pg_store import (
     PgExperimentStore,
     create_pg_pool,
@@ -169,6 +170,7 @@ class DatabaseNeuron:
         self.pool = None
         self.store = None
         self.access_logger = None
+        self.event_store: Optional[PgEventStore] = None
 
     def _build_task_bucket_resolver(self) -> Callable[[str], list[tuple[int, int]]]:
         """Closure that maps a task name to its FLOPs-equivalent bucket list.
@@ -300,6 +302,13 @@ class DatabaseNeuron:
         self.access_logger = PgAccessLogger(self.pool)
         await self.access_logger.init_schema()
 
+        # Validator event stream — backs the wandb-style live tail at
+        # /dashboard/api/validators/{hotkey}/events. Initialised in every
+        # mode so the dashboard process can read events even before the
+        # validator process touches the table.
+        self.event_store = PgEventStore(self.pool)
+        await self.event_store.init_schema()
+
         # Init agent_submissions + agent_bundles + training_metas tables
         from shared.pg_schema import AGENT_CODE_SCHEMA
         async with self.pool.acquire() as conn:
@@ -340,6 +349,7 @@ class DatabaseNeuron:
         if self.r2:
             set_r2(self.r2)
         set_access_logger(self.access_logger)
+        set_event_store(self.event_store)
 
         # ── Validator-surface wiring (Epistula auth + rate limit) ──
         if _mode_runs_validator_surface(self.mode):
@@ -557,6 +567,32 @@ class DatabaseNeuron:
 
         round_task: Optional[asyncio.Task] = None
 
+        # Periodic prune of validator_events. Runs in every mode so the
+        # dashboard process keeps the table bounded even when no
+        # validator is co-located with the DB.
+        prune_task: Optional[asyncio.Task] = None
+        if (
+            self.event_store is not None
+            and Config.EVENTS_RETENTION_DAYS > 0
+            and Config.EVENTS_PRUNE_INTERVAL_S > 0
+        ):
+            async def _prune_loop():
+                interval = max(60, int(Config.EVENTS_PRUNE_INTERVAL_S))
+                retention = int(Config.EVENTS_RETENTION_DAYS)
+                while True:
+                    await asyncio.sleep(interval)
+                    try:
+                        n = await self.event_store.prune(retention)
+                        if n:
+                            logger.info(
+                                "validator_events: pruned %d rows older than %d days",
+                                n, retention,
+                            )
+                    except Exception as e:
+                        logger.warning("validator_events prune failed: %s", e)
+
+            prune_task = asyncio.create_task(_prune_loop())
+
         if _mode_runs_chain(self.mode):
             # Round tracker — rounds are ~55 min (275 blocks × 12s), so a
             # 30s poll keeps miner_access_log.round_id within one block of
@@ -583,6 +619,8 @@ class DatabaseNeuron:
             except asyncio.CancelledError:
                 if round_task is not None:
                     round_task.cancel()
+                if prune_task is not None:
+                    prune_task.cancel()
                 server.should_exit = True
                 await server_task
         else:
@@ -590,6 +628,8 @@ class DatabaseNeuron:
             try:
                 await server_task
             except asyncio.CancelledError:
+                if prune_task is not None:
+                    prune_task.cancel()
                 server.should_exit = True
                 await server_task
 

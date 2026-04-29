@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from config import Config
 from shared.access_logger import extract_ids_from_body
 from shared.pg_access_logger import PgAccessLogger
+from shared.pg_events import PgEventStore
 
 app = FastAPI(title="RADAR Experiment DB (Centralized)")
 
@@ -82,6 +83,14 @@ _current_frontier = None
 _access_logger: Optional[PgAccessLogger] = None
 _hotkey_to_uid: dict[str, int] = {}
 
+# Validator event stream (wandb-style log + metric tail). Set by
+# database/neuron.py during init; left as None in test contexts.
+_event_store: Optional[PgEventStore] = None
+
+# Maximum events accepted in a single POST /events batch — defends the DB
+# server from outsized writes regardless of the validator's local config.
+_MAX_EVENTS_PER_BATCH: int = 1000
+
 
 def set_db(experiment_db):
     global db
@@ -131,6 +140,15 @@ def get_current_frontier():
 def set_access_logger(al: PgAccessLogger):
     global _access_logger
     _access_logger = al
+
+
+def set_event_store(es: Optional[PgEventStore]):
+    global _event_store
+    _event_store = es
+
+
+def get_event_store() -> Optional[PgEventStore]:
+    return _event_store
 
 
 def set_hotkey_map(mapping: dict[str, int]):
@@ -221,10 +239,15 @@ class SubmitTrainingMetaRequest(BaseModel):
     meta: dict
 
 
+class PostEventsRequest(BaseModel):
+    """Validator pushes a batch of log/metric events for the public tail."""
+    events: list[dict]
+
+
 # Routes that only validators (hotkeys with permit) may call
 _VALIDATOR_ONLY_PREFIXES = (
     "/experiments/add", "/frontier/update", "/provenance/record",
-    "/training_metas",
+    "/training_metas", "/events",
 )
 
 
@@ -275,6 +298,7 @@ async def auth_middleware(request: Request, call_next):
         or path.startswith("/agent_code")
         or path.startswith("/desearch")
         or path.startswith("/llm")
+        or path.startswith("/events")
     )
     if needs_auth:
         # ── Reject oversized bodies before reading fully ──
@@ -552,6 +576,40 @@ async def submit_training_meta(req: SubmitTrainingMetaRequest):
         )
         raise HTTPException(status_code=500, detail="Failed to cache training meta")
     return {"status": "ok"}
+
+
+@validator_router.post("/events")
+async def post_events(request: Request, req: PostEventsRequest):
+    """Validator flushes a batch of log/metric events.
+
+    The caller's hotkey is taken from the Epistula signature
+    (``request.state.caller_hotkey``); validators cannot post events on
+    behalf of another hotkey. Events with unknown ``kind`` are silently
+    dropped — the validator-side library only ever produces valid kinds,
+    and we don't want a misbehaving client to noisily fail the whole
+    batch.
+    """
+    if _event_store is None:
+        raise HTTPException(status_code=503, detail="Event store not configured")
+    hotkey = getattr(request.state, "caller_hotkey", "")
+    if not hotkey:
+        # Trusted-proxy mode skips Epistula; fall back to an explicit
+        # header so deployments using DB_API_KEY can still attribute
+        # events to a specific validator.
+        hotkey = request.headers.get("X-Validator-Hotkey", "")
+    if not hotkey:
+        raise HTTPException(status_code=403, detail="Hotkey required")
+
+    events = req.events or []
+    if len(events) > _MAX_EVENTS_PER_BATCH:
+        events = events[-_MAX_EVENTS_PER_BATCH:]
+
+    try:
+        n = await _event_store.insert_batch(hotkey, events)
+    except Exception as e:
+        logger.error("post_events insert failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Event insert failed")
+    return {"status": "ok", "inserted": n}
 
 
 @validator_router.post("/frontier/update")
