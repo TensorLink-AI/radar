@@ -92,6 +92,7 @@ class TestDesearchProxy:
             "date_filter": "PAST_2_YEARS",
             "result_type": "LINKS_WITH_FINAL_SUMMARY",
             "count": 10,
+            "streaming": False,
         }
 
     @pytest.mark.asyncio
@@ -171,6 +172,64 @@ class TestDesearchProxy:
 
         def _bad_json():
             raise _json.JSONDecodeError("Expecting value", "", 0)
+
+        mock_resp.json = _bad_json
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
+            with pytest.raises(HTTPException) as exc_info:
+                await proxy.search(0, "x")
+        assert exc_info.value.status_code == 502
+
+    @pytest.mark.asyncio
+    async def test_search_recovers_from_sse_stream(self):
+        """When upstream ignores streaming=False and returns an SSE event
+        stream, the proxy must recover the final payload from `data:` events
+        instead of returning a 502."""
+        import json as _json
+        proxy = DesearchProxy(max_queries=5, api_key="dt_testkey")
+        sse_body = (
+            'data: {"type": "flow", "content": {"id": "1", "type": '
+            '"Description", "content": "Searching", "status": "in_progress"}}\n\n'
+            'data: {"type": "flow", "content": {"id": "1", "type": "Links", '
+            '"content": [{"title": "Paper A", "id": "2301.00001"}, '
+            '{"title": "Paper B", "id": "2301.00002"}], "status": "completed"}}\n\n'
+            'data: [DONE]\n\n'
+        )
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.status_code = 200
+        mock_resp.text = sse_body
+
+        def _bad_json():
+            raise _json.JSONDecodeError("Expecting value", sse_body, 0)
+
+        mock_resp.json = _bad_json
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
+            resp = await proxy.search(0, "x", max_results=5)
+        assert len(resp.results) == 2
+        assert resp.results[0].title == "Paper A"
+        assert resp.results[0].arxiv_id == "2301.00001"
+
+    @pytest.mark.asyncio
+    async def test_search_sse_stream_with_no_results_returns_502(self):
+        """An SSE stream that only carries in-progress flow events with no
+        recoverable payload should still produce a 502 (not a 500)."""
+        import json as _json
+        proxy = DesearchProxy(max_queries=5, api_key="dt_testkey")
+        sse_body = (
+            'data: {"type": "flow", "content": {"id": "1", "type": '
+            '"Description", "content": "Searching", "status": "in_progress"}}\n\n'
+        )
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.status_code = 200
+        mock_resp.text = sse_body
+
+        def _bad_json():
+            raise _json.JSONDecodeError("Expecting value", sse_body, 0)
 
         mock_resp.json = _bad_json
         mock_client = AsyncMock()
