@@ -203,6 +203,12 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
         "val_loss_history": loop_result["val_history"],
         "best_val_loss": loop_result["best_val_loss"],
         "best_val_step": loop_result["best_val_step"],
+        "val_cadence_unit": loop_result["val_cadence_unit"],
+        "val_base": loop_result["val_base"],
+        "val_growth": loop_result["val_growth"],
+        "val_eval_tokens": loop_result["val_eval_tokens"],
+        "flops_per_step_estimate": loop_result["flops_per_step_estimate"],
+        "reference_eval_loss_history": [],
     }
 
 
@@ -215,6 +221,7 @@ _DEFAULTS = {
     "grad_clip": 1.0,
     "log_every_n_steps": 10,
     "val_base_step": 10,
+    "val_base_flops": 1e15,
     "val_growth": 2.0,
 }
 _CLAMPS = {
@@ -223,10 +230,13 @@ _CLAMPS = {
     "grad_clip": (0.0, 100.0),
     "log_every_n_steps": (1, 1000),
     "val_base_step": (1, 10000),
+    "val_base_flops": (1e12, 1e22),
     "val_growth": (1.1, 10.0),
 }
 _VAL_SCHEDULES = ("logarithmic", "fixed", "none")
 _DEFAULT_VAL_SCHEDULE = "logarithmic"
+_VAL_CADENCE_UNITS = ("flops", "step")
+_DEFAULT_VAL_CADENCE_UNIT = "flops"
 
 _AMP_DTYPE_WHITELIST = {"bfloat16": None, "float16": None, "float32": None}  # populated on first use
 
@@ -239,6 +249,7 @@ def _get_amp_dtypes():
 def _read_config(sub) -> dict:
     cfg = dict(_DEFAULTS)
     cfg["val_schedule"] = _DEFAULT_VAL_SCHEDULE
+    cfg["val_cadence_unit"] = _DEFAULT_VAL_CADENCE_UNIT
     if _has_callable(sub, "training_config"):
         try:
             user_cfg = sub.training_config()
@@ -253,6 +264,9 @@ def _read_config(sub) -> dict:
                     elif k == "val_schedule":
                         if isinstance(v, str) and v in _VAL_SCHEDULES:
                             cfg["val_schedule"] = v
+                    elif k == "val_cadence_unit":
+                        if isinstance(v, str) and v in _VAL_CADENCE_UNITS:
+                            cfg["val_cadence_unit"] = v
         except Exception:
             pass
     return cfg
@@ -334,11 +348,21 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
     best_state = None
     val_history: list[dict] = []
     train_history: list[dict] = []
-    next_val = (
-        cfg["val_base_step"]
-        if val_loader_factory and cfg["val_schedule"] != "none"
-        else -1
-    )
+
+    num_params = sum(p.numel() for p in model.parameters())
+    flops_per_optim_step = 0
+    cumulative_flops = 0
+    flops_estimated = False
+    val_eval_tokens = 0
+    val_enabled = bool(val_loader_factory) and cfg["val_schedule"] != "none"
+    use_flops_cadence_requested = cfg["val_cadence_unit"] == "flops"
+
+    # Cadence trigger state. -1 disables. We delay choosing between flops /
+    # step cadence until we've seen the first batch (so seq_len is known).
+    next_val = -1
+    next_val_flops = -1
+    if val_enabled and not use_flops_cadence_requested:
+        next_val = cfg["val_base_step"]
 
     model.train()
     step = 0
@@ -351,6 +375,38 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
 
         inputs = batch["input"].to(device) if "input" in batch else batch["context"].to(device)
         targets = batch["target"].to(device)
+
+        # Estimate flops_per_optim_step once on the first batch. Transformer
+        # tasks (input shape [batch, seq_len, ...]) get the analytical 6N
+        # formula; everything else falls back to 3× a single-step measurement.
+        if not flops_estimated:
+            flops_estimated = True
+            seq_len = int(inputs.shape[1]) if inputs.dim() >= 2 else 0
+            if num_params > 0 and seq_len > 1:
+                flops_per_optim_step = int(
+                    6 * num_params * cfg["batch_size"] * seq_len * cfg["grad_accum_steps"]
+                )
+            else:
+                try:
+                    measured = int(runner.measure_flops(model, device))
+                except Exception:
+                    measured = 0
+                if measured > 0:
+                    flops_per_optim_step = int(
+                        3 * measured * cfg["batch_size"] * cfg["grad_accum_steps"]
+                    )
+            if flops_per_optim_step <= 0:
+                logger.warning(
+                    "flops_per_optim_step estimation failed (num_params=%d, "
+                    "input.shape=%s); falling back to step-based val cadence",
+                    num_params, tuple(inputs.shape),
+                )
+
+            if val_enabled and use_flops_cadence_requested:
+                if flops_per_optim_step > 0:
+                    next_val_flops = int(cfg["val_base_flops"])
+                else:
+                    next_val = cfg["val_base_step"]
 
         # transform_batch hook
         if has_transform and not tb_disabled:
@@ -401,33 +457,53 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
             if scheduler:
                 scheduler.step()
             optim_step += 1
+            if flops_per_optim_step > 0:
+                cumulative_flops += flops_per_optim_step
 
             # Train loss logging (periodic)
             if optim_step % cfg["log_every_n_steps"] == 0:
-                train_history.append({
+                entry = {
                     "step": optim_step,
                     "loss": float(loss.item() * cfg["grad_accum_steps"]),
-                })
+                }
+                if flops_per_optim_step > 0:
+                    entry["flops"] = cumulative_flops
+                train_history.append(entry)
 
             # Val loss + best checkpoint (scheduled). Runs BEFORE on_step_end so
             # the submission's hook cannot observe val state. val_loss is a local
             # here only — never propagated to any submission hook.
-            if next_val > 0 and optim_step >= next_val:
-                val_result = _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled)
+            flops_trigger = next_val_flops > 0 and cumulative_flops >= next_val_flops
+            step_trigger = next_val > 0 and optim_step >= next_val
+            if flops_trigger or step_trigger:
+                val_result, tokens_seen = _run_val(
+                    runner, model, val_loader_factory, device, amp_dtype, amp_enabled,
+                )
                 if val_result is not None:
                     val_loss = val_result["loss"]
-                    val_history.append({"step": optim_step, **val_result})
+                    entry = {"step": optim_step, **val_result}
+                    if flops_per_optim_step > 0:
+                        entry["flops"] = cumulative_flops
+                    val_history.append(entry)
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         best_val_step = optim_step
                         # Clone state_dict to CPU to avoid holding GPU memory.
                         best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-                if cfg["val_schedule"] == "logarithmic":
-                    next_val = _next_val_step(optim_step, cfg["val_base_step"], cfg["val_growth"])
-                elif cfg["val_schedule"] == "fixed":
-                    next_val = optim_step + cfg["val_base_step"]
+                if val_eval_tokens == 0 and tokens_seen > 0:
+                    val_eval_tokens = tokens_seen
+
+                if flops_trigger:
+                    next_val_flops = max(
+                        next_val_flops + 1, int(next_val_flops * cfg["val_growth"]),
+                    )
                 else:
-                    next_val = -1
+                    if cfg["val_schedule"] == "logarithmic":
+                        next_val = _next_val_step(optim_step, cfg["val_base_step"], cfg["val_growth"])
+                    elif cfg["val_schedule"] == "fixed":
+                        next_val = optim_step + cfg["val_base_step"]
+                    else:
+                        next_val = -1
 
             if has_on_step:
                 try:
@@ -452,14 +528,21 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
     # at least one optimizer step), so the best_state captures end-of-run.
     if val_loader_factory and cfg["val_schedule"] != "none" and optim_step > 0:
         if not val_history or val_history[-1]["step"] != optim_step:
-            val_result = _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled)
+            val_result, tokens_seen = _run_val(
+                runner, model, val_loader_factory, device, amp_dtype, amp_enabled,
+            )
             if val_result is not None:
                 val_loss = val_result["loss"]
-                val_history.append({"step": optim_step, **val_result})
+                entry = {"step": optim_step, **val_result}
+                if flops_per_optim_step > 0:
+                    entry["flops"] = cumulative_flops
+                val_history.append(entry)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_val_step = optim_step
                     best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            if val_eval_tokens == 0 and tokens_seen > 0:
+                val_eval_tokens = tokens_seen
 
     return {
         "step": step,
@@ -468,27 +551,46 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
         "best_val_loss": (best_val_loss if best_val_step >= 0 else None),
         "best_val_step": best_val_step,
         "best_state": best_state,
+        "val_cadence_unit": cfg["val_cadence_unit"],
+        "val_base": (
+            float(cfg["val_base_flops"])
+            if cfg["val_cadence_unit"] == "flops" and flops_per_optim_step > 0
+            else float(cfg["val_base_step"])
+        ),
+        "val_growth": float(cfg["val_growth"]),
+        "val_eval_tokens": int(val_eval_tokens),
+        "flops_per_step_estimate": float(flops_per_optim_step),
+        "cumulative_flops": int(cumulative_flops),
     }
 
 
 def _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled):
-    """Run val: returns ``{"loss": float, **extra_metrics}`` or None on failure.
+    """Run val: returns ``(val_dict | None, tokens_seen)``.
 
-    ``extra_metrics`` come from the runner's ``compute_val_metrics`` hook,
-    aggregated gluonts-style (sum num + den across batches, then divide).
-    Val failures never kill training — caller treats None as "skip this round".
+    ``val_dict`` is ``{"loss": float, **extra_metrics}`` where ``extra_metrics``
+    come from the runner's ``compute_val_metrics`` hook, aggregated
+    gluonts-style (sum num + den across batches, then divide). Returns None
+    in the first slot when the loop produced no usable losses (so val failure
+    doesn't kill training — caller treats None as "skip this round").
+
+    ``tokens_seen`` is best-effort ``sum(batch_size * seq_len)`` across val
+    batches; 0 when seq_len isn't inferrable from the input shape.
     """
     import torch
     metric_fn = getattr(runner, "compute_val_metrics", None)
     try:
         model.eval()
         losses: list[float] = []
+        tokens_seen = 0
         # name -> [num_sum, den_sum]
         metric_sums: dict[str, list[float]] = {}
         with torch.no_grad():
             for batch in val_loader_factory():
                 inputs = batch["input"].to(device) if "input" in batch else batch["context"].to(device)
                 targets = batch["target"].to(device)
+                if inputs.dim() >= 2:
+                    seq = int(inputs.shape[1]) if inputs.dim() >= 2 else 0
+                    tokens_seen += int(inputs.shape[0]) * seq
                 with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
                     predictions = model(inputs)
                     # ALWAYS use task default_loss — not the submission's compute_loss.
@@ -516,15 +618,15 @@ def _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled):
                             bucket[0] += num
                             bucket[1] += den
         if not losses:
-            return None
+            return None, tokens_seen
         result: dict[str, float] = {"loss": sum(losses) / len(losses)}
         for name, (num_sum, den_sum) in metric_sums.items():
             if den_sum > 0 and math.isfinite(num_sum) and math.isfinite(den_sum):
                 result[name] = num_sum / den_sum
-        return result
+        return result, tokens_seen
     except Exception as e:
         logger.warning("val failed: %s", e)
-        return None
+        return None, 0
     finally:
         model.train()
 

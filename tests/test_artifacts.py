@@ -62,6 +62,63 @@ def test_training_meta_old_format_without_new_fields():
     assert meta.val_loss_history == []
     assert meta.best_val_loss is None
     assert meta.best_val_step == -1
+    # New schedule-policy fields default empty so legacy metas deserialize cleanly.
+    assert meta.val_cadence_unit == "step"
+    assert meta.val_base == 0.0
+    assert meta.val_growth == 0.0
+    assert meta.val_eval_tokens == 0
+    assert meta.flops_per_step_estimate == 0.0
+    assert meta.reference_eval_loss_history == []
+
+
+def test_training_meta_roundtrip_with_schedule_policy_fields():
+    """All new policy fields round-trip through to_dict/from_dict/to_json/from_json."""
+    train_hist = [
+        {"step": 100, "flops": 6_000_000, "loss": 1.5},
+        {"step": 200, "flops": 12_000_000, "loss": 1.0},
+    ]
+    val_hist = [
+        {"step": 100, "flops": 6_000_000, "loss": 1.7},
+        {"step": 200, "flops": 12_000_000, "loss": 1.2},
+    ]
+    ref_hist = [
+        {"step": 100, "flops": 6_000_000, "loss": 1.9},
+    ]
+    meta = TrainingMeta(
+        round_id=11, miner_hotkey="5Sched", status="success",
+        train_loss_history=train_hist,
+        val_loss_history=val_hist,
+        best_val_loss=1.2, best_val_step=200,
+        val_cadence_unit="flops",
+        val_base=1e15,
+        val_growth=2.0,
+        val_eval_tokens=4096,
+        flops_per_step_estimate=6e8,
+        reference_eval_loss_history=ref_hist,
+    )
+
+    # to_dict / from_dict round-trip
+    restored = TrainingMeta.from_dict(meta.to_dict())
+    assert restored.val_cadence_unit == "flops"
+    assert restored.val_base == 1e15
+    assert restored.val_growth == 2.0
+    assert restored.val_eval_tokens == 4096
+    assert restored.flops_per_step_estimate == 6e8
+    assert restored.reference_eval_loss_history == ref_hist
+    assert restored.train_loss_history == train_hist
+    assert restored.val_loss_history == val_hist
+
+    # to_json / from_json round-trip
+    restored2 = TrainingMeta.from_json(meta.to_json())
+    assert restored2.val_cadence_unit == "flops"
+    assert restored2.val_base == 1e15
+    assert restored2.val_growth == 2.0
+    assert restored2.val_eval_tokens == 4096
+    assert restored2.flops_per_step_estimate == 6e8
+    assert restored2.reference_eval_loss_history == ref_hist
+    # Loss histories with the new flops key survive JSON serialization intact.
+    assert restored2.train_loss_history == train_hist
+    assert restored2.val_loss_history == val_hist
 
 
 def test_training_meta_from_dict_ignores_extra_keys():
