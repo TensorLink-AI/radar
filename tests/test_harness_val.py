@@ -479,3 +479,131 @@ def test_read_config_invalid_val_schedule_falls_back():
     sub.training_config = lambda: {"val_schedule": "made_up"}
     cfg = _read_config(sub)
     assert cfg["val_schedule"] == "logarithmic"
+
+
+# ── compute_val_metrics aggregation ───────────────────────────────
+
+class _MetricRunner(_FakeRunner):
+    """FakeRunner that emits per-batch metric components.
+
+    ``metric_components`` is a list of per-batch ``{name: (num, den)}`` dicts.
+    Cycled if val is called more than once.
+    """
+
+    def __init__(self, *, metric_components, raise_on_metrics=False, **kw):
+        super().__init__(**kw)
+        self._components = metric_components
+        self._batch_idx = 0
+        self._raise_on_metrics = raise_on_metrics
+
+    def compute_val_metrics(self, predictions, targets, inputs):
+        if self._raise_on_metrics:
+            raise RuntimeError("simulated compute_val_metrics failure")
+        components = self._components[self._batch_idx % len(self._components)]
+        self._batch_idx += 1
+        return components
+
+
+def test_val_history_includes_compute_val_metrics_outputs():
+    """val_loss_history entries contain extra metric keys (e.g. crps, mase)."""
+    # Two batches per val pass; aggregator does num_sum/den_sum.
+    components = [
+        {"crps": (1.0, 2.0), "mase": (3.0, 6.0)},
+        {"crps": (3.0, 2.0), "mase": (1.0, 2.0)},
+    ]
+    runner = _MetricRunner(
+        val_batches=[_make_batch() for _ in range(2)],
+        default_loss_fn=lambda p, t, _i: torch.tensor(1.0),
+        metric_components=components,
+    )
+    sub = _make_submission(training_config={
+        "batch_size": 2, "log_every_n_steps": 100,
+        "val_schedule": "fixed", "val_base_step": 1,
+    })
+
+    import time
+    model = runner.build_model(sub, "cpu")
+    out = _training_loop(runner, sub, model, "cpu", time_budget=10, start=time.time())
+
+    assert out["val_history"], "val should have run at least once"
+    entry = out["val_history"][0]
+    # First val pass uses both component dicts: crps=(1+3)/(2+2)=1.0, mase=(3+1)/(6+2)=0.5
+    assert entry["loss"] == pytest.approx(1.0)
+    assert entry["crps"] == pytest.approx(1.0)
+    assert entry["mase"] == pytest.approx(0.5)
+
+
+def test_val_history_skips_metric_with_zero_denominator():
+    """Metrics whose summed denominator is non-positive are dropped, not NaN."""
+    components = [
+        {"crps": (1.0, 2.0), "degenerate": (5.0, 0.0)},
+        {"crps": (1.0, 2.0), "degenerate": (5.0, 0.0)},
+    ]
+    runner = _MetricRunner(
+        val_batches=[_make_batch() for _ in range(2)],
+        default_loss_fn=lambda p, t, _i: torch.tensor(0.5),
+        metric_components=components,
+    )
+    sub = _make_submission(training_config={
+        "batch_size": 2, "log_every_n_steps": 100,
+        "val_schedule": "fixed", "val_base_step": 1,
+    })
+
+    import time
+    model = runner.build_model(sub, "cpu")
+    out = _training_loop(runner, sub, model, "cpu", time_budget=10, start=time.time())
+
+    assert out["val_history"]
+    entry = out["val_history"][0]
+    assert entry["crps"] == pytest.approx(0.5)
+    assert "degenerate" not in entry, (
+        "metric with zero denominator must not appear in val_history"
+    )
+
+
+def test_compute_val_metrics_failure_does_not_kill_val():
+    """If compute_val_metrics raises, val still records loss without extras."""
+    runner = _MetricRunner(
+        val_batches=[_make_batch() for _ in range(2)],
+        default_loss_fn=lambda p, t, _i: torch.tensor(2.0),
+        metric_components=[{}],
+        raise_on_metrics=True,
+    )
+    sub = _make_submission(training_config={
+        "batch_size": 2, "log_every_n_steps": 100,
+        "val_schedule": "fixed", "val_base_step": 1,
+    })
+
+    import time
+    model = runner.build_model(sub, "cpu")
+    out = _training_loop(runner, sub, model, "cpu", time_budget=10, start=time.time())
+
+    assert out["val_history"]
+    entry = out["val_history"][0]
+    assert entry["loss"] == pytest.approx(2.0)
+    assert "crps" not in entry
+    assert "mase" not in entry
+
+
+def test_runner_without_compute_val_metrics_works():
+    """Backward compat: a runner that doesn't define compute_val_metrics still validates."""
+    runner = _FakeRunner(
+        val_batches=[_make_batch() for _ in range(2)],
+        default_loss_fn=lambda p, t, _i: torch.tensor(3.0),
+    )
+    assert not hasattr(runner, "compute_val_metrics")
+
+    sub = _make_submission(training_config={
+        "batch_size": 2, "log_every_n_steps": 100,
+        "val_schedule": "fixed", "val_base_step": 1,
+    })
+
+    import time
+    model = runner.build_model(sub, "cpu")
+    out = _training_loop(runner, sub, model, "cpu", time_budget=10, start=time.time())
+
+    assert out["val_history"]
+    entry = out["val_history"][0]
+    assert entry["loss"] == pytest.approx(3.0)
+    # Only step + loss — no extra metrics.
+    assert set(entry.keys()) == {"step", "loss"}

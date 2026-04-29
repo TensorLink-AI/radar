@@ -216,3 +216,77 @@ class TestPredTargetAlignment:
         assert seen_shapes["tgt"] == (2, 48, 1)
         assert len(seen_shapes["q"]) == 9
         assert torch.isfinite(loss)
+
+
+class TestComputeValMetrics:
+    """compute_val_metrics returns CRPS + MASE components for the pretrain val shard."""
+
+    def _runner(self):
+        from runner.timeseries_forecast.train import TSForecastingRunner
+        r = TSForecastingRunner()
+        r._constants = {
+            "context_len": 16,
+            "prediction_len": 8,
+            "num_variates": 1,
+            "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+        }
+        return r
+
+    def test_returns_crps_and_mase_components(self):
+        torch = pytest.importorskip("torch")
+        # Skip when prepare module isn't importable in the test env.
+        pytest.importorskip("runner.timeseries_forecast.prepare")
+        r = self._runner()
+        B, P, V, Q = 2, 8, 1, 9
+        preds = torch.zeros(B, P, V, Q)              # all-zeros forecast
+        tgts = torch.ones(B, P, V)                    # constant ones target
+        ctx = torch.arange(16, dtype=torch.float32).repeat(B, V, 1).permute(0, 2, 1)
+
+        out = r.compute_val_metrics(preds, tgts, ctx)
+        assert "crps" in out and "mase" in out
+        for name, val in out.items():
+            assert isinstance(val, tuple) and len(val) == 2
+            num, den = val
+            assert num >= 0.0 and den >= 0.0
+        # CRPS denominator = Σ |y| = B * P * V * 1.0 = 16
+        assert out["crps"][1] == pytest.approx(16.0)
+        # MASE error = Σ |1 - 0| = 16, scale = mean(|step diffs|)=1, so weighted = P*scale*B = 16
+        assert out["mase"][0] == pytest.approx(16.0)
+        assert out["mase"][1] == pytest.approx(16.0)
+
+    def test_drops_non_finite_samples(self):
+        torch = pytest.importorskip("torch")
+        pytest.importorskip("runner.timeseries_forecast.prepare")
+        r = self._runner()
+        B, P, V, Q = 3, 8, 1, 9
+        preds = torch.zeros(B, P, V, Q)
+        preds[1] = float("nan")  # one bad sample
+        tgts = torch.ones(B, P, V)
+        ctx = torch.arange(16, dtype=torch.float32).repeat(B, V, 1).permute(0, 2, 1)
+
+        out = r.compute_val_metrics(preds, tgts, ctx)
+        # Only 2 finite samples — denominator sums over them.
+        assert out["crps"][1] == pytest.approx(2 * P * V * 1.0)
+
+    def test_returns_empty_when_all_non_finite(self):
+        torch = pytest.importorskip("torch")
+        pytest.importorskip("runner.timeseries_forecast.prepare")
+        r = self._runner()
+        preds = torch.full((2, 8, 1, 9), float("nan"))
+        tgts = torch.ones(2, 8, 1)
+        ctx = torch.zeros(2, 16, 1)
+        out = r.compute_val_metrics(preds, tgts, ctx)
+        assert out == {}
+
+    def test_aligns_to_shorter_horizon(self):
+        """Mirrors default_loss: prediction_len > target_len truncates to target."""
+        torch = pytest.importorskip("torch")
+        pytest.importorskip("runner.timeseries_forecast.prepare")
+        r = self._runner()
+        # P_pred=8, P_target=4 — must align without crashing
+        preds = torch.zeros(2, 8, 1, 9)
+        tgts = torch.ones(2, 4, 1)
+        ctx = torch.zeros(2, 16, 1)
+        out = r.compute_val_metrics(preds, tgts, ctx)
+        assert "crps" in out and "mase" in out
+        assert out["crps"][1] == pytest.approx(2 * 4 * 1.0)
