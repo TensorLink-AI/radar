@@ -99,6 +99,15 @@ class TrainingMeta:
     val_loss_history: list[dict] = field(default_factory=list)
     best_val_loss: float | None = None
     best_val_step: int = -1
+    # Validation cadence policy — persisted so loss trajectories from runs
+    # with different model sizes / batch sizes / seq lens can be aligned on
+    # a FLOPs x-axis when fitting scaling laws across the experiment atlas.
+    val_cadence_unit: str = "step"          # "step" for legacy, "flops" for new runs
+    val_base: float = 0.0                   # FLOPs or steps depending on unit
+    val_growth: float = 0.0
+    val_eval_tokens: int = 0
+    flops_per_step_estimate: float = 0.0
+    reference_eval_loss_history: list[dict] = field(default_factory=list)
     # Hash verification chain
     checkpoint_sha256: str = ""
     architecture_sha256: str = ""
@@ -122,6 +131,12 @@ class TrainingMeta:
             "val_loss_history": self.val_loss_history,
             "best_val_loss": self.best_val_loss,
             "best_val_step": self.best_val_step,
+            "val_cadence_unit": self.val_cadence_unit,
+            "val_base": self.val_base,
+            "val_growth": self.val_growth,
+            "val_eval_tokens": self.val_eval_tokens,
+            "flops_per_step_estimate": self.flops_per_step_estimate,
+            "reference_eval_loss_history": self.reference_eval_loss_history,
             "checkpoint_sha256": self.checkpoint_sha256,
             "architecture_sha256": self.architecture_sha256,
             "stdout_sha256": self.stdout_sha256,

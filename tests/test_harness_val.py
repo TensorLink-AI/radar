@@ -248,6 +248,7 @@ def test_val_selects_best_checkpoint_minimum():
         "log_every_n_steps": 100,  # don't pollute train history
         "val_schedule": "fixed",
         "val_base_step": 1,
+        "val_cadence_unit": "step",
     })
 
     model = runner.build_model(sub, "cpu")
@@ -275,6 +276,7 @@ def test_val_dataloader_exception_does_not_kill_training():
     runner = _FakeRunner(raise_on_val_fetch=True)
     sub = _make_submission(training_config={
         "batch_size": 2, "log_every_n_steps": 100, "val_base_step": 1,
+        "val_cadence_unit": "step",
     })
 
     import time
@@ -298,6 +300,7 @@ def test_val_nan_losses_yield_no_history():
     sub = _make_submission(training_config={
         "batch_size": 2, "log_every_n_steps": 100,
         "val_schedule": "fixed", "val_base_step": 1,
+        "val_cadence_unit": "step",
     })
 
     import time
@@ -327,6 +330,7 @@ def test_val_uses_default_loss_not_submission_compute_loss():
         training_config={
             "batch_size": 2, "log_every_n_steps": 100,
             "val_schedule": "fixed", "val_base_step": 1,
+            "val_cadence_unit": "step",
         },
         compute_loss=degenerate_compute_loss,
     )
@@ -358,6 +362,7 @@ def test_on_step_end_does_not_receive_val_loss():
         training_config={
             "batch_size": 2, "log_every_n_steps": 100,
             "val_schedule": "fixed", "val_base_step": 1,
+            "val_cadence_unit": "step",
         },
         on_step_end=on_step_end,
     )
@@ -398,6 +403,110 @@ def test_train_loss_history_logged_at_log_every_n_steps():
         assert s % 5 == 0, f"Train history step {s} not a multiple of 5"
     # Strictly increasing.
     assert steps == sorted(steps)
+
+
+# ── FLOPs-keyed val cadence ───────────────────────────────────────
+
+class _BigFlopsRunner(_FakeRunner):
+    """Like _FakeRunner but with a measure_flops big enough that the FLOPs
+    cadence schedule actually crosses thresholds inside a short test run.
+    """
+
+    def __init__(self, flops_per_call: int = 50_000_000_000, **kw):
+        super().__init__(**kw)
+        self._flops_per_call = flops_per_call
+
+    def measure_flops(self, model, device):
+        return self._flops_per_call
+
+
+def test_val_cadence_flops_grows_by_val_growth():
+    """Consecutive ``flops`` values in val_history grow by ~val_growth.
+
+    With flops_per_optim_step ≈ 3 * 5e10 * 2 = 3e11, val_base_flops = 1e12,
+    val_growth = 2.0, the trigger fires whenever cumulative_flops crosses
+    next_val_flops, which doubles each fire. The recorded flops are the
+    cumulative_flops at the moment of fire — a slight overshoot, but the
+    ratio between consecutive fires settles near val_growth.
+    """
+    runner = _BigFlopsRunner(
+        flops_per_call=50_000_000_000,
+        train_batches=[_make_batch() for _ in range(120)],
+        val_batches=[_make_batch() for _ in range(2)],
+        default_loss_fn=lambda p, t, _i: torch.tensor(1.0),
+    )
+    sub = _make_submission(training_config={
+        "batch_size": 2, "log_every_n_steps": 1000,  # don't pollute
+        "val_schedule": "logarithmic",
+        "val_cadence_unit": "flops",
+        "val_base_flops": 1e12,
+        "val_growth": 2.0,
+    })
+
+    import time
+    model = runner.build_model(sub, "cpu")
+    out = _training_loop(runner, sub, model, "cpu", time_budget=60, start=time.time())
+
+    # Every val_history entry written under FLOPs cadence carries `flops`.
+    assert all("flops" in e for e in out["val_history"]), out["val_history"]
+
+    flops_values = [e["flops"] for e in out["val_history"]]
+    # The very last entry may be the synthetic final-step val (which fires
+    # regardless of the cadence schedule), so trim it before measuring growth.
+    if len(flops_values) >= 2 and flops_values[-1] < flops_values[-2] * 1.5:
+        flops_values = flops_values[:-1]
+
+    assert len(flops_values) >= 3, f"too few cadence-driven entries: {flops_values}"
+    for prev, curr in zip(flops_values[:-1], flops_values[1:]):
+        ratio = curr / prev
+        # The cumulative is at most one optim-step worth above next_val_flops,
+        # so consecutive ratios should sit in [val_growth*0.75, val_growth*1.5].
+        assert 1.5 <= ratio <= 3.0, (
+            f"ratio {ratio:.2f} between {prev}, {curr} not ~val_growth=2.0"
+        )
+
+    # Loop result also exposes the policy fields the harness persists.
+    assert out["flops_per_optim_step"] > 0
+    assert out["cumulative_flops"] > 0
+    assert out["cfg"]["val_cadence_unit"] == "flops"
+    assert out["cfg"]["val_base_flops"] == 1e12
+    assert out["cfg"]["val_growth"] == 2.0
+
+
+def test_val_cadence_step_preserves_legacy_schedule():
+    """val_cadence_unit='step' reproduces the logarithmic step schedule.
+
+    Backward compat: with val_base_step=5 and val_growth=2.0, the schedule
+    fires at optim_step 5, 10, 20, 40, ... — the legacy behaviour.
+    """
+    runner = _FakeRunner(
+        train_batches=[_make_batch() for _ in range(80)],
+        val_batches=[_make_batch() for _ in range(2)],
+        default_loss_fn=lambda p, t, _i: torch.tensor(1.0),
+    )
+    sub = _make_submission(training_config={
+        "batch_size": 2, "log_every_n_steps": 1000,
+        "val_schedule": "logarithmic",
+        "val_cadence_unit": "step",
+        "val_base_step": 5,
+        "val_growth": 2.0,
+    })
+
+    import time
+    model = runner.build_model(sub, "cpu")
+    out = _training_loop(runner, sub, model, "cpu", time_budget=60, start=time.time())
+
+    steps = [e["step"] for e in out["val_history"]]
+    # Each scheduled step must appear in the recorded history (the synthetic
+    # final-step val may also slip in; we check inclusion, not equality).
+    for expected in (5, 10, 20, 40):
+        assert expected in steps, f"missing scheduled step {expected} in {steps}"
+
+    # The harness still computes flops_per_optim_step in step mode (so the
+    # x-axis can still be flops-aligned downstream); the loop result reflects
+    # the requested cadence unit.
+    assert out["cfg"]["val_cadence_unit"] == "step"
+    assert out["flops_per_optim_step"] > 0
 
 
 # ── TrainingMeta round-trip with new fields ───────────────────────

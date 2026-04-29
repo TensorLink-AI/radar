@@ -835,6 +835,44 @@ def test_aligned_train_val_handles_empty_and_legacy():
     assert _aligned_train_val({"loss_curve": [1.0, 2.0]}) == ([], [])
 
 
+def test_step_loss_pairs_tolerates_flops_key():
+    """val_loss_history entries gained an optional ``flops`` key when the
+    harness keys cadence to FLOPs. The loss-pair extractor reads ``step`` and
+    ``loss`` by name, so the augmented and bare shapes must render identically.
+    """
+    from database.dashboard.api import (
+        _step_loss_pairs, _aligned_train_val, _meta_for_public,
+    )
+
+    base_val = [{"step": 10, "loss": 1.0}, {"step": 20, "loss": 0.5}]
+    augmented_val = [
+        {"step": 10, "flops": 6.0e12, "loss": 1.0},
+        {"step": 20, "flops": 1.2e13, "loss": 0.5},
+    ]
+
+    assert _step_loss_pairs(base_val) == _step_loss_pairs(augmented_val)
+
+    base_meta = {
+        "train_loss_history": [{"step": 10, "loss": 2.0}, {"step": 20, "loss": 1.0}],
+        "val_loss_history": base_val,
+    }
+    aug_meta = {
+        "train_loss_history": [
+            {"step": 10, "flops": 6.0e12, "loss": 2.0},
+            {"step": 20, "flops": 1.2e13, "loss": 1.0},
+        ],
+        "val_loss_history": augmented_val,
+    }
+    assert _aligned_train_val(base_meta) == _aligned_train_val(aug_meta)
+
+    base_pub = _meta_for_public(base_meta)
+    aug_pub = _meta_for_public(aug_meta)
+    assert base_pub["train_loss_history"] == aug_pub["train_loss_history"]
+    assert base_pub["val_loss_history"] == aug_pub["val_loss_history"]
+    assert base_pub.get("train_loss_final") == aug_pub.get("train_loss_final")
+    assert base_pub.get("val_loss_final") == aug_pub.get("val_loss_final")
+
+
 def test_extract_loss_series_covers_all_shapes():
     from database.dashboard.api import _extract_loss_series
 

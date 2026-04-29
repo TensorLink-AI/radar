@@ -175,6 +175,19 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
     from safetensors.torch import save_file
     save_file(state_to_save, checkpoint_path)
 
+    loop_cfg = loop_result.get("cfg", {})
+    flops_per_step = float(loop_result.get("flops_per_optim_step", 0) or 0)
+    cadence_unit = loop_cfg.get("val_cadence_unit", "step")
+    # When FLOPs estimation succeeded we report cadence as flops; otherwise we
+    # actually fell back to step cadence regardless of cfg.
+    if cadence_unit == "flops" and flops_per_step <= 0:
+        cadence_unit = "step"
+    val_base = (
+        float(loop_cfg.get("val_base_flops", 0.0))
+        if cadence_unit == "flops"
+        else float(loop_cfg.get("val_base_step", 0))
+    )
+
     return {
         "round_id": config.round_id,
         "miner_hotkey": config.miner_hotkey,
@@ -189,6 +202,12 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
         "val_loss_history": loop_result["val_history"],
         "best_val_loss": loop_result["best_val_loss"],
         "best_val_step": loop_result["best_val_step"],
+        "val_cadence_unit": cadence_unit,
+        "val_base": val_base,
+        "val_growth": float(loop_cfg.get("val_growth", 0.0)),
+        "val_eval_tokens": 0,
+        "flops_per_step_estimate": flops_per_step,
+        "reference_eval_loss_history": [],
     }
 
 
@@ -202,6 +221,7 @@ _DEFAULTS = {
     "log_every_n_steps": 10,
     "val_base_step": 10,
     "val_growth": 2.0,
+    "val_base_flops": 1e15,
 }
 _CLAMPS = {
     "batch_size": (1, 512),
@@ -210,9 +230,12 @@ _CLAMPS = {
     "log_every_n_steps": (1, 1000),
     "val_base_step": (1, 10000),
     "val_growth": (1.1, 10.0),
+    "val_base_flops": (1e12, 1e22),
 }
 _VAL_SCHEDULES = ("logarithmic", "fixed", "none")
 _DEFAULT_VAL_SCHEDULE = "logarithmic"
+_VAL_CADENCE_UNITS = ("flops", "step")
+_DEFAULT_VAL_CADENCE_UNIT = "flops"
 
 _AMP_DTYPE_WHITELIST = {"bfloat16": None, "float16": None, "float32": None}  # populated on first use
 
@@ -225,6 +248,7 @@ def _get_amp_dtypes():
 def _read_config(sub) -> dict:
     cfg = dict(_DEFAULTS)
     cfg["val_schedule"] = _DEFAULT_VAL_SCHEDULE
+    cfg["val_cadence_unit"] = _DEFAULT_VAL_CADENCE_UNIT
     if _has_callable(sub, "training_config"):
         try:
             user_cfg = sub.training_config()
@@ -239,6 +263,9 @@ def _read_config(sub) -> dict:
                     elif k == "val_schedule":
                         if isinstance(v, str) and v in _VAL_SCHEDULES:
                             cfg["val_schedule"] = v
+                    elif k == "val_cadence_unit":
+                        if isinstance(v, str) and v in _VAL_CADENCE_UNITS:
+                            cfg["val_cadence_unit"] = v
         except Exception:
             pass
     return cfg
@@ -273,7 +300,8 @@ def _read_amp_config(sub) -> dict:
 def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int, start: float) -> dict:
     """Generic training loop.
 
-    Returns {step, train_history, val_history, best_val_loss, best_val_step, best_state}.
+    Returns {step, train_history, val_history, best_val_loss, best_val_step,
+    best_state, flops_per_optim_step, cumulative_flops}.
     `best_state` is a CPU-cloned state_dict from the lowest-val-loss step,
     or None if val never ran (caller falls back to model.state_dict()).
     """
@@ -315,11 +343,25 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
     except Exception as e:
         logger.warning("get_val_dataloader failed, skipping val: %s", e)
 
+    num_params = sum(p.numel() for p in model.parameters())
+
     best_val_loss = float("inf")
     best_val_step = -1
     best_state = None
     val_history: list[dict] = []
     train_history: list[dict] = []
+
+    # FLOPs accounting. We compute flops_per_optim_step lazily on the first
+    # batch (need seq_len), so the FLOPs cadence schedule is initialized
+    # after that first batch is observed.
+    flops_per_optim_step = 0
+    cumulative_flops = 0
+    val_use_flops = (
+        val_loader_factory is not None
+        and cfg["val_schedule"] != "none"
+        and cfg["val_cadence_unit"] == "flops"
+    )
+    next_val_flops = float(cfg["val_base_flops"]) if val_use_flops else -1.0
     next_val = (
         cfg["val_base_step"]
         if val_loader_factory and cfg["val_schedule"] != "none"
@@ -337,6 +379,24 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
 
         inputs = batch["input"].to(device) if "input" in batch else batch["context"].to(device)
         targets = batch["target"].to(device)
+
+        # Compute flops_per_optim_step once, on the first batch we see, so
+        # we can key val cadence to FLOPs across runs of different sizes /
+        # batch shapes / seq lens.
+        if step == 0:
+            flops_per_optim_step = _estimate_flops_per_optim_step(
+                runner, model, device, inputs,
+                num_params=num_params,
+                batch_size=int(inputs.shape[0]),
+                grad_accum=cfg["grad_accum_steps"],
+            )
+            if val_use_flops and flops_per_optim_step <= 0:
+                # FLOPs estimation failed — log and fall back to step cadence.
+                logger.warning(
+                    "flops_per_optim_step=0; falling back to step-based val cadence",
+                )
+                val_use_flops = False
+                next_val_flops = -1.0
 
         # transform_batch hook
         if has_transform and not tb_disabled:
@@ -387,27 +447,50 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
             if scheduler:
                 scheduler.step()
             optim_step += 1
+            cumulative_flops += flops_per_optim_step
 
             # Train loss logging (periodic)
             if optim_step % cfg["log_every_n_steps"] == 0:
-                train_history.append({
+                entry = {
                     "step": optim_step,
                     "loss": float(loss.item() * cfg["grad_accum_steps"]),
-                })
+                }
+                if flops_per_optim_step > 0:
+                    entry["flops"] = cumulative_flops
+                train_history.append(entry)
 
             # Val loss + best checkpoint (scheduled). Runs BEFORE on_step_end so
             # the submission's hook cannot observe val state. val_loss is a local
             # here only — never propagated to any submission hook.
-            if next_val > 0 and optim_step >= next_val:
+            #
+            # FLOPs-keyed cadence (preferred): trigger when cumulative_flops
+            # crosses next_val_flops, then advance multiplicatively by val_growth.
+            # Step-keyed cadence (legacy / fallback): unchanged.
+            triggered = False
+            if val_use_flops and flops_per_optim_step > 0:
+                if cumulative_flops >= next_val_flops:
+                    triggered = True
+            elif next_val > 0 and optim_step >= next_val:
+                triggered = True
+
+            if triggered:
                 val_loss = _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled)
                 if val_loss is not None:
-                    val_history.append({"step": optim_step, "loss": val_loss})
+                    entry = {"step": optim_step, "loss": val_loss}
+                    if flops_per_optim_step > 0:
+                        entry["flops"] = cumulative_flops
+                    val_history.append(entry)
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         best_val_step = optim_step
                         # Clone state_dict to CPU to avoid holding GPU memory.
                         best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-                if cfg["val_schedule"] == "logarithmic":
+                if val_use_flops and flops_per_optim_step > 0:
+                    next_val_flops = max(
+                        next_val_flops + 1,
+                        int(next_val_flops * cfg["val_growth"]),
+                    )
+                elif cfg["val_schedule"] == "logarithmic":
                     next_val = _next_val_step(optim_step, cfg["val_base_step"], cfg["val_growth"])
                 elif cfg["val_schedule"] == "fixed":
                     next_val = optim_step + cfg["val_base_step"]
@@ -432,6 +515,7 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         optim_step += 1
+        cumulative_flops += flops_per_optim_step
 
     # Always run val at the final step too (if val is enabled and we did
     # at least one optimizer step), so the best_state captures end-of-run.
@@ -439,7 +523,10 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
         if not val_history or val_history[-1]["step"] != optim_step:
             val_loss = _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled)
             if val_loss is not None:
-                val_history.append({"step": optim_step, "loss": val_loss})
+                entry = {"step": optim_step, "loss": val_loss}
+                if flops_per_optim_step > 0:
+                    entry["flops"] = cumulative_flops
+                val_history.append(entry)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_val_step = optim_step
@@ -452,7 +539,43 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
         "best_val_loss": (best_val_loss if best_val_step >= 0 else None),
         "best_val_step": best_val_step,
         "best_state": best_state,
+        "flops_per_optim_step": flops_per_optim_step,
+        "cumulative_flops": cumulative_flops,
+        "cfg": cfg,
     }
+
+
+def _estimate_flops_per_optim_step(
+    runner: TaskRunner, model, device: str, inputs,
+    *, num_params: int, batch_size: int, grad_accum: int,
+) -> int:
+    """FLOPs-per-optim-step estimate, used to key val cadence to FLOPs.
+
+    Two paths:
+      * If the input tensor has a clear sequence dimension (3D+: B, T, ...),
+        use the standard transformer-style approximation
+        ``6 * num_params * B * T * grad_accum``.
+      * Otherwise, fall back to ``3 * runner.measure_flops(...) * B *
+        grad_accum`` — measure_flops already accounts for one forward pass,
+        and ``3x`` covers fwd+bwd as a generic non-transformer estimate.
+
+    Returns 0 on failure; callers fall back to step-based cadence.
+    """
+    try:
+        if hasattr(inputs, "shape") and len(inputs.shape) >= 3 and num_params > 0:
+            seq_len = int(inputs.shape[1])
+            if seq_len > 0:
+                return int(6 * num_params * batch_size * seq_len * grad_accum)
+        # Fallback: measure_flops gives a per-sample forward FLOP estimate.
+        try:
+            mf = int(runner.measure_flops(model, device))
+        except Exception:
+            mf = 0
+        if mf > 0:
+            return int(3 * mf * batch_size * grad_accum)
+    except Exception as e:
+        logger.warning("flops_per_optim_step estimation failed: %s", e)
+    return 0
 
 
 def _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled):

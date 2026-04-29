@@ -64,6 +64,73 @@ def test_training_meta_old_format_without_new_fields():
     assert meta.best_val_step == -1
 
 
+def test_training_meta_roundtrip_with_cadence_policy():
+    """All cadence-policy fields must survive to_dict / from_dict / to_json /
+    from_json so loss curves can be aligned on a FLOPs x-axis downstream.
+    """
+    import json as _json
+    meta = TrainingMeta(
+        round_id=99, miner_hotkey="5Cad", status="success",
+        val_cadence_unit="flops",
+        val_base=1e15,
+        val_growth=2.0,
+        val_eval_tokens=12345,
+        flops_per_step_estimate=6.0e12,
+        reference_eval_loss_history=[
+            {"step": 100, "flops": 6.0e14, "loss": 1.5},
+            {"step": 200, "flops": 1.2e15, "loss": 1.0},
+        ],
+        train_loss_history=[{"step": 10, "flops": 6.0e13, "loss": 2.0}],
+        val_loss_history=[{"step": 10, "flops": 6.0e13, "loss": 2.5}],
+    )
+
+    blob = meta.to_dict()
+    assert blob["val_cadence_unit"] == "flops"
+    assert blob["val_base"] == 1e15
+    assert blob["val_growth"] == 2.0
+    assert blob["val_eval_tokens"] == 12345
+    assert blob["flops_per_step_estimate"] == 6.0e12
+    assert blob["reference_eval_loss_history"] == [
+        {"step": 100, "flops": 6.0e14, "loss": 1.5},
+        {"step": 200, "flops": 1.2e15, "loss": 1.0},
+    ]
+
+    restored = TrainingMeta.from_dict(blob)
+    assert restored.val_cadence_unit == "flops"
+    assert restored.val_base == 1e15
+    assert restored.val_growth == 2.0
+    assert restored.val_eval_tokens == 12345
+    assert restored.flops_per_step_estimate == 6.0e12
+    assert restored.reference_eval_loss_history == meta.reference_eval_loss_history
+    assert restored.train_loss_history == [{"step": 10, "flops": 6.0e13, "loss": 2.0}]
+
+    text = meta.to_json()
+    parsed = _json.loads(text)
+    assert parsed["val_cadence_unit"] == "flops"
+    assert parsed["flops_per_step_estimate"] == 6.0e12
+
+    restored_via_json = TrainingMeta.from_json(text)
+    assert restored_via_json.val_cadence_unit == "flops"
+    assert restored_via_json.val_base == 1e15
+    assert restored_via_json.flops_per_step_estimate == 6.0e12
+    assert restored_via_json.reference_eval_loss_history == meta.reference_eval_loss_history
+
+
+def test_training_meta_legacy_blobs_default_cadence_to_step():
+    """Pre-cadence-policy metas must deserialize with backward-compat defaults."""
+    legacy = {
+        "round_id": 1, "miner_hotkey": "5Old", "status": "success",
+        "train_loss_history": [{"step": 10, "loss": 1.0}],
+    }
+    meta = TrainingMeta.from_dict(legacy)
+    assert meta.val_cadence_unit == "step"
+    assert meta.val_base == 0.0
+    assert meta.val_growth == 0.0
+    assert meta.val_eval_tokens == 0
+    assert meta.flops_per_step_estimate == 0.0
+    assert meta.reference_eval_loss_history == []
+
+
 def test_training_meta_from_dict_ignores_extra_keys():
     d = {"round_id": 5, "status": "success", "unknown_field": "ignored"}
     meta = TrainingMeta.from_dict(d)
