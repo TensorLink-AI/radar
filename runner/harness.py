@@ -67,23 +67,6 @@ class TaskRunner(Protocol):
         """
         return None
 
-    def compute_transfer_metrics(
-        self, model: Any, device: str, amp_dtype: Any, amp_enabled: bool,
-    ) -> dict | None:
-        """Optional: extra named val metrics the harness should log alongside
-        the held-out pretrain pinball loss.
-
-        For ts_forecasting this returns ``{"ncrps": ..., "mase": ...}`` —
-        geo-mean ratios against seasonal-naive across a small GIFT-Eval
-        subset. Cost is meaningful, so the runner is expected to bound it
-        internally (dataset count, batch cap, etc.).
-
-        Return None / empty dict to skip. Failures here MUST NOT kill
-        training — the harness wraps the call in try/except and treats
-        any exception as "no extra metrics this tick".
-        """
-        return None
-
 
 @dataclass
 class TrainingConfig:
@@ -491,15 +474,14 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
                 triggered = True
 
             if triggered:
-                metrics = _record_val_metrics(
-                    runner, model, val_loader_factory, device, amp_dtype, amp_enabled,
-                )
-                if metrics is not None:
-                    val_history.append(_val_history_entry(
-                        metrics, optim_step, cumulative_flops, flops_per_optim_step,
-                    ))
-                    if metrics["val_pinball"] < best_val_loss:
-                        best_val_loss = metrics["val_pinball"]
+                val_loss = _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled)
+                if val_loss is not None:
+                    entry = {"step": optim_step, "loss": val_loss}
+                    if flops_per_optim_step > 0:
+                        entry["flops"] = cumulative_flops
+                    val_history.append(entry)
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
                         best_val_step = optim_step
                         # Clone state_dict to CPU to avoid holding GPU memory.
                         best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -539,15 +521,14 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
     # at least one optimizer step), so the best_state captures end-of-run.
     if val_loader_factory and cfg["val_schedule"] != "none" and optim_step > 0:
         if not val_history or val_history[-1]["step"] != optim_step:
-            metrics = _record_val_metrics(
-                runner, model, val_loader_factory, device, amp_dtype, amp_enabled,
-            )
-            if metrics is not None:
-                val_history.append(_val_history_entry(
-                    metrics, optim_step, cumulative_flops, flops_per_optim_step,
-                ))
-                if metrics["val_pinball"] < best_val_loss:
-                    best_val_loss = metrics["val_pinball"]
+            val_loss = _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled)
+            if val_loss is not None:
+                entry = {"step": optim_step, "loss": val_loss}
+                if flops_per_optim_step > 0:
+                    entry["flops"] = cumulative_flops
+                val_history.append(entry)
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
                     best_val_step = optim_step
                     best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
@@ -595,49 +576,6 @@ def _estimate_flops_per_optim_step(
     except Exception as e:
         logger.warning("flops_per_optim_step estimation failed: %s", e)
     return 0
-
-
-def _record_val_metrics(runner, model, val_loader_factory, device, amp_dtype, amp_enabled):
-    """Run all named val metrics for one cadence tick.
-
-    Returns a dict with at least ``val_pinball`` (= mean pinball loss on the
-    held-out pretrain shard, the IID scaling-law signal). When the runner
-    exposes ``compute_transfer_metrics``, also returns ``ncrps`` / ``mase``
-    (geo-mean ratios against seasonal-naive across the GIFT-Eval subset).
-
-    Returns None if val_pinball itself failed — val_history then skips this
-    tick the same as before. Transfer-metric failures are non-fatal: we log
-    val_pinball alone and move on.
-    """
-    import math
-    val_pinball = _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled)
-    if val_pinball is None:
-        return None
-    metrics: dict = {"val_pinball": float(val_pinball)}
-    if _has_callable(runner, "compute_transfer_metrics"):
-        try:
-            extra = runner.compute_transfer_metrics(model, device, amp_dtype, amp_enabled)
-        except Exception as e:
-            logger.warning("compute_transfer_metrics failed: %s", e)
-            extra = None
-        if isinstance(extra, dict):
-            for key in ("ncrps", "mase"):
-                v = extra.get(key)
-                if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v)):
-                    metrics[key] = float(v)
-    return metrics
-
-
-def _val_history_entry(metrics: dict, optim_step: int, cumulative_flops: int, flops_per_optim_step: int) -> dict:
-    """Build a val_history entry from a metrics dict.
-
-    ``loss`` is preserved as an alias for ``val_pinball`` so legacy consumers
-    (dashboard, scoring, downstream chart code) keep working unchanged.
-    """
-    entry = {"step": optim_step, "loss": metrics["val_pinball"], **metrics}
-    if flops_per_optim_step > 0:
-        entry["flops"] = cumulative_flops
-    return entry
 
 
 def _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled):
