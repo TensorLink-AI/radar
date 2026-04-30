@@ -15,6 +15,19 @@ Submission config (training_config()):
   - val_schedule: "logarithmic" | "fixed" | "none" (default "logarithmic")
   - val_base_step: first val step / fixed interval (default 10)
   - val_growth: log-schedule multiplier (default 2.0)
+
+Optional submission conventions (all opt-in; default behaviour unchanged):
+  - ``model._aux_losses``: if forward() appends differentiable scalar tensors
+    to this list, the harness sums them and adds the sum to the main loss
+    before backprop, then clears the list. Lets MoE/sparse/regularized
+    architectures surface auxiliary objectives (load balancing, KL, sparsity).
+    Non-finite aux totals are dropped silently — they never crash training.
+  - ``on_step_begin``: symmetric to ``on_step_end``; called after backward()
+    and before optimizer.step() on every accumulated optim step. Same
+    signature as ``on_step_end``; failures are logged and swallowed.
+  - Time budget is sqrt-scaled by ``max_flops`` (anchored at 10M FLOPs,
+    clamped to [base, 4×base]), so larger models get proportionally more
+    wallclock without unbounded round drift.
 """
 
 from __future__ import annotations
@@ -81,6 +94,22 @@ class TaskRunner(Protocol):
         return {}
 
 
+REFERENCE_FLOPS = 10_000_000  # 10M FLOPs is the time-budget anchor
+
+
+def _scaled_time_budget(base: int, max_flops: int) -> int:
+    """Sqrt-scale ``base`` by ``max_flops / REFERENCE_FLOPS``, clamped to [base, 4×base].
+
+    Returns ``base`` unchanged when ``max_flops`` is unset (<= 0) so size-gate-disabled
+    rounds keep deterministic timing.
+    """
+    if max_flops <= 0:
+        return base
+    factor = math.sqrt(max_flops / REFERENCE_FLOPS)
+    scaled = int(base * factor)
+    return max(base, min(scaled, 4 * base))
+
+
 @dataclass
 class TrainingConfig:
     """Generic training config extracted from dispatch payload."""
@@ -118,8 +147,10 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+    effective_budget = _scaled_time_budget(config.time_budget, config.max_flops)
+
     os.environ["SEED"] = str(config.seed)
-    os.environ["TIME_BUDGET"] = str(config.time_budget)
+    os.environ["TIME_BUDGET"] = str(effective_budget)
     os.environ.setdefault("RADAR_GIFT_EVAL_CACHE", "/tmp/radar_gift_eval")
 
     # 1. Load submission
@@ -170,7 +201,7 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
             logger.warning("init_weights() failed: %s", e)
 
     try:
-        loop_result = _training_loop(runner, sub, model, device, config.time_budget, start)
+        loop_result = _training_loop(runner, sub, model, device, effective_budget, start)
     except Exception as e:
         return _fail(
             config, "failed", str(e),
@@ -195,6 +226,7 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
         "status": "success",
         "flops_equivalent_size": flops_equiv,
         "training_time_seconds": time.time() - start,
+        "effective_time_budget": effective_budget,
         "num_steps": step,
         "num_params_M": num_params / 1e6,
         "peak_vram_mb": torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else 0.0,
@@ -330,6 +362,7 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
 
     has_transform = _has_callable(sub, "transform_batch")
     has_on_step = _has_callable(sub, "on_step_end")
+    has_on_step_begin = _has_callable(sub, "on_step_begin")
     tb_disabled = False
     tb_slow = 0
     tb_fail = 0
@@ -435,7 +468,24 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
 
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
             predictions = model(inputs)
-            loss = loss_fn(predictions, targets) / cfg["grad_accum_steps"]
+            loss = loss_fn(predictions, targets)
+
+            # Optional auxiliary losses: model.forward() may append differentiable
+            # scalar tensors to ``model._aux_losses`` (MoE balance, sparsity, KL,
+            # …). Sum and add before the grad-accum divide. Drop non-finite totals
+            # silently — the existing isfinite(loss) guard below handles whatever
+            # remains. Always clear the list so it doesn't leak across steps.
+            aux = getattr(model, "_aux_losses", None)
+            if aux:
+                aux_terms = [t for t in aux if torch.is_tensor(t) and t.requires_grad]
+                if aux_terms:
+                    aux_total = sum(aux_terms)
+                    if torch.isfinite(aux_total):
+                        loss = loss + aux_total
+                if isinstance(aux, list):
+                    aux.clear()
+
+            loss = loss / cfg["grad_accum_steps"]
 
         # Skip backward when loss is non-finite (gradient explosion / bad loss fn)
         if not torch.isfinite(loss):
@@ -450,6 +500,18 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
 
         loss.backward()
         if (step + 1) % cfg["grad_accum_steps"] == 0:
+            if has_on_step_begin:
+                try:
+                    # ``step`` matches the value on_step_end will see for this same
+                    # optim step (pre-increment optim_step + 1) so both hooks share
+                    # an index when paired.
+                    sub.on_step_begin(
+                        model=model, optimizer=optimizer,
+                        step=optim_step + 1, total_steps=total_steps_est,
+                        loss_value=loss.item() * cfg["grad_accum_steps"],
+                    )
+                except Exception as e:
+                    logger.warning("on_step_begin() failed: %s", e)
             if cfg["grad_clip"] > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
             optimizer.step()
