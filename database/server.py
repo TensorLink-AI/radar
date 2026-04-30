@@ -47,7 +47,7 @@ _rate_limit: int = 60  # requests per minute per validator
 # IP-based rate limiter for unauthenticated / pre-auth flood protection
 _ip_rate_window: dict[str, list[float]] = defaultdict(list)
 _ip_rate_lock = threading.Lock()
-_IP_RATE_LIMIT: int = 120  # max requests per minute per IP (pre-auth)
+_ip_rate_limit: int = 120  # max requests per minute per IP (pre-auth)
 
 # Maximum request body size (5 MB) — reject oversized payloads early
 _MAX_BODY_BYTES: int = 5 * 1024 * 1024
@@ -106,6 +106,11 @@ def set_auth(metagraph):
 def set_rate_limit(limit: int):
     global _rate_limit
     _rate_limit = limit
+
+
+def set_ip_rate_limit(limit: int):
+    global _ip_rate_limit
+    _ip_rate_limit = limit
 
 
 def set_challenge(challenge):
@@ -182,7 +187,7 @@ def _check_ip_rate_limit(ip: str) -> bool:
         now = time.time()
         window = _ip_rate_window[ip]
         _ip_rate_window[ip] = [t for t in window if now - t < 60]
-        if len(_ip_rate_window[ip]) >= _IP_RATE_LIMIT:
+        if len(_ip_rate_window[ip]) >= _ip_rate_limit:
             return False
         _ip_rate_window[ip].append(now)
         return True
