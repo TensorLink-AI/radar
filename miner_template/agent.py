@@ -28,6 +28,22 @@ The ``code`` field should be a Python module that defines:
 and saved with the experiment. They're self-reported, so don't expect them to
 count for trust — pair them with the validator-observed proxy access logs if
 you want a story that holds up under scrutiny.
+
+Optional architecture conventions (all opt-in, harness-side):
+  * ``model._aux_losses``: if your ``forward()`` appends differentiable scalar
+    tensors to this list (e.g. ``self._aux_losses.append(0.01 * entropy_term)``
+    for an MoE load-balancing penalty, sparsity term, or KL regularizer), the
+    harness sums them, adds the sum to the main loss before backprop, then
+    clears the list. Non-finite aux totals are dropped silently. Architectures
+    that never touch ``_aux_losses`` train identically to the previous harness.
+  * ``on_step_begin(model, optimizer, step, total_steps, loss_value)``: called
+    after ``loss.backward()`` and before ``optimizer.step()`` on every
+    accumulated optim step. Useful for gradient surgery (PCGrad), per-group
+    grad clipping, EMA-teacher updates, or progressive freezing. Mirrors the
+    existing ``on_step_end`` signature; failures are logged and swallowed.
+  * Time budget: the harness sqrt-scales ``time_budget`` by ``max_flops`` (10M
+    FLOPs anchor, clamped to ``[base, 4×base]``) so larger architectures get
+    proportionally more wallclock without unbounded round drift.
 """
 
 import json
