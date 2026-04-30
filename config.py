@@ -81,6 +81,21 @@ class Config:
     R2_BUCKET: str = os.getenv("R2_BUCKET", "") or os.getenv("HIPPIUS_BUCKET", "")
     R2_PRESIGNED_TTL: int = int(os.getenv("RADAR_PRESIGNED_TTL", "5400"))
 
+    # ── Hippius / Substrate Phase C publishing ──────────────────────
+    # Phase 1 of the Hippius migration ships the signing/serialisation
+    # contract (`shared/substrate.py`) but leaves the publishing pipeline
+    # off by default — existing validators are not affected by merging
+    # this code. Operators opt in by setting HIPPIUS_ENABLED=true once the
+    # downstream phases (IPFS upload, on-chain extrinsic) are wired up.
+    HIPPIUS_ENABLED: bool = os.getenv("HIPPIUS_ENABLED", "false").lower() == "true"
+    HIPPIUS_IPFS_API_URL: str = os.getenv("HIPPIUS_IPFS_API_URL", "")
+    HIPPIUS_KEY: str = os.getenv("HIPPIUS_KEY", "")
+    HIPPIUS_SUBSTRATE_RPC: str = os.getenv("HIPPIUS_SUBSTRATE_RPC", "")
+    SUBSTRATE_APP_TAG: str = os.getenv("SUBSTRATE_APP_TAG", "radar")
+    SUBSTRATE_SCHEMA_VERSION: str = os.getenv(
+        "SUBSTRATE_SCHEMA_VERSION", "radar.substrate.v1",
+    )
+
     # ── Round Timing ───────────────────────────────────────────────
     #
     # Timing is controlled at three distinct layers. Read this carefully —
