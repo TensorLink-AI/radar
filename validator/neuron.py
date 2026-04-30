@@ -812,40 +812,17 @@ class Validator:
 
         gate_passed = 0
         gate_failed = 0
+        # Persist every Phase-C result, not just the ones that passed the size
+        # gate. Failed-gate and eval-error rows still go to the DB with
+        # success=False so they show up on the dashboard — without this, a
+        # completed experiment that lands outside the round's FLOPs bucket
+        # (or hits any Phase C error, which forces flops=0 and auto-fails the
+        # gate) leaves only a single log line on one validator and never
+        # surfaces to operators.
         for uid, metrics in eval_results.items():
-            if metrics.get("passed_size_gate"):
+            passed_gate = bool(metrics.get("passed_size_gate"))
+            if passed_gate:
                 gate_passed += 1
-                proposal = filtered.get(uid, Proposal())
-
-                miner_hk = self.metagraph.hotkeys[uid] if uid < len(self.metagraph.hotkeys) else ""
-                meta = agent_meta.get(uid, {})
-                element = DataElement(
-                    name=f"round_{challenge.round_id}_miner_{uid}",
-                    code=proposal.code,
-                    metric=metrics.get(primary_name),
-                    success=True,
-                    objectives=metrics,
-                    miner_uid=uid,
-                    miner_hotkey=miner_hk,
-                    motivation=proposal.motivation,
-                    trace=meta.get("agent_log", ""),
-                    reasoning=meta.get("reasoning", "") or proposal.reasoning,
-                    tool_calls=meta.get("tool_calls", []) or proposal.tool_calls,
-                    agent_behavior=meta.get("agent_behavior", {}),
-                    task=task_name,
-                    round_id=challenge.round_id,
-                )
-
-                # Write to centralized DB
-                new_idx = await self.db_client.add_experiment(element.to_dict())
-                if new_idx is not None:
-                    element.index = new_idx
-                pareto.update(element)
-
-                # Detect and store architectural components
-                components = detect_components(proposal.code)
-                if components and element.index >= 0:
-                    await self.db_client.record_components(element.index, components)
             else:
                 gate_failed += 1
                 logger.warning(
@@ -854,6 +831,40 @@ class Validator:
                     challenge.min_flops_equivalent, challenge.max_flops_equivalent,
                     metrics.get("error", ""),
                 )
+
+            proposal = filtered.get(uid, Proposal())
+            miner_hk = self.metagraph.hotkeys[uid] if uid < len(self.metagraph.hotkeys) else ""
+            meta = agent_meta.get(uid, {})
+            element = DataElement(
+                name=f"round_{challenge.round_id}_miner_{uid}",
+                code=proposal.code,
+                metric=metrics.get(primary_name) if passed_gate else None,
+                success=passed_gate,
+                objectives=metrics,
+                miner_uid=uid,
+                miner_hotkey=miner_hk,
+                motivation=proposal.motivation,
+                trace=meta.get("agent_log", ""),
+                reasoning=meta.get("reasoning", "") or proposal.reasoning,
+                tool_calls=meta.get("tool_calls", []) or proposal.tool_calls,
+                agent_behavior=meta.get("agent_behavior", {}),
+                analysis=metrics.get("error", "") if not passed_gate else "",
+                task=task_name,
+                round_id=challenge.round_id,
+            )
+
+            # Write to centralized DB
+            new_idx = await self.db_client.add_experiment(element.to_dict())
+            if new_idx is not None:
+                element.index = new_idx
+
+            # Pareto + component tracking are scoring concerns — only feasible,
+            # successful runs participate.
+            if passed_gate:
+                pareto.update(element)
+                components = detect_components(proposal.code)
+                if components and element.index >= 0:
+                    await self.db_client.record_components(element.index, components)
 
         logger.info(
             "Experiment recording: %d passed size gate, %d failed, Pareto size: %d",
