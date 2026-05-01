@@ -238,8 +238,63 @@ async def publish_phase_c_records(
     return result
 
 
+# ── Round-loop integration helper ────────────────────────────────────
+
+
+async def run_substrate_publish_step(
+    *,
+    hippius,
+    wallet,
+    challenge,
+    eval_results: dict[int, dict],
+    training_metas: dict[int, dict],
+    commitments: dict,
+    metagraph,
+    my_uid: int,
+    current_block: int,
+    task_name: str,
+    block_hash: str,
+) -> dict[int, str]:
+    """Build, sign, and publish a Phase C bundle. Best-effort; never raises.
+
+    Returns ``{miner_uid: bundle_cid}`` (all miners share the round's single
+    bundle CID) so Phase 5 can thread CIDs into per-miner DB writes. Returns
+    an empty dict when ``hippius`` is None, ``eval_results`` is empty, or
+    record building / upload fails.
+    """
+    if hippius is None or not eval_results:
+        return {}
+    try:
+        records = await build_phase_c_records(
+            wallet=wallet, challenge=challenge,
+            eval_results=eval_results, training_metas=training_metas,
+            commitments=commitments, metagraph=metagraph,
+            my_uid=my_uid, current_block=current_block,
+            task_name=task_name, block_hash=block_hash,
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort by design
+        logger.warning(
+            "Substrate publishing failed (non-fatal): record build error: %s", e,
+        )
+        return {}
+    upload_result = await publish_phase_c_records(
+        hippius, records,
+        round_id=int(getattr(challenge, "round_id", 0)),
+        validator_hotkey=wallet.hotkey.ss58_address,
+    )
+    if upload_result is None:
+        return {}
+    cid = getattr(upload_result, "cid", None) or (
+        upload_result.get("cid", "") if isinstance(upload_result, dict) else ""
+    )
+    if not cid:
+        return {}
+    return {int(uid): cid for uid in eval_results}
+
+
 __all__ = [
     "UploadResult",
     "build_phase_c_records",
     "publish_phase_c_records",
+    "run_substrate_publish_step",
 ]

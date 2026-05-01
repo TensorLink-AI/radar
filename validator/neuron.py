@@ -45,6 +45,7 @@ from validator.db_proxy import (
 )
 from validator.evaluator import evaluate_all_checkpoints
 from validator.pod_manager import pre_validate_code
+from validator.substrate_publisher import run_substrate_publish_step
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +207,15 @@ class Validator:
             except Exception as e:
                 logger.warning("Cognition-wiki R2 unavailable: %s", e)
 
+        # Substrate publishing (best-effort, opt-in via Config.HIPPIUS_ENABLED).
+        # The Hippius client wrapper from TEN-242 isn't shipped yet, so the
+        # import is lazy and tolerant: with HIPPIUS_ENABLED=false (the default)
+        # nothing is imported and `self.hippius` stays None. Operators who
+        # opt in before the wrapper lands get a warning and the validator
+        # continues to run normally — substrate publishing is never a
+        # precondition for weight setting.
+        self.hippius = self._init_hippius()
+
         # Training coordinator
         my_uid = self._my_uid()
         if self.r2:
@@ -243,6 +253,28 @@ class Validator:
         if hotkeys is not None and hotkey in hotkeys:
             return hotkeys.index(hotkey)
         return -1
+
+    def _init_hippius(self):
+        """Construct the Hippius client when opted in; return None otherwise."""
+        if not Config.HIPPIUS_ENABLED:
+            return None
+        try:
+            from shared.hippius_client import HippiusClient  # type: ignore
+        except ImportError:
+            logger.warning(
+                "HIPPIUS_ENABLED=true but shared.hippius_client is not "
+                "available yet (TEN-242). Substrate publishing disabled."
+            )
+            return None
+        try:
+            return HippiusClient(
+                ipfs_api_url=Config.HIPPIUS_IPFS_API_URL,
+                hippius_key=Config.HIPPIUS_KEY,
+                substrate_rpc=Config.HIPPIUS_SUBSTRATE_RPC,
+            )
+        except Exception as e:  # noqa: BLE001 — best-effort
+            logger.warning("Hippius client init failed: %s", e)
+            return None
 
     def _get_validator_uids(
         self,
@@ -864,6 +896,25 @@ class Validator:
             eval_results, challenge, pareto, round_task.objectives, penalties,
             training_metas=training_metas,
         )
+
+        # Best-effort: publish signed Phase C records to Hippius/substrate.
+        # Returns {miner_uid: bundle_cid} so Phase 5 can thread CIDs into
+        # the per-miner DB writes. Empty dict when disabled, no client, or
+        # publish failed — never raises.
+        substrate_cids = await run_substrate_publish_step(
+            hippius=self.hippius, wallet=self.wallet,
+            challenge=challenge, eval_results=eval_results,
+            training_metas=training_metas, commitments=commitments,
+            metagraph=self.metagraph, my_uid=self._my_uid(),
+            current_block=current_block, task_name=task_name,
+            block_hash=block_hash,
+        )
+        if substrate_cids:
+            logger.info(
+                "Substrate published: round_id=%d cid=%s miners=%d",
+                challenge.round_id, next(iter(substrate_cids.values())),
+                len(substrate_cids),
+            )
 
         if round_scores:
             nonzero = {uid: s for uid, s in round_scores.items() if s > 0}
