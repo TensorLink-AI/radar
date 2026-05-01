@@ -97,18 +97,25 @@ class DatabaseClient:
         element_data: dict,
         substrate_cid: str = "",
         validator_hotkey: str = "",
+        artifact_cids: Optional[list[dict]] = None,
     ) -> Optional[int]:
         """POST a DataElement dict to the database. Returns new index or None.
 
         When ``substrate_cid`` is non-empty the server appends a
-        ``{kind, validator_hotkey, cid, round_id}`` entry to the row's
-        ``substrate_cids`` audit list. ``validator_hotkey`` defaults to
-        the empty string so old callers keep working.
+        ``{kind: "phase_c_record", validator_hotkey, cid, round_id}`` entry
+        to the row's ``substrate_cids`` audit list.
+
+        ``artifact_cids`` (TEN-240 Phase 7) supplies extra audit entries
+        for dual-written non-DB artifacts. Each element is appended to the
+        list verbatim — callers set the ``kind`` (``checkpoint``,
+        ``architecture``, ``training_meta``, …).
         """
         payload: dict = {"data": element_data}
         if substrate_cid:
             payload["substrate_cid"] = substrate_cid
             payload["validator_hotkey"] = validator_hotkey
+        if artifact_cids:
+            payload["artifact_cids"] = artifact_cids
         result = await self._post("/experiments/add", payload)
         if result and "index" in result:
             return result["index"]

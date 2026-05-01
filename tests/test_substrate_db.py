@@ -222,6 +222,53 @@ def test_add_experiment_with_substrate_cid_appends_audit_entry():
     }]
 
 
+def test_add_experiment_with_artifact_cids_appends_each():
+    """Phase 7: artifact_cids land in the same substrate_cids list with
+    their declared kinds (checkpoint/architecture/training_meta).
+    Entries without a ``cid`` are dropped server-side so a half-built
+    dual-write doesn't poison the audit list."""
+    client, store, _ = _server_with_store()
+    r = client.post(
+        "/experiments/add",
+        json={
+            "data": {"name": "exp", "round_id": 42, "miner_uid": 5},
+            "substrate_cid": "bafyrec",
+            "validator_hotkey": "5Gabc",
+            "artifact_cids": [
+                {"kind": "checkpoint", "cid": "bafyckpt"},
+                {"kind": "architecture", "cid": "bafyarch"},
+                {"kind": "training_meta", "cid": "bafymeta"},
+                {"kind": "noop"},  # missing cid — dropped
+            ],
+        },
+    )
+    assert r.status_code == 200
+    cids = store._elements[0].substrate_cids
+    kinds = [c["kind"] for c in cids]
+    assert kinds == [
+        "phase_c_record", "checkpoint", "architecture", "training_meta",
+    ]
+    assert {c["cid"] for c in cids} == {
+        "bafyrec", "bafyckpt", "bafyarch", "bafymeta",
+    }
+
+
+def test_add_experiment_artifact_cids_pydantic_rejects_non_dicts():
+    """Strict input validation: a string in artifact_cids → 422 Unprocessable.
+
+    Catches validator-side bugs early rather than silently filtering them
+    out and producing partial audit lists."""
+    client, _, _ = _server_with_store()
+    r = client.post(
+        "/experiments/add",
+        json={
+            "data": {"name": "exp", "round_id": 42},
+            "artifact_cids": ["not a dict"],
+        },
+    )
+    assert r.status_code == 422
+
+
 def test_get_experiment_response_includes_substrate_cids():
     client, store, _ = _server_with_store()
     store._elements.append(DataElement(

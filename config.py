@@ -96,6 +96,21 @@ class Config:
         "SUBSTRATE_SCHEMA_VERSION", "radar.substrate.v1",
     )
 
+    # ── Hippius artifact dual-write (TEN-240 Phase 7) ───────────────
+    # When enabled, validator-side artifact writes (dispatch records,
+    # frontier snapshots, training_meta cache) fan out to both R2 and
+    # Hippius. Defaults off so existing deployments are unaffected by
+    # merging — operators flip in staging first. See docs/HIPPIUS_STORAGE.md.
+    DUAL_WRITE_ARTIFACTS: bool = (
+        os.getenv("RADAR_DUAL_WRITE_ARTIFACTS", "false").lower() == "true"
+    )
+    # When enabled, ArtifactStore.get_bytes falls back to the other backend
+    # when the primary one fails. Off by default during rollout so failures
+    # stay loud and we don't accidentally paper over a misconfiguration.
+    HIPPIUS_ARTIFACT_FALLBACK: bool = (
+        os.getenv("RADAR_HIPPIUS_ARTIFACT_FALLBACK", "false").lower() == "true"
+    )
+
     # ── Round Timing ───────────────────────────────────────────────
     #
     # Timing is controlled at three distinct layers. Read this carefully —

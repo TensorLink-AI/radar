@@ -216,12 +216,32 @@ class Validator:
         # precondition for weight setting.
         self.hippius = self._init_hippius()
 
+        # Dual-write artifact store (TEN-240 Phase 7). Constructed only
+        # when an operator has explicitly opted in via
+        # RADAR_DUAL_WRITE_ARTIFACTS — default deploy keeps the historical
+        # R2-only path. When None, coordinator/etc. fall back to direct
+        # R2 calls and behave exactly as before.
+        self.artifact_store = None
+        if Config.DUAL_WRITE_ARTIFACTS and (self.r2 or self.hippius):
+            from shared.artifact_store import ArtifactStore
+            self.artifact_store = ArtifactStore(
+                r2=self.r2, hippius=self.hippius,
+                dual_write=True,
+                allow_fallback=Config.HIPPIUS_ARTIFACT_FALLBACK,
+            )
+            logger.info(
+                "Artifact dual-write enabled (r2=%s, hippius=%s, fallback=%s)",
+                bool(self.r2), bool(self.hippius),
+                Config.HIPPIUS_ARTIFACT_FALLBACK,
+            )
+
         # Training coordinator
         my_uid = self._my_uid()
         if self.r2:
             self.coordinator = TrainingCoordinator(
                 wallet=self.wallet, metagraph=self.metagraph,
                 r2=self.r2, my_uid=my_uid,
+                artifact_store=self.artifact_store,
             )
         else:
             self.coordinator = None

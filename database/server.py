@@ -203,13 +203,18 @@ class AddExperimentRequest(BaseModel):
     """Validator POSTs experiment data after Phase C.
 
     ``substrate_cid`` and ``validator_hotkey`` are optional; when set, the
-    server appends a ``{kind, validator_hotkey, cid, round_id}`` entry to
-    the row's ``substrate_cids`` audit list. Empty values keep the legacy
-    behaviour for backwards compat.
+    server appends a ``{kind: "phase_c_record", validator_hotkey, cid,
+    round_id}`` entry to the row's ``substrate_cids`` audit list.
+
+    ``artifact_cids`` (TEN-240 Phase 7) carries Hippius CIDs for the
+    dual-written non-DB artifacts (checkpoint, architecture,
+    training_meta). Each element is appended to the audit list verbatim;
+    callers are responsible for the ``kind`` field.
     """
     data: dict
     substrate_cid: str = ""
     validator_hotkey: str = ""
+    artifact_cids: list[dict] = []
 
 
 class RecordComponentsRequest(BaseModel):
@@ -562,17 +567,23 @@ async def add_experiment(req: AddExperimentRequest):
     from shared.database import DataElement
     try:
         element = DataElement.from_dict(req.data)
+        # Defensive: from_dict may have produced something unexpected.
+        if not isinstance(element.substrate_cids, list):
+            element.substrate_cids = []
+        cids = list(element.substrate_cids)
         if req.substrate_cid:
-            entry = {
+            cids.append({
                 "kind": "phase_c_record",
                 "validator_hotkey": req.validator_hotkey,
                 "cid": req.substrate_cid,
                 "round_id": int(element.round_id),
-            }
-            # Defensive: from_dict may have produced something unexpected.
-            if not isinstance(element.substrate_cids, list):
-                element.substrate_cids = []
-            element.substrate_cids = list(element.substrate_cids) + [entry]
+            })
+        # Append artifact CIDs verbatim (TEN-240 Phase 7). Filter to dicts
+        # so a malformed caller can't poison the list with non-objects.
+        for entry in req.artifact_cids or []:
+            if isinstance(entry, dict) and entry.get("cid"):
+                cids.append(entry)
+        element.substrate_cids = cids
         idx = await d.add(element)
     except Exception as e:
         logger.error("add_experiment failed: %s", e, exc_info=True)
