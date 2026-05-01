@@ -92,9 +92,24 @@ class DatabaseClient:
         except Exception:
             return False
 
-    async def add_experiment(self, element_data: dict) -> Optional[int]:
-        """POST a DataElement dict to the database. Returns new index or None."""
-        result = await self._post("/experiments/add", {"data": element_data})
+    async def add_experiment(
+        self,
+        element_data: dict,
+        substrate_cid: str = "",
+        validator_hotkey: str = "",
+    ) -> Optional[int]:
+        """POST a DataElement dict to the database. Returns new index or None.
+
+        When ``substrate_cid`` is non-empty the server appends a
+        ``{kind, validator_hotkey, cid, round_id}`` entry to the row's
+        ``substrate_cids`` audit list. ``validator_hotkey`` defaults to
+        the empty string so old callers keep working.
+        """
+        payload: dict = {"data": element_data}
+        if substrate_cid:
+            payload["substrate_cid"] = substrate_cid
+            payload["validator_hotkey"] = validator_hotkey
+        result = await self._post("/experiments/add", payload)
         if result and "index" in result:
             return result["index"]
         return None

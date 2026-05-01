@@ -52,6 +52,10 @@ class DataElement:
     generated_samples: list = field(default_factory=list)
     task: str = ""
     round_id: int = -1
+    # Substrate audit trail: list of {kind, validator_hotkey, cid, round_id}
+    # entries written by validators after Phase C. One per validator that
+    # published a Hippius bundle covering this experiment.
+    substrate_cids: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -134,6 +138,15 @@ class DataElement:
             "loss_curve": safe_lc,
         }
 
+        substrate_cids = self.substrate_cids
+        if isinstance(substrate_cids, str):
+            try:
+                substrate_cids = json.loads(substrate_cids)
+            except (ValueError, TypeError):
+                substrate_cids = []
+        if not isinstance(substrate_cids, list):
+            substrate_cids = []
+
         return {
             "index": self.index,
             "timestamp": self.timestamp,
@@ -149,6 +162,7 @@ class DataElement:
             "analysis": self.analysis,
             "score": score,
             "round_id": self.round_id,
+            "substrate_cids": substrate_cids,
             "provenance": {
                 "self_reported": {
                     "motivation": self.motivation,

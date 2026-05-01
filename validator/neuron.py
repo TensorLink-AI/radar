@@ -868,8 +868,14 @@ class Validator:
                     round_id=challenge.round_id,
                 )
 
-                # Write to centralized DB
-                new_idx = await self.db_client.add_experiment(element.to_dict())
+                # Write to centralized DB. When this validator published
+                # a Phase C bundle this round, attach the CID so the row
+                # carries an audit-trail entry pointing at the bundle.
+                new_idx = await self.db_client.add_experiment(
+                    element.to_dict(),
+                    substrate_cid=substrate_cids.get(uid, ""),
+                    validator_hotkey=self.wallet.hotkey.ss58_address,
+                )
                 if new_idx is not None:
                     element.index = new_idx
                 pareto.update(element)

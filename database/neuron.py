@@ -30,7 +30,7 @@ from database.server import (
     app, include_validator_routes,
     set_db, set_auth, set_challenge, set_frontier,
     set_access_logger, set_hotkey_map, set_rate_limit,
-    set_r2, set_pool,
+    set_r2, set_hippius, set_pool,
     get_current_challenge, get_current_frontier,
 )
 from shared.migrations import apply_migrations
@@ -165,10 +165,44 @@ class DatabaseNeuron:
             except Exception as e:
                 logger.warning("R2 audit log unavailable: %s", e)
 
+        # Hippius client — opt-in via Config.HIPPIUS_ENABLED. Powers the
+        # /experiments/{id}/verify endpoint on the validator surface; the
+        # rest of the DB server doesn't need it. Lazy import + tolerant
+        # construction mirrors the validator-side wiring (TEN-244).
+        self.hippius = self._init_hippius()
+
         # Pool, store, logger set in async init
         self.pool = None
         self.store = None
         self.access_logger = None
+
+    def _init_hippius(self):
+        """Construct the Hippius client when opted in; return None otherwise.
+
+        Mirrors `Validator._init_hippius`: lazy import so the module loads
+        without the TEN-242 wrapper present, tolerant constructor so a flap
+        at startup downgrades to disabled instead of crashing the DB server.
+        """
+        if not Config.HIPPIUS_ENABLED:
+            return None
+        try:
+            from shared.hippius_client import HippiusClient  # type: ignore
+        except ImportError:
+            logger.warning(
+                "HIPPIUS_ENABLED=true but shared.hippius_client is not "
+                "available yet (TEN-242). /experiments/{id}/verify will "
+                "respond 503 until the wrapper ships."
+            )
+            return None
+        try:
+            return HippiusClient(
+                ipfs_api_url=Config.HIPPIUS_IPFS_API_URL,
+                hippius_key=Config.HIPPIUS_KEY,
+                substrate_rpc=Config.HIPPIUS_SUBSTRATE_RPC,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Hippius client init failed: %s", e)
+            return None
 
     def _build_task_bucket_resolver(self) -> Callable[[str], list[tuple[int, int]]]:
         """Closure that maps a task name to its FLOPs-equivalent bucket list.
@@ -339,6 +373,8 @@ class DatabaseNeuron:
         set_pool(self.pool)
         if self.r2:
             set_r2(self.r2)
+        if self.hippius:
+            set_hippius(self.hippius)
         set_access_logger(self.access_logger)
 
         # ── Validator-surface wiring (Epistula auth + rate limit) ──
