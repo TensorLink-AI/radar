@@ -314,6 +314,10 @@ async def verify_miner_pod(
 ) -> tuple[bool, str]:
     """Check Basilica public metadata to verify a trainer pod.
 
+    The Targon equivalent lives in ``validator/trainer_verify.py`` —
+    this function stays as the legacy / default check while
+    ``RADAR_HOSTING_BACKEND=basilica``.
+
     Args:
         instance_name: Basilica deployment instance name.
         expected_image: Expected image reference (e.g. 'ghcr.io/org/repo:tag').
