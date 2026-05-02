@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 db = None  # PgExperimentStore
 _r2 = None  # R2AuditLog (for agent code storage)
 _pool = None  # asyncpg pool (for agent_submissions table)
+_hippius = None  # HippiusClient — used by GET /experiments/{id}/verify
 
 # Auth middleware reference
 _metagraph = None
@@ -91,6 +92,12 @@ def set_db(experiment_db):
 def set_r2(r2):
     global _r2
     _r2 = r2
+
+
+def set_hippius(hippius):
+    """Inject a Hippius client (used by /experiments/{id}/verify)."""
+    global _hippius
+    _hippius = hippius
 
 
 def set_pool(pool):
@@ -198,8 +205,21 @@ class SearchRequest(BaseModel):
 
 
 class AddExperimentRequest(BaseModel):
-    """Validator POSTs experiment data after Phase C."""
+    """Validator POSTs experiment data after Phase C.
+
+    ``substrate_cid`` and ``validator_hotkey`` are optional; when set, the
+    server appends a ``{kind: "phase_c_record", validator_hotkey, cid,
+    round_id}`` entry to the row's ``substrate_cids`` audit list.
+
+    ``artifact_cids`` (TEN-240 Phase 7) carries Hippius CIDs for the
+    dual-written non-DB artifacts (checkpoint, architecture,
+    training_meta). Each element is appended to the audit list verbatim;
+    callers are responsible for the ``kind`` field.
+    """
     data: dict
+    substrate_cid: str = ""
+    validator_hotkey: str = ""
+    artifact_cids: list[dict] = []
 
 
 class RecordComponentsRequest(BaseModel):
@@ -508,15 +528,67 @@ async def get_experiment(index: int):
     return elem.to_api_dict()
 
 
+@validator_router.get("/experiments/{index}/verify")
+async def verify_experiment_route(index: int):
+    """Independently verify the substrate audit trail for one experiment.
+
+    For each CID in ``substrate_cids``: download the bundle from Hippius,
+    locate the (round_id, miner_uid) record, sr25519-verify the signature,
+    and compare the record's metric dict with what's in the DB. Returns
+    per-CID flags + discrepancy strings, never raises on per-CID errors.
+
+    503 when the server has no Hippius client wired up.
+    """
+    d = _require_db()
+    elem = await d.get(index)
+    if elem is None:
+        raise HTTPException(status_code=404, detail=f"Experiment {index} not found")
+    if _hippius is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Hippius not configured — substrate verification unavailable",
+        )
+    from database.verify import verify_experiment
+    verifications = await verify_experiment(hippius=_hippius, element=elem)
+    return {
+        "experiment_id": index,
+        "substrate_cids": list(elem.substrate_cids or []),
+        "verifications": verifications,
+    }
+
+
 # ── Write endpoints (new — validators only) ──────────────
 
 @validator_router.post("/experiments/add")
 async def add_experiment(req: AddExperimentRequest):
-    """Validator writes a DataElement after Phase C."""
+    """Validator writes a DataElement after Phase C.
+
+    When ``req.substrate_cid`` is set, append a ``phase_c_record`` entry to
+    the element's ``substrate_cids`` audit list before insert. The entry
+    captures who published the bundle (validator_hotkey), where it lives
+    (cid), and which round it covers (taken from element.round_id).
+    """
     d = _require_db()
     from shared.database import DataElement
     try:
         element = DataElement.from_dict(req.data)
+        # Defensive: from_dict may have produced something unexpected.
+        if not isinstance(element.substrate_cids, list):
+            element.substrate_cids = []
+        cids = list(element.substrate_cids)
+        if req.substrate_cid:
+            cids.append({
+                "kind": "phase_c_record",
+                "validator_hotkey": req.validator_hotkey,
+                "cid": req.substrate_cid,
+                "round_id": int(element.round_id),
+            })
+        # Append artifact CIDs verbatim (TEN-240 Phase 7). Filter to dicts
+        # so a malformed caller can't poison the list with non-objects.
+        for entry in req.artifact_cids or []:
+            if isinstance(entry, dict) and entry.get("cid"):
+                cids.append(entry)
+        element.substrate_cids = cids
         idx = await d.add(element)
     except Exception as e:
         logger.error("add_experiment failed: %s", e, exc_info=True)

@@ -79,6 +79,14 @@ jobs:
         with:
           fetch-depth: 0
       - name: Scan new migrations for destructive patterns
+        env:
+          # Pass the PR body via env rather than ${{ }} interpolation —
+          # bodies routinely contain backticks, $vars, and quotes that
+          # break the runner's bash script when interpolated raw (the
+          # script source ends up containing PR-body text and bash treats
+          # backticks as command substitution). See PR #142 (TEN-240
+          # Phase 7) which tripped exit code 2 from a backtick-rich body.
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           NEW=$(git diff --diff-filter=A origin/${{ github.base_ref }}...HEAD \
                   -- 'database/migrations/*.sql' || true)
@@ -89,7 +97,7 @@ jobs:
           CONTENT=$(git diff --diff-filter=A origin/${{ github.base_ref }}...HEAD \
                       -- 'database/migrations/*.sql')
           if echo "$CONTENT" | grep -iE '^\+.*(DROP TABLE|DROP COLUMN|ALTER COLUMN [^,;]+ TYPE)' > /dev/null; then
-            if ! echo "${{ github.event.pull_request.body }}" | grep -q "ALLOW_DESTRUCTIVE"; then
+            if ! printf '%s' "$PR_BODY" | grep -q "ALLOW_DESTRUCTIVE"; then
               echo "::error::Destructive migration detected. Add 'ALLOW_DESTRUCTIVE' to the PR description to approve."
               exit 1
             fi

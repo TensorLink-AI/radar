@@ -125,11 +125,19 @@ def compute_fallback(
 class TrainingCoordinator:
     """Orchestrates Phase B dispatch and R2 artifact monitoring."""
 
-    def __init__(self, wallet, metagraph, r2: "R2AuditLog", my_uid: int):
+    def __init__(
+        self, wallet, metagraph, r2: "R2AuditLog", my_uid: int,
+        artifact_store=None,
+    ):
         self.wallet = wallet
         self.metagraph = metagraph
         self.r2 = r2
         self.my_uid = my_uid
+        # Optional dual-write store (TEN-240 Phase 7). When present, JSON
+        # artifacts (dispatch records, frontier snapshots) fan out to both
+        # R2 and Hippius. Falls back to R2-only when None — historical
+        # behaviour and the default.
+        self.artifact_store = artifact_store
         self._fallback_uids: dict[int, set[int]] = {}  # round_id → UIDs using proxy
 
     def compute_my_jobs(
@@ -551,7 +559,7 @@ class TrainingCoordinator:
         return results
 
     async def write_dispatch_record(self, round_id: int, results: list[TrainingResult]):
-        """Write dispatch record to R2 for auditability."""
+        """Write dispatch record to R2 (and Hippius if dual-write enabled)."""
         hotkey = self.wallet.hotkey.ss58_address
         key = f"round_{round_id}/dispatch/vali_{hotkey}.json"
         records = []
@@ -564,17 +572,31 @@ class TrainingCoordinator:
                 "training_time_seconds": r.training_time_seconds,
                 "checkpoint_key": r.checkpoint_key,
             })
-        self.r2.upload_json(key, {"dispatcher": hotkey, "round_id": round_id, "jobs": records})
+        body = {"dispatcher": hotkey, "round_id": round_id, "jobs": records}
+        if self.artifact_store is not None:
+            await self.artifact_store.put_json(key, body, {
+                "app": "radar", "kind": "dispatch",
+                "round_id": str(round_id), "validator_hotkey": hotkey,
+            })
+        else:
+            self.r2.upload_json(key, body)
 
     async def write_frontier(
         self, frontier_data: list[dict], task_name: str = "",
     ):
-        """Write current frontier to R2, scoped by task."""
+        """Write current frontier to R2 (and Hippius if dual-write enabled)."""
         if task_name:
             key = f"frontier/{task_name}/latest.json"
         else:
             key = "frontier/latest.json"
-        self.r2.upload_json(key, {"frontier": frontier_data})
+        body = {"frontier": frontier_data}
+        if self.artifact_store is not None:
+            await self.artifact_store.put_json(key, body, {
+                "app": "radar", "kind": "frontier",
+                "task": task_name or "default",
+            })
+        else:
+            self.r2.upload_json(key, body)
 
     async def prepare_trainers(
         self,

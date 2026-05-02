@@ -82,7 +82,7 @@ scripts/         Localnet test script + Postgres startup
 | `shared/dedup.py` | Code similarity (provenance queries) |
 | `shared/scoring.py` | Size-gated Pareto frontier scoring (Phase C) |
 | `shared/commitment.py` | On-chain Docker image + endpoint commitment |
-| `shared/r2_audit.py` | R2 storage for checkpoints, snapshots, dispatch records |
+| `shared/r2_audit.py` | S3-compatible artifact storage. Hippius (Substrate) is the primary backend; Cloudflare R2 stays supported as a legacy fallback. Exports `HippiusStorage` (preferred) and `R2AuditLog` (alias). |
 | `database/server.py` | Centralized DB API (FastAPI, all experiment routes) |
 | `database/neuron.py` | Subnet owner process (Postgres + API server) |
 | `validator/neuron.py` | Main validator loop (3-phase: collect → train → evaluate) |
@@ -235,6 +235,29 @@ frontier/latest.json                                        # Current Pareto fro
 - [x] Validator reverse proxy for miners (`validator/db_proxy.py`)
 - [x] DatabaseClient for validator -> DB server communication (`shared/db_client.py`)
 - [x] Validator / dashboard deploy split (`RADAR_NEURON_MODE`)
+- [x] Hippius (Substrate) artifact backend with R2 legacy fallback (`shared/r2_audit.py`)
+
+## Artifact Storage (Hippius / R2)
+
+Primary backend is **Hippius**, a Substrate-based decentralized object store
+with an S3-compatible API at `https://s3.hippius.com`. Cloudflare R2 stays
+supported as a legacy fallback so existing deployments keep working without
+an env-var change. The client (`shared.r2_audit.HippiusStorage`, aliased as
+`R2AuditLog`) reads `HIPPIUS_*` first, then falls back to `R2_*`:
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `HIPPIUS_ACCESS_KEY_ID` | `R2_ACCESS_KEY_ID` | Hippius access key (begins with `hip_`). Falls back to the legacy R2 var. |
+| `HIPPIUS_SECRET_ACCESS_KEY` | `R2_SECRET_ACCESS_KEY` | Hippius secret. Falls back to the legacy R2 var. |
+| `HIPPIUS_BUCKET` | `R2_BUCKET` | Bucket name for experiment artifacts. |
+| `HIPPIUS_REGION` | `decentralized` | Required by Hippius; leave as default. |
+| `HIPPIUS_ENDPOINT_URL` | `https://s3.hippius.com` | Override for private gateways. The legacy `R2_ACCOUNT_ID`-derived endpoint is only used when no `HIPPIUS_*` vars are set. |
+| `MOCK_S3_ENDPOINT` | unset | Localnet override (`scripts/mock_r2_server.py`). `MOCK_R2_ENDPOINT` remains an alias for back-compat. |
+
+Operators migrating from R2: leave the existing `R2_*` vars in place and
+add `HIPPIUS_*` once your Hippius keys are issued — the client will pick up
+the new backend automatically. To cut over fully, also set
+`HIPPIUS_BUCKET` (or unset `R2_BUCKET`) so dispatched URLs point at Hippius.
 
 ## Neuron Mode Environment Variables
 

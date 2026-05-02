@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS experiments (
     timestamp DOUBLE PRECISION NOT NULL DEFAULT 0.0,
     round_id BIGINT,
     task TEXT NOT NULL DEFAULT '',
+    -- Substrate audit trail (TEN-240). One element per validator that
+    -- published a Phase C Hippius bundle covering this experiment.
+    substrate_cids JSONB NOT NULL DEFAULT '[]',
     search_vector tsvector
 );
 -- Migration: round_id is derived from ``seed_int % 2**32`` in
@@ -60,6 +63,7 @@ CREATE INDEX IF NOT EXISTS idx_task_success ON experiments(task, success);
 CREATE INDEX IF NOT EXISTS idx_task_metric ON experiments(task, metric)
     WHERE metric IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_search ON experiments USING GIN(search_vector);
+CREATE INDEX IF NOT EXISTS idx_substrate_cids ON experiments USING GIN(substrate_cids);
 """
 
 FTS_FUNCTION_DDL = """
@@ -282,6 +286,10 @@ def row_to_element(row) -> DataElement:
         _decode_jsonb(row["agent_behavior"], {})
         if "agent_behavior" in row_keys else {}
     )
+    substrate_cids = (
+        _decode_jsonb(row["substrate_cids"], [])
+        if "substrate_cids" in row_keys else []
+    )
 
     return DataElement(
         index=row["id"],
@@ -307,6 +315,7 @@ def row_to_element(row) -> DataElement:
         timestamp=row["timestamp"],
         task=row["task"],
         round_id=row["round_id"] if row["round_id"] is not None else -1,
+        substrate_cids=substrate_cids,
     )
 
 
@@ -333,13 +342,13 @@ def _jsonb(value) -> str:
 
 
 def element_to_params(element: DataElement, next_id: int) -> tuple:
-    """Convert a DataElement to a positional tuple for INSERT ($1..$23).
+    """Convert a DataElement to a positional tuple for INSERT ($1..$24).
 
     JSONB columns (loss_curve, generated_samples, objectives, tool_calls,
-    agent_behavior) are explicitly serialised with ``json.dumps`` so
-    asyncpg sends a valid JSON string regardless of statement-cache or
-    connection-pooler settings.  Float ``inf``/``nan`` are replaced with
-    ``null`` to keep PostgreSQL happy.
+    agent_behavior, substrate_cids) are explicitly serialised with
+    ``json.dumps`` so asyncpg sends a valid JSON string regardless of
+    statement-cache or connection-pooler settings.  Float ``inf``/``nan``
+    are replaced with ``null`` to keep PostgreSQL happy.
     """
     round_id = element.round_id if element.round_id >= 0 else None
     return (
@@ -366,6 +375,7 @@ def element_to_params(element: DataElement, next_id: int) -> tuple:
         element.reasoning,
         _jsonb(element.tool_calls),
         _jsonb(element.agent_behavior),
+        _jsonb(element.substrate_cids),
     )
 
 
@@ -375,13 +385,13 @@ INSERT INTO experiments (
     parent_index, generation, score, miner_uid, miner_hotkey,
     loss_curve, manifest_sha256, generated_samples, objectives,
     timestamp, round_id, task,
-    reasoning, tool_calls, agent_behavior
+    reasoning, tool_calls, agent_behavior, substrate_cids
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8,
     $9, $10, $11, $12, $13,
     $14, $15, $16, $17,
     $18, $19, $20,
-    $21, $22, $23
+    $21, $22, $23, $24
 )
 """
 

@@ -435,8 +435,15 @@ for attempt in $(seq 1 10); do
     sleep 1
 done
 
-# Configure R2 credentials — these are accepted by the mock server (no auth check)
-export MOCK_R2_ENDPOINT="http://127.0.0.1:${MOCK_R2_PORT}"
+# Configure storage credentials — accepted by the mock server (no auth check).
+# Export both the new HIPPIUS_* names (primary) and the legacy R2_* names so
+# any code path on either side of the migration finds what it expects.
+export MOCK_S3_ENDPOINT="http://127.0.0.1:${MOCK_R2_PORT}"
+export MOCK_R2_ENDPOINT="$MOCK_S3_ENDPOINT"  # legacy alias
+export HIPPIUS_ACCESS_KEY_ID="test"
+export HIPPIUS_SECRET_ACCESS_KEY="test"
+export HIPPIUS_BUCKET="$R2_BUCKET"
+export HIPPIUS_REGION="decentralized"
 export R2_ACCOUNT_ID="local"
 export R2_ACCESS_KEY_ID="test"
 export R2_SECRET_ACCESS_KEY="test"
@@ -444,7 +451,7 @@ export R2_BUCKET="$R2_BUCKET"
 
 # Create the bucket directory so ListObjects works
 mkdir -p "$MOCK_R2_STORAGE/$R2_BUCKET"
-ok "R2 configured: endpoint=$MOCK_R2_ENDPOINT bucket=$R2_BUCKET"
+ok "Artifact storage configured: endpoint=$MOCK_S3_ENDPOINT bucket=$R2_BUCKET"
 echo ""
 
 # =============================================================================

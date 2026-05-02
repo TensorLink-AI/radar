@@ -166,7 +166,7 @@ python validator/neuron.py --netuid <N> --subtensor.network <network> --wallet.n
 
 ### Infrastructure Requirements
 
-* **R2 storage** for checkpoint storage and artifact sharing. Set `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` env vars.
+* **Artifact storage** (S3-compatible) for checkpoints and cross-validator sharing. The default backend is **Hippius** (Substrate-based decentralized object store at `https://s3.hippius.com`); set `HIPPIUS_ACCESS_KEY_ID`, `HIPPIUS_SECRET_ACCESS_KEY`, `HIPPIUS_BUCKET`. Cloudflare R2 stays supported as a legacy fallback — if `HIPPIUS_*` is unset the client transparently reads `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` instead, so existing deployments keep working without an env-var change.
 * **CPU for Phase C eval.** Checkpoint evaluation runs on CPU by default (override with `RADAR_EVAL_DEVICE`). Each eval takes seconds. No GPU required for validators.
 * **DB proxy.** The validator runs a reverse-proxy FastAPI on `RADAR_PROXY_PORT` (default 8080). It forwards `/experiments/*`, `/challenge`, `/frontier`, `/provenance/*` to the subnet owner's centralised DB server, and hosts `/desearch/*` and `/llm/v1/*` locally with per-miner rate limits. The DB itself (Postgres) is run by the subnet owner, not the validator.
 * **DB server deployable modes.** The subnet-owner `database/neuron.py` binary supports three modes via `RADAR_NEURON_MODE`:
@@ -233,7 +233,7 @@ shared/                          Core libraries (validator + miner)
   protocol.py                      Challenge/Proposal wire format (JSON)
   auth.py                          Epistula signing/verification (SR25519)
   challenge.py                     Deterministic challenge + size buckets
-  r2_audit.py                      R2 storage, upload/download/hash verification
+  r2_audit.py                      Hippius/R2 artifact storage, upload/download/hash verification
   task.py                          TaskSpec + Objective, pluggable task definitions
   pg_schema.py                     Postgres DDL + row conversion
   pg_store.py                      Async Postgres experiment store
