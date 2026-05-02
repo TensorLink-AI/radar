@@ -109,23 +109,30 @@ async def test_round_with_hippius_disabled_unchanged():
 
 @pytest.mark.asyncio
 async def test_round_with_hippius_enabled_publishes():
-    """A configured client gets called exactly once with a bundle + metadata,
-    and every miner's UID maps to the returned CID."""
+    """A configured client gets called exactly once with the structured args,
+    and every miner's UID maps to the returned bundle key."""
     inputs = _round_inputs(num_miners=3)
-    upload = UploadResult(cid="bafyfakecid", size_bytes=1024)
+    upload = UploadResult(
+        key="radar/0/phase_c/7/abcdef0123456789.tar",
+        metadata={"app_tag": "radar", "phase": "phase_c", "run_id": "7"},
+        tags={"app_tag": "radar", "phase": "phase_c", "netuid": "0"},
+        size=1024, etag="deadbeef",
+    )
     client = type("C", (), {})()
     client.upload_bundle = AsyncMock(return_value=upload)
 
     cids = await run_substrate_publish_step(hippius=client, **inputs)
 
     client.upload_bundle.assert_awaited_once()
-    args, _ = client.upload_bundle.call_args
-    bundle_bytes, metadata = args
+    call = client.upload_bundle.call_args
+    bundle_bytes = call.args[0]
     assert isinstance(bundle_bytes, (bytes, bytearray))
-    assert metadata["app"] == "radar"
-    assert metadata["round_id"] == "7"
-    assert metadata["record_count"] == "3"
-    assert cids == {1: "bafyfakecid", 2: "bafyfakecid", 3: "bafyfakecid"}
+    assert call.kwargs["app_tag"] == "radar"
+    assert call.kwargs["phase"] == "phase_c"
+    assert call.kwargs["run_id"] == "7"
+    assert call.kwargs["extra_metadata"]["record_count"] == "3"
+    # All miners share the same bundle key (one bundle per round).
+    assert cids == {1: upload.key, 2: upload.key, 3: upload.key}
 
 
 @pytest.mark.asyncio

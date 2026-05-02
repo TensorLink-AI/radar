@@ -12,11 +12,9 @@ pipeline. Two functions:
     down weight-setting; on any failure the publisher logs a warning and
     returns ``None``.
 
-The Hippius client is duck-typed: anything with
-``await client.upload_bundle(data: bytes, metadata: dict) -> UploadResult`` works.
-The `UploadResult` dataclass below is a forward-compatible placeholder until
-TEN-242 (Hippius client wrapper) lands and re-homes it to
-`shared.hippius_client`.
+The Hippius client is the structured `shared.hippius_client.HippiusClient`
+(TEN-242): ``await client.upload_bundle(data, *, app_tag, phase, run_id,
+netuid, extra_metadata=None) -> BundleRef``.
 """
 
 from __future__ import annotations
@@ -24,7 +22,6 @@ from __future__ import annotations
 import logging
 import math
 import time
-from dataclasses import dataclass
 from typing import Any, Optional
 
 from shared.substrate import (
@@ -38,17 +35,9 @@ from shared.substrate import (
 logger = logging.getLogger(__name__)
 
 
-# Forward-compat placeholder. Phase 2 (TEN-242) will define the canonical
-# UploadResult in shared/hippius_client.py and the publisher will import from
-# there; until then we keep a local stub so the public signature in this
-# module is precise and testable.
-@dataclass(frozen=True)
-class UploadResult:
-    """Outcome of a successful Hippius upload."""
-    cid: str
-    size_bytes: int
-    block_number: Optional[int] = None
-    block_timestamp: Optional[float] = None
+# Phase 2 (TEN-242) ships ``BundleRef`` as the canonical upload return type;
+# this re-export keeps existing callers' imports stable.
+from shared.hippius_client import BundleRef, UploadResult  # noqa: E402,F401
 
 
 # ── Pure record construction ─────────────────────────────────────────
@@ -188,6 +177,9 @@ async def publish_phase_c_records(
     records: list[PhaseCRecord],
     round_id: int,
     validator_hotkey: str,
+    *,
+    netuid: int = 0,
+    app_tag: str = "radar",
 ) -> Optional[UploadResult]:
     """Upload a Phase C record bundle to Hippius. Best-effort — never raises.
 
@@ -212,15 +204,19 @@ async def publish_phase_c_records(
     try:
         bundle = records_to_bundle(records)
         digest = bundle_sha256(bundle)
-        metadata = {
-            "app": "radar",
-            "schema_version": SCHEMA_VERSION,
-            "round_id": str(round_id),
-            "validator_hotkey": validator_hotkey,
-            "record_count": str(len(records)),
-            "bundle_sha256": digest,
-        }
-        result = await hippius.upload_bundle(bundle, metadata)
+        # The structured args go on the S3 key + tags; the rest of the
+        # schema rides as user metadata so /verify can sanity-check it.
+        result = await hippius.upload_bundle(
+            bundle,
+            app_tag=app_tag, phase="phase_c",
+            run_id=str(round_id), netuid=netuid,
+            extra_metadata={
+                "schema_version": SCHEMA_VERSION,
+                "validator_hotkey": validator_hotkey,
+                "record_count": str(len(records)),
+                "bundle_sha256": digest,
+            },
+        )
     except Exception as e:  # noqa: BLE001 — best-effort by design
         logger.warning(
             "Substrate publish failed for round_id=%d (%d records): %s",
@@ -228,7 +224,7 @@ async def publish_phase_c_records(
         )
         return None
     if result is not None:
-        cid = getattr(result, "cid", None) or (
+        cid = getattr(result, "cid", None) or getattr(result, "key", "") or (
             result.get("cid", "") if isinstance(result, dict) else ""
         )
         logger.info(
@@ -254,6 +250,7 @@ async def run_substrate_publish_step(
     current_block: int,
     task_name: str,
     block_hash: str,
+    netuid: int = 0,
 ) -> dict[int, str]:
     """Build, sign, and publish a Phase C bundle. Best-effort; never raises.
 
@@ -281,6 +278,7 @@ async def run_substrate_publish_step(
         hippius, records,
         round_id=int(getattr(challenge, "round_id", 0)),
         validator_hotkey=wallet.hotkey.ss58_address,
+        netuid=netuid,
     )
     if upload_result is None:
         return {}

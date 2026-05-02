@@ -313,7 +313,12 @@ async def test_publish_success_returns_result(
         metagraph=metagraph, my_uid=0, current_block=100_000,
         task_name="ts_forecasting", block_hash="0xabc",
     )
-    expected = UploadResult(cid="bafyfake123", size_bytes=512)
+    expected = UploadResult(
+        key="radar/0/phase_c/42/abcdef0123456789.tar",
+        metadata={"app_tag": "radar", "phase": "phase_c", "run_id": "42"},
+        tags={"app_tag": "radar", "phase": "phase_c", "netuid": "0"},
+        size=512, etag="deadbeef",
+    )
     client = type("C", (), {})()
     client.upload_bundle = AsyncMock(return_value=expected)
 
@@ -324,15 +329,18 @@ async def test_publish_success_returns_result(
 
     assert result is expected
     client.upload_bundle.assert_awaited_once()
-    args, _ = client.upload_bundle.call_args
-    bundle_bytes, metadata = args
-    # Metadata carries the spec'd tags
-    assert metadata["app"] == "radar"
-    assert metadata["schema_version"] == SCHEMA_VERSION
-    assert metadata["round_id"] == "42"
-    assert metadata["validator_hotkey"] == wallet.hotkey.ss58_address
-    assert metadata["record_count"] == "2"
-    assert metadata["bundle_sha256"] == bundle_sha256(bundle_bytes)
+    # New structured API: positional bundle bytes, then keyword args.
+    call = client.upload_bundle.call_args
+    bundle_bytes = call.args[0]
+    kwargs = call.kwargs
+    assert kwargs["app_tag"] == "radar"
+    assert kwargs["phase"] == "phase_c"
+    assert kwargs["run_id"] == "42"
+    extra = kwargs["extra_metadata"]
+    assert extra["schema_version"] == SCHEMA_VERSION
+    assert extra["validator_hotkey"] == wallet.hotkey.ss58_address
+    assert extra["record_count"] == "2"
+    assert extra["bundle_sha256"] == bundle_sha256(bundle_bytes)
     # Bundle round-trips back to the same records (cryptographically intact).
     parsed = records_from_bundle(bundle_bytes)
     assert parsed == records

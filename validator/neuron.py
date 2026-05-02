@@ -933,7 +933,7 @@ class Validator:
             training_metas=training_metas, commitments=commitments,
             metagraph=self.metagraph, my_uid=self._my_uid(),
             current_block=current_block, task_name=task_name,
-            block_hash=block_hash,
+            block_hash=block_hash, netuid=int(self.netuid),
         )
         if substrate_cids:
             logger.info(

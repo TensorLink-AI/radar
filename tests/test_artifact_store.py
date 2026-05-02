@@ -51,7 +51,7 @@ class _FakeR2:
 
 
 class _FakeHippius:
-    """Async stand-in for HippiusClient.upload/download."""
+    """Async stand-in for HippiusClient.upload/download (Phase 2 structured)."""
 
     def __init__(self, *, fail: bool = False, return_none: bool = False):
         self._store: dict[str, bytes] = {}
@@ -60,21 +60,36 @@ class _FakeHippius:
         self.return_none = return_none
         self._next_id = 0
 
-    async def upload_bundle(self, data: bytes, metadata: dict):
+    async def upload_bundle(
+        self, data: bytes, *,
+        app_tag: str = "radar", phase: str, run_id: str,
+        netuid: int = 0, extra_metadata=None,
+    ):
         if self.fail:
             raise RuntimeError("hippius down")
         if self.return_none:
             return None
         self._next_id += 1
-        cid = f"bafyfake{self._next_id}"
-        self._store[cid] = data
-        self._meta[cid] = dict(metadata)
-        return MagicMock(cid=cid, size_bytes=len(data))
+        # Mirror the real client's content-addressed key shape so tests can
+        # assert against it. Also stash everything for inspection.
+        import hashlib as _hl
+        sha = _hl.sha256(data).hexdigest()
+        key = f"{app_tag}/{netuid}/{phase}/{run_id}/{sha[:16]}.tar"
+        self._store[key] = data
+        self._meta[key] = {
+            "app_tag": app_tag, "phase": phase, "run_id": run_id,
+            "netuid": str(netuid), **(extra_metadata or {}),
+        }
+        return MagicMock(
+            key=key, cid=key, size=len(data), etag="fakeetag",
+            metadata=self._meta[key],
+            tags={"app_tag": app_tag, "phase": phase, "netuid": str(netuid)},
+        )
 
-    async def download_bundle(self, cid: str) -> bytes:
-        if self.fail or cid not in self._store:
-            raise RuntimeError(f"missing cid {cid}")
-        return self._store[cid]
+    async def download_bundle(self, key_or_cid: str) -> bytes:
+        if self.fail or key_or_cid not in self._store:
+            raise RuntimeError(f"missing key {key_or_cid}")
+        return self._store[key_or_cid]
 
 
 # ── put_bytes / put_json ──────────────────────────────────────────────
@@ -87,7 +102,8 @@ async def test_put_bytes_both_succeed():
     res = await store.put_bytes("k.json", b'{"a":1}', {"kind": "test"})
     assert res.r2_ok and res.hippius_ok
     assert res.r2_key == "k.json"
-    assert res.hippius_cid.startswith("bafyfake")
+    # Content-addressed key shape: {app_tag}/{netuid}/{phase}/{run_id}/...
+    assert "/" in res.hippius_cid and res.hippius_cid.endswith(".tar")
     assert not res.both_failed
     assert r2._store["k.json"] == b'{"a":1}'
     counters = store.snapshot_counters()
@@ -283,9 +299,10 @@ async def test_coordinator_routes_through_artifact_store_when_present():
     assert r2_payload["dispatcher"] == "5Vali"
     assert r2_payload["round_id"] == 7
     assert len(hip._store) == 1
-    cid = next(iter(hip._store))
-    assert hip._meta[cid]["kind"] == "dispatch"
-    assert hip._meta[cid]["validator_hotkey"] == "5Vali"
+    key = next(iter(hip._store))
+    # Translation: artifact_store metadata.kind -> Hippius phase tag.
+    assert hip._meta[key]["phase"] == "dispatch"
+    assert hip._meta[key]["validator_hotkey"] == "5Vali"
 
 
 @pytest.mark.asyncio

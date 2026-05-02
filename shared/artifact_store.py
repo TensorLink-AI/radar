@@ -132,15 +132,38 @@ class ArtifactStore:
                 pass
 
     async def _write_hippius(self, data: bytes, metadata: dict) -> str:
-        """Best-effort Hippius write. Returns CID on success, '' on failure."""
+        """Best-effort Hippius write. Returns the S3 key on success, '' on failure.
+
+        Translates the caller's free-form metadata dict into the structured
+        ``upload_bundle`` call shape Phase 2 settled on:
+          * ``app_tag`` → metadata["app"]            (default "radar")
+          * ``phase``   → metadata["kind"]            (e.g. "frontier",
+                                                       "dispatch", "checkpoint")
+          * ``run_id``  → metadata["run_id"] / "round_id"
+                          / metadata["task"] / "default"
+          * ``netuid``  → metadata["netuid"]          (default 0)
+        Anything else in the dict goes through as ``extra_metadata``.
+        """
         if self.hippius is None:
             return ""
+        meta = dict(metadata or {})
+        app_tag = str(meta.pop("app", None) or "radar")
+        phase = str(meta.pop("kind", None) or meta.pop("phase", None) or "blob")
+        run_id = str(
+            meta.pop("run_id", None) or meta.pop("round_id", None)
+            or meta.pop("task", None) or "default",
+        )
         try:
-            result = await self.hippius.upload_bundle(data, metadata)
+            netuid = int(meta.pop("netuid", 0) or 0)
+        except (TypeError, ValueError):
+            netuid = 0
+        try:
+            result = await self.hippius.upload_bundle(
+                data, app_tag=app_tag, phase=phase, run_id=run_id,
+                netuid=netuid, extra_metadata=meta,
+            )
         except NotImplementedError as e:
-            # Phase 2 (TEN-242) hasn't shipped upload yet. Treat as a
-            # disabled backend rather than a bug — operators see the
-            # warning once at startup, not on every write.
+            # Defensive: a stub client (read-only fork) treated as disabled.
             logger.debug("Hippius upload skipped (not yet implemented): %s", e)
             return ""
         except Exception as e:
@@ -148,8 +171,9 @@ class ArtifactStore:
             return ""
         if result is None:
             return ""
-        return getattr(result, "cid", None) or (
-            result.get("cid", "") if isinstance(result, dict) else ""
+        return getattr(result, "key", "") or getattr(result, "cid", "") or (
+            result.get("key", "") or result.get("cid", "")
+            if isinstance(result, dict) else ""
         )
 
     # ── Public API ───────────────────────────────────────────────────

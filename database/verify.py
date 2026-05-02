@@ -137,6 +137,23 @@ async def verify_experiment(
             out.append(result)
             continue
 
+        # 1b. Tag verification (TEN-242). When the Hippius client supports
+        # ``head_bundle`` and we hit it via the S3 path, sanity-check that
+        # the object's tags claim the same validator we expect. Best-effort:
+        # IPFS-gateway-only deploys, public mirrors, and pre-Phase-2 audit
+        # entries all skip this without failing the row.
+        if validator_hotkey and hasattr(hippius, "head_bundle"):
+            try:
+                ref = await hippius.head_bundle(cid)
+                meta_hk = ref.metadata.get("validator_hotkey", "") if ref else ""
+                if meta_hk and meta_hk != validator_hotkey:
+                    result["discrepancies"].append(
+                        f"tag validator_hotkey mismatch: object={meta_hk!r} "
+                        f"audit={validator_hotkey!r}",
+                    )
+            except Exception:  # noqa: BLE001 — head is optional
+                pass
+
         # 2. Parse + locate the matching record.
         try:
             records = records_from_bundle(data)
