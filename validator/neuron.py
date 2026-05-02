@@ -876,6 +876,25 @@ class Validator:
             except Exception:
                 pass
 
+        # Best-effort: publish signed Phase C records to Hippius/substrate.
+        # Returns {miner_uid: bundle_cid} so the per-miner DB writes below
+        # can attach the CID. Empty dict when disabled, no client, or
+        # publish failed — never raises.
+        substrate_cids = await run_substrate_publish_step(
+            hippius=self.hippius, wallet=self.wallet,
+            challenge=challenge, eval_results=eval_results,
+            training_metas=training_metas, commitments=commitments,
+            metagraph=self.metagraph, my_uid=self._my_uid(),
+            current_block=current_block, task_name=task_name,
+            block_hash=block_hash, netuid=int(self.netuid),
+        )
+        if substrate_cids:
+            logger.info(
+                "Substrate published: round_id=%d cid=%s miners=%d",
+                challenge.round_id, next(iter(substrate_cids.values())),
+                len(substrate_cids),
+            )
+
         gate_passed = 0
         gate_failed = 0
         for uid, metrics in eval_results.items():
@@ -936,25 +955,6 @@ class Validator:
             eval_results, challenge, pareto, round_task.objectives, penalties,
             training_metas=training_metas,
         )
-
-        # Best-effort: publish signed Phase C records to Hippius/substrate.
-        # Returns {miner_uid: bundle_cid} so Phase 5 can thread CIDs into
-        # the per-miner DB writes. Empty dict when disabled, no client, or
-        # publish failed — never raises.
-        substrate_cids = await run_substrate_publish_step(
-            hippius=self.hippius, wallet=self.wallet,
-            challenge=challenge, eval_results=eval_results,
-            training_metas=training_metas, commitments=commitments,
-            metagraph=self.metagraph, my_uid=self._my_uid(),
-            current_block=current_block, task_name=task_name,
-            block_hash=block_hash, netuid=int(self.netuid),
-        )
-        if substrate_cids:
-            logger.info(
-                "Substrate published: round_id=%d cid=%s miners=%d",
-                challenge.round_id, next(iter(substrate_cids.values())),
-                len(substrate_cids),
-            )
 
         if round_scores:
             nonzero = {uid: s for uid, s in round_scores.items() if s > 0}
