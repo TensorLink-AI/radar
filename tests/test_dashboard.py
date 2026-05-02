@@ -955,6 +955,151 @@ def test_provenance_top_experiments_includes_names(logged_in):
     assert names[1] == "child"
 
 
+# ── Per-experiment provenance public endpoints ───────────────
+
+
+class _FakeProvenance:
+    """Stand-in for ``PgProvenanceQuery`` in dashboard tests."""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    async def get_influences(self, experiment_id: int):
+        self.calls.append(("influences", experiment_id))
+        return [
+            {"source_id": 0, "evidence_type": "accessed",
+             "detail": {"round_id": 7}},
+            {"source_id": 0, "evidence_type": "shared_component",
+             "detail": {"component": "Attention"}},
+        ]
+
+    async def get_impact(self, experiment_id: int):
+        self.calls.append(("impact", experiment_id))
+        return [
+            {"target_id": 2, "evidence_type": "accessed_by",
+             "detail": {"round_id": 8}},
+        ]
+
+    async def get_similar(self, experiment_id: int, top_k: int = 10):
+        self.calls.append(("similar", experiment_id, top_k))
+        return [
+            {"target_id": 0, "jaccard": 0.9},
+            {"target_id": 2, "jaccard": 0.4},
+        ][:top_k]
+
+    async def get_experiment_graph(self, experiment_id: int, depth: int = 3):
+        self.calls.append(("graph", experiment_id, depth))
+        return {
+            "experiment_id": experiment_id,
+            "influences": await self.get_influences(experiment_id),
+            "impact": await self.get_impact(experiment_id),
+            "components": ["Attention", "LayerNorm"],
+        }
+
+
+@pytest.fixture
+def with_fake_provenance(logged_in):
+    """Attach a _FakeProvenance to the dashboard's store for one test.
+
+    Also clears the per-IP rate window — the dashboard suite shares a
+    single TestClient host across many tests, so by the time the
+    provenance block runs the window is near saturation and otherwise
+    bleeds 429s into later public-API tests.
+    """
+    from database import server as db_server
+    from database.dashboard import app as dash_app
+
+    db_server._ip_rate_window.clear()
+    state = dash_app._state
+    prev = state.store.provenance
+    fake = _FakeProvenance()
+    state.store.provenance = fake
+    try:
+        yield logged_in, fake
+    finally:
+        state.store.provenance = prev
+        db_server._ip_rate_window.clear()
+
+
+def test_provenance_influences_endpoint(with_fake_provenance):
+    client, fake = with_fake_provenance
+    r = client.get("/dashboard/api/provenance/1/influences.json")
+    assert r.status_code == 200
+    data = r.json()
+    assert isinstance(data, list)
+    assert any(item["source_id"] == 0 for item in data)
+    assert ("influences", 1) in fake.calls
+
+
+def test_provenance_impact_endpoint(with_fake_provenance):
+    client, fake = with_fake_provenance
+    r = client.get("/dashboard/api/provenance/1/impact.json")
+    assert r.status_code == 200
+    data = r.json()
+    assert data[0]["target_id"] == 2
+    assert ("impact", 1) in fake.calls
+
+
+def test_provenance_similar_endpoint(with_fake_provenance):
+    client, fake = with_fake_provenance
+    r = client.get("/dashboard/api/provenance/1/similar.json?top_k=1")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data) == 1
+    assert data[0]["target_id"] == 0
+    assert ("similar", 1, 1) in fake.calls
+
+
+def test_provenance_similar_clamps_top_k(with_fake_provenance):
+    client, fake = with_fake_provenance
+    # 9999 → clamped to 50
+    client.get("/dashboard/api/provenance/1/similar.json?top_k=9999")
+    assert ("similar", 1, 50) in fake.calls
+    # 0 → clamped to 1
+    client.get("/dashboard/api/provenance/1/similar.json?top_k=0")
+    assert ("similar", 1, 1) in fake.calls
+
+
+def test_provenance_graph_endpoint(with_fake_provenance):
+    client, fake = with_fake_provenance
+    r = client.get("/dashboard/api/provenance/1/graph.json")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["experiment_id"] == 1
+    assert "influences" in data and "impact" in data and "components" in data
+    assert ("graph", 1, 3) in fake.calls
+
+
+def test_provenance_endpoints_503_when_index_not_ready(logged_in):
+    """If ``store.provenance`` is None, all per-experiment endpoints 503.
+
+    This is the bootstrap state on a freshly-started dashboard process
+    before ``init_schema`` runs. The aggregate heatmap endpoints don't
+    depend on the index and remain available.
+    """
+    from database import server as db_server
+    from database.dashboard import app as dash_app
+
+    db_server._ip_rate_window.clear()
+    state = dash_app._state
+    prev = state.store.provenance
+    state.store.provenance = None
+    try:
+        for path in (
+            "/dashboard/api/provenance/1/influences.json",
+            "/dashboard/api/provenance/1/impact.json",
+            "/dashboard/api/provenance/1/similar.json",
+            "/dashboard/api/provenance/1/graph.json",
+        ):
+            r = logged_in.get(path)
+            assert r.status_code == 503, path
+        # Aggregates still work
+        r = logged_in.get("/dashboard/api/provenance/miner_rounds.json")
+        assert r.status_code == 200
+    finally:
+        state.store.provenance = prev
+
+
 # ── Agent bundle viewer + diff ────────────────────────────────
 
 

@@ -437,6 +437,52 @@ async def provenance_top_experiments(top_k: int = 20) -> dict:
     return await q.top_experiments_activity(state.pool, top_k=top_k)
 
 
+def _require_provenance():
+    prov = getattr(get_state().store, "provenance", None)
+    if prov is None:
+        raise HTTPException(
+            status_code=503, detail="Provenance index not ready",
+        )
+    return prov
+
+
+@router.get("/provenance/{experiment_id}/influences.json")
+async def provenance_influences(experiment_id: int) -> list[dict]:
+    """What this experiment was influenced by.
+
+    Each entry is ``{source_id, evidence_type, detail}``. ``evidence_type``
+    is one of ``accessed`` (the miner queried that experiment that round),
+    ``frontier`` (it was on the round's frontier), or ``shared_component``
+    (overlapping code component).
+    """
+    return await _require_provenance().get_influences(experiment_id)
+
+
+@router.get("/provenance/{experiment_id}/impact.json")
+async def provenance_impact(experiment_id: int) -> list[dict]:
+    """Which later experiments were exposed to this one.
+
+    Each entry is ``{target_id, evidence_type, detail}``.
+    """
+    return await _require_provenance().get_impact(experiment_id)
+
+
+@router.get("/provenance/{experiment_id}/similar.json")
+async def provenance_similar(experiment_id: int, top_k: int = 10) -> list[dict]:
+    """Code-similarity ranking against recent experiments.
+
+    Each entry is ``{target_id, jaccard, ...}``. Capped at 50.
+    """
+    top_k = max(1, min(int(top_k), 50))
+    return await _require_provenance().get_similar(experiment_id, top_k=top_k)
+
+
+@router.get("/provenance/{experiment_id}/graph.json")
+async def provenance_graph(experiment_id: int) -> dict:
+    """Bundled influences + impact + components for one experiment."""
+    return await _require_provenance().get_experiment_graph(experiment_id)
+
+
 # ── SPA summary endpoints ─────────────────────────────────────
 
 @router.get("/tasks_stats.json")
