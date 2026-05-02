@@ -373,9 +373,36 @@ def test_access_log_skips_non_experiment_paths():
         loop = _asyncio.new_event_loop()
         loop.run_until_complete(_asyncio.sleep(0.05))
         loop.close()
-        # Still logs the access, but with no experiment IDs extracted
+        # Still logs the access. The aggregate /provenance/component_stats
+        # response carries no per-experiment IDs and the path itself isn't
+        # an /provenance/{id} shape, so nothing gets extracted.
         assert logger.calls
         assert logger.calls[-1]["experiment_ids"] == []
+    finally:
+        _uninstall_access_logger()
+
+
+def test_access_log_captures_id_from_provenance_path():
+    """Agent queries /provenance/{exp_id}/influences to learn lineage.
+    Even when the body has no extractable keys, the URL itself proves the
+    miner asked about that experiment — capture it from the path so the
+    provenance heatmap reflects the access.
+    """
+    _setup()
+    logger = _install_access_logger()
+    with _ip_rate_lock:
+        _ip_rate_window.pop("testclient", None)
+    try:
+        client = TestClient(app)
+        r = client.get("/provenance/0/influences")
+        assert r.status_code == 200
+        import asyncio as _asyncio
+        loop = _asyncio.new_event_loop()
+        loop.run_until_complete(_asyncio.sleep(0.05))
+        loop.close()
+        assert logger.calls, "middleware did not log /provenance/0/influences"
+        assert 0 in logger.calls[-1]["experiment_ids"]
+        assert logger.calls[-1]["endpoint"] == "/provenance/0/influences"
     finally:
         _uninstall_access_logger()
 

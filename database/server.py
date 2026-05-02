@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from config import Config
-from shared.access_logger import extract_ids_from_body
+from shared.access_logger import extract_ids_from_body, extract_ids_from_path
 from shared.pg_access_logger import PgAccessLogger
 
 app = FastAPI(title="RADAR Experiment DB (Centralized)")
@@ -63,7 +63,7 @@ _ACCESS_LOG_BODY_CAP: int = 256 * 1024
 # caller's access record. Everything else (agent_code blobs, desearch,
 # /health) is skipped to avoid unnecessary body buffering.
 _PROVENANCE_CAPTURE_PREFIXES = (
-    "/experiments", "/frontier", "/challenge",
+    "/experiments", "/frontier", "/challenge", "/provenance",
 )
 
 # Agent code limits
@@ -353,6 +353,13 @@ async def auth_middleware(request: Request, call_next):
         exp_ids: list[int] = []
         if any(path.startswith(p) for p in _PROVENANCE_CAPTURE_PREFIXES):
             response, exp_ids = await _buffer_and_extract_ids(response)
+
+        # The URL itself encodes intent: /experiments/42, /provenance/42/...
+        # Merge path-derived IDs so we still log a hit when the body shape
+        # has no extractable keys (graph wrappers, 2xx empty lists).
+        path_ids = extract_ids_from_path(path)
+        if path_ids:
+            exp_ids = sorted(set(exp_ids) | set(path_ids))
 
         miner_hotkey = request.headers.get("X-Miner-Hotkey", "")
         miner_uid_str = request.headers.get("X-Miner-UID", "-1")
