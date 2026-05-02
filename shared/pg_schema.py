@@ -41,6 +41,11 @@ CREATE TABLE IF NOT EXISTS experiments (
 -- ``shared.challenge.generate_challenge`` and can exceed INT32's 2.1B max.
 -- Widen existing deployments to BIGINT; no-op if already BIGINT.
 ALTER TABLE experiments ALTER COLUMN round_id TYPE BIGINT;
+-- Migration (TEN-240): substrate_cids was added to the CREATE TABLE above
+-- after deployments already had an experiments table, so the IF NOT EXISTS
+-- table-create is a no-op and the column is missing. Add it explicitly.
+ALTER TABLE experiments
+    ADD COLUMN IF NOT EXISTS substrate_cids JSONB NOT NULL DEFAULT '[]';
 """
 
 SCHEMA_INDEX_DDL = """
