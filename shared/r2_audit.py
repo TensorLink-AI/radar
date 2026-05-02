@@ -28,6 +28,12 @@ logger = logging.getLogger(__name__)
 HIPPIUS_DEFAULT_ENDPOINT = "https://s3.hippius.com"
 HIPPIUS_DEFAULT_REGION = "decentralized"
 
+# R2 rejects any region outside this set with InvalidRegionName, so when the
+# resolved endpoint is the R2 per-account URL we have to default to "auto"
+# instead of Hippius's "decentralized".
+R2_DEFAULT_REGION = "auto"
+_R2_ENDPOINT_SUFFIX = ".r2.cloudflarestorage.com"
+
 
 def _first_set(*values: str) -> str:
     """Return the first truthy value, or ``""``."""
@@ -64,10 +70,9 @@ class HippiusStorage:
             os.getenv("HIPPIUS_SECRET_ACCESS_KEY", ""),
             os.getenv("R2_SECRET_ACCESS_KEY", ""),
         )
-        region = region or _first_set(
+        explicit_region = region or _first_set(
             os.getenv("HIPPIUS_REGION", ""),
             os.getenv("R2_REGION", ""),
-            HIPPIUS_DEFAULT_REGION,
         )
 
         # Endpoint resolution order:
@@ -99,6 +104,16 @@ class HippiusStorage:
             resolved_endpoint = f"https://{legacy_account_id}.r2.cloudflarestorage.com"
         else:
             resolved_endpoint = HIPPIUS_DEFAULT_ENDPOINT
+
+        # Region default depends on which backend the endpoint points at:
+        # R2 rejects "decentralized" (InvalidRegionName) and only accepts
+        # wnam/enam/weur/eeur/apac/oc/auto. Hippius requires "decentralized".
+        if explicit_region:
+            region = explicit_region
+        elif resolved_endpoint.endswith(_R2_ENDPOINT_SUFFIX):
+            region = R2_DEFAULT_REGION
+        else:
+            region = HIPPIUS_DEFAULT_REGION
 
         import boto3
         from botocore.config import Config as BotoConfig
