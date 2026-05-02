@@ -329,6 +329,109 @@ This image-level defense is one of several layers; behavioral
 attestation, spot re-execution, canary tasks, and stamp streaming are
 separate validator-side concerns and do not live here.
 
+## Targon migration (Basilica → Targon hosting)
+
+Trainer pods are migrating from Basilica to **Targon**, a confidential
+compute platform that runs containers on Intel TDX CVMs with NVIDIA
+H100/H200/B200 GPUs in CC mode. Targon provides hardware-rooted
+attestation (TDX quote signed by the CPU + NRAS GPU token signed by
+NVIDIA) verifiable through `https://tower.targon.com`.
+
+Both miner and validator pick the backend via
+`RADAR_HOSTING_BACKEND=basilica|targon` (default `basilica` during
+rollout). A deployment is fully one or the other — no half-and-half.
+
+### What Targon's attestation proves
+
+| Attestation says | Targon proves it | Targon does NOT prove it |
+|---|---|---|
+| Image bytes | ✅ workload runs digest X | — |
+| GPU is in CC mode | ✅ NRAS token | — |
+| TDX hardware identity | ✅ Intel quote | — |
+| Launch config (command/args/env) | ❌ — only image bytes | image hardening's job |
+| Behavior matches intent | ❌ | spot re-execution + canary tasks |
+
+The image-hardening layer (`runner/entrypoint.sh` + `_bootstrap.py` +
+`/boot_proof`) closes the launch-config gap. Targon attestation +
+boot proof together cover the full image-level trust chain.
+
+### Verification stack (validator side)
+
+For each round, after a miner posts `TrainerReady`:
+
+1. **Workload digest** — `targon.verify_image_digest(uid, OFFICIAL_TRAINING_IMAGE_DIGEST)`.
+2. **TDX + NRAS attestation** — `targon.verify_attestation(cvm_ip, miner_hk, validator_hk, nonce)` end-to-end via tower; cross-checks the GPU class miner declared.
+3. **Boot proof** — `GET {trainer_url}/boot_proof`, validate signature. Feature-flagged via `RADAR_REQUIRE_BOOT_PROOF` (off until hardened image is universal). 503 = bootstrap didn't run = launch-config bypass.
+
+All three must pass. Failures exclude the miner from the round.
+
+### Mid-round re-verification
+
+While Phase B runs, validators re-execute checks (1) and (3) at
+2–3 deterministic offsets within the training window. Offsets are
+seeded from `block_hash XOR round_id XOR miner_uid` — every validator
+agrees on when checks happen but the miner can't predict them. Skip
+(2) on re-verify because the workload UID is already pinned.
+Mid-run failures mark the miner `compromised` for the round.
+
+### What's per-round (off-chain) vs persistent (on-chain)
+
+- **On-chain via `ImageCommitment`**: `code_hash`, `listener_url`,
+  `subnet_version`. The same set as today — Targon does NOT add new
+  on-chain fields. The trainer image digest is *not* on chain because
+  every miner runs the same subnet-owner-blessed digest, so there's
+  no per-miner variation worth committing to (and the 128-byte chain
+  budget can't hold it anyway). Validators read the expected digest
+  from `Config.OFFICIAL_TRAINING_IMAGE_DIGEST`.
+- **Per-round via signed `TrainerReady`**: `targon_workload_uid`,
+  `cvm_ip`, `gpu_class`, `image_digest`. Ephemeral, Epistula-signed
+  by the miner hotkey, scoped to one round.
+
+### Hybrid fallback when Targon is down
+
+If the circuit breaker opens (5 consecutive failures within 60s
+default), validators tag affected miners with `targon_unavailable`
+on that round, accept their dispatches, and apply
+`Config.TARGON_UNAVAILABLE_SCORE_MULTIPLIER` (default 0.5) to their
+final score. This keeps the subnet alive during a Targon outage
+without fully rewarding miners who couldn't be attested in real-time.
+
+The 0.5 multiplier is a deliberate policy trade-off: full weight
+during outages would let attackers wait for / trigger Targon
+unavailability to launder unattested runs; zero weight would brick
+the subnet during routine API maintenance. Half-weight stays open
+for honest miners and rejects strategic exploitation. Tunable via
+the env var if the trade-off needs adjusting.
+
+### Operator runbook
+
+**Miner**:
+
+1. Get a Targon API key (https://docs.targon.com — separate account from validators).
+2. Push the trainer image to a registry Targon can reach. Public GHCR works; for private registries set `RADAR_TARGON_REGISTRY_USERNAME`/`PASSWORD`/`SERVER`.
+3. Set on the miner host:
+   ```
+   RADAR_HOSTING_BACKEND=targon
+   TARGON_API_KEY=tg_...
+   OFFICIAL_TRAINING_IMAGE=ghcr.io/...   # subnet-owner-blessed image
+   OFFICIAL_TRAINING_IMAGE_DIGEST=sha256:...
+   RADAR_TRAINER_GPU_MODELS=H200          # or H100, B200 — first entry wins
+   ```
+4. Restart the miner. It refuses to boot if `TARGON_API_KEY` is missing under `RADAR_HOSTING_BACKEND=targon` — clear startup error rather than cryptic deploy failure.
+
+**Validator**:
+
+1. Get a Targon API key (separate account from miners).
+2. Set:
+   ```
+   RADAR_HOSTING_BACKEND=targon
+   TARGON_API_KEY=tg_...
+   OFFICIAL_TRAINING_IMAGE_DIGEST=sha256:...   # must match miner
+   RADAR_REQUIRE_BOOT_PROOF=false              # flip to true once hardened image is universal
+   ```
+3. Restart the validator. The Targon client is constructed lazily —
+   Basilica deployments don't load `targon-sdk` at runtime.
+
 ## What's Outstanding
 
 - [ ] **Real Basilica deployment** — integrate Basilica API for pod lifecycle

@@ -33,7 +33,10 @@ from shared.database import DataElement
 from shared.db_client import DatabaseClient
 from shared.protocol import Challenge, Proposal
 from shared.provenance import detect_components
-from shared.scoring import score_round, scores_to_weights, ema_update, compute_penalties
+from shared.scoring import (
+    apply_round_metadata, compute_penalties, ema_update,
+    score_round, scores_to_weights,
+)
 from shared.task import TaskSpec, load_task, load_enabled_tasks
 from validator.collection import run_and_collect_agents
 from validator.coordinator import (
@@ -922,6 +925,23 @@ class Validator:
             eval_results, challenge, pareto, round_task.objectives, penalties,
             training_metas=training_metas,
         )
+
+        # Apply Targon migration's hybrid-fallback policy: targon_unavailable
+        # gets a 0.5× multiplier (default), compromised UIDs zeroed entirely.
+        # No-op when round_metadata is empty (Basilica deployments, or
+        # Targon round with no flags fired).
+        round_metadata = (
+            self.coordinator.round_metadata(challenge.round_id)
+            if hasattr(self.coordinator, "round_metadata") else None
+        )
+        if round_metadata and (round_metadata.get("targon_unavailable") or round_metadata.get("compromised")):
+            logger.info(
+                "Applying Targon round metadata (round %d): unavailable=%s compromised=%s",
+                challenge.round_id,
+                round_metadata.get("targon_unavailable"),
+                round_metadata.get("compromised"),
+            )
+            round_scores = apply_round_metadata(round_scores, round_metadata)
 
         # Best-effort: publish signed Phase C records to Hippius/substrate.
         # Returns {miner_uid: bundle_cid} so Phase 5 can thread CIDs into

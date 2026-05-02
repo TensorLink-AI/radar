@@ -5,7 +5,7 @@ import math
 from shared.database import DataElement
 from shared.pareto import ParetoFront
 from shared.scoring import (
-    passes_size_gate, score_round, compute_penalties,
+    apply_round_metadata, passes_size_gate, score_round, compute_penalties,
     scores_to_weights, ema_update,
 )
 
@@ -304,3 +304,44 @@ def test_score_round_no_objectives_scores_all_zero():
     }
     scores = score_round(eval_results, _MockChallenge(), _pareto(), [], {})
     assert scores == {0: 0.0}
+
+
+# ── Targon migration: round-metadata multiplier / exclusion ──────────
+
+
+class TestApplyRoundMetadata:
+    def test_no_metadata_passthrough(self):
+        out = apply_round_metadata({1: 0.7, 2: 0.3}, None)
+        assert out == {1: 0.7, 2: 0.3}
+
+    def test_empty_metadata_passthrough(self):
+        out = apply_round_metadata({1: 0.7}, {})
+        assert out == {1: 0.7}
+
+    def test_targon_unavailable_applies_multiplier(self):
+        # Default Config.TARGON_UNAVAILABLE_SCORE_MULTIPLIER = 0.5
+        scores = {1: 1.0, 2: 0.4}
+        out = apply_round_metadata(scores, {"targon_unavailable": [1]})
+        assert out[1] == 0.5
+        assert out[2] == 0.4
+
+    def test_compromised_zeroes_score(self):
+        scores = {1: 1.0, 2: 0.4}
+        out = apply_round_metadata(scores, {"compromised": [1]})
+        assert out[1] == 0.0
+        assert out[2] == 0.4
+
+    def test_compromised_overrides_unavailable(self):
+        # If both flags fire, compromise wins (security > availability).
+        scores = {1: 1.0}
+        out = apply_round_metadata(
+            scores,
+            {"targon_unavailable": [1], "compromised": [1]},
+        )
+        assert out[1] == 0.0
+
+    def test_does_not_mutate_input(self):
+        scores = {1: 1.0, 2: 0.4}
+        snapshot = dict(scores)
+        _ = apply_round_metadata(scores, {"targon_unavailable": [1]})
+        assert scores == snapshot
