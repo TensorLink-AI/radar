@@ -29,7 +29,7 @@ from config import Config, validate_neuron_mode
 from database.server import (
     app, include_validator_routes,
     set_db, set_auth, set_challenge, set_frontier,
-    set_access_logger, set_hotkey_map, set_rate_limit,
+    set_access_logger, set_hotkey_map, set_rate_limit, set_ip_rate_limit,
     set_r2, set_hippius, set_pool,
     get_current_challenge, get_current_frontier,
 )
@@ -382,6 +382,7 @@ class DatabaseNeuron:
             include_validator_routes(app)
             set_auth(self.metagraph)
             set_rate_limit(Config.DB_VALI_RATE_LIMIT)
+            set_ip_rate_limit(Config.DB_IP_RATE_LIMIT)
 
             # Desearch proxy (SN22 arxiv search)
             if Config.DESEARCH_ENABLED:

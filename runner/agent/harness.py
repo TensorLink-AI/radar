@@ -170,6 +170,12 @@ def main():
     miner_uid = challenge.get("miner_uid")
     if miner_uid is not None:
         default_headers["X-Miner-UID"] = str(miner_uid)
+    # Without X-Miner-Hotkey the DB server logs every agent request under the
+    # synthetic "validator" hotkey, collapsing per-miner provenance heatmaps
+    # into a single row.
+    miner_hotkey = challenge.get("miner_hotkey")
+    if miner_hotkey:
+        default_headers["X-Miner-Hotkey"] = str(miner_hotkey)
 
     client = GatedClient(allowed_prefixes, default_headers=default_headers)
     log(f"GatedClient initialised with {len(allowed_prefixes)} allowed prefixes")

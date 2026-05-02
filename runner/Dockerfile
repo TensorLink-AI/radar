@@ -2,8 +2,9 @@ FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# iproute2 + util-linux for the sandbox network namespace wrapper.
 RUN apt-get update && apt-get install -y \
-    python3 python3-pip git \
+    python3 python3-pip git iproute2 util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir \
@@ -19,6 +20,14 @@ COPY __init__.py /workspace/runner/__init__.py
 COPY harness.py /workspace/runner/harness.py
 COPY server.py /workspace/runner/server.py
 COPY server.py /workspace/server.py
+
+# ── Sandbox runner (untrusted miner code lives here) ──────────────
+COPY sandbox.py /workspace/runner/sandbox.py
+COPY sandbox_runner.py /workspace/sandbox_runner.py
+COPY uploads.py /workspace/runner/uploads.py
+COPY sandbox_wrap.sh /usr/local/bin/sandbox_wrap.sh
+RUN chmod 555 /usr/local/bin/sandbox_wrap.sh \
+    && chmod 444 /workspace/sandbox_runner.py
 
 # ── Timeseries forecast runner ─────────────────────────────────────
 RUN mkdir -p /workspace/runner/timeseries_forecast
@@ -56,8 +65,22 @@ COPY shared_pretrain_data.py /workspace/shared/pretrain_data.py
 COPY shared_gift_eval.py /workspace/shared/gift_eval.py
 RUN touch /workspace/shared/__init__.py
 
-# Lock down frozen files
-RUN chmod -R 444 /workspace/frozen/
+# Lock down frozen + harness files so miner code can't replace them at runtime.
+RUN chmod -R 444 /workspace/frozen/ \
+    && chmod 444 /workspace/runner/harness.py /workspace/runner/sandbox.py \
+                 /workspace/runner/timeseries_forecast/harness.py \
+                 /workspace/runner/timeseries_forecast/train.py \
+                 /workspace/runner/timeseries_forecast/prepare.py \
+                 /workspace/runner/timeseries_forecast/pretrain_loader.py \
+                 /workspace/harness.py /workspace/prepare.py \
+                 /workspace/evaluate.py /workspace/flops.py \
+                 /workspace/pretrain_loader.py
+
+# Sandbox workspace — recreated per-job by run_sandbox().
+RUN mkdir -p /workspace/sandbox/checkpoints \
+             /workspace/sandbox/shards \
+             /workspace/sandbox/val_shards \
+             /workspace/sandbox/gift_eval
 
 WORKDIR /workspace
 EXPOSE 8081

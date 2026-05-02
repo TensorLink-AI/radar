@@ -835,6 +835,38 @@ def test_aligned_train_val_handles_empty_and_legacy():
     assert _aligned_train_val({"loss_curve": [1.0, 2.0]}) == ([], [])
 
 
+def test_step_loss_pairs_tolerates_flops_key():
+    """Entries with the new {step, flops, loss} shape render identically to {step, loss}."""
+    from database.dashboard.api import _step_loss_pairs, _aligned_train_val, _meta_for_public
+
+    plain = [{"step": 10, "loss": 5.0}, {"step": 20, "loss": 4.0}]
+    augmented = [
+        {"step": 10, "flops": 6_000_000, "loss": 5.0},
+        {"step": 20, "flops": 12_000_000, "loss": 4.0},
+    ]
+    assert _step_loss_pairs(plain) == _step_loss_pairs(augmented)
+
+    # Mixing rows with and without the flops key is tolerated.
+    mixed = [
+        {"step": 10, "loss": 5.0},
+        {"step": 20, "flops": 12_000_000, "loss": 4.0},
+    ]
+    assert _step_loss_pairs(mixed) == _step_loss_pairs(plain)
+
+    # Whole-meta shaping output is also identical: train + val arrays match,
+    # and so do the scalar finals the public SPA reads.
+    plain_meta = {
+        "train_loss_history": plain,
+        "val_loss_history": [{"step": 20, "loss": 3.5}],
+    }
+    augmented_meta = {
+        "train_loss_history": augmented,
+        "val_loss_history": [{"step": 20, "flops": 12_000_000, "loss": 3.5}],
+    }
+    assert _aligned_train_val(plain_meta) == _aligned_train_val(augmented_meta)
+    assert _meta_for_public(plain_meta) == _meta_for_public(augmented_meta)
+
+
 def test_extract_loss_series_covers_all_shapes():
     from database.dashboard.api import _extract_loss_series
 

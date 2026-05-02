@@ -15,12 +15,26 @@ Submission config (training_config()):
   - val_schedule: "logarithmic" | "fixed" | "none" (default "logarithmic")
   - val_base_step: first val step / fixed interval (default 10)
   - val_growth: log-schedule multiplier (default 2.0)
+
+Optional submission conventions (all opt-in; default behaviour unchanged):
+  - ``model._aux_losses``: if forward() appends differentiable scalar tensors
+    to this list, the harness sums them and adds the sum to the main loss
+    before backprop, then clears the list. Lets MoE/sparse/regularized
+    architectures surface auxiliary objectives (load balancing, KL, sparsity).
+    Non-finite aux totals are dropped silently — they never crash training.
+  - ``on_step_begin``: symmetric to ``on_step_end``; called after backward()
+    and before optimizer.step() on every accumulated optim step. Same
+    signature as ``on_step_end``; failures are logged and swallowed.
+  - Time budget is sqrt-scaled by ``max_flops`` (anchored at 10M FLOPs,
+    clamped to [base, 4×base]), so larger models get proportionally more
+    wallclock without unbounded round drift.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -67,6 +81,34 @@ class TaskRunner(Protocol):
         """
         return None
 
+    def compute_val_metrics(
+        self, predictions: Any, targets: Any, inputs: Any,
+    ) -> dict[str, tuple[float, float]]:
+        """Optional: extra val metrics aggregated gluonts-style across batches.
+
+        Return ``{metric_name: (numerator_sum, denominator_sum)}`` for the
+        batch. The harness sums num/den across all val batches and reports
+        ``num_sum / den_sum`` per metric in each ``val_loss_history`` entry.
+        Default: no extra metrics.
+        """
+        return {}
+
+
+REFERENCE_FLOPS = 10_000_000  # 10M FLOPs is the time-budget anchor
+
+
+def _scaled_time_budget(base: int, max_flops: int) -> int:
+    """Sqrt-scale ``base`` by ``max_flops / REFERENCE_FLOPS``, clamped to [base, 4×base].
+
+    Returns ``base`` unchanged when ``max_flops`` is unset (<= 0) so size-gate-disabled
+    rounds keep deterministic timing.
+    """
+    if max_flops <= 0:
+        return base
+    factor = math.sqrt(max_flops / REFERENCE_FLOPS)
+    scaled = int(base * factor)
+    return max(base, min(scaled, 4 * base))
+
 
 @dataclass
 class TrainingConfig:
@@ -105,8 +147,10 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+    effective_budget = _scaled_time_budget(config.time_budget, config.max_flops)
+
     os.environ["SEED"] = str(config.seed)
-    os.environ["TIME_BUDGET"] = str(config.time_budget)
+    os.environ["TIME_BUDGET"] = str(effective_budget)
     os.environ.setdefault("RADAR_GIFT_EVAL_CACHE", "/tmp/radar_gift_eval")
 
     # 1. Load submission
@@ -157,7 +201,7 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
             logger.warning("init_weights() failed: %s", e)
 
     try:
-        loop_result = _training_loop(runner, sub, model, device, config.time_budget, start)
+        loop_result = _training_loop(runner, sub, model, device, effective_budget, start)
     except Exception as e:
         return _fail(
             config, "failed", str(e),
@@ -170,8 +214,9 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
 
     # 7. Save checkpoint — prefer best-val state if we tracked one, else current.
     state_to_save = best_state if best_state is not None else model.state_dict()
-    checkpoint_path = "/workspace/checkpoints/model.safetensors"
-    os.makedirs("/workspace/checkpoints", exist_ok=True)
+    checkpoint_dir = os.environ.get("CHECKPOINT_DIR", "/workspace/checkpoints")
+    checkpoint_path = os.path.join(checkpoint_dir, "model.safetensors")
+    os.makedirs(checkpoint_dir, exist_ok=True)
     from safetensors.torch import save_file
     save_file(state_to_save, checkpoint_path)
 
@@ -181,6 +226,7 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
         "status": "success",
         "flops_equivalent_size": flops_equiv,
         "training_time_seconds": time.time() - start,
+        "effective_time_budget": effective_budget,
         "num_steps": step,
         "num_params_M": num_params / 1e6,
         "peak_vram_mb": torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else 0.0,
@@ -189,6 +235,12 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
         "val_loss_history": loop_result["val_history"],
         "best_val_loss": loop_result["best_val_loss"],
         "best_val_step": loop_result["best_val_step"],
+        "val_cadence_unit": loop_result["val_cadence_unit"],
+        "val_base": loop_result["val_base"],
+        "val_growth": loop_result["val_growth"],
+        "val_eval_tokens": loop_result["val_eval_tokens"],
+        "flops_per_step_estimate": loop_result["flops_per_step_estimate"],
+        "reference_eval_loss_history": [],
     }
 
 
@@ -201,6 +253,7 @@ _DEFAULTS = {
     "grad_clip": 1.0,
     "log_every_n_steps": 10,
     "val_base_step": 10,
+    "val_base_flops": 1e15,
     "val_growth": 2.0,
 }
 _CLAMPS = {
@@ -209,10 +262,13 @@ _CLAMPS = {
     "grad_clip": (0.0, 100.0),
     "log_every_n_steps": (1, 1000),
     "val_base_step": (1, 10000),
+    "val_base_flops": (1e12, 1e22),
     "val_growth": (1.1, 10.0),
 }
 _VAL_SCHEDULES = ("logarithmic", "fixed", "none")
 _DEFAULT_VAL_SCHEDULE = "logarithmic"
+_VAL_CADENCE_UNITS = ("flops", "step")
+_DEFAULT_VAL_CADENCE_UNIT = "flops"
 
 _AMP_DTYPE_WHITELIST = {"bfloat16": None, "float16": None, "float32": None}  # populated on first use
 
@@ -225,6 +281,7 @@ def _get_amp_dtypes():
 def _read_config(sub) -> dict:
     cfg = dict(_DEFAULTS)
     cfg["val_schedule"] = _DEFAULT_VAL_SCHEDULE
+    cfg["val_cadence_unit"] = _DEFAULT_VAL_CADENCE_UNIT
     if _has_callable(sub, "training_config"):
         try:
             user_cfg = sub.training_config()
@@ -239,6 +296,9 @@ def _read_config(sub) -> dict:
                     elif k == "val_schedule":
                         if isinstance(v, str) and v in _VAL_SCHEDULES:
                             cfg["val_schedule"] = v
+                    elif k == "val_cadence_unit":
+                        if isinstance(v, str) and v in _VAL_CADENCE_UNITS:
+                            cfg["val_cadence_unit"] = v
         except Exception:
             pass
     return cfg
@@ -302,6 +362,7 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
 
     has_transform = _has_callable(sub, "transform_batch")
     has_on_step = _has_callable(sub, "on_step_end")
+    has_on_step_begin = _has_callable(sub, "on_step_begin")
     tb_disabled = False
     tb_slow = 0
     tb_fail = 0
@@ -320,11 +381,21 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
     best_state = None
     val_history: list[dict] = []
     train_history: list[dict] = []
-    next_val = (
-        cfg["val_base_step"]
-        if val_loader_factory and cfg["val_schedule"] != "none"
-        else -1
-    )
+
+    num_params = sum(p.numel() for p in model.parameters())
+    flops_per_optim_step = 0
+    cumulative_flops = 0
+    flops_estimated = False
+    val_eval_tokens = 0
+    val_enabled = bool(val_loader_factory) and cfg["val_schedule"] != "none"
+    use_flops_cadence_requested = cfg["val_cadence_unit"] == "flops"
+
+    # Cadence trigger state. -1 disables. We delay choosing between flops /
+    # step cadence until we've seen the first batch (so seq_len is known).
+    next_val = -1
+    next_val_flops = -1
+    if val_enabled and not use_flops_cadence_requested:
+        next_val = cfg["val_base_step"]
 
     model.train()
     step = 0
@@ -337,6 +408,38 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
 
         inputs = batch["input"].to(device) if "input" in batch else batch["context"].to(device)
         targets = batch["target"].to(device)
+
+        # Estimate flops_per_optim_step once on the first batch. Transformer
+        # tasks (input shape [batch, seq_len, ...]) get the analytical 6N
+        # formula; everything else falls back to 3× a single-step measurement.
+        if not flops_estimated:
+            flops_estimated = True
+            seq_len = int(inputs.shape[1]) if inputs.dim() >= 2 else 0
+            if num_params > 0 and seq_len > 1:
+                flops_per_optim_step = int(
+                    6 * num_params * cfg["batch_size"] * seq_len * cfg["grad_accum_steps"]
+                )
+            else:
+                try:
+                    measured = int(runner.measure_flops(model, device))
+                except Exception:
+                    measured = 0
+                if measured > 0:
+                    flops_per_optim_step = int(
+                        3 * measured * cfg["batch_size"] * cfg["grad_accum_steps"]
+                    )
+            if flops_per_optim_step <= 0:
+                logger.warning(
+                    "flops_per_optim_step estimation failed (num_params=%d, "
+                    "input.shape=%s); falling back to step-based val cadence",
+                    num_params, tuple(inputs.shape),
+                )
+
+            if val_enabled and use_flops_cadence_requested:
+                if flops_per_optim_step > 0:
+                    next_val_flops = int(cfg["val_base_flops"])
+                else:
+                    next_val = cfg["val_base_step"]
 
         # transform_batch hook
         if has_transform and not tb_disabled:
@@ -365,7 +468,24 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
 
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
             predictions = model(inputs)
-            loss = loss_fn(predictions, targets) / cfg["grad_accum_steps"]
+            loss = loss_fn(predictions, targets)
+
+            # Optional auxiliary losses: model.forward() may append differentiable
+            # scalar tensors to ``model._aux_losses`` (MoE balance, sparsity, KL,
+            # …). Sum and add before the grad-accum divide. Drop non-finite totals
+            # silently — the existing isfinite(loss) guard below handles whatever
+            # remains. Always clear the list so it doesn't leak across steps.
+            aux = getattr(model, "_aux_losses", None)
+            if aux:
+                aux_terms = [t for t in aux if torch.is_tensor(t) and t.requires_grad]
+                if aux_terms:
+                    aux_total = sum(aux_terms)
+                    if torch.isfinite(aux_total):
+                        loss = loss + aux_total
+                if isinstance(aux, list):
+                    aux.clear()
+
+            loss = loss / cfg["grad_accum_steps"]
 
         # Skip backward when loss is non-finite (gradient explosion / bad loss fn)
         if not torch.isfinite(loss):
@@ -380,6 +500,18 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
 
         loss.backward()
         if (step + 1) % cfg["grad_accum_steps"] == 0:
+            if has_on_step_begin:
+                try:
+                    # ``step`` matches the value on_step_end will see for this same
+                    # optim step (pre-increment optim_step + 1) so both hooks share
+                    # an index when paired.
+                    sub.on_step_begin(
+                        model=model, optimizer=optimizer,
+                        step=optim_step + 1, total_steps=total_steps_est,
+                        loss_value=loss.item() * cfg["grad_accum_steps"],
+                    )
+                except Exception as e:
+                    logger.warning("on_step_begin() failed: %s", e)
             if cfg["grad_clip"] > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
             optimizer.step()
@@ -387,32 +519,53 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
             if scheduler:
                 scheduler.step()
             optim_step += 1
+            if flops_per_optim_step > 0:
+                cumulative_flops += flops_per_optim_step
 
             # Train loss logging (periodic)
             if optim_step % cfg["log_every_n_steps"] == 0:
-                train_history.append({
+                entry = {
                     "step": optim_step,
                     "loss": float(loss.item() * cfg["grad_accum_steps"]),
-                })
+                }
+                if flops_per_optim_step > 0:
+                    entry["flops"] = cumulative_flops
+                train_history.append(entry)
 
             # Val loss + best checkpoint (scheduled). Runs BEFORE on_step_end so
             # the submission's hook cannot observe val state. val_loss is a local
             # here only — never propagated to any submission hook.
-            if next_val > 0 and optim_step >= next_val:
-                val_loss = _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled)
-                if val_loss is not None:
-                    val_history.append({"step": optim_step, "loss": val_loss})
+            flops_trigger = next_val_flops > 0 and cumulative_flops >= next_val_flops
+            step_trigger = next_val > 0 and optim_step >= next_val
+            if flops_trigger or step_trigger:
+                val_result, tokens_seen = _run_val(
+                    runner, model, val_loader_factory, device, amp_dtype, amp_enabled,
+                )
+                if val_result is not None:
+                    val_loss = val_result["loss"]
+                    entry = {"step": optim_step, **val_result}
+                    if flops_per_optim_step > 0:
+                        entry["flops"] = cumulative_flops
+                    val_history.append(entry)
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         best_val_step = optim_step
                         # Clone state_dict to CPU to avoid holding GPU memory.
                         best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-                if cfg["val_schedule"] == "logarithmic":
-                    next_val = _next_val_step(optim_step, cfg["val_base_step"], cfg["val_growth"])
-                elif cfg["val_schedule"] == "fixed":
-                    next_val = optim_step + cfg["val_base_step"]
+                if val_eval_tokens == 0 and tokens_seen > 0:
+                    val_eval_tokens = tokens_seen
+
+                if flops_trigger:
+                    next_val_flops = max(
+                        next_val_flops + 1, int(next_val_flops * cfg["val_growth"]),
+                    )
                 else:
-                    next_val = -1
+                    if cfg["val_schedule"] == "logarithmic":
+                        next_val = _next_val_step(optim_step, cfg["val_base_step"], cfg["val_growth"])
+                    elif cfg["val_schedule"] == "fixed":
+                        next_val = optim_step + cfg["val_base_step"]
+                    else:
+                        next_val = -1
 
             if has_on_step:
                 try:
@@ -437,13 +590,21 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
     # at least one optimizer step), so the best_state captures end-of-run.
     if val_loader_factory and cfg["val_schedule"] != "none" and optim_step > 0:
         if not val_history or val_history[-1]["step"] != optim_step:
-            val_loss = _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled)
-            if val_loss is not None:
-                val_history.append({"step": optim_step, "loss": val_loss})
+            val_result, tokens_seen = _run_val(
+                runner, model, val_loader_factory, device, amp_dtype, amp_enabled,
+            )
+            if val_result is not None:
+                val_loss = val_result["loss"]
+                entry = {"step": optim_step, **val_result}
+                if flops_per_optim_step > 0:
+                    entry["flops"] = cumulative_flops
+                val_history.append(entry)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_val_step = optim_step
                     best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            if val_eval_tokens == 0 and tokens_seen > 0:
+                val_eval_tokens = tokens_seen
 
     return {
         "step": step,
@@ -452,34 +613,82 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
         "best_val_loss": (best_val_loss if best_val_step >= 0 else None),
         "best_val_step": best_val_step,
         "best_state": best_state,
+        "val_cadence_unit": cfg["val_cadence_unit"],
+        "val_base": (
+            float(cfg["val_base_flops"])
+            if cfg["val_cadence_unit"] == "flops" and flops_per_optim_step > 0
+            else float(cfg["val_base_step"])
+        ),
+        "val_growth": float(cfg["val_growth"]),
+        "val_eval_tokens": int(val_eval_tokens),
+        "flops_per_step_estimate": float(flops_per_optim_step),
+        "cumulative_flops": int(cumulative_flops),
     }
 
 
 def _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled):
-    """Compute mean val loss over the full val dataloader using task's default_loss.
+    """Run val: returns ``(val_dict | None, tokens_seen)``.
 
-    Returns None on any failure (so val failure doesn't kill training).
+    ``val_dict`` is ``{"loss": float, **extra_metrics}`` where ``extra_metrics``
+    come from the runner's ``compute_val_metrics`` hook, aggregated
+    gluonts-style (sum num + den across batches, then divide). Returns None
+    in the first slot when the loop produced no usable losses (so val failure
+    doesn't kill training — caller treats None as "skip this round").
+
+    ``tokens_seen`` is best-effort ``sum(batch_size * seq_len)`` across val
+    batches; 0 when seq_len isn't inferrable from the input shape.
     """
     import torch
+    metric_fn = getattr(runner, "compute_val_metrics", None)
     try:
         model.eval()
-        losses = []
+        losses: list[float] = []
+        tokens_seen = 0
+        # name -> [num_sum, den_sum]
+        metric_sums: dict[str, list[float]] = {}
         with torch.no_grad():
             for batch in val_loader_factory():
                 inputs = batch["input"].to(device) if "input" in batch else batch["context"].to(device)
                 targets = batch["target"].to(device)
+                if inputs.dim() >= 2:
+                    seq = int(inputs.shape[1]) if inputs.dim() >= 2 else 0
+                    tokens_seen += int(inputs.shape[0]) * seq
                 with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
                     predictions = model(inputs)
                     # ALWAYS use task default_loss — not the submission's compute_loss.
                     loss = runner.default_loss(predictions, targets)
                 if torch.isfinite(loss):
                     losses.append(float(loss.item()))
+                if metric_fn is not None:
+                    try:
+                        components = metric_fn(predictions, targets, inputs)
+                    except Exception as e:
+                        logger.warning("compute_val_metrics() failed: %s", e)
+                        components = None
+                    if isinstance(components, dict):
+                        for name, val in components.items():
+                            if not isinstance(val, tuple) or len(val) != 2:
+                                continue
+                            try:
+                                num = float(val[0])
+                                den = float(val[1])
+                            except (TypeError, ValueError):
+                                continue
+                            if not (math.isfinite(num) and math.isfinite(den)):
+                                continue
+                            bucket = metric_sums.setdefault(name, [0.0, 0.0])
+                            bucket[0] += num
+                            bucket[1] += den
         if not losses:
-            return None
-        return sum(losses) / len(losses)
+            return None, tokens_seen
+        result: dict[str, float] = {"loss": sum(losses) / len(losses)}
+        for name, (num_sum, den_sum) in metric_sums.items():
+            if den_sum > 0 and math.isfinite(num_sum) and math.isfinite(den_sum):
+                result[name] = num_sum / den_sum
+        return result, tokens_seen
     except Exception as e:
         logger.warning("val failed: %s", e)
-        return None
+        return None, 0
     finally:
         model.train()
 
