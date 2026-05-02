@@ -50,10 +50,12 @@ class TestMultiValidatorTrainerReady:
         TrainerReady to the second validator."""
         miner = _make_miner()
 
-        # Simulate a deployment already stored from the first validator
-        mock_deployment = SimpleNamespace(
-            url="https://pod-1.basilica.ai",
+        # Simulate a deployment already stored from the first validator.
+        # ``handle_prepare`` now passes a Deployment object through.
+        from miner.hosting import Deployment
+        mock_deployment = Deployment(
             name="pod-1",
+            url="https://pod-1.basilica.ai",
         )
         round_id = 12345
         miner.active_deployments[round_id] = (mock_deployment, 1000.0, 1800)
@@ -69,11 +71,9 @@ class TestMultiValidatorTrainerReady:
             with patch.object(miner, "_teardown_prior_rounds", new_callable=AsyncMock):
                 await miner.handle_prepare(second_request)
 
-            # Must have notified the second validator
             mock_post.assert_called_once_with(
                 round_id,
-                "https://pod-1.basilica.ai",
-                "pod-1",
+                mock_deployment,
                 "http://validator-B:8080",
             )
 
