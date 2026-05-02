@@ -189,6 +189,35 @@ class Config:
     # The validator proxy and presigned R2 URLs are added automatically.
     AGENT_ALLOWED_URLS: str = os.getenv("RADAR_AGENT_ALLOWED_URLS", "")
 
+    # ── Hosting Backend ────────────────────────────────────────
+    # "basilica" (default, legacy) or "targon" (TDX-attested confidential
+    # GPU pods). Both miner and validator must agree on the same backend
+    # for a deployment — set this consistently across the stack.
+    HOSTING_BACKEND: str = os.getenv("RADAR_HOSTING_BACKEND", "basilica").lower()
+
+    # Targon API endpoints.
+    TARGON_API_BASE_URL: str = os.getenv("RADAR_TARGON_API_BASE_URL", "https://api.targon.com")
+    # Tower verifies TDX quotes + NRAS GPU tokens.
+    TARGON_TOWER_URL: str = os.getenv("RADAR_TARGON_TOWER_URL", "https://tower.targon.com")
+    # Per-call HTTP timeout for Targon and tower endpoints.
+    TARGON_VERIFICATION_TIMEOUT: float = float(os.getenv("RADAR_TARGON_VERIFICATION_TIMEOUT", "5"))
+    # Consecutive failures before the breaker opens; reset window.
+    TARGON_CIRCUIT_BREAKER_THRESHOLD: int = int(os.getenv("RADAR_TARGON_BREAKER_THRESHOLD", "5"))
+    TARGON_CIRCUIT_BREAKER_RESET: float = float(os.getenv("RADAR_TARGON_BREAKER_RESET", "60"))
+    # Score multiplier applied to a miner's contribution when the round
+    # was tagged ``targon_unavailable=True`` (Targon API was down at
+    # verify time). Keeps the subnet alive without fully rewarding miners
+    # who can't be attested in real-time. See CLAUDE.md → Targon migration.
+    TARGON_UNAVAILABLE_SCORE_MULTIPLIER: float = float(
+        os.getenv("RADAR_TARGON_UNAVAILABLE_MULTIPLIER", "0.5")
+    )
+    # Number of mid-round re-verification checkpoints.
+    TARGON_REVERIFY_CHECKPOINTS: int = int(os.getenv("RADAR_TARGON_REVERIFY_CHECKPOINTS", "3"))
+    # Hard-fail when /boot_proof returns 503 / wrong hashes_root_sha256.
+    # Off until the hardened image is rolled out — TODO: flip to true once
+    # OFFICIAL_TRAINING_IMAGE_DIGEST points at a hardened image.
+    REQUIRE_BOOT_PROOF: bool = os.getenv("RADAR_REQUIRE_BOOT_PROOF", "false").lower() == "true"
+
     # ── Warm-Standby Trainer ────────────────────────────────────
     TRAINER_PREPARE_TIMEOUT: int = int(os.getenv("RADAR_TRAINER_PREPARE_TIMEOUT", "600"))
     TRAINER_READY_POLL_INTERVAL: int = int(os.getenv("RADAR_TRAINER_READY_POLL", "15"))
