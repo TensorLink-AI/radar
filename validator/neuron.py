@@ -808,7 +808,21 @@ class Validator:
             )
 
         # ── SCORING ───────────────────────────────────────────
+        logger.info(
+            "Phase D (scoring): round %d, %d eval results, frontier size %d, bucket=[%d, %d]",
+            challenge.round_id, len(eval_results), len(feasible_frontier),
+            challenge.min_flops_equivalent, challenge.max_flops_equivalent,
+        )
         penalties = compute_penalties(training_metas, eval_results)
+        nonzero_penalties = {uid: p for uid, p in penalties.items() if p > 0}
+        if nonzero_penalties:
+            logger.info(
+                "Penalties applied to %d UIDs: %s",
+                len(nonzero_penalties),
+                {uid: f"{p:.2f}" for uid, p in sorted(nonzero_penalties.items())},
+            )
+        else:
+            logger.info("Penalties: none")
 
         # Track trainer reliability
         fallback_uids = (
@@ -955,6 +969,12 @@ class Validator:
         # EMA on raw scores, softmax applied once in _set_weights()
         all_uids = list(range(self.metagraph.n))
         self.ema_scores = ema_update(self.ema_scores, round_scores, all_uids, Config.EMA_ALPHA)
+        nonzero_ema = {uid: s for uid, s in self.ema_scores.items() if s > 0}
+        logger.info(
+            "EMA updated (alpha=%.2f): %d UIDs nonzero — %s",
+            Config.EMA_ALPHA, len(nonzero_ema),
+            {uid: f"{s:.4f}" for uid, s in sorted(nonzero_ema.items())} if nonzero_ema else "all zero",
+        )
         self._set_weights()
 
         # Write frontier to centralized DB + R2
