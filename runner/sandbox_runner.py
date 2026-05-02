@@ -149,7 +149,7 @@ def _seal_stdout() -> None:
 def _apply_env(config: dict) -> None:
     """Translate the sandbox config into the env vars the harness reads."""
     os.environ["CHECKPOINT_DIR"] = config.get(
-        "checkpoint_dir", "/workspace/sandbox/checkpoints",
+        "checkpoint_dir", "/var/radar/sandbox/checkpoints",
     )
     os.environ["SEED"] = str(config.get("seed", 42))
     os.environ["TIME_BUDGET"] = str(config.get("time_budget", 300))

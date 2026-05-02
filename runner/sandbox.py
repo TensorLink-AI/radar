@@ -29,7 +29,10 @@ from typing import Iterable
 logger = logging.getLogger(__name__)
 
 # Workspace layout — must match the Dockerfile.
-SANDBOX_ROOT = "/workspace/sandbox"
+# /workspace itself is read-only (chmod 555) on the hardened image so
+# the bootstrap can guarantee no extra files appear in protected dirs.
+# Per-job state lives under /var/radar/sandbox instead.
+SANDBOX_ROOT = "/var/radar/sandbox"
 SHARD_DIR = os.path.join(SANDBOX_ROOT, "shards")
 VAL_SHARD_DIR = os.path.join(SANDBOX_ROOT, "val_shards")
 GIFT_EVAL_DIR = os.path.join(SANDBOX_ROOT, "gift_eval")

@@ -46,7 +46,7 @@ def _success_result():
         "num_steps": 10,
         "num_params_M": 0.5,
         "peak_vram_mb": 100.0,
-        "checkpoint_path": "/workspace/sandbox/checkpoints/model.safetensors",
+        "checkpoint_path": "/var/radar/sandbox/checkpoints/model.safetensors",
     }, "")
 
 

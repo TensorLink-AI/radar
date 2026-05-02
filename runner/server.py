@@ -24,6 +24,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from runner.boot_proof import build_boot_proof_response
 from runner.sandbox import (
     GIFT_EVAL_DIR,
     SHARD_DIR,
@@ -286,6 +287,22 @@ async def _train_and_upload(
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/boot_proof")
+async def boot_proof():
+    """Return the bootstrap's integrity proof, hotkey-signed.
+
+    Validators call this to confirm /usr/local/bin/radar-entrypoint.sh
+    actually ran. If the operator overrode the container's command/args
+    on Targon's deploy API, the bootstrap never wrote
+    /tmp/boot_proof.json — this endpoint 503s, which is the
+    bypass-detection signal.
+    """
+    status, body = build_boot_proof_response()
+    if status != 200:
+        return JSONResponse(status_code=status, content=body)
+    return body
 
 
 def _load_metagraph():
