@@ -16,6 +16,7 @@ from typing import Optional, TYPE_CHECKING
 
 import httpx
 
+from config import Config
 from shared.auth import sign_request
 from shared.protocol import Proposal, TrainerRequest, TrainerReady, TrainerRelease
 
@@ -145,6 +146,12 @@ class TrainingCoordinator:
         # round_id → {uid → True} for miners flagged as compromised during
         # mid-round re-verification. Excluded from scoring.
         self._compromised: dict[int, dict[int, bool]] = {}
+        # round_id → {uid → TrainerReady} so mid-run reverify knows where
+        # each accepted miner's CVM lives. Populated in prepare_trainers.
+        self._ready_msgs: dict[int, dict[int, "TrainerReady"]] = {}
+        # round_id → list[asyncio.Task] of in-flight mid-round reverify
+        # tasks. Cancelled by release_trainers / cancel_mid_round_reverify.
+        self._reverify_tasks: dict[int, list[asyncio.Task]] = {}
         self._targon_client = None
 
     def compute_my_jobs(
@@ -619,7 +626,6 @@ class TrainingCoordinator:
 
         Returns {uid: trainer_url} for all miners that responded or fell back.
         """
-        from config import Config
         from validator.db_proxy import get_ready_trainers
         from validator.pod_manager import verify_miner_pod
 
@@ -684,6 +690,8 @@ class TrainingCoordinator:
 
         # Track the per-round flags so dispatch / scoring can read them.
         targon_unavailable: dict[int, bool] = self._targon_unavailable.setdefault(round_id, {})
+        # Cache ready messages so mid-round reverify can re-hit each CVM.
+        ready_cache: dict[int, "TrainerReady"] = self._ready_msgs.setdefault(round_id, {})
 
         while asyncio.get_event_loop().time() < deadline:
             ready = get_ready_trainers(round_id)
@@ -706,6 +714,7 @@ class TrainingCoordinator:
                         )
                     continue
                 result[uid] = ready_msg.trainer_url
+                ready_cache[uid] = ready_msg
                 logger.info("UID %d trainer ready at %s", uid, ready_msg.trainer_url)
 
             if len(result) >= len(sent_uids):
@@ -789,6 +798,8 @@ class TrainingCoordinator:
         logger.info("Released %d trainers (round %d)", released, round_id)
         clear_ready_trainers(round_id)
         self._fallback_uids.pop(round_id, None)
+        await self.cancel_mid_round_reverify(round_id)
+        self._ready_msgs.pop(round_id, None)
 
     # ── Trainer verification (backend-aware) ──────────────────────
 
@@ -869,6 +880,78 @@ class TrainingCoordinator:
             )
             return False
         return True
+
+    def schedule_mid_round_reverify(
+        self,
+        round_id: int,
+        block_hash: str,
+        training_window_seconds: float,
+        n_checkpoints: int | None = None,
+    ) -> int:
+        """Fire background reverify tasks at deterministic offsets.
+
+        Returns the number of tasks spawned. Caller invokes this once at
+        the start of Phase B; the tasks self-clean and ``release_trainers``
+        cancels any stragglers. No-op for the Basilica backend.
+        """
+        if Config.HOSTING_BACKEND != "targon":
+            return 0
+        from validator.trainer_verify import reverify_offsets
+        ready_msgs = self._ready_msgs.get(round_id) or {}
+        n = n_checkpoints if n_checkpoints is not None else Config.TARGON_REVERIFY_CHECKPOINTS
+        spawned: list[asyncio.Task] = []
+        for uid, ready_msg in ready_msgs.items():
+            if not ready_msg.targon_workload_uid:
+                continue  # Basilica miner in a Targon-mode validator — skip.
+            offsets = reverify_offsets(
+                block_hash, round_id, uid,
+                n=n, window_seconds=training_window_seconds,
+            )
+            spawned.append(asyncio.create_task(
+                self._run_reverify_schedule(round_id, uid, ready_msg, offsets)
+            ))
+        self._reverify_tasks.setdefault(round_id, []).extend(spawned)
+        if spawned:
+            logger.info(
+                "Scheduled mid-round reverify: round=%d miners=%d checkpoints_each=%d",
+                round_id, len(spawned), n,
+            )
+        return len(spawned)
+
+    async def _run_reverify_schedule(
+        self, round_id: int, miner_uid: int, ready_msg, offsets: list[float],
+    ) -> None:
+        """Sleep to each offset, then run reverify_running once. Stops early on first failure."""
+        last = 0.0
+        for offset in offsets:
+            delta = max(0.0, offset - last)
+            try:
+                await asyncio.sleep(delta)
+            except asyncio.CancelledError:
+                return
+            last = offset
+            try:
+                ok = await self.reverify_running(round_id, miner_uid, ready_msg, "")
+            except Exception as e:
+                logger.warning(
+                    "Reverify task crashed for round=%d uid=%d: %s",
+                    round_id, miner_uid, e,
+                )
+                return
+            if not ok:
+                # reverify_running already logged + recorded compromise.
+                return
+
+    async def cancel_mid_round_reverify(self, round_id: int) -> None:
+        tasks = self._reverify_tasks.pop(round_id, [])
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
 
     def round_metadata(self, round_id: int) -> dict:
         """Snapshot Targon flags for the round — written into experiment rows.

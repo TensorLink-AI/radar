@@ -647,6 +647,19 @@ class Validator:
             commitments=commitments,
             extras=extras,
         )
+        # Targon: schedule mid-round reverify of every accepted CVM at
+        # deterministic offsets within the training window. No-op for
+        # Basilica deployments. Tasks self-clean; release_trainers
+        # cancels stragglers.
+        try:
+            window_s = float(Config.TRAINING_WINDOW_BLOCKS * 12)
+            self.coordinator.schedule_mid_round_reverify(
+                challenge.round_id,
+                block_hash=block_hash,
+                training_window_seconds=window_s,
+            )
+        except Exception as e:
+            logger.warning("schedule_mid_round_reverify failed (round %d): %s", challenge.round_id, e)
         _OK_STATUSES = ("success", "accepted", "already_running")
         succeeded = sum(1 for r in my_results if r.status == "success")
         accepted = sum(1 for r in my_results if r.status in ("accepted", "already_running"))

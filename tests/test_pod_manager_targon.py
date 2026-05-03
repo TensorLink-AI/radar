@@ -8,6 +8,7 @@ checks composing correctly and on the deterministic reverify offsets.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -309,3 +310,113 @@ class TestBootProofHelpers:
         with patch("validator.trainer_verify.httpx.AsyncClient", return_value=client):
             out = await fetch_boot_proof("https://x", timeout=1.0)
         assert out is None
+
+
+# ── schedule_mid_round_reverify ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_schedule_reverify_noop_on_basilica(monkeypatch):
+    """No reverify tasks scheduled for Basilica deployments."""
+    from validator import coordinator as coord_mod
+    monkeypatch.setattr(coord_mod.Config, "HOSTING_BACKEND", "basilica")
+    coord = coord_mod.TrainingCoordinator(
+        wallet=MagicMock(), metagraph=MagicMock(),
+        r2=MagicMock(), my_uid=0,
+    )
+    coord._ready_msgs[1] = {5: _ready()}
+    spawned = coord.schedule_mid_round_reverify(
+        round_id=1, block_hash="abcd", training_window_seconds=10.0,
+    )
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_schedule_reverify_skips_basilica_uids_in_targon_mode(monkeypatch):
+    from validator import coordinator as coord_mod
+    monkeypatch.setattr(coord_mod.Config, "HOSTING_BACKEND", "targon")
+    coord = coord_mod.TrainingCoordinator(
+        wallet=MagicMock(), metagraph=MagicMock(),
+        r2=MagicMock(), my_uid=0,
+    )
+    # One Targon miner, one Basilica miner (no targon_workload_uid).
+    targon_ready = _ready(targon_workload_uid="wl_1")
+    basilica_ready = TrainerReady(
+        round_id=1, trainer_url="https://b", instance_name="i",
+        miner_hotkey="hk", targon_workload_uid="",
+    )
+    coord._ready_msgs[1] = {5: targon_ready, 6: basilica_ready}
+
+    # Stub reverify_running so the scheduled task completes instantly.
+    async def _fake_reverify(rid, uid, rmsg, bh):
+        return True
+    coord.reverify_running = _fake_reverify
+
+    spawned = coord.schedule_mid_round_reverify(
+        round_id=1, block_hash="abcd",
+        training_window_seconds=0.05, n_checkpoints=1,
+    )
+    assert spawned == 1  # only the Targon miner
+    await coord.cancel_mid_round_reverify(1)
+
+
+@pytest.mark.asyncio
+async def test_schedule_reverify_runs_at_offsets_and_marks_compromise(monkeypatch):
+    """End-to-end: tasks fire at offsets and a digest mismatch records compromise."""
+    from validator import coordinator as coord_mod
+    monkeypatch.setattr(coord_mod.Config, "HOSTING_BACKEND", "targon")
+    monkeypatch.setattr(coord_mod.Config, "REQUIRE_BOOT_PROOF", False)
+    monkeypatch.setattr(coord_mod.Config, "OFFICIAL_TRAINING_IMAGE_DIGEST", "sha256:expected")
+
+    coord = coord_mod.TrainingCoordinator(
+        wallet=MagicMock(hotkey=MagicMock(ss58_address="vh")),
+        metagraph=MagicMock(hotkeys=["", "", "", "", "", "mh"]),
+        r2=MagicMock(), my_uid=0,
+    )
+    coord._ready_msgs[1] = {5: _ready(targon_workload_uid="wl_x")}
+
+    # Mock the targon client's verify so reverify_workload reports mismatch.
+    fake_targon = MagicMock()
+    fake_targon.verify_image_digest = AsyncMock(return_value=False)
+    coord._targon_client = fake_targon
+
+    # Use a tiny window so the task fires fast.
+    coord.schedule_mid_round_reverify(
+        round_id=1, block_hash="abcdef0123456789",
+        training_window_seconds=0.05, n_checkpoints=1,
+    )
+    # Wait for tasks to complete.
+    tasks = coord._reverify_tasks.get(1, [])
+    for t in tasks:
+        await t
+
+    assert coord._compromised.get(1, {}).get(5) is True
+
+
+@pytest.mark.asyncio
+async def test_cancel_reverify_stops_in_flight_tasks(monkeypatch):
+    from validator import coordinator as coord_mod
+    monkeypatch.setattr(coord_mod.Config, "HOSTING_BACKEND", "targon")
+    coord = coord_mod.TrainingCoordinator(
+        wallet=MagicMock(), metagraph=MagicMock(hotkeys=["", "", "", "", "", "mh"]),
+        r2=MagicMock(), my_uid=0,
+    )
+    coord._ready_msgs[1] = {5: _ready(targon_workload_uid="wl")}
+
+    # reverify_running blocks long enough for cancel to land.
+    async def _slow(rid, uid, rmsg, bh):
+        await asyncio.sleep(60)
+        return True
+    coord.reverify_running = _slow
+
+    coord.schedule_mid_round_reverify(
+        round_id=1, block_hash="aa",
+        training_window_seconds=10.0, n_checkpoints=2,
+    )
+    await asyncio.sleep(0.01)
+    await coord.cancel_mid_round_reverify(1)
+
+    # All tasks should be done (cancelled).
+    tasks = coord._reverify_tasks.get(1, [])
+    assert all(t.done() for t in tasks)
+    assert 1 not in coord._reverify_tasks  # cleared
