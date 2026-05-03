@@ -23,6 +23,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from config import Config
+from miner.health_monitor import HealthMonitor
 from miner.hosting import (
     Deployment, TargonReadinessTimeout, deploy_basilica, deploy_targon,
     get_targon_registry_creds, teardown_basilica_sync, teardown_targon,
@@ -75,6 +76,10 @@ class Miner:
 
         # Active Basilica deployments: round_id → (deployment, created_at, ttl)
         self.active_deployments: dict[int, tuple[object, float, int]] = {}
+        # round_id → HealthMonitor (Targon only). Started after readiness,
+        # stopped on release/teardown. Defensive logging — does NOT
+        # influence the round.
+        self._health_monitors: dict[int, HealthMonitor] = {}
 
         # Validator db_urls to notify when deployment completes: round_id → [urls]
         self._pending_notify: dict[int, list[str]] = {}
@@ -290,6 +295,8 @@ class Miner:
                 deployment.targon_workload_uid or "-",
                 deployment.url, deployment.name, Config.HOSTING_BACKEND,
             )
+            if Config.HOSTING_BACKEND == "targon" and deployment.targon_workload_uid:
+                self._start_health_monitor(request.round_id, deployment)
         except Exception as e:
             logger.error(
                 "POST_READY_FAILED round=%d uid=%s error=%s",
@@ -304,6 +311,7 @@ class Miner:
             if rid < current_round_id and entry != "pending"
         ]
         for rid in prior_rounds:
+            await self._stop_health_monitor(rid)
             entry = self.active_deployments.pop(rid)
             deployment, _ts, _ttl = entry
             if deployment.targon_workload_uid:
@@ -426,6 +434,25 @@ class Miner:
 
         atexit.register(_atexit_handler)
 
+    def _start_health_monitor(self, round_id: int, deployment: Deployment) -> None:
+        existing = self._health_monitors.pop(round_id, None)
+        if existing is not None:
+            asyncio.create_task(existing.stop())
+        monitor = HealthMonitor(
+            round_id=round_id,
+            trainer_url=deployment.url,
+            workload_uid=deployment.targon_workload_uid,
+            poll_interval_s=Config.TARGON_HEALTH_POLL_INTERVAL_S,
+            fail_grace_s=Config.TARGON_HEALTH_FAIL_GRACE_S,
+        )
+        monitor.start()
+        self._health_monitors[round_id] = monitor
+
+    async def _stop_health_monitor(self, round_id: int) -> None:
+        monitor = self._health_monitors.pop(round_id, None)
+        if monitor is not None:
+            await monitor.stop()
+
     async def _teardown_all_active(self) -> None:
         """Synchronous-feeling teardown of every active deployment."""
         active = list(self.active_deployments.items())
@@ -443,6 +470,7 @@ class Miner:
 
     async def handle_release(self, round_id: int):
         """Tear down the trainer pod for a completed round."""
+        await self._stop_health_monitor(round_id)
         entry = self.active_deployments.pop(round_id, None)
         if entry and entry != "pending":
             deployment = entry[0]

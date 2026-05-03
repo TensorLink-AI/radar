@@ -417,7 +417,25 @@ the env var if the trade-off needs adjusting.
    OFFICIAL_TRAINING_IMAGE_DIGEST=sha256:...
    RADAR_TRAINER_GPU_MODELS=H200          # or H100, B200 — first entry wins
    ```
-4. Restart the miner. It refuses to boot if `TARGON_API_KEY` is missing under `RADAR_HOSTING_BACKEND=targon` — clear startup error rather than cryptic deploy failure.
+4. Restart the miner. The startup sequence under `RADAR_HOSTING_BACKEND=targon`:
+   - Refuses to boot without `TARGON_API_KEY` (clear error pointing to docs).
+   - Validates the key via a cheap `list_workloads` call before subscribing to the metagraph.
+   - Lists any workloads owned by this account from a prior process and tears them down (`ORPHAN_TEARDOWN` log line per uid).
+
+   While running:
+   - Per round: deploy → poll `/health` + CVM `/api/v1/evidence` for up to `RADAR_TARGON_READINESS_TIMEOUT` seconds (default 180; TDX boot adds 60–120s) → tear down previous round's workload synchronously (3 retries, 1s/2s/4s backoff) → post `TrainerReady`.
+   - On readiness timeout the workload is torn down and the round is dropped — we never advertise a half-ready URL.
+   - A background `HealthMonitor` polls `/health` every 30s during the round; >2 consecutive minutes failed marks the round locally compromised (`HEALTH_COMPROMISED` log) but does NOT trigger redeploy. The validator's mid-run reverify is the authoritative signal — miner-side health is defensive logging only.
+   - On SIGTERM/SIGINT/atexit, every active workload is torn down before the process exits. On crash, the next startup's orphan reaper catches the leak.
+
+   Telemetry tags every Targon-touching log line with structured prefixes:
+   `DEPLOY_OK`, `DEPLOY_FAILED`, `READINESS_OK`, `READINESS_TIMEOUT`,
+   `TRAINER_READY`, `POST_READY_FAILED`, `PRIOR_TEARDOWN_LEAK`,
+   `SHUTDOWN_TEARDOWN`, `ORPHAN_TEARDOWN`, `HEALTH_DEGRADED`,
+   `HEALTH_RECOVERED`, `HEALTH_COMPROMISED` — plus `round_id`, `uid`,
+   and elapsed seconds. `DEPLOY_FAILED` (code/auth) and `POST_READY_FAILED`
+   (network/HTTP) are distinct log lines so operators can debug the right
+   layer.
 
 **Validator**:
 
