@@ -230,6 +230,14 @@ class Miner:
             if netuid:
                 pod_env["NETUID"] = netuid
 
+            # Propagate Epistula tolerance so operators can widen the
+            # window without rebuilding the trainer image. Trainer pods
+            # commonly drift from the miner host's clock, and the default
+            # baked into the image may not be enough.
+            tolerance = os.environ.get("RADAR_EPISTULA_TOLERANCE", "")
+            if tolerance:
+                pod_env["RADAR_EPISTULA_TOLERANCE"] = tolerance
+
             logger.info(
                 "Deploying Basilica pod %s (image=%s, ttl=%ds, gpu=%d x %dGB min)",
                 deploy_name, self.trainer_image, ttl, request.gpu_count, request.min_gpu_memory_gb,
