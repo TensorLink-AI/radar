@@ -23,11 +23,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from config import Config
-from miner.health_monitor import HealthMonitor
 from miner.hosting import (
     Deployment, TargonReadinessTimeout, deploy_basilica, deploy_targon,
     get_targon_registry_creds, teardown_basilica_sync,
     teardown_targon_with_retry, wait_for_trainer_ready,
+)
+from miner.targon_lifecycle import (
+    HealthMonitorRegistry, install_shutdown_handlers,
+    make_targon_client, validate_and_reap_orphans,
 )
 from shared.agent_code import bundle_from_directory, compute_code_hash
 from shared.auth import sign_request, verify_request
@@ -74,13 +77,11 @@ class Miner:
         self.listener_port = int(getattr(config, "listener_port", Config.MINER_LISTENER_PORT))
         self.external_ip = getattr(config, "external_ip", "") or "0.0.0.0"
 
-        # Active Basilica deployments: round_id → (deployment, created_at, ttl)
+        # Active deployments: round_id → (deployment, created_at, ttl)
         self.active_deployments: dict[int, tuple[object, float, int]] = {}
-        # round_id → HealthMonitor (Targon only). Started after readiness,
-        # stopped on release/teardown. Defensive logging — does NOT
-        # influence the round.
-        self._health_monitors: dict[int, HealthMonitor] = {}
-        # Set by the SIGTERM/SIGINT handler so the run loop exits cleanly.
+        # Targon-only — defensive logging via HealthMonitor per round.
+        self._health_monitors = HealthMonitorRegistry()
+        # Set by SIGTERM/SIGINT so the run loop exits cleanly.
         self._shutdown_event: asyncio.Event | None = None
 
         # Validator db_urls to notify when deployment completes: round_id → [urls]
@@ -298,7 +299,7 @@ class Miner:
                 deployment.url, deployment.name, Config.HOSTING_BACKEND,
             )
             if Config.HOSTING_BACKEND == "targon" and deployment.targon_workload_uid:
-                self._start_health_monitor(request.round_id, deployment)
+                self._health_monitors.start(request.round_id, deployment)
         except Exception as e:
             logger.error(
                 "POST_READY_FAILED round=%d uid=%s error=%s",
@@ -313,7 +314,7 @@ class Miner:
             if rid < current_round_id and entry != "pending"
         ]
         for rid in prior_rounds:
-            await self._stop_health_monitor(rid)
+            await self._health_monitors.stop(rid)
             entry = self.active_deployments.pop(rid)
             deployment, _ts, _ttl = entry
             if deployment.targon_workload_uid:
@@ -363,97 +364,11 @@ class Miner:
 
     def _get_targon_client(self):
         if not getattr(self, "_targon_client", None):
-            from shared.targon_breaker import CircuitBreaker
-            from shared.targon_client import TargonClient
-            self._targon_client = TargonClient(
-                base_url=Config.TARGON_API_BASE_URL,
-                tower_url=Config.TARGON_TOWER_URL,
-                timeout=Config.TARGON_VERIFICATION_TIMEOUT,
-                breaker=CircuitBreaker(
-                    threshold=Config.TARGON_CIRCUIT_BREAKER_THRESHOLD,
-                    reset_after=Config.TARGON_CIRCUIT_BREAKER_RESET,
-                ),
-            )
+            self._targon_client = make_targon_client()
         return self._targon_client
 
     async def _targon_startup_check(self) -> None:
-        """Validate creds + reap any orphan workloads owned by this account."""
-        client = self._get_targon_client()
-        try:
-            await client.validate_credentials()
-            logger.info("Targon credentials validated")
-        except Exception as e:
-            raise RuntimeError(
-                f"Targon credentials invalid or API unreachable at startup: {e}. "
-                "Check TARGON_API_KEY at https://docs.targon.com."
-            ) from e
-
-        # Tear down any workloads still alive from a prior process.
-        try:
-            workloads = await client.list_active_workloads()
-        except Exception as e:
-            logger.warning("Could not list workloads at startup (continuing): %s", e)
-            return
-        if not workloads:
-            return
-        logger.warning(
-            "Found %d orphan workloads from prior process — tearing down",
-            len(workloads),
-        )
-        for wl in workloads:
-            ok = await teardown_targon_with_retry(client, wl.uid)
-            logger.info("ORPHAN_TEARDOWN uid=%s ok=%s", wl.uid, ok)
-
-    def _install_shutdown_handlers(self) -> None:
-        """Tear down all active workloads on SIGTERM/SIGINT, then exit cleanly.
-
-        Sets ``self._shutdown_event`` so the run loop wakes up and exits
-        instead of spinning. The handler also schedules a teardown task
-        bounded by a short timeout so we don't block forever when
-        Targon is unreachable at shutdown time — leaked workloads are
-        caught by the next process's startup orphan reap.
-        """
-        import signal
-
-        loop = asyncio.get_event_loop()
-        self._shutdown_event = asyncio.Event()
-
-        async def _shutdown(sig_name: str):
-            logger.info("Shutdown signal %s received — tearing down active workloads", sig_name)
-            try:
-                await asyncio.wait_for(self._teardown_all_active(), timeout=30.0)
-            except asyncio.TimeoutError:
-                logger.warning("Teardown exceeded 30s — leaving remaining workloads to next-startup reap")
-            except Exception as e:
-                logger.warning("Teardown raised: %s", e)
-            self._shutdown_event.set()
-
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                loop.add_signal_handler(sig, lambda s=sig: loop.create_task(_shutdown(s.name)))
-            except (NotImplementedError, RuntimeError):
-                # Non-Unix or already-running-loop tests — fall back to
-                # default signal behaviour (KeyboardInterrupt for SIGINT).
-                pass
-
-    def _start_health_monitor(self, round_id: int, deployment: Deployment) -> None:
-        existing = self._health_monitors.pop(round_id, None)
-        if existing is not None:
-            asyncio.create_task(existing.stop())
-        monitor = HealthMonitor(
-            round_id=round_id,
-            trainer_url=deployment.url,
-            workload_uid=deployment.targon_workload_uid,
-            poll_interval_s=Config.TARGON_HEALTH_POLL_INTERVAL_S,
-            fail_grace_s=Config.TARGON_HEALTH_FAIL_GRACE_S,
-        )
-        monitor.start()
-        self._health_monitors[round_id] = monitor
-
-    async def _stop_health_monitor(self, round_id: int) -> None:
-        monitor = self._health_monitors.pop(round_id, None)
-        if monitor is not None:
-            await monitor.stop()
+        await validate_and_reap_orphans(self._get_targon_client())
 
     async def _teardown_all_active(self) -> None:
         """Synchronous-feeling teardown of every active deployment."""
@@ -472,7 +387,7 @@ class Miner:
 
     async def handle_release(self, round_id: int):
         """Tear down the trainer pod for a completed round."""
-        await self._stop_health_monitor(round_id)
+        await self._health_monitors.stop(round_id)
         entry = self.active_deployments.pop(round_id, None)
         if entry and entry != "pending":
             deployment = entry[0]
@@ -608,7 +523,12 @@ class Miner:
         if Config.HOSTING_BACKEND == "targon":
             await self._targon_startup_check()
 
-        self._install_shutdown_handlers()
+        self._shutdown_event = asyncio.Event()
+        install_shutdown_handlers(
+            asyncio.get_event_loop(),
+            self._shutdown_event,
+            self._teardown_all_active,
+        )
         self.start_listener()
         await self.submit_agent_code()
         logger.info(
