@@ -34,8 +34,10 @@ def request_obj():
 async def test_deploy_targon_passes_empty_command_args(request_obj):
     """The whole point of the hardening: command/args must be empty."""
     targon = MagicMock()
+    # cvm_ip empty in handle is the production reality (Targon routing
+    # subdomain isn't a usable CVM endpoint).
     handle = MagicMock(uid="wl_xyz", url="https://wl_xyz.targon.network",
-                      cvm_ip="wl_xyz.targon.network", name="trainer-1", status="running")
+                      cvm_ip="", name="trainer-1", status="running")
     targon.deploy_workload = AsyncMock(return_value=handle)
 
     deployment = await deploy_targon(
@@ -62,7 +64,7 @@ async def test_deploy_targon_passes_empty_command_args(request_obj):
     assert deployment.targon_workload_uid == "wl_xyz"
     assert deployment.deployed_image_digest == "sha256:abc"
     assert deployment.gpu_class == "H200"
-    assert deployment.cvm_ip == "wl_xyz.targon.network"
+    assert deployment.cvm_ip == ""
 
 
 @pytest.mark.asyncio

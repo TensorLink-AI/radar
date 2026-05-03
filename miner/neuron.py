@@ -26,7 +26,7 @@ from config import Config
 from miner.health_monitor import HealthMonitor
 from miner.hosting import (
     Deployment, TargonReadinessTimeout, deploy_basilica, deploy_targon,
-    get_targon_registry_creds, teardown_basilica_sync, teardown_targon,
+    get_targon_registry_creds, teardown_basilica_sync,
     teardown_targon_with_retry, wait_for_trainer_ready,
 )
 from shared.agent_code import bundle_from_directory, compute_code_hash
@@ -80,6 +80,8 @@ class Miner:
         # stopped on release/teardown. Defensive logging — does NOT
         # influence the round.
         self._health_monitors: dict[int, HealthMonitor] = {}
+        # Set by the SIGTERM/SIGINT handler so the run loop exits cleanly.
+        self._shutdown_event: asyncio.Event | None = None
 
         # Validator db_urls to notify when deployment completes: round_id → [urls]
         self._pending_notify: dict[int, list[str]] = {}
@@ -403,36 +405,36 @@ class Miner:
             logger.info("ORPHAN_TEARDOWN uid=%s ok=%s", wl.uid, ok)
 
     def _install_shutdown_handlers(self) -> None:
-        """Tear down all active workloads on SIGTERM/SIGINT/atexit.
+        """Tear down all active workloads on SIGTERM/SIGINT, then exit cleanly.
 
-        ``asyncio`` signal handlers schedule the coroutine on the running
-        loop. ``atexit`` runs synchronously after the loop closes; it's a
-        last-ditch fallback for non-signal exits and uses run_until_complete.
+        Sets ``self._shutdown_event`` so the run loop wakes up and exits
+        instead of spinning. The handler also schedules a teardown task
+        bounded by a short timeout so we don't block forever when
+        Targon is unreachable at shutdown time — leaked workloads are
+        caught by the next process's startup orphan reap.
         """
-        import atexit
         import signal
 
         loop = asyncio.get_event_loop()
+        self._shutdown_event = asyncio.Event()
 
-        def _signal_handler():
-            logger.info("Shutdown signal received — tearing down active workloads")
-            loop.create_task(self._teardown_all_active())
+        async def _shutdown(sig_name: str):
+            logger.info("Shutdown signal %s received — tearing down active workloads", sig_name)
+            try:
+                await asyncio.wait_for(self._teardown_all_active(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.warning("Teardown exceeded 30s — leaving remaining workloads to next-startup reap")
+            except Exception as e:
+                logger.warning("Teardown raised: %s", e)
+            self._shutdown_event.set()
 
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
-                loop.add_signal_handler(sig, _signal_handler)
+                loop.add_signal_handler(sig, lambda s=sig: loop.create_task(_shutdown(s.name)))
             except (NotImplementedError, RuntimeError):
-                # Windows / non-mainloop tests — atexit covers it.
+                # Non-Unix or already-running-loop tests — fall back to
+                # default signal behaviour (KeyboardInterrupt for SIGINT).
                 pass
-
-        def _atexit_handler():
-            try:
-                if not loop.is_closed() and not loop.is_running():
-                    loop.run_until_complete(self._teardown_all_active())
-            except Exception as e:
-                logger.warning("atexit teardown failed: %s", e)
-
-        atexit.register(_atexit_handler)
 
     def _start_health_monitor(self, round_id: int, deployment: Deployment) -> None:
         existing = self._health_monitors.pop(round_id, None)
@@ -617,7 +619,18 @@ class Miner:
         )
 
         while True:
-            await asyncio.sleep(300)
+            try:
+                # Sleep up to 300s but wake immediately on shutdown signal.
+                if self._shutdown_event is not None:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=300)
+                else:
+                    await asyncio.sleep(300)
+                # Reaching here means the event fired — exit the loop.
+                logger.info("Shutdown event set — exiting run loop")
+                return
+            except asyncio.TimeoutError:
+                pass  # normal heartbeat tick
+
             try:
                 self.metagraph = self.subtensor.metagraph(self.netuid)
                 await self._reap_stale_deployments()

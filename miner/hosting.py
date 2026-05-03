@@ -145,10 +145,6 @@ async def deploy_targon(
     )
 
 
-async def teardown_targon(targon_client, uid: str) -> None:
-    await targon_client.teardown_workload(uid)
-
-
 # ── Backend dispatch ────────────────────────────────────────────────
 
 

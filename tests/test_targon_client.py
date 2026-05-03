@@ -155,7 +155,9 @@ class TestDeployWorkload:
         assert captured["image"] == "ghcr.io/x:y"
         assert captured["resource"] == "h200"
         assert handle.uid == "wl_abc"
-        assert handle.cvm_ip == "wl_abc.targon.network"
+        # Targon routing-edge subdomain → empty cvm_ip until the SDK
+        # exposes the raw CVM IP. See _extract_cvm_ip docstring.
+        assert handle.cvm_ip == ""
         assert handle.gpu_class == "H200"
 
     @pytest.mark.asyncio
@@ -383,6 +385,25 @@ class TestVerifyAttestation:
                 )
 
     @pytest.mark.asyncio
+    async def test_no_cvm_ip_returns_unverified_without_calling_endpoints(self, api_key):
+        """Empty cvm_ip → AttestationResult(verified=False) with a clear error,
+        no CVM or tower calls made."""
+        c = TargonClient()
+        called = {"any": False}
+
+        def handler(method, url, kwargs):
+            called["any"] = True
+            return _ok_response({"verified": True})
+
+        with patch("shared.targon_attest.httpx.AsyncClient", lambda **kw: _FakeAsyncClient(handler)):
+            result = await c.verify_attestation(
+                cvm_ip="", miner_hotkey="mh", validator_hotkey="vh",
+            )
+        assert result.verified is False
+        assert "no CVM IP" in result.error
+        assert not called["any"]
+
+    @pytest.mark.asyncio
     async def test_tower_rejects_returns_unverified(self, api_key):
         c = TargonClient()
         evidence = {"quote": "AAA"}
@@ -407,8 +428,13 @@ class TestVerifyAttestation:
 
 class TestExtractCvmIp:
     @pytest.mark.parametrize("url,expected", [
-        ("https://wl_abc.targon.network", "wl_abc.targon.network"),
+        # Routing-edge subdomains return empty — see docstring.
+        ("https://wl_abc.targon.network", ""),
+        ("https://wl_xyz.targon.com", ""),
+        # Raw IP is returned as-is.
         ("https://1.2.3.4:8081", "1.2.3.4"),
+        # Unrelated host (e.g. private deployment) is passed through.
+        ("https://my-cvm.example.com", "my-cvm.example.com"),
         ("", ""),
         ("not-a-url", ""),
     ])

@@ -63,14 +63,34 @@ class RegistryCreds:
 
 
 def _extract_cvm_ip(url: str) -> str:
-    """Hostname from a Targon workload URL (subdomain or raw IP)."""
+    """Best-effort raw CVM IP from a Targon workload URL.
+
+    Targon's serverless API typically routes through ``*.targon.network``
+    or ``*.targon.com`` edge subdomains; the per-CVM
+    ``http://<ip>:8080/api/v1/evidence`` endpoint is reachable only at
+    the underlying host's raw IP, which the SDK does not currently
+    expose. We return ``""`` when the URL hostname is one of those
+    routing edges so the attestation flow surfaces a clear "no CVM IP"
+    error instead of attempting to hit an unrelated endpoint.
+
+    When Targon's deploy response starts including the raw CVM IP as
+    a separate field, plumb it through ``WorkloadHandle.cvm_ip``
+    directly and bypass this helper.
+    """
     if not url:
         return ""
     try:
         from urllib.parse import urlparse
-        return urlparse(url).hostname or ""
+        host = urlparse(url).hostname or ""
     except Exception:
         return ""
+    if not host:
+        return ""
+    # Targon's known routing-edge suffixes — these are not CVM hosts.
+    for suffix in (".targon.network", ".targon.com"):
+        if host.endswith(suffix):
+            return ""
+    return host
 
 
 class TargonClient:
@@ -266,6 +286,13 @@ class TargonClient:
         # Raises TargonUnavailable on outage; returns verified=False on
         # any other failure so the caller can keep exclusion-vs-soft-fail
         # distinct. Per-step protocol lives in shared/targon_attest.py.
+        if not cvm_ip:
+            return AttestationResult(
+                verified=False,
+                error="no CVM IP available — Targon SDK does not expose the "
+                      "raw IP and the workload URL is a routing edge. "
+                      "Attestation requires a future Targon API addition.",
+            )
         nonce = nonce or fresh_nonce()
 
         async def _evidence():
