@@ -102,6 +102,10 @@ async def train(request: Request):
             from shared.auth import verify_request
             ok, err, sender = verify_request(dict(request.headers), body, metagraph, require_stake=True)
             if not ok:
+                signed_by = request.headers.get("x-epistula-signed-by", "?")
+                logger.warning(
+                    "Auth rejected from %s: %s", signed_by, err,
+                )
                 return JSONResponse(status_code=403, content={"error": err})
         except Exception as e:
             logger.error("Auth verification failed: %s", e)
