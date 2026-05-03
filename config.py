@@ -217,6 +217,14 @@ class Config:
     # Off until the hardened image is rolled out — TODO: flip to true once
     # OFFICIAL_TRAINING_IMAGE_DIGEST points at a hardened image.
     REQUIRE_BOOT_PROOF: bool = os.getenv("RADAR_REQUIRE_BOOT_PROOF", "false").lower() == "true"
+    # How long the miner polls the trainer's /health and the CVM's
+    # evidence endpoint after Targon's deploy_workload returns. TDX
+    # adds 60–120s on top of container start; 180s is comfortable.
+    TARGON_READINESS_TIMEOUT_S: float = float(os.getenv("RADAR_TARGON_READINESS_TIMEOUT", "180"))
+    # Health-monitor poll interval for the per-round background task.
+    # >2 consecutive minutes failed marks the round locally compromised.
+    TARGON_HEALTH_POLL_INTERVAL_S: float = float(os.getenv("RADAR_TARGON_HEALTH_POLL", "30"))
+    TARGON_HEALTH_FAIL_GRACE_S: float = float(os.getenv("RADAR_TARGON_HEALTH_FAIL_GRACE", "120"))
 
     # ── Warm-Standby Trainer ────────────────────────────────────
     TRAINER_PREPARE_TIMEOUT: int = int(os.getenv("RADAR_TRAINER_PREPARE_TIMEOUT", "600"))

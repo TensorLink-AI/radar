@@ -128,3 +128,187 @@ def test_miner_does_not_require_api_key_for_basilica(monkeypatch):
         bt_mock.Subtensor.return_value.metagraph.return_value = MagicMock(n=1)
         m = mn.Miner(stub_cfg)
     assert m.netuid == 1
+
+
+# ── wait_for_trainer_ready ──────────────────────────────────────────
+
+
+from miner.hosting import (
+    TargonReadinessTimeout, teardown_targon_with_retry, wait_for_trainer_ready,
+)
+
+
+@pytest.mark.asyncio
+async def test_readiness_returns_when_both_endpoints_up(monkeypatch):
+    """Both /health and /api/v1/evidence reachable → returns cleanly."""
+    health_resp = MagicMock(status_code=200)
+    evidence_resp = MagicMock(status_code=405)  # method not allowed but server is up
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.get = AsyncMock(return_value=health_resp)
+    client.post = AsyncMock(return_value=evidence_resp)
+
+    with patch("miner.hosting.httpx.AsyncClient", return_value=client):
+        await wait_for_trainer_ready(
+            trainer_url="https://t",
+            cvm_ip="1.2.3.4",
+            timeout_s=5.0,
+            poll_interval_s=0.01,
+        )
+
+    client.get.assert_awaited()
+    client.post.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_readiness_times_out_when_health_never_ok(monkeypatch):
+    health_resp = MagicMock(status_code=503)
+    evidence_resp = MagicMock(status_code=405)
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.get = AsyncMock(return_value=health_resp)
+    client.post = AsyncMock(return_value=evidence_resp)
+
+    with patch("miner.hosting.httpx.AsyncClient", return_value=client):
+        with pytest.raises(TargonReadinessTimeout) as excinfo:
+            await wait_for_trainer_ready(
+                trainer_url="https://t",
+                cvm_ip="1.2.3.4",
+                timeout_s=0.1,
+                poll_interval_s=0.01,
+            )
+    assert "healthy=False" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_readiness_no_cvm_ip_skips_evidence_check():
+    health_resp = MagicMock(status_code=200)
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.get = AsyncMock(return_value=health_resp)
+    client.post = AsyncMock()  # should never be called
+
+    with patch("miner.hosting.httpx.AsyncClient", return_value=client):
+        await wait_for_trainer_ready(
+            trainer_url="https://t", cvm_ip="",
+            timeout_s=2.0, poll_interval_s=0.01,
+        )
+    client.post.assert_not_awaited()
+
+
+# ── teardown_targon_with_retry ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_teardown_succeeds_first_attempt():
+    targon = MagicMock()
+    targon.teardown_workload = AsyncMock()
+    ok = await teardown_targon_with_retry(targon, "wl_x", attempts=3)
+    assert ok is True
+    targon.teardown_workload.assert_awaited_once_with("wl_x")
+
+
+@pytest.mark.asyncio
+async def test_teardown_retries_then_succeeds():
+    targon = MagicMock()
+    calls = [RuntimeError("fail"), None]
+    async def _td(uid):
+        x = calls.pop(0)
+        if isinstance(x, Exception):
+            raise x
+    targon.teardown_workload = AsyncMock(side_effect=[RuntimeError("fail"), None])
+
+    with patch("miner.hosting.asyncio.sleep", AsyncMock()):
+        ok = await teardown_targon_with_retry(targon, "wl_x", attempts=3)
+    assert ok is True
+    assert targon.teardown_workload.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_teardown_gives_up_after_attempts():
+    targon = MagicMock()
+    targon.teardown_workload = AsyncMock(side_effect=RuntimeError("nope"))
+
+    with patch("miner.hosting.asyncio.sleep", AsyncMock()):
+        ok = await teardown_targon_with_retry(targon, "wl_x", attempts=3)
+    assert ok is False
+    assert targon.teardown_workload.await_count == 3
+
+
+# ── Targon startup orphan cleanup ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_startup_check_validates_then_reaps_orphans(monkeypatch):
+    monkeypatch.setenv("TARGON_API_KEY", "k")
+    from miner import neuron as mn
+    monkeypatch.setattr(mn.Config, "HOSTING_BACKEND", "targon")
+
+    stub_cfg = MagicMock(netuid=1)
+    with patch.object(mn, "bt"):
+        m = mn.Miner(stub_cfg)
+
+    fake_client = MagicMock()
+    fake_client.validate_credentials = AsyncMock()
+    orphan = MagicMock(uid="orphan_1")
+    fake_client.list_active_workloads = AsyncMock(return_value=[orphan])
+    fake_client.teardown_workload = AsyncMock()
+    m._targon_client = fake_client
+
+    await m._targon_startup_check()
+    fake_client.validate_credentials.assert_awaited_once()
+    fake_client.list_active_workloads.assert_awaited_once()
+    fake_client.teardown_workload.assert_awaited_with("orphan_1")
+
+
+@pytest.mark.asyncio
+async def test_startup_check_raises_on_invalid_credentials(monkeypatch):
+    monkeypatch.setenv("TARGON_API_KEY", "k")
+    from miner import neuron as mn
+    monkeypatch.setattr(mn.Config, "HOSTING_BACKEND", "targon")
+
+    stub_cfg = MagicMock(netuid=1)
+    with patch.object(mn, "bt"):
+        m = mn.Miner(stub_cfg)
+
+    fake_client = MagicMock()
+    fake_client.validate_credentials = AsyncMock(side_effect=RuntimeError("401"))
+    m._targon_client = fake_client
+
+    with pytest.raises(RuntimeError, match="Targon credentials"):
+        await m._targon_startup_check()
+
+
+# ── Shutdown teardown ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_shutdown_tears_down_all_active(monkeypatch):
+    monkeypatch.setenv("TARGON_API_KEY", "k")
+    from miner import neuron as mn
+    monkeypatch.setattr(mn.Config, "HOSTING_BACKEND", "targon")
+
+    stub_cfg = MagicMock(netuid=1)
+    with patch.object(mn, "bt"):
+        m = mn.Miner(stub_cfg)
+
+    dep1 = Deployment(name="t1", url="https://t1", targon_workload_uid="wl_1")
+    dep2 = Deployment(name="t2", url="https://t2", targon_workload_uid="wl_2")
+    m.active_deployments[1] = (dep1, 0.0, 1800)
+    m.active_deployments[2] = (dep2, 0.0, 1800)
+    m.active_deployments[3] = "pending"
+
+    fake = MagicMock()
+    fake.teardown_workload = AsyncMock()
+    m._targon_client = fake
+
+    with patch("miner.hosting.asyncio.sleep", AsyncMock()):
+        await m._teardown_all_active()
+
+    assert m.active_deployments == {}
+    assert fake.teardown_workload.await_count == 2
+    called = {c.args[0] for c in fake.teardown_workload.await_args_list}
+    assert called == {"wl_1", "wl_2"}

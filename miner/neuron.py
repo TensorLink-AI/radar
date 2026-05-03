@@ -24,8 +24,9 @@ from fastapi.responses import JSONResponse
 
 from config import Config
 from miner.hosting import (
-    Deployment, deploy_basilica, deploy_targon,
+    Deployment, TargonReadinessTimeout, deploy_basilica, deploy_targon,
     get_targon_registry_creds, teardown_basilica_sync, teardown_targon,
+    teardown_targon_with_retry, wait_for_trainer_ready,
 )
 from shared.agent_code import bundle_from_directory, compute_code_hash
 from shared.auth import sign_request, verify_request
@@ -220,15 +221,63 @@ class Miner:
 
         network = os.environ.get("SUBTENSOR_NETWORK", "") or getattr(self.subtensor, "network", "") or ""
 
+        deploy_start = time.time()
         try:
             deployment = await self._deploy_one(request, hotkey, network, ttl)
+        except Exception as e:
+            logger.error(
+                "DEPLOY_FAILED round=%d backend=%s elapsed=%.1fs error=%s",
+                request.round_id, Config.HOSTING_BACKEND, time.time() - deploy_start, e,
+                exc_info=True,
+            )
+            self.active_deployments.pop(request.round_id, None)
+            return
 
+        logger.info(
+            "DEPLOY_OK round=%d backend=%s uid=%s url=%s elapsed=%.1fs",
+            request.round_id, Config.HOSTING_BACKEND,
+            deployment.targon_workload_uid or deployment.name,
+            deployment.url, time.time() - deploy_start,
+        )
+
+        # On Targon: wait for /health and CVM evidence endpoint before
+        # advertising the trainer. Tear down on timeout so we don't leak
+        # a half-ready workload.
+        if Config.HOSTING_BACKEND == "targon":
+            try:
+                ready_start = time.time()
+                await wait_for_trainer_ready(
+                    trainer_url=deployment.url,
+                    cvm_ip=deployment.cvm_ip,
+                    timeout_s=Config.TARGON_READINESS_TIMEOUT_S,
+                )
+                logger.info(
+                    "READINESS_OK round=%d uid=%s elapsed=%.1fs",
+                    request.round_id, deployment.targon_workload_uid,
+                    time.time() - ready_start,
+                )
+            except TargonReadinessTimeout as e:
+                logger.error(
+                    "READINESS_TIMEOUT round=%d uid=%s: %s — tearing down",
+                    request.round_id, deployment.targon_workload_uid, e,
+                )
+                await teardown_targon_with_retry(
+                    self._get_targon_client(), deployment.targon_workload_uid,
+                )
+                self.active_deployments.pop(request.round_id, None)
+                return
+
+        # Tear down the previous round's workload synchronously before
+        # we mark this one active. Targon bills by uptime; leaks cost
+        # real money.
+        await self._teardown_previous_round(request.round_id)
+
+        try:
             await self._post_trainer_ready(
                 request.round_id, deployment, request.validator_db_url,
             )
             self.active_deployments[request.round_id] = (deployment, time.time(), ttl)
 
-            # Notify any validators that arrived while deployment was pending
             for db_url in self._pending_notify.pop(request.round_id, []):
                 logger.info(
                     "Notifying queued validator at %s for round %d",
@@ -236,12 +285,44 @@ class Miner:
                 )
                 await self._post_trainer_ready(request.round_id, deployment, db_url)
             logger.info(
-                "Trainer ready for round %d at %s (instance=%s, backend=%s)",
-                request.round_id, deployment.url, deployment.name, Config.HOSTING_BACKEND,
+                "TRAINER_READY round=%d uid=%s url=%s instance=%s backend=%s",
+                request.round_id,
+                deployment.targon_workload_uid or "-",
+                deployment.url, deployment.name, Config.HOSTING_BACKEND,
             )
         except Exception as e:
-            logger.error("Failed to deploy trainer for round %d: %s", request.round_id, e, exc_info=True)
+            logger.error(
+                "POST_READY_FAILED round=%d uid=%s error=%s",
+                request.round_id, deployment.targon_workload_uid, e, exc_info=True,
+            )
             self.active_deployments.pop(request.round_id, None)
+
+    async def _teardown_previous_round(self, current_round_id: int) -> None:
+        """Tear down all rounds older than the current one. Sync, with retry on Targon."""
+        prior_rounds = [
+            rid for rid, entry in self.active_deployments.items()
+            if rid < current_round_id and entry != "pending"
+        ]
+        for rid in prior_rounds:
+            entry = self.active_deployments.pop(rid)
+            deployment, _ts, _ttl = entry
+            if deployment.targon_workload_uid:
+                ok = await teardown_targon_with_retry(
+                    self._get_targon_client(), deployment.targon_workload_uid,
+                )
+                if not ok:
+                    logger.error(
+                        "PRIOR_TEARDOWN_LEAK round=%d uid=%s — workload may bill until TTL",
+                        rid, deployment.targon_workload_uid,
+                    )
+            else:
+                try:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, teardown_basilica_sync, deployment.raw)
+                except Exception as e:
+                    logger.warning(
+                        "Prior-round Basilica teardown failed for round %d: %s", rid, e,
+                    )
 
     async def _deploy_one(
         self, request: TrainerRequest, hotkey: str, network: str, ttl: int,
@@ -285,6 +366,81 @@ class Miner:
             )
         return self._targon_client
 
+    async def _targon_startup_check(self) -> None:
+        """Validate creds + reap any orphan workloads owned by this account."""
+        client = self._get_targon_client()
+        try:
+            await client.validate_credentials()
+            logger.info("Targon credentials validated")
+        except Exception as e:
+            raise RuntimeError(
+                f"Targon credentials invalid or API unreachable at startup: {e}. "
+                "Check TARGON_API_KEY at https://docs.targon.com."
+            ) from e
+
+        # Tear down any workloads still alive from a prior process.
+        try:
+            workloads = await client.list_active_workloads()
+        except Exception as e:
+            logger.warning("Could not list workloads at startup (continuing): %s", e)
+            return
+        if not workloads:
+            return
+        logger.warning(
+            "Found %d orphan workloads from prior process — tearing down",
+            len(workloads),
+        )
+        for wl in workloads:
+            ok = await teardown_targon_with_retry(client, wl.uid)
+            logger.info("ORPHAN_TEARDOWN uid=%s ok=%s", wl.uid, ok)
+
+    def _install_shutdown_handlers(self) -> None:
+        """Tear down all active workloads on SIGTERM/SIGINT/atexit.
+
+        ``asyncio`` signal handlers schedule the coroutine on the running
+        loop. ``atexit`` runs synchronously after the loop closes; it's a
+        last-ditch fallback for non-signal exits and uses run_until_complete.
+        """
+        import atexit
+        import signal
+
+        loop = asyncio.get_event_loop()
+
+        def _signal_handler():
+            logger.info("Shutdown signal received — tearing down active workloads")
+            loop.create_task(self._teardown_all_active())
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, _signal_handler)
+            except (NotImplementedError, RuntimeError):
+                # Windows / non-mainloop tests — atexit covers it.
+                pass
+
+        def _atexit_handler():
+            try:
+                if not loop.is_closed() and not loop.is_running():
+                    loop.run_until_complete(self._teardown_all_active())
+            except Exception as e:
+                logger.warning("atexit teardown failed: %s", e)
+
+        atexit.register(_atexit_handler)
+
+    async def _teardown_all_active(self) -> None:
+        """Synchronous-feeling teardown of every active deployment."""
+        active = list(self.active_deployments.items())
+        for rid, entry in active:
+            if entry == "pending":
+                self.active_deployments.pop(rid, None)
+                continue
+            deployment, _ts, _ttl = entry
+            self.active_deployments.pop(rid, None)
+            try:
+                await self._teardown(deployment)
+                logger.info("SHUTDOWN_TEARDOWN round=%d ok", rid)
+            except Exception as e:
+                logger.warning("SHUTDOWN_TEARDOWN round=%d failed: %s", rid, e)
+
     async def handle_release(self, round_id: int):
         """Tear down the trainer pod for a completed round."""
         entry = self.active_deployments.pop(round_id, None)
@@ -297,9 +453,15 @@ class Miner:
                 logger.debug("Teardown failed: %s (TTL will clean up)", e)
 
     async def _teardown(self, deployment: Deployment) -> None:
-        """Backend-aware teardown. Targon = SDK delete; Basilica = .delete()."""
+        """Backend-aware teardown.
+
+        Targon path retries 3 times with exponential backoff — the workload
+        bills by uptime, so quietly leaking it costs the operator real money.
+        """
         if deployment.targon_workload_uid:
-            await teardown_targon(self._get_targon_client(), deployment.targon_workload_uid)
+            await teardown_targon_with_retry(
+                self._get_targon_client(), deployment.targon_workload_uid,
+            )
             return
         # Basilica deployment objects expose a sync .delete() — run in executor.
         loop = asyncio.get_event_loop()
@@ -411,6 +573,12 @@ class Miner:
 
     async def run(self):
         """Start listener, submit agent code, and keep alive."""
+        # Targon startup: validate creds + reap any leaked workloads from
+        # a prior crashed process before we start subscribing to validators.
+        if Config.HOSTING_BACKEND == "targon":
+            await self._targon_startup_check()
+
+        self._install_shutdown_handlers()
         self.start_listener()
         await self.submit_agent_code()
         logger.info(

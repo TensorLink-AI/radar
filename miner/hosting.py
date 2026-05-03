@@ -1,7 +1,7 @@
 """Miner-side trainer deployment — Basilica or Targon, picked by config.
 
 Keeps ``miner/neuron.py`` slim. Each backend exposes the same shape
-of return (a ``Deployment`` namedtuple-ish object with the fields the
+of return (a ``Deployment`` dataclass with the fields the
 TrainerReady envelope cares about) so ``handle_prepare`` can be
 backend-agnostic.
 """
@@ -12,8 +12,11 @@ import asyncio
 import functools
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -161,3 +164,96 @@ def get_targon_registry_creds() -> Optional[object]:
         username=user,
         password=pw,
     )
+
+
+# ── Post-deploy readiness ───────────────────────────────────────────
+
+
+class TargonReadinessTimeout(Exception):
+    """Workload deployed but never became responsive in the budget window."""
+
+
+async def wait_for_trainer_ready(
+    *,
+    trainer_url: str,
+    cvm_ip: str,
+    timeout_s: float = 180.0,
+    poll_interval_s: float = 5.0,
+    health_path: str = "/health",
+) -> None:
+    """Poll the trainer's health and the CVM's evidence endpoint until both respond.
+
+    Raises ``TargonReadinessTimeout`` if either is still unresponsive
+    after ``timeout_s``. The miner tears down the workload on
+    timeout — callers must handle the exception.
+
+    TDX boot takes 60–120s on top of normal container start, so
+    default budget is 180s.
+    """
+    deadline = time.monotonic() + timeout_s
+    health_url = f"{trainer_url.rstrip('/')}{health_path}"
+    evidence_url = f"http://{cvm_ip}:8080/api/v1/evidence" if cvm_ip else ""
+
+    healthy = False
+    evidence_up = False
+    last_err = ""
+    async with httpx.AsyncClient(timeout=5.0) as http:
+        while time.monotonic() < deadline:
+            if not healthy:
+                try:
+                    resp = await http.get(health_url)
+                    if resp.status_code == 200:
+                        healthy = True
+                        logger.info("Trainer /health up at %s", health_url)
+                except Exception as e:
+                    last_err = f"/health: {e}"
+            if not evidence_up and evidence_url:
+                # We don't actually post a quote — we just probe that the
+                # endpoint exists. A 405 / 400 also counts (the server is up).
+                try:
+                    resp = await http.post(evidence_url, json={"nonce": "ping"})
+                    if resp.status_code < 500:
+                        evidence_up = True
+                        logger.info("CVM evidence endpoint up at %s", evidence_url)
+                except Exception as e:
+                    last_err = f"evidence: {e}"
+            elif not evidence_url:
+                evidence_up = True  # nothing to wait for
+            if healthy and evidence_up:
+                return
+            await asyncio.sleep(poll_interval_s)
+
+    raise TargonReadinessTimeout(
+        f"trainer not ready in {timeout_s:.0f}s "
+        f"(healthy={healthy}, evidence={evidence_up}, last_err={last_err})"
+    )
+
+
+# ── Teardown with retry ─────────────────────────────────────────────
+
+
+async def teardown_targon_with_retry(
+    targon_client, uid: str, *, attempts: int = 3,
+) -> bool:
+    """Sync teardown of a Targon workload with exponential backoff (1s/2s/4s).
+
+    Returns True on success. Targon bills by uptime; leaks cost real
+    money so we retry harder than the fire-and-forget path. If all
+    attempts fail the caller should at least know — surface False
+    instead of swallowing.
+    """
+    for i in range(attempts):
+        try:
+            await targon_client.teardown_workload(uid)
+            logger.info("Targon teardown ok for %s (attempt %d)", uid, i + 1)
+            return True
+        except Exception as e:
+            wait = 2 ** i
+            logger.warning(
+                "Targon teardown failed for %s (attempt %d/%d): %s — retrying in %ds",
+                uid, i + 1, attempts, e, wait,
+            )
+            if i + 1 < attempts:
+                await asyncio.sleep(wait)
+    logger.error("Targon teardown gave up after %d attempts for %s", attempts, uid)
+    return False

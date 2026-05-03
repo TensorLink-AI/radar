@@ -178,6 +178,38 @@ class TestDeployWorkload:
         assert captured["registry"] is not None
 
 
+class TestValidateCredentials:
+    @pytest.mark.asyncio
+    async def test_passes_on_successful_list(self, api_key):
+        c = TargonClient()
+
+        class FakeSL:
+            def __init__(self, sdk): pass
+            async def list_container(self): return []
+
+        with patch("targon.client.serverless.AsyncServerlessClient", FakeSL), \
+             patch.object(c, "_get_sdk_client", return_value=MagicMock()):
+            await c.validate_credentials()  # does not raise
+
+    @pytest.mark.asyncio
+    async def test_raises_unavailable_on_repeated_5xx(self, api_key, fast_breaker):
+        c = TargonClient(breaker=fast_breaker, max_retries=2)
+
+        class FakeSL:
+            def __init__(self, sdk): pass
+            async def list_container(self):
+                raise httpx.HTTPStatusError(
+                    "boom", request=MagicMock(),
+                    response=MagicMock(status_code=503),
+                )
+
+        with patch("targon.client.serverless.AsyncServerlessClient", FakeSL), \
+             patch.object(c, "_get_sdk_client", return_value=MagicMock()), \
+             patch("shared.targon_client.asyncio.sleep", AsyncMock()):
+            with pytest.raises(TargonUnavailable):
+                await c.validate_credentials()
+
+
 class TestTeardown:
     @pytest.mark.asyncio
     async def test_calls_delete(self, api_key):

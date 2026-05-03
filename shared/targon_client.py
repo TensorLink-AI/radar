@@ -214,25 +214,24 @@ class TargonClient:
 
     async def list_active_workloads(self) -> list[WorkloadHandle]:
         from targon.client.serverless import AsyncServerlessClient
-        sdk = self._get_sdk_client()
-        sl = AsyncServerlessClient(sdk)
-
-        async def _list():
-            return await sl.list_container()
-
-        items = await self._call(_list)
+        sl = AsyncServerlessClient(self._get_sdk_client())
+        items = await self._call(lambda: sl.list_container())
         out = []
         for item in items:
             urls = getattr(item, "urls", None) or []
             url = urls[0].url if urls else ""
             out.append(WorkloadHandle(
-                uid=getattr(item, "uid", ""),
-                name=getattr(item, "name", ""),
-                url=url,
-                cvm_ip=_extract_cvm_ip(url),
+                uid=getattr(item, "uid", ""), name=getattr(item, "name", ""),
+                url=url, cvm_ip=_extract_cvm_ip(url),
                 status=getattr(item, "status", ""),
             ))
         return out
+
+    async def validate_credentials(self) -> None:
+        # Cheap call used at miner/validator startup. Raises TargonError
+        # on auth failure; raises TargonUnavailable if the API is down
+        # at boot time (caller decides whether to retry or hard-fail).
+        await self.list_active_workloads()
 
     # ── Verification (validators) ──────────────────────────────────
 
