@@ -28,7 +28,7 @@ class Deployment:
     targon_workload_uid: str = ""
     cvm_ip: str = ""
     gpu_class: str = ""
-    image_digest: str = ""
+    deployed_image_digest: str = ""      # what the miner actually deployed
     # The backend's native handle (basilica deployment object, or
     # the WorkloadHandle from targon_client). Used for teardown.
     raw: object = None
@@ -107,7 +107,7 @@ async def deploy_targon(
     targon_client,
     request,
     image: str,
-    image_digest: str,
+    deployed_image_digest: str,
     hotkey: str,
     netuid: int,
     subtensor_network: str,
@@ -137,7 +137,7 @@ async def deploy_targon(
         targon_workload_uid=handle.uid,
         cvm_ip=handle.cvm_ip,
         gpu_class=gpu_class,
-        image_digest=image_digest,
+        deployed_image_digest=deployed_image_digest,
         raw=handle,
     )
 

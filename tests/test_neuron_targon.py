@@ -42,7 +42,7 @@ async def test_deploy_targon_passes_empty_command_args(request_obj):
         targon_client=targon,
         request=request_obj,
         image="ghcr.io/x:y",
-        image_digest="sha256:abc",
+        deployed_image_digest="sha256:abc",
         hotkey="hk1234567890abcdef",
         netuid=42,
         subtensor_network="finney",
@@ -60,7 +60,7 @@ async def test_deploy_targon_passes_empty_command_args(request_obj):
     assert "42" in kwargs["name"]
 
     assert deployment.targon_workload_uid == "wl_xyz"
-    assert deployment.image_digest == "sha256:abc"
+    assert deployment.deployed_image_digest == "sha256:abc"
     assert deployment.gpu_class == "H200"
     assert deployment.cvm_ip == "wl_xyz.targon.network"
 
@@ -75,7 +75,7 @@ async def test_deploy_targon_propagates_failure(request_obj):
             targon_client=targon,
             request=request_obj,
             image="img",
-            image_digest="sha256:def",
+            deployed_image_digest="sha256:def",
             hotkey="hk",
             netuid=1,
             subtensor_network="finney",

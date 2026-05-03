@@ -65,6 +65,16 @@ async def verify_trainer(
     """
     from shared.targon_breaker import TargonUnavailable
 
+    # Sanity: miner self-declared digest should match the validator's
+    # expected digest. Mismatch is a hard fail — Targon's verify would
+    # also catch it but failing early gives a cleaner error.
+    declared = getattr(ready, "deployed_image_digest", "")
+    if declared and expected_image_digest and declared != expected_image_digest:
+        return VerifyResult(
+            ok=False,
+            reason=f"declared digest {declared} != expected {expected_image_digest}",
+        )
+
     # (b) Workload-digest verify.
     try:
         digest_ok = await targon_client.verify_image_digest(

@@ -33,7 +33,7 @@ def _ready(**overrides):
         targon_workload_uid="wl_abc",
         cvm_ip="wl.targon.network",
         gpu_class="H200",
-        image_digest="sha256:digest_abc",
+        deployed_image_digest="sha256:digest_abc",
     )
     base.update(overrides)
     return TrainerReady(**base)

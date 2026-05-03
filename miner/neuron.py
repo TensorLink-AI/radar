@@ -162,7 +162,7 @@ class Miner:
             targon_workload_uid=deployment.targon_workload_uid,
             cvm_ip=deployment.cvm_ip,
             gpu_class=deployment.gpu_class,
-            image_digest=deployment.image_digest,
+            deployed_image_digest=deployment.deployed_image_digest,
         )
         body = ready.to_json().encode()
         headers = sign_request(self.wallet, body)
@@ -254,7 +254,7 @@ class Miner:
                 targon_client=self._get_targon_client(),
                 request=request,
                 image=self.trainer_image,
-                image_digest=Config.OFFICIAL_TRAINING_IMAGE_DIGEST,
+                deployed_image_digest=Config.OFFICIAL_TRAINING_IMAGE_DIGEST,
                 hotkey=hotkey,
                 netuid=self.netuid,
                 subtensor_network=network,

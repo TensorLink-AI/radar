@@ -163,7 +163,7 @@ class TrainerReady:
     """Miner → Validator: my trainer pod is live at this URL.
 
     The Targon-specific fields (``targon_workload_uid``, ``cvm_ip``,
-    ``gpu_class``, ``image_digest``) are populated only when
+    ``gpu_class``, ``deployed_image_digest``) are populated only when
     ``RADAR_HOSTING_BACKEND=targon``; on Basilica deploys they stay
     empty strings. The miner signs the whole envelope via Epistula —
     the validator trusts these per-round ephemeral fields because the
@@ -177,8 +177,8 @@ class TrainerReady:
     # Targon hosting metadata (empty on Basilica deploys).
     targon_workload_uid: str = ""
     cvm_ip: str = ""
-    gpu_class: str = ""        # "H100" | "H200" | "B200"
-    image_digest: str = ""     # the digest the miner deployed
+    gpu_class: str = ""               # "H100" | "H200" | "B200"
+    deployed_image_digest: str = ""   # the digest the miner deployed
 
     def to_json(self) -> str:
         return json.dumps({
@@ -189,7 +189,7 @@ class TrainerReady:
             "targon_workload_uid": self.targon_workload_uid,
             "cvm_ip": self.cvm_ip,
             "gpu_class": self.gpu_class,
-            "image_digest": self.image_digest,
+            "deployed_image_digest": self.deployed_image_digest,
         })
 
     @classmethod
