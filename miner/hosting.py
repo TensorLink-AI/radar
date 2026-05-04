@@ -27,13 +27,18 @@ class Deployment:
 
     name: str
     url: str
+    # Backend identifier: "" / "basilica" / "targon" / "runpod".
+    backend: str = ""
     # Targon-only — empty for Basilica deploys.
     targon_workload_uid: str = ""
     cvm_ip: str = ""
     gpu_class: str = ""
     deployed_image_digest: str = ""      # what the miner actually deployed
-    # The backend's native handle (basilica deployment object, or
-    # the WorkloadHandle from targon_client). Used for teardown.
+    # RunPod-only — empty for other backends.
+    runpod_pod_id: str = ""
+    # The backend's native handle (basilica deployment object,
+    # WorkloadHandle from targon_client, or PodHandle from
+    # runpod_client). Used for teardown.
     raw: object = None
 
 
@@ -147,6 +152,7 @@ async def deploy_targon(
     return Deployment(
         name=handle.name or deploy_name,
         url=handle.url,
+        backend="targon",
         targon_workload_uid=handle.uid,
         cvm_ip=handle.cvm_ip,
         gpu_class=gpu_class,

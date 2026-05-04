@@ -142,6 +142,20 @@ class Validator:
                 "RADAR_HOSTING_BACKEND=targon but OFFICIAL_TRAINING_IMAGE_DIGEST is empty. "
                 "Without a pinned digest the verify chain becomes a no-op — refusing to start."
             )
+        # Validators on the RunPod backend need their own RunPod API key
+        # to query pod metadata via verify_pod_image; the digest pin is
+        # the only image-bytes check we have on this backend.
+        if Config.HOSTING_BACKEND == "runpod" and not os.environ.get("RUNPOD_API_KEY"):
+            raise RuntimeError(
+                "RADAR_HOSTING_BACKEND=runpod but RUNPOD_API_KEY is not set. "
+                "Validators need a RunPod API key to verify pod image digests. "
+                "See https://docs.runpod.io."
+            )
+        if Config.HOSTING_BACKEND == "runpod" and not Config.OFFICIAL_TRAINING_IMAGE_DIGEST:
+            raise RuntimeError(
+                "RADAR_HOSTING_BACKEND=runpod but OFFICIAL_TRAINING_IMAGE_DIGEST is empty. "
+                "Without a pinned digest there's nothing to verify — refusing to start."
+            )
 
         # Bittensor components
         self.wallet = bt.Wallet(config=config)
@@ -986,19 +1000,24 @@ class Validator:
             training_metas=training_metas,
         )
 
-        # Apply Targon migration's hybrid-fallback policy: targon_unavailable
-        # gets a 0.5× multiplier (default), compromised UIDs zeroed entirely.
-        # No-op when round_metadata is empty (Basilica deployments, or
-        # Targon round with no flags fired).
+        # Apply round metadata: targon_unavailable gets the
+        # TARGON_UNAVAILABLE_SCORE_MULTIPLIER, non_attested gets the
+        # NON_ATTESTED_SCORE_MULTIPLIER, compromised UIDs zeroed entirely.
+        # No-op when no flags fired.
         round_metadata = (
             self.coordinator.round_metadata(challenge.round_id)
             if hasattr(self.coordinator, "round_metadata") else None
         )
-        if round_metadata and (round_metadata.get("targon_unavailable") or round_metadata.get("compromised")):
+        if round_metadata and (
+            round_metadata.get("targon_unavailable")
+            or round_metadata.get("non_attested")
+            or round_metadata.get("compromised")
+        ):
             logger.info(
-                "Applying Targon round metadata (round %d): unavailable=%s compromised=%s",
+                "Applying round metadata (round %d): unavailable=%s non_attested=%s compromised=%s",
                 challenge.round_id,
                 round_metadata.get("targon_unavailable"),
+                round_metadata.get("non_attested"),
                 round_metadata.get("compromised"),
             )
             round_scores = apply_round_metadata(round_scores, round_metadata)

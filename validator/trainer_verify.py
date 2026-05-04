@@ -50,6 +50,10 @@ class VerifyResult:
     targon_unavailable: bool = False
     boot_proof: Optional[dict] = None
     gpu_class: str = ""
+    # True when the round was hosted on a backend with hardware
+    # attestation (currently: only Targon). RunPod / Basilica deploys
+    # set this to False so scoring can apply NON_ATTESTED_SCORE_MULTIPLIER.
+    attested: bool = False
 
 
 async def verify_trainer(
@@ -133,6 +137,76 @@ async def verify_trainer(
         ok=True,
         boot_proof=boot_proof,
         gpu_class=attest.gpu_class,
+        attested=True,
+    )
+
+
+async def verify_trainer_runpod(
+    *,
+    ready,
+    miner_hotkey: str,
+    expected_image_digest: str,
+    trainer_url: str,
+    runpod_client,
+    require_boot_proof: bool = False,
+    boot_proof_timeout: float = 5.0,
+) -> VerifyResult:
+    """Verify a RunPod-deployed trainer.
+
+    Two checks (no TDX/NRAS path on this backend):
+
+      1. Image-digest pin via RunPod API (``runpod_client.verify_pod_image``).
+      2. Boot proof — feature-flagged. Soft on RunPod since the proof
+         signer is the miner-controlled pod; we pair this with the
+         non-attested score multiplier rather than treating it as a
+         hardware-rooted check.
+
+    Result always carries ``attested=False`` — caller propagates this to
+    scoring so honest RunPod miners receive the
+    ``NON_ATTESTED_SCORE_MULTIPLIER`` discount.
+    """
+    declared = getattr(ready, "deployed_image_digest", "")
+    if declared and expected_image_digest and declared != expected_image_digest:
+        return VerifyResult(
+            ok=False,
+            reason=f"declared digest {declared} != expected {expected_image_digest}",
+        )
+
+    pod_id = getattr(ready, "runpod_pod_id", "")
+    if not pod_id:
+        return VerifyResult(ok=False, reason="TrainerReady missing runpod_pod_id")
+
+    try:
+        ok, why = await runpod_client.verify_pod_image(pod_id, expected_image_digest)
+    except Exception as e:
+        return VerifyResult(ok=False, reason=f"runpod verify_pod_image: {e}")
+    if not ok:
+        return VerifyResult(ok=False, reason=why)
+
+    boot_proof = await fetch_boot_proof(trainer_url, timeout=boot_proof_timeout)
+    if require_boot_proof:
+        proof_ok, reason = check_boot_proof(
+            boot_proof,
+            expected_signer_hotkey=miner_hotkey,
+            expected_hashes_root=_expected_hashes_root(),
+        )
+        if not proof_ok:
+            return VerifyResult(
+                ok=False,
+                reason=f"boot_proof: {reason}",
+                boot_proof=boot_proof,
+            )
+    elif boot_proof is None:
+        logger.warning(
+            "Boot proof unavailable for RunPod pod %s — feature-flagged off, treating as pass",
+            pod_id,
+        )
+
+    return VerifyResult(
+        ok=True,
+        boot_proof=boot_proof,
+        gpu_class=getattr(ready, "gpu_class", ""),
+        attested=False,
     )
 
 

@@ -143,6 +143,10 @@ class TrainingCoordinator:
         # round_id → {uid → True} for miners verified during a Targon outage.
         # Scoring multiplies their contribution by TARGON_UNAVAILABLE_SCORE_MULTIPLIER.
         self._targon_unavailable: dict[int, dict[int, bool]] = {}
+        # round_id → {uid → True} for miners hosted on a non-attested
+        # backend (currently: RunPod). Scoring multiplies their
+        # contribution by NON_ATTESTED_SCORE_MULTIPLIER.
+        self._non_attested: dict[int, dict[int, bool]] = {}
         # round_id → {uid → True} for miners flagged as compromised during
         # mid-round re-verification. Excluded from scoring.
         self._compromised: dict[int, dict[int, bool]] = {}
@@ -153,6 +157,7 @@ class TrainingCoordinator:
         # tasks. Cancelled by release_trainers / cancel_mid_round_reverify.
         self._reverify_tasks: dict[int, list[asyncio.Task]] = {}
         self._targon_client = None
+        self._runpod_client = None
 
     def compute_my_jobs(
         self,
@@ -691,6 +696,7 @@ class TrainingCoordinator:
 
         # Track the per-round flags so dispatch / scoring can read them.
         targon_unavailable: dict[int, bool] = self._targon_unavailable.setdefault(round_id, {})
+        non_attested: dict[int, bool] = self._non_attested.setdefault(round_id, {})
         # Cache ready messages so mid-round reverify can re-hit each CVM.
         ready_cache: dict[int, "TrainerReady"] = self._ready_msgs.setdefault(round_id, {})
 
@@ -699,7 +705,7 @@ class TrainingCoordinator:
             for uid, ready_msg in ready.items():
                 if uid in result:
                     continue
-                ok, reason, soft_fail = await self._verify_ready(ready_msg, uid)
+                ok, reason, soft_fail, attested = await self._verify_ready(ready_msg, uid)
                 if not ok:
                     if soft_fail:
                         # Targon API down — let the round proceed with a flag.
@@ -716,7 +722,15 @@ class TrainingCoordinator:
                     continue
                 result[uid] = ready_msg.trainer_url
                 ready_cache[uid] = ready_msg
-                logger.info("UID %d trainer ready at %s", uid, ready_msg.trainer_url)
+                if not attested:
+                    non_attested[uid] = True
+                    logger.info(
+                        "UID %d trainer ready at %s (non-attested backend, "
+                        "score discounted by NON_ATTESTED_SCORE_MULTIPLIER)",
+                        uid, ready_msg.trainer_url,
+                    )
+                else:
+                    logger.info("UID %d trainer ready at %s", uid, ready_msg.trainer_url)
 
             if len(result) >= len(sent_uids):
                 break
@@ -819,12 +833,27 @@ class TrainingCoordinator:
             )
         return self._targon_client
 
-    async def _verify_ready(self, ready_msg, uid: int) -> tuple[bool, str, bool]:
-        """Verify a TrainerReady envelope. Returns (ok, reason, soft_fail).
+    def _get_runpod_client(self):
+        if self._runpod_client is None:
+            from shared.runpod_client import RunPodClient
+            self._runpod_client = RunPodClient(
+                base_url=Config.RUNPOD_API_BASE_URL,
+                timeout=Config.RUNPOD_VERIFICATION_TIMEOUT,
+            )
+        return self._runpod_client
+
+    async def _verify_ready(self, ready_msg, uid: int) -> tuple[bool, str, bool, bool]:
+        """Verify a TrainerReady envelope.
+
+        Returns ``(ok, reason, soft_fail, attested)``.
 
         ``soft_fail=True`` means the round should proceed with a
         ``targon_unavailable`` flag instead of excluding the miner —
         the only soft-fail signal is the Targon circuit breaker.
+
+        ``attested=False`` flags the miner as having been hosted on a
+        non-attested backend (RunPod / Basilica) — scoring will apply
+        ``NON_ATTESTED_SCORE_MULTIPLIER`` to their contribution.
         """
         if Config.HOSTING_BACKEND == "targon":
             from validator.trainer_verify import verify_trainer
@@ -841,14 +870,32 @@ class TrainingCoordinator:
                 wallet=self.wallet,
                 require_boot_proof=Config.REQUIRE_BOOT_PROOF,
             )
-            return result.ok, result.reason, result.targon_unavailable
+            return result.ok, result.reason, result.targon_unavailable, result.attested
+
+        if Config.HOSTING_BACKEND == "runpod":
+            from validator.trainer_verify import verify_trainer_runpod
+            hotkey = (
+                self.metagraph.hotkeys[uid]
+                if uid < len(self.metagraph.hotkeys) else ready_msg.miner_hotkey
+            )
+            result = await verify_trainer_runpod(
+                ready=ready_msg,
+                miner_hotkey=hotkey,
+                expected_image_digest=Config.OFFICIAL_TRAINING_IMAGE_DIGEST,
+                trainer_url=ready_msg.trainer_url,
+                runpod_client=self._get_runpod_client(),
+                require_boot_proof=Config.REQUIRE_BOOT_PROOF,
+            )
+            # RunPod has no soft-fail equivalent (no circuit breaker
+            # because failures are categorical, not transient outages).
+            return result.ok, result.reason, False, result.attested
 
         # Basilica path — preserve original behavior.
         from validator.pod_manager import verify_miner_pod
         if not ready_msg.instance_name:
-            return True, "", False
+            return True, "", False, False
         ok, reason = await verify_miner_pod(ready_msg.instance_name)
-        return ok, reason, False
+        return ok, reason, False, False
 
     async def reverify_running(
         self, round_id: int, miner_uid: int, ready_msg, block_hash: str,
@@ -861,7 +908,7 @@ class TrainingCoordinator:
         block-derived (see compute_assignments for the same pattern).
         """
         if Config.HOSTING_BACKEND != "targon":
-            return True  # No mid-run check on Basilica.
+            return True  # No mid-run check on Basilica or RunPod.
         from validator.trainer_verify import reverify_workload
         miner_hotkey = (
             self.metagraph.hotkeys[miner_uid]
@@ -961,14 +1008,18 @@ class TrainingCoordinator:
                 pass
 
     def round_metadata(self, round_id: int) -> dict:
-        """Snapshot Targon flags for the round — written into experiment rows.
+        """Snapshot per-round verification flags — written into experiment rows.
 
-        Returns a dict with ``targon_unavailable`` (list of UIDs that
-        verified soft) and ``compromised`` (list of UIDs that failed
-        re-verify). Scoring reads these to apply the multiplier and
-        exclusion respectively.
+        Returns a dict with:
+          - ``targon_unavailable``: UIDs that verified during a Targon
+            outage (soft-pass) → ``TARGON_UNAVAILABLE_SCORE_MULTIPLIER``.
+          - ``non_attested``: UIDs hosted on a non-attested backend
+            (RunPod) → ``NON_ATTESTED_SCORE_MULTIPLIER``.
+          - ``compromised``: UIDs that failed mid-round re-verify →
+            excluded from scoring entirely.
         """
         return {
             "targon_unavailable": sorted((self._targon_unavailable.get(round_id) or {}).keys()),
+            "non_attested": sorted((self._non_attested.get(round_id) or {}).keys()),
             "compromised": sorted((self._compromised.get(round_id) or {}).keys()),
         }

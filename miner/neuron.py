@@ -28,6 +28,11 @@ from miner.hosting import (
     get_targon_registry_creds, teardown_basilica_sync,
     teardown_targon_with_retry, wait_for_trainer_ready,
 )
+from miner.runpod_lifecycle import (
+    deploy_runpod, get_runpod_registry_creds, make_runpod_client,
+    parse_gpu_types, teardown_runpod_with_retry,
+    validate_and_reap_orphans_runpod, wait_for_runpod_ready,
+)
 from miner.targon_lifecycle import (
     HealthMonitorRegistry, install_shutdown_handlers,
     make_targon_client, validate_and_reap_orphans,
@@ -62,10 +67,26 @@ class Miner:
                 "Without a pinned digest validators cannot verify the deployed image — "
                 "set OFFICIAL_TRAINING_IMAGE_DIGEST=sha256:... to the subnet-owner-blessed value."
             )
+        # RunPod symmetric checks. The digest pin is the only image-bytes
+        # verification we have on this backend, so it's mandatory.
+        if Config.HOSTING_BACKEND == "runpod" and not os.environ.get("RUNPOD_API_KEY"):
+            raise RuntimeError(
+                "RADAR_HOSTING_BACKEND=runpod but RUNPOD_API_KEY is not set. "
+                "Set the env var to the operator's RunPod account API key "
+                "(see https://docs.runpod.io for issuance)."
+            )
+        if Config.HOSTING_BACKEND == "runpod" and not Config.OFFICIAL_TRAINING_IMAGE_DIGEST:
+            raise RuntimeError(
+                "RADAR_HOSTING_BACKEND=runpod but OFFICIAL_TRAINING_IMAGE_DIGEST is empty. "
+                "RunPod has no hardware attestation — the digest pin is the only "
+                "image-bytes verification available. Set "
+                "OFFICIAL_TRAINING_IMAGE_DIGEST=sha256:... to the subnet-owner-blessed value."
+            )
 
         self.wallet = bt.Wallet(config=config)
         self.subtensor = bt.Subtensor(config=config)
         self._targon_client = None
+        self._runpod_client = None
 
         # Cache metagraph — synced periodically in keep-alive loop
         self.metagraph = self.subtensor.metagraph(self.netuid)
@@ -174,10 +195,12 @@ class Miner:
             trainer_url=deployment.url,
             instance_name=deployment.name,
             miner_hotkey=hotkey,
+            backend=deployment.backend or Config.HOSTING_BACKEND,
             targon_workload_uid=deployment.targon_workload_uid,
             cvm_ip=deployment.cvm_ip,
             gpu_class=deployment.gpu_class,
             deployed_image_digest=deployment.deployed_image_digest,
+            runpod_pod_id=deployment.runpod_pod_id,
         )
         body = ready.to_json().encode()
         headers = sign_request(self.wallet, body)
@@ -283,6 +306,37 @@ class Miner:
                 self._pending_notify.pop(request.round_id, None)
                 return
 
+        # On RunPod: wait for the pod to enter RUNNING and /health to
+        # respond. The proxy URL may only be assigned after the pod is
+        # running, so we re-resolve trainer_url here.
+        if Config.HOSTING_BACKEND == "runpod":
+            try:
+                ready_start = time.time()
+                resolved_url = await wait_for_runpod_ready(
+                    runpod_client=self._get_runpod_client(),
+                    pod_id=deployment.runpod_pod_id,
+                    trainer_url=deployment.url,
+                    timeout_s=Config.RUNPOD_READINESS_TIMEOUT_S,
+                )
+                if resolved_url and resolved_url != deployment.url:
+                    deployment.url = resolved_url
+                logger.info(
+                    "READINESS_OK round=%d pod_id=%s elapsed=%.1fs",
+                    request.round_id, deployment.runpod_pod_id,
+                    time.time() - ready_start,
+                )
+            except TargonReadinessTimeout as e:
+                logger.error(
+                    "READINESS_TIMEOUT round=%d pod_id=%s: %s — tearing down",
+                    request.round_id, deployment.runpod_pod_id, e,
+                )
+                await teardown_runpod_with_retry(
+                    self._get_runpod_client(), deployment.runpod_pod_id,
+                )
+                self.active_deployments.pop(request.round_id, None)
+                self._pending_notify.pop(request.round_id, None)
+                return
+
         # Tear down the previous round's workload synchronously before
         # we mark this one active. Targon bills by uptime; leaks cost
         # real money.
@@ -317,7 +371,7 @@ class Miner:
             self._pending_notify.pop(request.round_id, None)
 
     async def _teardown_previous_round(self, current_round_id: int) -> None:
-        """Tear down all rounds older than the current one. Sync, with retry on Targon."""
+        """Tear down all rounds older than the current one. Sync, with retry on Targon/RunPod."""
         prior_rounds = [
             rid for rid, entry in self.active_deployments.items()
             if rid < current_round_id and entry != "pending"
@@ -332,8 +386,17 @@ class Miner:
                 )
                 if not ok:
                     logger.error(
-                        "PRIOR_TEARDOWN_LEAK round=%d uid=%s — workload may bill until TTL",
+                        "PRIOR_TEARDOWN_LEAK round=%d backend=targon uid=%s — workload may bill until TTL",
                         rid, deployment.targon_workload_uid,
+                    )
+            elif deployment.runpod_pod_id:
+                ok = await teardown_runpod_with_retry(
+                    self._get_runpod_client(), deployment.runpod_pod_id,
+                )
+                if not ok:
+                    logger.error(
+                        "PRIOR_TEARDOWN_LEAK round=%d backend=runpod pod_id=%s — pod may bill until manually deleted",
+                        rid, deployment.runpod_pod_id,
                     )
             else:
                 try:
@@ -347,7 +410,7 @@ class Miner:
     async def _deploy_one(
         self, request: TrainerRequest, hotkey: str, network: str, ttl: int,
     ) -> Deployment:
-        """Backend-agnostic deploy. Picks Basilica or Targon by Config.HOSTING_BACKEND."""
+        """Backend-agnostic deploy. Dispatches on Config.HOSTING_BACKEND."""
         if Config.HOSTING_BACKEND == "targon":
             gpu_class = (Config.TRAINER_GPU_MODELS.split(",")[0].strip()
                          if Config.TRAINER_GPU_MODELS else "H200")
@@ -361,6 +424,21 @@ class Miner:
                 subtensor_network=network,
                 gpu_class=gpu_class,
                 registry=get_targon_registry_creds(),
+            )
+        if Config.HOSTING_BACKEND == "runpod":
+            gpu_type_ids = parse_gpu_types(Config.RUNPOD_GPU_TYPES)
+            return await deploy_runpod(
+                runpod_client=self._get_runpod_client(),
+                request=request,
+                image=self.trainer_image,
+                deployed_image_digest=Config.OFFICIAL_TRAINING_IMAGE_DIGEST,
+                hotkey=hotkey,
+                netuid=self.netuid,
+                subtensor_network=network,
+                gpu_type_ids=gpu_type_ids,
+                cloud_type=Config.RUNPOD_CLOUD_TYPE,
+                container_disk_gb=Config.RUNPOD_CONTAINER_DISK_GB,
+                registry=get_runpod_registry_creds(),
             )
         return await deploy_basilica(
             request=request,
@@ -376,8 +454,16 @@ class Miner:
             self._targon_client = make_targon_client()
         return self._targon_client
 
+    def _get_runpod_client(self):
+        if not getattr(self, "_runpod_client", None):
+            self._runpod_client = make_runpod_client()
+        return self._runpod_client
+
     async def _targon_startup_check(self) -> None:
         await validate_and_reap_orphans(self._get_targon_client())
+
+    async def _runpod_startup_check(self) -> None:
+        await validate_and_reap_orphans_runpod(self._get_runpod_client())
 
     async def _teardown_all_active(self) -> None:
         """Synchronous-feeling teardown of every active deployment."""
@@ -409,12 +495,17 @@ class Miner:
     async def _teardown(self, deployment: Deployment) -> None:
         """Backend-aware teardown.
 
-        Targon path retries 3 times with exponential backoff — the workload
-        bills by uptime, so quietly leaking it costs the operator real money.
+        Targon and RunPod paths retry 3 times with exponential backoff —
+        both bill by uptime, so quietly leaking pods costs real money.
         """
         if deployment.targon_workload_uid:
             await teardown_targon_with_retry(
                 self._get_targon_client(), deployment.targon_workload_uid,
+            )
+            return
+        if deployment.runpod_pod_id:
+            await teardown_runpod_with_retry(
+                self._get_runpod_client(), deployment.runpod_pod_id,
             )
             return
         # Basilica deployment objects expose a sync .delete() — run in executor.
@@ -527,10 +618,14 @@ class Miner:
 
     async def run(self):
         """Start listener, submit agent code, and keep alive."""
-        # Targon startup: validate creds + reap any leaked workloads from
-        # a prior crashed process before we start subscribing to validators.
+        # Targon / RunPod startup: validate creds + reap any leaked
+        # workloads from a prior crashed process before we start
+        # subscribing to validators. Both backends bill by uptime, so
+        # leaking even a few pods across crashes adds up.
         if Config.HOSTING_BACKEND == "targon":
             await self._targon_startup_check()
+        elif Config.HOSTING_BACKEND == "runpod":
+            await self._runpod_startup_check()
 
         self._shutdown_event = asyncio.Event()
         install_shutdown_handlers(

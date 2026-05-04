@@ -187,26 +187,37 @@ def apply_round_metadata(
     scores: dict[int, float],
     round_metadata: dict | None,
 ) -> dict[int, float]:
-    """Apply Targon migration's hybrid-fallback policy to per-miner scores.
+    """Apply per-round verification flags to scores.
 
     ``round_metadata`` is the dict produced by
     ``TrainingCoordinator.round_metadata`` — it contains:
 
-      - ``targon_unavailable``: list of UIDs verified during a Targon
-        outage. Their score gets multiplied by
-        ``Config.TARGON_UNAVAILABLE_SCORE_MULTIPLIER`` (default 0.5)
+      - ``targon_unavailable``: UIDs verified during a Targon outage.
+        Score × ``Config.TARGON_UNAVAILABLE_SCORE_MULTIPLIER`` (default 0.5)
         so the round still progresses without fully rewarding miners
         we couldn't attest in real-time.
-      - ``compromised``: list of UIDs that failed mid-round
-        re-verification. Excluded from scoring entirely (score → 0).
+      - ``non_attested``: UIDs hosted on a non-attested backend
+        (RunPod). Score × ``Config.NON_ATTESTED_SCORE_MULTIPLIER``
+        (default 0.6) — permanent discount reflecting the lack of
+        hardware-rooted attestation. Distinct from ``targon_unavailable``
+        which is transient; this one is structural to the backend.
+      - ``compromised``: UIDs that failed mid-round re-verification.
+        Excluded from scoring entirely (score → 0).
+
+    A UID can in principle land in multiple sets — if both
+    ``targon_unavailable`` and ``non_attested`` apply, the multipliers
+    compound (this can happen if the operator runs a hybrid stack).
+    ``compromised`` always wins → 0.
 
     Returns a NEW dict; the input ``scores`` is not mutated.
     """
     if not round_metadata:
         return dict(scores)
     from config import Config
-    multiplier = float(Config.TARGON_UNAVAILABLE_SCORE_MULTIPLIER)
+    targon_mult = float(Config.TARGON_UNAVAILABLE_SCORE_MULTIPLIER)
+    non_attested_mult = float(Config.NON_ATTESTED_SCORE_MULTIPLIER)
     targon_unavailable = set(round_metadata.get("targon_unavailable") or [])
+    non_attested = set(round_metadata.get("non_attested") or [])
     compromised = set(round_metadata.get("compromised") or [])
 
     out: dict[int, float] = {}
@@ -214,10 +225,12 @@ def apply_round_metadata(
         if uid in compromised:
             out[uid] = 0.0
             continue
+        adjusted = score
         if uid in targon_unavailable:
-            out[uid] = score * multiplier
-            continue
-        out[uid] = score
+            adjusted *= targon_mult
+        if uid in non_attested:
+            adjusted *= non_attested_mult
+        out[uid] = adjusted
     return out
 
 

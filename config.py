@@ -190,9 +190,11 @@ class Config:
     AGENT_ALLOWED_URLS: str = os.getenv("RADAR_AGENT_ALLOWED_URLS", "")
 
     # ── Hosting Backend ────────────────────────────────────────
-    # "basilica" (default, legacy) or "targon" (TDX-attested confidential
-    # GPU pods). Both miner and validator must agree on the same backend
-    # for a deployment — set this consistently across the stack.
+    # "basilica" (default, legacy), "targon" (TDX-attested confidential
+    # GPU pods), or "runpod" (commodity GPU cloud, non-attested but
+    # widest GPU selection — A100, RTX 4090, L40S, H100, H200, etc.).
+    # Both miner and validator must agree on the same backend for a
+    # deployment — set this consistently across the stack.
     HOSTING_BACKEND: str = os.getenv("RADAR_HOSTING_BACKEND", "basilica").lower()
 
     # Targon API endpoints.
@@ -230,6 +232,44 @@ class Config:
     # >2 consecutive minutes failed marks the round locally compromised.
     TARGON_HEALTH_POLL_INTERVAL_S: float = float(os.getenv("RADAR_TARGON_HEALTH_POLL", "30"))
     TARGON_HEALTH_FAIL_GRACE_S: float = float(os.getenv("RADAR_TARGON_HEALTH_FAIL_GRACE", "120"))
+
+    # ── RunPod Backend ──────────────────────────────────────────
+    # Commodity GPU cloud — wider GPU selection (A100, RTX 4090, L40S,
+    # H100, H200) at lower price points than confidential compute.
+    # Trade-off: no TDX/NRAS hardware attestation. Trust falls back to
+    # (a) RunPod's API confirming the pod is running the digest-pinned
+    # image, (b) the hardened-image bootstrap chain, and (c) the
+    # NON_ATTESTED_SCORE_MULTIPLIER policy. See CLAUDE.md → RunPod
+    # backend for the full trust story.
+    RUNPOD_API_BASE_URL: str = os.getenv("RADAR_RUNPOD_API_BASE_URL", "https://rest.runpod.io/v1")
+    RUNPOD_VERIFICATION_TIMEOUT: float = float(os.getenv("RADAR_RUNPOD_TIMEOUT", "10"))
+    # SECURE = RunPod-owned T3/T4 DCs (SOC 2 Type II). COMMUNITY = third-party
+    # hosts. Default to SECURE; operators can opt into COMMUNITY for cost.
+    RUNPOD_CLOUD_TYPE: str = os.getenv("RADAR_RUNPOD_CLOUD_TYPE", "SECURE").upper()
+    # Comma-separated GPU type IDs in priority order. Miner's deploy_runpod
+    # picks the first available match. RunPod uses display names like
+    # "NVIDIA A100 80GB PCIe", "NVIDIA RTX 4090", "NVIDIA H100 80GB HBM3".
+    RUNPOD_GPU_TYPES: str = os.getenv(
+        "RADAR_RUNPOD_GPU_TYPES",
+        "NVIDIA A100 80GB PCIe,NVIDIA RTX 4090,NVIDIA L40S",
+    )
+    # How long the miner polls /health after the pod transitions to RUNNING.
+    # Cold starts on COMMUNITY can be 60-120s; SECURE is faster.
+    RUNPOD_READINESS_TIMEOUT_S: float = float(os.getenv("RADAR_RUNPOD_READINESS_TIMEOUT", "240"))
+    # Container disk (GB) requested for trainer pod. Trainer image + cached
+    # checkpoints + scratch — 50GB is comfortable for our timeseries runner.
+    RUNPOD_CONTAINER_DISK_GB: int = int(os.getenv("RADAR_RUNPOD_CONTAINER_DISK_GB", "50"))
+    # Score multiplier applied to a miner whose round was hosted on a
+    # non-attested backend (currently: RunPod). Distinct from the
+    # ``targon_unavailable`` transient-outage multiplier — this one
+    # reflects a permanent trust gap (no hardware attestation), so
+    # honest RunPod miners get reduced weight by design. The trade-off
+    # is policy: too high and attackers route through RunPod to launder
+    # unattested runs, too low and the subnet pushes operators to pay
+    # for confidential compute they can't afford.
+    NON_ATTESTED_SCORE_MULTIPLIER: float = float(
+        os.getenv("RADAR_NON_ATTESTED_MULTIPLIER", "0.6")
+    )
 
     # ── Warm-Standby Trainer ────────────────────────────────────
     TRAINER_PREPARE_TIMEOUT: int = int(os.getenv("RADAR_TRAINER_PREPARE_TIMEOUT", "600"))
