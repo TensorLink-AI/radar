@@ -1,24 +1,52 @@
 """Tests for shared/targon_client.py + targon_breaker + targon_attest.
 
 We mock the SDK and httpx via monkeypatching — no respx dependency.
+
+The real ``targon`` SDK pulls in ``keyring`` → ``secretstorage`` →
+``cryptography`` (Rust + cffi) at import time, which fails in minimal
+test environments. We register stub ``targon`` and
+``targon.client.serverless`` modules in ``sys.modules`` BEFORE the
+client tries to import them, so ``patch("targon.client.serverless...")``
+works without the real package being installed.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import sys
+import types
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
-from shared.targon_attest import (
+
+def _install_targon_stubs():
+    """Register fake targon modules so SDK imports succeed without the real dep."""
+    if "targon" not in sys.modules:
+        targon_mod = types.ModuleType("targon")
+        targon_mod.Client = MagicMock()
+        sys.modules["targon"] = targon_mod
+    if "targon.client" not in sys.modules:
+        sys.modules["targon.client"] = types.ModuleType("targon.client")
+    if "targon.client.serverless" not in sys.modules:
+        serverless = types.ModuleType("targon.client.serverless")
+        serverless.AsyncServerlessClient = MagicMock()
+        serverless.RegistryConfig = MagicMock()
+        sys.modules["targon.client.serverless"] = serverless
+
+
+_install_targon_stubs()
+
+
+from shared.targon_attest import (  # noqa: E402
     AttestationResult,
     fresh_nonce,
     parse_tower_response,
 )
-from shared.targon_breaker import CircuitBreaker, TargonUnavailable
-from shared.targon_client import (
+from shared.targon_breaker import CircuitBreaker, TargonUnavailable  # noqa: E402
+from shared.targon_client import (  # noqa: E402
     DEFAULT_BASE_URL,
     RegistryCreds,
     TargonClient,

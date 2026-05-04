@@ -55,15 +55,27 @@ def _ok_attest(gpu_class="H200"):
 
 @pytest.mark.asyncio
 async def test_verify_trainer_all_pass():
+    """End-to-end verify_trainer with a real (signed) boot proof."""
+    try:
+        import bittensor as bt
+    except ImportError:
+        pytest.skip("bittensor not installed")
+
+    kp = bt.Keypair.create_from_mnemonic(bt.Keypair.generate_mnemonic())
+    from validator.trainer_verify import _canonical_json
+    proof = {"hashes_root_sha256": "deadbeef", "bootstrap_version": "1"}
+    sig = kp.sign(_canonical_json(proof)).hex()
+    boot_proof = {"proof": proof, "signature": sig, "signer_hotkey": kp.ss58_address}
+
     targon = MagicMock()
     targon.verify_image_digest = AsyncMock(return_value=True)
     targon.verify_attestation = AsyncMock(return_value=_ok_attest())
 
     with patch("validator.trainer_verify.fetch_boot_proof",
-               AsyncMock(return_value={"proof": {}, "signature": "abcd"})):
+               AsyncMock(return_value=boot_proof)):
         result = await verify_trainer(
             ready=_ready(),
-            miner_hotkey="hk_miner",
+            miner_hotkey=kp.ss58_address,
             expected_image_digest="sha256:digest_abc",
             trainer_url="https://wl.targon.network",
             targon_client=targon,
@@ -71,7 +83,7 @@ async def test_verify_trainer_all_pass():
             require_boot_proof=True,
         )
 
-    assert result.ok is True
+    assert result.ok is True, result.reason
     assert result.gpu_class == "H200"
 
 
@@ -229,19 +241,30 @@ class TestReverifyOffsets:
 
 @pytest.mark.asyncio
 async def test_reverify_skips_attestation():
+    try:
+        import bittensor as bt
+    except ImportError:
+        pytest.skip("bittensor not installed")
+    kp = bt.Keypair.create_from_mnemonic(bt.Keypair.generate_mnemonic())
+    from validator.trainer_verify import _canonical_json
+    proof = {"hashes_root_sha256": "x"}
+    sig = kp.sign(_canonical_json(proof)).hex()
+    boot_proof = {"proof": proof, "signature": sig, "signer_hotkey": kp.ss58_address}
+
     targon = MagicMock()
     targon.verify_image_digest = AsyncMock(return_value=True)
     targon.verify_attestation = AsyncMock()
 
-    with patch("validator.trainer_verify.fetch_boot_proof", AsyncMock(return_value={"proof": {}, "signature": "x"})):
+    with patch("validator.trainer_verify.fetch_boot_proof", AsyncMock(return_value=boot_proof)):
         result = await reverify_workload(
             ready=_ready(),
             expected_image_digest="sha256:digest_abc",
             trainer_url="https://wl",
             targon_client=targon,
             require_boot_proof=True,
+            expected_signer_hotkey=kp.ss58_address,
         )
-    assert result.ok is True
+    assert result.ok is True, result.reason
     targon.verify_attestation.assert_not_awaited()
 
 
@@ -282,21 +305,75 @@ async def test_reverify_soft_fails_on_breaker():
 
 class TestBootProofHelpers:
     def test_check_boot_proof_missing(self):
-        ok, reason = check_boot_proof(None, "sha256:x")
+        ok, reason = check_boot_proof(None)
         assert not ok
         assert reason == "missing"
 
     def test_check_boot_proof_no_signature(self):
-        ok, reason = check_boot_proof({"proof": {}}, "sha256:x")
+        ok, reason = check_boot_proof({"proof": {}})
         assert not ok
         assert "signature" in reason
 
-    def test_check_boot_proof_ok(self):
+    def test_check_boot_proof_rejects_garbage_signature(self):
+        # A non-empty signature string is no longer enough — it must verify
+        # cryptographically. This was the audit gap that turned the prior
+        # check into a no-op.
         ok, reason = check_boot_proof(
-            {"proof": {"hashes_root_sha256": "abc"}, "signature": "sig"}, "sha256:x",
+            {"proof": {"hashes_root_sha256": "abc"},
+             "signature": "deadbeef" * 8,
+             "signer_hotkey": "5stub"},
         )
-        assert ok
-        assert reason == ""
+        assert not ok
+        assert reason
+
+    def test_check_boot_proof_signer_mismatch(self):
+        ok, reason = check_boot_proof(
+            {"proof": {}, "signature": "ab", "signer_hotkey": "5wrong"},
+            expected_signer_hotkey="5expected",
+        )
+        assert not ok
+        assert "signer mismatch" in reason
+
+    def test_check_boot_proof_signature_not_hex(self):
+        ok, reason = check_boot_proof(
+            {"proof": {}, "signature": "not-hex!!", "signer_hotkey": "5x"},
+        )
+        assert not ok
+        assert "hex" in reason
+
+    def test_check_boot_proof_real_signature_passes(self):
+        """Sign a real proof with a real keypair, confirm verification accepts it."""
+        try:
+            import bittensor as bt
+        except ImportError:
+            pytest.skip("bittensor not installed")
+        kp = bt.Keypair.create_from_mnemonic(bt.Keypair.generate_mnemonic())
+        proof = {"hashes_root_sha256": "abc123", "bootstrap_version": "1"}
+        from validator.trainer_verify import _canonical_json
+        sig = kp.sign(_canonical_json(proof)).hex()
+        ok, reason = check_boot_proof(
+            {"proof": proof, "signature": sig, "signer_hotkey": kp.ss58_address},
+            expected_signer_hotkey=kp.ss58_address,
+            expected_hashes_root="abc123",
+        )
+        assert ok, reason
+
+    def test_check_boot_proof_hashes_root_mismatch(self):
+        try:
+            import bittensor as bt
+        except ImportError:
+            pytest.skip("bittensor not installed")
+        kp = bt.Keypair.create_from_mnemonic(bt.Keypair.generate_mnemonic())
+        proof = {"hashes_root_sha256": "actual"}
+        from validator.trainer_verify import _canonical_json
+        sig = kp.sign(_canonical_json(proof)).hex()
+        ok, reason = check_boot_proof(
+            {"proof": proof, "signature": sig, "signer_hotkey": kp.ss58_address},
+            expected_signer_hotkey=kp.ss58_address,
+            expected_hashes_root="expected",
+        )
+        assert not ok
+        assert "hashes_root mismatch" in reason
 
     @pytest.mark.asyncio
     async def test_fetch_boot_proof_503_returns_none(self):

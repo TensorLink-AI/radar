@@ -201,7 +201,9 @@ async def wait_for_trainer_ready(
     evidence_url = f"http://{cvm_ip}:8080/api/v1/evidence" if cvm_ip else ""
 
     healthy = False
-    evidence_up = False
+    # No CVM IP means there's no evidence endpoint to wait for (Basilica,
+    # private deploys without raw-IP exposure). Treat as already up.
+    evidence_up = not evidence_url
     last_err = ""
     async with httpx.AsyncClient(timeout=5.0) as http:
         while time.monotonic() < deadline:
@@ -213,7 +215,7 @@ async def wait_for_trainer_ready(
                         logger.info("Trainer /health up at %s", health_url)
                 except Exception as e:
                     last_err = f"/health: {e}"
-            if not evidence_up and evidence_url:
+            if not evidence_up:
                 # We don't actually post a quote — we just probe that the
                 # endpoint exists. A 405 / 400 also counts (the server is up).
                 try:
@@ -223,8 +225,6 @@ async def wait_for_trainer_ready(
                         logger.info("CVM evidence endpoint up at %s", evidence_url)
                 except Exception as e:
                     last_err = f"evidence: {e}"
-            elif not evidence_url:
-                evidence_up = True  # nothing to wait for
             if healthy and evidence_up:
                 return
             await asyncio.sleep(poll_interval_s)

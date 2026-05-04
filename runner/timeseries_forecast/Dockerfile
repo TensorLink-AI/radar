@@ -64,6 +64,7 @@ RUN touch /workspace/shared/__init__.py
 COPY entrypoint.sh /usr/local/bin/radar-entrypoint.sh
 COPY _bootstrap.py /workspace/_bootstrap.py
 COPY _gen_hashes.py /workspace/_gen_hashes.py
+COPY boot_proof.py /workspace/runner/boot_proof.py
 
 # Per-job sandbox lives outside /workspace.
 RUN mkdir -p /var/radar/sandbox/checkpoints \
@@ -90,6 +91,7 @@ RUN chmod 555 /usr/local/bin/radar-entrypoint.sh \
                  /workspace/runner/server.py \
                  /workspace/runner/sandbox.py \
                  /workspace/runner/uploads.py \
+                 /workspace/runner/boot_proof.py \
                  /workspace/runner/timeseries_forecast/__init__.py \
                  /workspace/runner/timeseries_forecast/train.py \
                  /workspace/runner/timeseries_forecast/eval_template.py \

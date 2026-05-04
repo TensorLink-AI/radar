@@ -129,6 +129,20 @@ class Validator:
         self.config = config
         self.netuid = config.netuid
 
+        # Fail-fast on Targon misconfig — operator gets a clear error at
+        # startup instead of a stack trace mid-round when verify fires.
+        if Config.HOSTING_BACKEND == "targon" and not os.environ.get("TARGON_API_KEY"):
+            raise RuntimeError(
+                "RADAR_HOSTING_BACKEND=targon but TARGON_API_KEY is not set. "
+                "Validators need a Targon API key to verify image digests + attestations. "
+                "See https://docs.targon.com."
+            )
+        if Config.HOSTING_BACKEND == "targon" and not Config.OFFICIAL_TRAINING_IMAGE_DIGEST:
+            raise RuntimeError(
+                "RADAR_HOSTING_BACKEND=targon but OFFICIAL_TRAINING_IMAGE_DIGEST is empty. "
+                "Without a pinned digest the verify chain becomes a no-op — refusing to start."
+            )
+
         # Bittensor components
         self.wallet = bt.Wallet(config=config)
         self.subtensor = bt.Subtensor(config=config)

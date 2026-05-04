@@ -26,6 +26,7 @@ hybrid-fallback policy (reduced scoring weight, no exclusion).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import random
@@ -35,6 +36,11 @@ from typing import Optional
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+def _canonical_json(obj) -> bytes:
+    """Stable JSON encoding — must match runner/boot_proof.py exactly."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
 
 
 @dataclass
@@ -109,7 +115,11 @@ async def verify_trainer(
     # (d) Boot proof — feature-flagged. Independent of Targon.
     boot_proof = await fetch_boot_proof(trainer_url, timeout=boot_proof_timeout)
     if require_boot_proof:
-        ok, reason = check_boot_proof(boot_proof, expected_image_digest)
+        ok, reason = check_boot_proof(
+            boot_proof,
+            expected_signer_hotkey=miner_hotkey,
+            expected_hashes_root=_expected_hashes_root(),
+        )
         if not ok:
             return VerifyResult(ok=False, reason=f"boot_proof: {reason}", boot_proof=boot_proof)
     elif boot_proof is None:
@@ -124,6 +134,15 @@ async def verify_trainer(
         boot_proof=boot_proof,
         gpu_class=attest.gpu_class,
     )
+
+
+def _expected_hashes_root() -> str:
+    """Read the pinned root from Config at call time so tests can monkeypatch."""
+    try:
+        from config import Config
+        return Config.EXPECTED_BOOT_HASHES_ROOT
+    except Exception:
+        return ""
 
 
 async def fetch_boot_proof(trainer_url: str, *, timeout: float) -> Optional[dict]:
@@ -144,29 +163,62 @@ async def fetch_boot_proof(trainer_url: str, *, timeout: float) -> Optional[dict
         return None
 
 
-def check_boot_proof(boot_proof: Optional[dict], expected_image_digest: str) -> tuple[bool, str]:
-    """Validate a boot-proof envelope. Caller decides whether to enforce.
+def check_boot_proof(
+    boot_proof: Optional[dict],
+    *,
+    expected_signer_hotkey: str = "",
+    expected_hashes_root: str = "",
+) -> tuple[bool, str]:
+    """Validate a boot-proof envelope.
 
-    Verifies:
-      - the proof exists,
-      - the signer matches a hotkey we trust (caller's responsibility —
-        we just check there *is* a signer),
-      - the signature decodes (we don't reverify here; ed25519/SR25519
-        signature verification belongs at the call site so the caller
-        can decide whether to fetch the trainer's hotkey from the
-        metagraph).
+    Returns ``(ok, reason)``. All checks below must pass:
 
-    Cross-checking ``hashes_root_sha256`` against an expected value is
-    out of scope — the caller maintains the table of expected roots
-    keyed by ``OFFICIAL_TRAINING_IMAGE_DIGEST``.
+    1. Envelope exists and contains ``proof`` + ``signature`` + ``signer_hotkey``.
+    2. ``signer_hotkey`` equals the expected miner hotkey (when supplied) —
+       a forged proof signed by some other key fails here.
+    3. The SR25519 signature verifies over the canonical JSON encoding of
+       ``proof``. Without this the prior version was a no-op — anyone could
+       return ``{"signature": "x"}`` and pass.
+    4. ``proof.hashes_root_sha256`` matches the pinned root (when supplied) —
+       a tampered image with a different file table fails here even if the
+       signature is valid.
     """
     if boot_proof is None:
         return False, "missing"
     if not isinstance(boot_proof, dict):
         return False, "malformed"
-    # ``proof`` must be present (even if empty in tests); signature must be non-empty.
-    if "proof" not in boot_proof or not boot_proof.get("signature"):
+    proof = boot_proof.get("proof")
+    if not isinstance(proof, dict):
+        return False, "no proof"
+    signature_hex = boot_proof.get("signature") or ""
+    signer = boot_proof.get("signer_hotkey") or ""
+    if not signature_hex or not signer:
         return False, "no signature"
+
+    if expected_signer_hotkey and signer != expected_signer_hotkey:
+        return False, f"signer mismatch: got {signer[:16]} expected {expected_signer_hotkey[:16]}"
+
+    # Verify the SR25519 signature over the canonical JSON of `proof`.
+    try:
+        signature = bytes.fromhex(signature_hex)
+    except ValueError:
+        return False, "signature not hex"
+    payload = _canonical_json(proof)
+    try:
+        import bittensor as bt
+        keypair = bt.Keypair(ss58_address=signer)
+        if not keypair.verify(payload, signature):
+            return False, "signature invalid"
+    except ImportError:
+        return False, "bittensor unavailable for signature verify"
+    except Exception as e:
+        return False, f"signature verify error: {e}"
+
+    if expected_hashes_root:
+        got = proof.get("hashes_root_sha256") or ""
+        if got != expected_hashes_root:
+            return False, f"hashes_root mismatch: got {got[:16]} expected {expected_hashes_root[:16]}"
+
     return True, ""
 
 
@@ -190,6 +242,7 @@ def reverify_offsets(
 async def reverify_workload(
     *, ready, expected_image_digest: str, trainer_url: str,
     targon_client, require_boot_proof: bool, boot_proof_timeout: float = 5.0,
+    expected_signer_hotkey: str = "",
 ) -> VerifyResult:
     """Mid-round re-verification — runs only checks (b) and (d).
 
@@ -208,7 +261,11 @@ async def reverify_workload(
 
     boot_proof = await fetch_boot_proof(trainer_url, timeout=boot_proof_timeout)
     if require_boot_proof:
-        ok, reason = check_boot_proof(boot_proof, expected_image_digest)
+        ok, reason = check_boot_proof(
+            boot_proof,
+            expected_signer_hotkey=expected_signer_hotkey or ready.miner_hotkey,
+            expected_hashes_root=_expected_hashes_root(),
+        )
         if not ok:
             return VerifyResult(ok=False, reason=f"reverify boot_proof: {reason}", boot_proof=boot_proof)
     return VerifyResult(ok=True, boot_proof=boot_proof)

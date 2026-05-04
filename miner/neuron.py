@@ -56,6 +56,12 @@ class Miner:
                 "RADAR_HOSTING_BACKEND=targon but TARGON_API_KEY is not set. "
                 "Set the env var to the validator/miner's Targon account API key."
             )
+        if Config.HOSTING_BACKEND == "targon" and not Config.OFFICIAL_TRAINING_IMAGE_DIGEST:
+            raise RuntimeError(
+                "RADAR_HOSTING_BACKEND=targon but OFFICIAL_TRAINING_IMAGE_DIGEST is empty. "
+                "Without a pinned digest validators cannot verify the deployed image — "
+                "set OFFICIAL_TRAINING_IMAGE_DIGEST=sha256:... to the subnet-owner-blessed value."
+            )
 
         self.wallet = bt.Wallet(config=config)
         self.subtensor = bt.Subtensor(config=config)
@@ -239,6 +245,7 @@ class Miner:
                 exc_info=True,
             )
             self.active_deployments.pop(request.round_id, None)
+            self._pending_notify.pop(request.round_id, None)
             return
 
         logger.info(
@@ -273,6 +280,7 @@ class Miner:
                     self._get_targon_client(), deployment.targon_workload_uid,
                 )
                 self.active_deployments.pop(request.round_id, None)
+                self._pending_notify.pop(request.round_id, None)
                 return
 
         # Tear down the previous round's workload synchronously before
@@ -306,6 +314,7 @@ class Miner:
                 request.round_id, deployment.targon_workload_uid, e, exc_info=True,
             )
             self.active_deployments.pop(request.round_id, None)
+            self._pending_notify.pop(request.round_id, None)
 
     async def _teardown_previous_round(self, current_round_id: int) -> None:
         """Tear down all rounds older than the current one. Sync, with retry on Targon."""
