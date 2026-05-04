@@ -16,8 +16,12 @@ import bittensor as bt
 
 logger = logging.getLogger(__name__)
 
-# Epistula timestamp tolerance (seconds) — increase for cross-machine clock skew
-EPISTULA_TIMESTAMP_TOLERANCE = int(os.getenv("RADAR_EPISTULA_TOLERANCE", "30"))
+# Epistula timestamp tolerance (seconds). Cross-machine clock skew between
+# validator hosts and miner trainer pods is the most common cause of 403s
+# here, so the default is intentionally generous. Replay protection still
+# relies on the SR25519 signature + uuid4 nonce; the timestamp window only
+# bounds how long a captured signed message can be replayed.
+EPISTULA_TIMESTAMP_TOLERANCE = int(os.getenv("RADAR_EPISTULA_TOLERANCE", "120"))
 
 
 def sign_request(wallet: bt.Wallet, body: bytes) -> dict[str, str]:
@@ -61,8 +65,17 @@ def verify_request(
         ts = int(timestamp_str)
     except ValueError:
         return False, "Invalid timestamp", ""
-    if abs(time.time() - ts) > EPISTULA_TIMESTAMP_TOLERANCE:
-        return False, "Timestamp too old or too far in future", ""
+    skew = int(time.time() - ts)
+    if abs(skew) > EPISTULA_TIMESTAMP_TOLERANCE:
+        # Surface the actual skew + tolerance so miner operators can see at
+        # a glance that this is a clock-sync problem (NTP, container drift)
+        # rather than a signing bug, and tune RADAR_EPISTULA_TOLERANCE if
+        # needed.
+        err = (
+            f"Timestamp too old or too far in future "
+            f"(skew={skew}s, tolerance=±{EPISTULA_TIMESTAMP_TOLERANCE}s)"
+        )
+        return False, err, ""
 
     # Verify sender is registered
     uid = get_uid_for_hotkey(metagraph, hotkey)

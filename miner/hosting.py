@@ -60,6 +60,13 @@ async def deploy_basilica(
         pod_env["SUBTENSOR_NETWORK"] = subtensor_network
     if netuid:
         pod_env["NETUID"] = str(netuid)
+    # Propagate Epistula tolerance so operators can widen the auth window
+    # without rebuilding the trainer image. Trainer pods commonly drift
+    # from the miner host's clock; the default baked into the image may
+    # not be enough on noisy infrastructure.
+    tolerance = os.environ.get("RADAR_EPISTULA_TOLERANCE", "")
+    if tolerance:
+        pod_env["RADAR_EPISTULA_TOLERANCE"] = tolerance
 
     deploy_kwargs = dict(
         name=deploy_name,
@@ -124,6 +131,9 @@ async def deploy_targon(
         env["SUBTENSOR_NETWORK"] = subtensor_network
     if netuid:
         env["NETUID"] = str(netuid)
+    tolerance = os.environ.get("RADAR_EPISTULA_TOLERANCE", "")
+    if tolerance:
+        env["RADAR_EPISTULA_TOLERANCE"] = tolerance
 
     handle = await targon_client.deploy_workload(
         image=image,
