@@ -16,6 +16,7 @@ from typing import Optional, TYPE_CHECKING
 
 import httpx
 
+from config import Config
 from shared.auth import sign_request
 from shared.protocol import Proposal, TrainerRequest, TrainerReady, TrainerRelease
 
@@ -139,6 +140,19 @@ class TrainingCoordinator:
         # behaviour and the default.
         self.artifact_store = artifact_store
         self._fallback_uids: dict[int, set[int]] = {}  # round_id → UIDs using proxy
+        # round_id → {uid → True} for miners verified during a Targon outage.
+        # Scoring multiplies their contribution by TARGON_UNAVAILABLE_SCORE_MULTIPLIER.
+        self._targon_unavailable: dict[int, dict[int, bool]] = {}
+        # round_id → {uid → True} for miners flagged as compromised during
+        # mid-round re-verification. Excluded from scoring.
+        self._compromised: dict[int, dict[int, bool]] = {}
+        # round_id → {uid → TrainerReady} so mid-run reverify knows where
+        # each accepted miner's CVM lives. Populated in prepare_trainers.
+        self._ready_msgs: dict[int, dict[int, "TrainerReady"]] = {}
+        # round_id → list[asyncio.Task] of in-flight mid-round reverify
+        # tasks. Cancelled by release_trainers / cancel_mid_round_reverify.
+        self._reverify_tasks: dict[int, list[asyncio.Task]] = {}
+        self._targon_client = None
 
     def compute_my_jobs(
         self,
@@ -265,7 +279,8 @@ class TrainingCoordinator:
             for attempt in range(max_retries + 1):
                 try:
                     # Sign fresh every attempt so the Epistula timestamp
-                    # is always within the 30s tolerance window.
+                    # stays inside the EPISTULA_TIMESTAMP_TOLERANCE window
+                    # (default 120s; tunable via RADAR_EPISTULA_TOLERANCE).
                     headers = sign_request(self.wallet, payload)
                     headers["Content-Type"] = "application/json"
                     resp = await client.post(
@@ -612,7 +627,6 @@ class TrainingCoordinator:
 
         Returns {uid: trainer_url} for all miners that responded or fell back.
         """
-        from config import Config
         from validator.db_proxy import get_ready_trainers
         from validator.pod_manager import verify_miner_pod
 
@@ -636,7 +650,7 @@ class TrainingCoordinator:
 
         # Fire TrainerRequest to all miners with listener_urls.
         # Re-sign per miner so the Epistula timestamp stays fresh —
-        # stale timestamps (>30s) cause miners to reject with 403.
+        # stale timestamps cause miners to reject with 403.
         with_listener = {uid: c for uid, c in commitments.items() if c.listener_url}
         without_listener = {uid: c for uid, c in commitments.items() if not c.listener_url}
         if without_listener:
@@ -675,20 +689,33 @@ class TrainingCoordinator:
         deadline = asyncio.get_event_loop().time() + Config.TRAINER_PREPARE_TIMEOUT
         result: dict[int, str] = {}
 
+        # Track the per-round flags so dispatch / scoring can read them.
+        targon_unavailable: dict[int, bool] = self._targon_unavailable.setdefault(round_id, {})
+        # Cache ready messages so mid-round reverify can re-hit each CVM.
+        ready_cache: dict[int, "TrainerReady"] = self._ready_msgs.setdefault(round_id, {})
+
         while asyncio.get_event_loop().time() < deadline:
             ready = get_ready_trainers(round_id)
             for uid, ready_msg in ready.items():
                 if uid in result:
                     continue
-                # Verify the pod via Basilica public metadata
-                if ready_msg.instance_name:
-                    ok, reason = await verify_miner_pod(ready_msg.instance_name)
-                    if not ok:
+                ok, reason, soft_fail = await self._verify_ready(ready_msg, uid)
+                if not ok:
+                    if soft_fail:
+                        # Targon API down — let the round proceed with a flag.
+                        targon_unavailable[uid] = True
+                        result[uid] = ready_msg.trainer_url
+                        logger.warning(
+                            "UID %d trainer accepted with targon_unavailable=True: %s",
+                            uid, reason,
+                        )
+                    else:
                         logger.warning(
                             "UID %d TrainerReady failed verification: %s", uid, reason,
                         )
-                        continue
+                    continue
                 result[uid] = ready_msg.trainer_url
+                ready_cache[uid] = ready_msg
                 logger.info("UID %d trainer ready at %s", uid, ready_msg.trainer_url)
 
             if len(result) >= len(sent_uids):
@@ -772,3 +799,176 @@ class TrainingCoordinator:
         logger.info("Released %d trainers (round %d)", released, round_id)
         clear_ready_trainers(round_id)
         self._fallback_uids.pop(round_id, None)
+        await self.cancel_mid_round_reverify(round_id)
+        self._ready_msgs.pop(round_id, None)
+
+    # ── Trainer verification (backend-aware) ──────────────────────
+
+    def _get_targon_client(self):
+        if self._targon_client is None:
+            from shared.targon_breaker import CircuitBreaker
+            from shared.targon_client import TargonClient
+            self._targon_client = TargonClient(
+                base_url=Config.TARGON_API_BASE_URL,
+                tower_url=Config.TARGON_TOWER_URL,
+                timeout=Config.TARGON_VERIFICATION_TIMEOUT,
+                breaker=CircuitBreaker(
+                    threshold=Config.TARGON_CIRCUIT_BREAKER_THRESHOLD,
+                    reset_after=Config.TARGON_CIRCUIT_BREAKER_RESET,
+                ),
+            )
+        return self._targon_client
+
+    async def _verify_ready(self, ready_msg, uid: int) -> tuple[bool, str, bool]:
+        """Verify a TrainerReady envelope. Returns (ok, reason, soft_fail).
+
+        ``soft_fail=True`` means the round should proceed with a
+        ``targon_unavailable`` flag instead of excluding the miner —
+        the only soft-fail signal is the Targon circuit breaker.
+        """
+        if Config.HOSTING_BACKEND == "targon":
+            from validator.trainer_verify import verify_trainer
+            hotkey = (
+                self.metagraph.hotkeys[uid]
+                if uid < len(self.metagraph.hotkeys) else ready_msg.miner_hotkey
+            )
+            result = await verify_trainer(
+                ready=ready_msg,
+                miner_hotkey=hotkey,
+                expected_image_digest=Config.OFFICIAL_TRAINING_IMAGE_DIGEST,
+                trainer_url=ready_msg.trainer_url,
+                targon_client=self._get_targon_client(),
+                wallet=self.wallet,
+                require_boot_proof=Config.REQUIRE_BOOT_PROOF,
+            )
+            return result.ok, result.reason, result.targon_unavailable
+
+        # Basilica path — preserve original behavior.
+        from validator.pod_manager import verify_miner_pod
+        if not ready_msg.instance_name:
+            return True, "", False
+        ok, reason = await verify_miner_pod(ready_msg.instance_name)
+        return ok, reason, False
+
+    async def reverify_running(
+        self, round_id: int, miner_uid: int, ready_msg, block_hash: str,
+    ) -> bool:
+        """Run a single mid-round re-verification. Returns False on compromise.
+
+        Caller schedules this at deterministic offsets within the
+        training window via ``trainer_verify.reverify_offsets``. We
+        keep that helper out of the hot path because the offsets are
+        block-derived (see compute_assignments for the same pattern).
+        """
+        if Config.HOSTING_BACKEND != "targon":
+            return True  # No mid-run check on Basilica.
+        from validator.trainer_verify import reverify_workload
+        miner_hotkey = (
+            self.metagraph.hotkeys[miner_uid]
+            if miner_uid < len(self.metagraph.hotkeys) else ready_msg.miner_hotkey
+        )
+        result = await reverify_workload(
+            ready=ready_msg,
+            expected_image_digest=Config.OFFICIAL_TRAINING_IMAGE_DIGEST,
+            trainer_url=ready_msg.trainer_url,
+            targon_client=self._get_targon_client(),
+            require_boot_proof=Config.REQUIRE_BOOT_PROOF,
+            expected_signer_hotkey=miner_hotkey,
+        )
+        if result.targon_unavailable:
+            self._targon_unavailable.setdefault(round_id, {})[miner_uid] = True
+            return True  # treat as soft-pass
+        if not result.ok:
+            self._compromised.setdefault(round_id, {})[miner_uid] = True
+            logger.warning(
+                "Mid-run reverify failed for UID %d (round %d): %s",
+                miner_uid, round_id, result.reason,
+            )
+            return False
+        return True
+
+    def schedule_mid_round_reverify(
+        self,
+        round_id: int,
+        block_hash: str,
+        training_window_seconds: float,
+        n_checkpoints: int | None = None,
+    ) -> int:
+        """Fire background reverify tasks at deterministic offsets.
+
+        Returns the number of tasks spawned. Caller invokes this once at
+        the start of Phase B; the tasks self-clean and ``release_trainers``
+        cancels any stragglers. No-op for the Basilica backend.
+        """
+        if Config.HOSTING_BACKEND != "targon":
+            return 0
+        from validator.trainer_verify import reverify_offsets
+        ready_msgs = self._ready_msgs.get(round_id) or {}
+        n = n_checkpoints if n_checkpoints is not None else Config.TARGON_REVERIFY_CHECKPOINTS
+        spawned: list[asyncio.Task] = []
+        for uid, ready_msg in ready_msgs.items():
+            if not ready_msg.targon_workload_uid:
+                continue  # Basilica miner in a Targon-mode validator — skip.
+            offsets = reverify_offsets(
+                block_hash, round_id, uid,
+                n=n, window_seconds=training_window_seconds,
+            )
+            spawned.append(asyncio.create_task(
+                self._run_reverify_schedule(round_id, uid, ready_msg, offsets, block_hash)
+            ))
+        self._reverify_tasks.setdefault(round_id, []).extend(spawned)
+        if spawned:
+            logger.info(
+                "Scheduled mid-round reverify: round=%d miners=%d checkpoints_each=%d",
+                round_id, len(spawned), n,
+            )
+        return len(spawned)
+
+    async def _run_reverify_schedule(
+        self, round_id: int, miner_uid: int, ready_msg, offsets: list[float],
+        block_hash: str = "",
+    ) -> None:
+        """Sleep to each offset, then run reverify_running once. Stops early on first failure."""
+        last = 0.0
+        for offset in offsets:
+            delta = max(0.0, offset - last)
+            try:
+                await asyncio.sleep(delta)
+            except asyncio.CancelledError:
+                return
+            last = offset
+            try:
+                ok = await self.reverify_running(round_id, miner_uid, ready_msg, block_hash)
+            except Exception as e:
+                logger.warning(
+                    "Reverify task crashed for round=%d uid=%d: %s",
+                    round_id, miner_uid, e,
+                )
+                return
+            if not ok:
+                # reverify_running already logged + recorded compromise.
+                return
+
+    async def cancel_mid_round_reverify(self, round_id: int) -> None:
+        tasks = self._reverify_tasks.pop(round_id, [])
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    def round_metadata(self, round_id: int) -> dict:
+        """Snapshot Targon flags for the round — written into experiment rows.
+
+        Returns a dict with ``targon_unavailable`` (list of UIDs that
+        verified soft) and ``compromised`` (list of UIDs that failed
+        re-verify). Scoring reads these to apply the multiplier and
+        exclusion respectively.
+        """
+        return {
+            "targon_unavailable": sorted((self._targon_unavailable.get(round_id) or {}).keys()),
+            "compromised": sorted((self._compromised.get(round_id) or {}).keys()),
+        }

@@ -33,7 +33,10 @@ from shared.database import DataElement
 from shared.db_client import DatabaseClient
 from shared.protocol import Challenge, Proposal
 from shared.provenance import detect_components
-from shared.scoring import score_round, scores_to_weights, ema_update, compute_penalties
+from shared.scoring import (
+    apply_round_metadata, compute_penalties, ema_update,
+    score_round, scores_to_weights,
+)
 from shared.task import TaskSpec, load_task, load_enabled_tasks
 from validator.collection import run_and_collect_agents
 from validator.coordinator import (
@@ -125,6 +128,20 @@ class Validator:
     def __init__(self, config: bt.Config):
         self.config = config
         self.netuid = config.netuid
+
+        # Fail-fast on Targon misconfig — operator gets a clear error at
+        # startup instead of a stack trace mid-round when verify fires.
+        if Config.HOSTING_BACKEND == "targon" and not os.environ.get("TARGON_API_KEY"):
+            raise RuntimeError(
+                "RADAR_HOSTING_BACKEND=targon but TARGON_API_KEY is not set. "
+                "Validators need a Targon API key to verify image digests + attestations. "
+                "See https://docs.targon.com."
+            )
+        if Config.HOSTING_BACKEND == "targon" and not Config.OFFICIAL_TRAINING_IMAGE_DIGEST:
+            raise RuntimeError(
+                "RADAR_HOSTING_BACKEND=targon but OFFICIAL_TRAINING_IMAGE_DIGEST is empty. "
+                "Without a pinned digest the verify chain becomes a no-op — refusing to start."
+            )
 
         # Bittensor components
         self.wallet = bt.Wallet(config=config)
@@ -644,6 +661,19 @@ class Validator:
             commitments=commitments,
             extras=extras,
         )
+        # Targon: schedule mid-round reverify of every accepted CVM at
+        # deterministic offsets within the training window. No-op for
+        # Basilica deployments. Tasks self-clean; release_trainers
+        # cancels stragglers.
+        try:
+            window_s = float(Config.TRAINING_WINDOW_BLOCKS * 12)
+            self.coordinator.schedule_mid_round_reverify(
+                challenge.round_id,
+                block_hash=block_hash,
+                training_window_seconds=window_s,
+            )
+        except Exception as e:
+            logger.warning("schedule_mid_round_reverify failed (round %d): %s", challenge.round_id, e)
         _OK_STATUSES = ("success", "accepted", "already_running")
         succeeded = sum(1 for r in my_results if r.status == "success")
         accepted = sum(1 for r in my_results if r.status in ("accepted", "already_running"))
@@ -955,6 +985,23 @@ class Validator:
             eval_results, challenge, pareto, round_task.objectives, penalties,
             training_metas=training_metas,
         )
+
+        # Apply Targon migration's hybrid-fallback policy: targon_unavailable
+        # gets a 0.5× multiplier (default), compromised UIDs zeroed entirely.
+        # No-op when round_metadata is empty (Basilica deployments, or
+        # Targon round with no flags fired).
+        round_metadata = (
+            self.coordinator.round_metadata(challenge.round_id)
+            if hasattr(self.coordinator, "round_metadata") else None
+        )
+        if round_metadata and (round_metadata.get("targon_unavailable") or round_metadata.get("compromised")):
+            logger.info(
+                "Applying Targon round metadata (round %d): unavailable=%s compromised=%s",
+                challenge.round_id,
+                round_metadata.get("targon_unavailable"),
+                round_metadata.get("compromised"),
+            )
+            round_scores = apply_round_metadata(round_scores, round_metadata)
 
         if round_scores:
             nonzero = {uid: s for uid, s in round_scores.items() if s > 0}

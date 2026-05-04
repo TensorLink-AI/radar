@@ -183,6 +183,44 @@ def score_round(
     return scores
 
 
+def apply_round_metadata(
+    scores: dict[int, float],
+    round_metadata: dict | None,
+) -> dict[int, float]:
+    """Apply Targon migration's hybrid-fallback policy to per-miner scores.
+
+    ``round_metadata`` is the dict produced by
+    ``TrainingCoordinator.round_metadata`` — it contains:
+
+      - ``targon_unavailable``: list of UIDs verified during a Targon
+        outage. Their score gets multiplied by
+        ``Config.TARGON_UNAVAILABLE_SCORE_MULTIPLIER`` (default 0.5)
+        so the round still progresses without fully rewarding miners
+        we couldn't attest in real-time.
+      - ``compromised``: list of UIDs that failed mid-round
+        re-verification. Excluded from scoring entirely (score → 0).
+
+    Returns a NEW dict; the input ``scores`` is not mutated.
+    """
+    if not round_metadata:
+        return dict(scores)
+    from config import Config
+    multiplier = float(Config.TARGON_UNAVAILABLE_SCORE_MULTIPLIER)
+    targon_unavailable = set(round_metadata.get("targon_unavailable") or [])
+    compromised = set(round_metadata.get("compromised") or [])
+
+    out: dict[int, float] = {}
+    for uid, score in scores.items():
+        if uid in compromised:
+            out[uid] = 0.0
+            continue
+        if uid in targon_unavailable:
+            out[uid] = score * multiplier
+            continue
+        out[uid] = score
+    return out
+
+
 def compute_penalties(
     training_metas: dict[int, dict],
     eval_results: dict[int, dict],
