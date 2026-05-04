@@ -279,7 +279,8 @@ class TrainingCoordinator:
             for attempt in range(max_retries + 1):
                 try:
                     # Sign fresh every attempt so the Epistula timestamp
-                    # is always within the 30s tolerance window.
+                    # stays inside the EPISTULA_TIMESTAMP_TOLERANCE window
+                    # (default 120s; tunable via RADAR_EPISTULA_TOLERANCE).
                     headers = sign_request(self.wallet, payload)
                     headers["Content-Type"] = "application/json"
                     resp = await client.post(
@@ -649,7 +650,7 @@ class TrainingCoordinator:
 
         # Fire TrainerRequest to all miners with listener_urls.
         # Re-sign per miner so the Epistula timestamp stays fresh —
-        # stale timestamps (>30s) cause miners to reject with 403.
+        # stale timestamps cause miners to reject with 403.
         with_listener = {uid: c for uid, c in commitments.items() if c.listener_url}
         without_listener = {uid: c for uid, c in commitments.items() if not c.listener_url}
         if without_listener:
@@ -862,12 +863,17 @@ class TrainingCoordinator:
         if Config.HOSTING_BACKEND != "targon":
             return True  # No mid-run check on Basilica.
         from validator.trainer_verify import reverify_workload
+        miner_hotkey = (
+            self.metagraph.hotkeys[miner_uid]
+            if miner_uid < len(self.metagraph.hotkeys) else ready_msg.miner_hotkey
+        )
         result = await reverify_workload(
             ready=ready_msg,
             expected_image_digest=Config.OFFICIAL_TRAINING_IMAGE_DIGEST,
             trainer_url=ready_msg.trainer_url,
             targon_client=self._get_targon_client(),
             require_boot_proof=Config.REQUIRE_BOOT_PROOF,
+            expected_signer_hotkey=miner_hotkey,
         )
         if result.targon_unavailable:
             self._targon_unavailable.setdefault(round_id, {})[miner_uid] = True
@@ -908,7 +914,7 @@ class TrainingCoordinator:
                 n=n, window_seconds=training_window_seconds,
             )
             spawned.append(asyncio.create_task(
-                self._run_reverify_schedule(round_id, uid, ready_msg, offsets)
+                self._run_reverify_schedule(round_id, uid, ready_msg, offsets, block_hash)
             ))
         self._reverify_tasks.setdefault(round_id, []).extend(spawned)
         if spawned:
@@ -920,6 +926,7 @@ class TrainingCoordinator:
 
     async def _run_reverify_schedule(
         self, round_id: int, miner_uid: int, ready_msg, offsets: list[float],
+        block_hash: str = "",
     ) -> None:
         """Sleep to each offset, then run reverify_running once. Stops early on first failure."""
         last = 0.0
@@ -931,7 +938,7 @@ class TrainingCoordinator:
                 return
             last = offset
             try:
-                ok = await self.reverify_running(round_id, miner_uid, ready_msg, "")
+                ok = await self.reverify_running(round_id, miner_uid, ready_msg, block_hash)
             except Exception as e:
                 logger.warning(
                     "Reverify task crashed for round=%d uid=%d: %s",

@@ -217,6 +217,11 @@ class Config:
     # Off until the hardened image is rolled out — TODO: flip to true once
     # OFFICIAL_TRAINING_IMAGE_DIGEST points at a hardened image.
     REQUIRE_BOOT_PROOF: bool = os.getenv("RADAR_REQUIRE_BOOT_PROOF", "false").lower() == "true"
+    # Expected sha256 of the canonical-encoded bootstrap hash table for the
+    # blessed image. Pinned by the subnet owner alongside
+    # OFFICIAL_TRAINING_IMAGE_DIGEST. Empty disables the root-hash cross-check
+    # (signature + signer-hotkey checks still run when boot proof is present).
+    EXPECTED_BOOT_HASHES_ROOT: str = os.getenv("RADAR_EXPECTED_BOOT_HASHES_ROOT", "")
     # How long the miner polls the trainer's /health and the CVM's
     # evidence endpoint after Targon's deploy_workload returns. TDX
     # adds 60–120s on top of container start; 180s is comfortable.

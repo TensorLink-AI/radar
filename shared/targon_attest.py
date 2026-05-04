@@ -18,6 +18,7 @@ Targon account).
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -55,7 +56,7 @@ async def fetch_cvm_evidence(
     out unsigned.
     """
     url = f"http://{cvm_ip}:8080/api/v1/evidence"
-    body = ('{"nonce":"' + nonce + '"}').encode()
+    body = json.dumps({"nonce": nonce}).encode()
     headers = {"Content-Type": "application/json"}
     if wallet is not None:
         try:

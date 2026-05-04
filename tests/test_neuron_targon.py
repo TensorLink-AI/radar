@@ -248,6 +248,7 @@ async def test_startup_check_validates_then_reaps_orphans(monkeypatch):
     monkeypatch.setenv("TARGON_API_KEY", "k")
     from miner import neuron as mn
     monkeypatch.setattr(mn.Config, "HOSTING_BACKEND", "targon")
+    monkeypatch.setattr(mn.Config, "OFFICIAL_TRAINING_IMAGE_DIGEST", "sha256:abc")
 
     stub_cfg = MagicMock(netuid=1)
     with patch.object(mn, "bt"):
@@ -271,6 +272,7 @@ async def test_startup_check_raises_on_invalid_credentials(monkeypatch):
     monkeypatch.setenv("TARGON_API_KEY", "k")
     from miner import neuron as mn
     monkeypatch.setattr(mn.Config, "HOSTING_BACKEND", "targon")
+    monkeypatch.setattr(mn.Config, "OFFICIAL_TRAINING_IMAGE_DIGEST", "sha256:abc")
 
     stub_cfg = MagicMock(netuid=1)
     with patch.object(mn, "bt"):
@@ -292,6 +294,7 @@ async def test_shutdown_tears_down_all_active(monkeypatch):
     monkeypatch.setenv("TARGON_API_KEY", "k")
     from miner import neuron as mn
     monkeypatch.setattr(mn.Config, "HOSTING_BACKEND", "targon")
+    monkeypatch.setattr(mn.Config, "OFFICIAL_TRAINING_IMAGE_DIGEST", "sha256:abc")
 
     stub_cfg = MagicMock(netuid=1)
     with patch.object(mn, "bt"):

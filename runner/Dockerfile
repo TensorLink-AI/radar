@@ -75,6 +75,7 @@ RUN touch /workspace/shared/__init__.py
 COPY entrypoint.sh /usr/local/bin/radar-entrypoint.sh
 COPY _bootstrap.py /workspace/_bootstrap.py
 COPY _gen_hashes.py /workspace/_gen_hashes.py
+COPY boot_proof.py /workspace/runner/boot_proof.py
 
 # Per-job sandbox lives OUTSIDE /workspace so the read-only lockdown
 # below doesn't have to carve out an exception for it.
@@ -102,6 +103,7 @@ RUN chmod 555 /usr/local/bin/radar-entrypoint.sh \
                  /workspace/evaluate.py /workspace/flops.py \
                  /workspace/pretrain_loader.py /workspace/env.py \
                  /workspace/runner/__init__.py \
+                 /workspace/runner/boot_proof.py \
                  /workspace/runner/harness.py \
                  /workspace/runner/server.py \
                  /workspace/runner/sandbox.py \

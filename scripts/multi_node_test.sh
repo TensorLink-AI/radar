@@ -359,15 +359,16 @@ if ! docker build -t radar-runner:latest -f runner/Dockerfile runner/ > "$TRAINE
     cp runner/entrypoint.sh runner/timeseries_forecast/entrypoint.sh
     cp runner/_bootstrap.py runner/timeseries_forecast/_bootstrap.py
     cp runner/_gen_hashes.py runner/timeseries_forecast/_gen_hashes.py
+    cp runner/boot_proof.py runner/timeseries_forecast/boot_proof.py
     if ! docker build -t radar-runner:latest runner/timeseries_forecast/ >> "$TRAINER_LOG" 2>&1; then
         rm -f runner/timeseries_forecast/auth.py runner/timeseries_forecast/artifacts.py runner/timeseries_forecast/r2_audit.py runner/timeseries_forecast/pretrain_data.py runner/timeseries_forecast/gift_eval.py
-        rm -f runner/timeseries_forecast/server.py runner/timeseries_forecast/runner_harness.py runner/timeseries_forecast/sandbox.py runner/timeseries_forecast/sandbox_runner.py runner/timeseries_forecast/sandbox_wrap.sh runner/timeseries_forecast/uploads.py runner/timeseries_forecast/entrypoint.sh runner/timeseries_forecast/_bootstrap.py runner/timeseries_forecast/_gen_hashes.py
-            echo "  Trainer build log: $TRAINER_LOG"
+        rm -f runner/timeseries_forecast/server.py runner/timeseries_forecast/runner_harness.py runner/timeseries_forecast/sandbox.py runner/timeseries_forecast/sandbox_runner.py runner/timeseries_forecast/sandbox_wrap.sh runner/timeseries_forecast/uploads.py runner/timeseries_forecast/entrypoint.sh runner/timeseries_forecast/_bootstrap.py runner/timeseries_forecast/_gen_hashes.py runner/timeseries_forecast/boot_proof.py
+        echo "  Trainer build log: $TRAINER_LOG"
         tail -20 "$TRAINER_LOG"
         fail "Trainer Docker build failed — see log above"
     fi
     rm -f runner/timeseries_forecast/auth.py runner/timeseries_forecast/artifacts.py runner/timeseries_forecast/r2_audit.py runner/timeseries_forecast/pretrain_data.py runner/timeseries_forecast/gift_eval.py
-    rm -f runner/timeseries_forecast/server.py runner/timeseries_forecast/runner_harness.py runner/timeseries_forecast/sandbox.py runner/timeseries_forecast/sandbox_runner.py runner/timeseries_forecast/sandbox_wrap.sh runner/timeseries_forecast/uploads.py runner/timeseries_forecast/entrypoint.sh runner/timeseries_forecast/_bootstrap.py runner/timeseries_forecast/_gen_hashes.py
+    rm -f runner/timeseries_forecast/server.py runner/timeseries_forecast/runner_harness.py runner/timeseries_forecast/sandbox.py runner/timeseries_forecast/sandbox_runner.py runner/timeseries_forecast/sandbox_wrap.sh runner/timeseries_forecast/uploads.py runner/timeseries_forecast/entrypoint.sh runner/timeseries_forecast/_bootstrap.py runner/timeseries_forecast/_gen_hashes.py runner/timeseries_forecast/boot_proof.py
 fi
 
 # Clean up copied files
