@@ -71,7 +71,15 @@ Someone always wins once the frontier is beaten. Early-round bootstrapping (no f
 
 The mechanism is designed so the only way to earn more TAO is to submit better architectures.
 
-**Miners can't tamper with training.** The trainer pod runs the subnet's official frozen training image, not the miner's code. Cryptographic attestation from the GPU backend verifies the image digest matches the on-chain commitment. Presigned URLs prevent trainers from accessing other miners' artifacts. If attestation fails, the trainer scores zero for the entire round.
+**Miners can't tamper with training.** The trainer pod runs the subnet's official frozen training image, not the miner's code. Three independent layers verify this:
+
+1. **Hardware attestation.** Trainer pods run on Targon (Intel TDX confidential VMs with H100/H200/B200 GPUs in CC mode). The TDX quote is signed by the CPU, the NRAS GPU token is signed by NVIDIA, and both are verified end-to-end via `tower.targon.com`. This proves *which image bytes* are running on real, isolated hardware.
+2. **Image digest pinning.** The deployed workload's image digest is checked against `OFFICIAL_TRAINING_IMAGE_DIGEST`. Miners can't substitute a modified image without failing this check.
+3. **Launch-config hardening.** The image's entrypoint (`/usr/local/bin/radar-entrypoint.sh`, chmod 555) refuses to run if any operator-supplied `command`/`args` are passed, scrubs preload-style env vars (`LD_PRELOAD`, `PYTHONPATH`, etc.), pins `PYTHONNOUSERSITE=1`, and execs a stdlib-only bootstrap (`/workspace/_bootstrap.py`, chmod 444). The bootstrap sha256-verifies every load-bearing file against a build-time hash table, refuses to start if any file mismatches or any unexpected file appears in the protected dirs, and writes a `/tmp/boot_proof.json` record of what booted. Validators fetch `GET /boot_proof` (signed with the miner hotkey) and verify the hashes root; a 503 means the bootstrap didn't run, which is the bypass-detection signal.
+
+Targon attestation closes the "what image is running" gap; image hardening closes the "how was it launched" gap. Together they form the trainer trust chain. Validators re-execute the digest + boot-proof checks at 2–3 deterministic offsets within Phase B (seeded from `block_hash XOR round_id XOR miner_uid`, so miners can't predict when), and a mid-run failure marks the miner compromised for the round.
+
+Presigned URLs prevent trainers from accessing other miners' artifacts. If any attestation step fails, the trainer scores zero for the entire round.
 
 **Cross-evaluation prevents self-serving.** Miner A's architecture trains on Miner B's pod. Assignment is deterministic from the block hash, so neither party can influence it. Since B runs the frozen harness, B can't give A's architecture preferential treatment even if they wanted to.
 
@@ -100,7 +108,7 @@ python miner/neuron.py --netuid <N> --subtensor.network <network> --wallet.name 
 The miner neuron has two responsibilities:
 
 1. **Agent code hosting**: serves your `.py` bundle at `GET /agent_code` and commits its content hash on-chain. Validators fetch + verify each round.
-2. **Warm-standby trainer listener**: a lightweight FastAPI process (no GPU) that deploys attested GPU pods on demand via the pluggable backend when a validator dispatches a Phase B training job.
+2. **Warm-standby trainer listener**: a lightweight FastAPI process (no GPU) that deploys attested GPU pods on demand via the pluggable backend (`RADAR_HOSTING_BACKEND=basilica|targon`) when a validator dispatches a Phase B training job. On Targon, the listener tears down prior-round workloads synchronously, polls `/health` + the CVM evidence endpoint for readiness (default 180s, configurable via `RADAR_TARGON_READINESS_TIMEOUT`), runs a background `HealthMonitor` during the round, and reaps orphaned workloads at startup. SIGTERM/SIGINT/atexit handlers tear down active workloads before exit. Every Targon-touching log line is structurally tagged (`DEPLOY_OK`, `READINESS_TIMEOUT`, `TRAINER_READY`, `HEALTH_COMPROMISED`, `ORPHAN_TEARDOWN`, etc.) for operator debugging.
 
 ### Subnet-provided services (inside the agent sandbox)
 
@@ -122,7 +130,8 @@ Read this first.
 * **Output shape mismatch.** Must be exactly `(batch, prediction_len, num_variates, num_quantiles)`.
 * **Failing to beat the frontier by 0.5%.** Once a feasible frontier exists in the round's bucket, ties and regressions against the best frontier CRPS score 0 (see Scoring).
 * **Your trainer pod is down or unreachable.** If your trainer listener fails to produce an attested GPU pod, or the pod times out during Phase B, you score zero for the round.
-* **Attestation failure.** If your trainer pod isn't running the official training image (verified by digest against the on-chain commitment), score = 0.
+* **Attestation failure.** If your trainer pod fails Targon TDX/NRAS attestation, the workload digest doesn't match `OFFICIAL_TRAINING_IMAGE_DIGEST`, or `GET /boot_proof` returns 503 / a bad hashes root, score = 0. This applies to the initial check *and* every mid-round re-verify (run at 2–3 deterministic offsets within Phase B).
+* **Targon outage** (hybrid fallback). If the validator-side circuit breaker opens (5 consecutive failures within 60s), affected miners are tagged `targon_unavailable` for that round. Their dispatches are still accepted but the final score is multiplied by `Config.TARGON_UNAVAILABLE_SCORE_MULTIPLIER` (default 0.5) — half-weight, deliberately, to keep the subnet alive during routine API maintenance without rewarding miners who could exploit forced outages to launder unattested runs.
 
 ### What Your Agent Controls
 
@@ -176,7 +185,8 @@ python validator/neuron.py --netuid <N> --subtensor.network <network> --wallet.n
   The `/dashboard/api/*` endpoints are public by design; anyone on the internet can read agent source code, stdout logs, and experiments. Do not add fields there that shouldn't be world-readable. The internal Jinja pages at `/dashboard/*` remain operator-gated.
 * **Two processes locally.** For dev work, run `RADAR_NEURON_MODE=validator python database/neuron.py --port 8090` alongside `RADAR_NEURON_MODE=dashboard python database/neuron.py --port 8091` pointing at the same Postgres (`RADAR_PG_DSN`). Pool sizing and statement timeouts are controlled per-process via `RADAR_PG_POOL_MIN`, `RADAR_PG_POOL_MAX`, and `RADAR_PG_STATEMENT_TIMEOUT_MS`.
 * **Agent pods** on the subnet's pluggable GPU backend. Validators dispatch agent runs to attested pods using the subnet's official `radar-agent` image. Phase A runs up to `RADAR_AGENT_CONCURRENCY` (default 8) pods concurrently; each runs a miner's injected `.py` bundle.
-* **Bandwidth.** Validators download checkpoints (safetensors per miner per round) from R2 during Phase C.
+* **Hosting backend selection.** Both miners and validators pick the hosting backend via `RADAR_HOSTING_BACKEND=basilica|targon` (default `basilica` during rollout). Targon deployments need a `TARGON_API_KEY` (separate accounts for miner and validator), `OFFICIAL_TRAINING_IMAGE_DIGEST` matched on both sides, and (validator only) `RADAR_REQUIRE_BOOT_PROOF=true` once the hardened image is universal. The Targon SDK is loaded lazily — Basilica deployments don't import it.
+* **Bandwidth.** Validators download checkpoints (safetensors per miner per round) from R2/Hippius during Phase C.
 
 ### What Each Phase Costs
 
@@ -258,15 +268,26 @@ miner/neuron.py                  Serve agent .py bundle + commit hash on-chain;
                                  warm-standby trainer listener (no GPU)
 miner_template/                  Starter kit (agent.py + deploy.py)
 
-runner/timeseries_forecast/      Frozen training environment
-  harness.py                       Training loop + recipe hooks
-  server.py                        Trainer HTTP endpoint (POST /train)
-  flops.py                         FLOPs measurement (analytical + wallclock)
-  prepare.py                       Data pipeline + validate()
+runner/                          Frozen training image (subnet-owner)
+  entrypoint.sh                    Hardened ENTRYPOINT (chmod 555): refuses operator
+                                   command/args, scrubs preload env, execs bootstrap
+  _bootstrap.py                    Stdlib-only sha256 verifier (chmod 444); writes
+                                   /tmp/boot_proof.json then execvp's into server.py
+  _gen_hashes.py                   Build-time hash table generator (single source of truth)
+  boot_proof.py                    /boot_proof endpoint signing + validator-side verify
+  server.py                        Trainer HTTP endpoint (POST /train, GET /boot_proof)
+  timeseries_forecast/             Frozen ts_forecasting harness
+    harness.py                     Training loop + recipe hooks
+    flops.py                       FLOPs measurement (analytical + wallclock)
+    prepare.py                     Data pipeline + validate()
+    evaluate.py                    CRPS/MASE computation
+  agent/                           Official sandboxed agent image (subnet-owner)
+    Dockerfile                     Builds ghcr.io/tensorlink-ai/radar/radar-agent
+    entrypoint.sh                  Programs iptables egress allowlist, then exec
 
-runner/agent/                    Official sandboxed agent image (subnet-owner)
-  Dockerfile                       Builds ghcr.io/tensorlink-ai/radar/radar-agent
-  entrypoint.sh                    Programs iptables egress allowlist, then exec
+shared/targon_client.py          Targon hosting client: deploy/teardown workloads
+shared/targon_attest.py          TDX+NRAS verification via tower.targon.com
+shared/targon_breaker.py         Circuit breaker driving the hybrid-fallback multiplier
 ```
 
 ### Wire Protocol
@@ -331,6 +352,43 @@ scratchpad/{hotkey}/state.tar.gz                   # Agent persistent state
 | Frontier improvement threshold | 0.5% |
 | Query rate limit | 10/miner/min |
 | Size gate tolerance | 10% |
+
+## Trainer Pod Hosting (Basilica → Targon migration)
+
+Trainer pods are migrating from Basilica to **Targon**, a confidential-compute platform that runs containers on Intel TDX CVMs with NVIDIA H100/H200/B200 GPUs in CC mode. Targon provides hardware-rooted attestation (TDX quote signed by the CPU + NRAS GPU token signed by NVIDIA) verifiable end-to-end through `https://tower.targon.com`.
+
+The backend is selected per-deployment via `RADAR_HOSTING_BACKEND=basilica|targon` (default `basilica` during rollout). A deployment is fully one or the other — no half-and-half.
+
+### What attestation proves (and doesn't)
+
+| Attestation says | Targon proves it | Targon does NOT prove it |
+|---|---|---|
+| Image bytes | ✅ workload runs digest X | — |
+| GPU is in CC mode | ✅ NRAS token | — |
+| TDX hardware identity | ✅ Intel quote | — |
+| Launch config (command/args/env) | ❌ — only image bytes | image hardening's job |
+| Behavior matches intent | ❌ | spot re-execution + canary tasks |
+
+The image-hardening layer (`runner/entrypoint.sh` + `runner/_bootstrap.py` + `runner/boot_proof.py`) closes the launch-config gap. Together they form the full image-level trust chain.
+
+### Per-round verification stack (validator)
+
+After a miner posts `TrainerReady`:
+
+1. **Workload digest** — `targon.verify_image_digest(uid, OFFICIAL_TRAINING_IMAGE_DIGEST)`.
+2. **TDX + NRAS attestation** — `targon.verify_attestation(cvm_ip, miner_hk, validator_hk, nonce)` end-to-end via tower; cross-checks the GPU class the miner declared.
+3. **Boot proof** — `GET {trainer_url}/boot_proof`, validate hotkey signature + hashes root. Feature-flagged via `RADAR_REQUIRE_BOOT_PROOF` until the hardened image is universal. 503 = bootstrap didn't run = launch-config bypass.
+
+All three must pass. Failures exclude the miner from the round. During Phase B, validators re-execute checks (1) and (3) at 2–3 deterministic offsets seeded from `block_hash XOR round_id XOR miner_uid` — every validator agrees on when checks happen but the miner can't predict them. (2) is skipped on re-verify because the workload UID is already pinned.
+
+### What's per-round vs persistent (on-chain)
+
+* **On-chain via `ImageCommitment`**: `code_hash`, `listener_url`, `subnet_version`. Same set as today — Targon adds no new on-chain fields. The trainer image digest is *not* on chain because every miner runs the same subnet-owner-blessed digest, so there's no per-miner variation worth committing (and the 128-byte chain budget can't hold it). Validators read the expected digest from `Config.OFFICIAL_TRAINING_IMAGE_DIGEST`.
+* **Per-round via signed `TrainerReady`**: `targon_workload_uid`, `cvm_ip`, `gpu_class`, `deployed_image_digest`. Ephemeral, Epistula-signed by the miner hotkey, scoped to one round.
+
+### Hybrid fallback
+
+If Targon is down (circuit breaker opens after 5 consecutive failures within 60s, default), validators tag affected miners `targon_unavailable`, accept their dispatches, and apply `Config.TARGON_UNAVAILABLE_SCORE_MULTIPLIER` (default 0.5) to their final score. Half-weight is a deliberate trade-off: full weight during outages would let attackers wait for / trigger Targon unavailability to launder unattested runs; zero weight would brick the subnet during routine API maintenance. Tunable via the env var if the trade-off needs adjusting.
 
 ## Research Lineage
 
