@@ -719,11 +719,9 @@ class Validator:
                     r.arch_owner, r.trainer_uid, r.status, r.error,
                 )
 
-        await self.coordinator.write_dispatch_record(challenge.round_id, my_results)
-
         # Build the uid → submission_id map. Start with my own jobs (in-memory
         # source of truth for the submission_ids I just minted), then merge in
-        # other validators' submission_ids by reading their dispatch records.
+        # other validators' submission_ids after Phase B closes.
         uid_to_sid: dict[int, str] = {
             r.arch_owner: r.submission_id
             for r in my_results if r.submission_id
@@ -735,6 +733,14 @@ class Validator:
             await self._wait_until_block(
                 round_start + Config.SUBMISSION_WINDOW_BLOCKS + Config.TRAINING_WINDOW_BLOCKS
             )
+
+        # Publish the dispatch record AFTER the Phase B training window closes.
+        # The record carries the submission_id ↔ arch_owner mapping that lets
+        # other validators resolve checkpoints in Phase C. Hippius is public
+        # by design (decentralized object store), so writing the record any
+        # earlier would let a trainer-host fetch it mid-training and learn
+        # whose architecture they're running — defeating the anonymisation.
+        await self.coordinator.write_dispatch_record(challenge.round_id, my_results)
 
         # Pull other validators' dispatch records so we can poll for their
         # checkpoints too (Phase C requires every validator to evaluate every
@@ -802,15 +808,13 @@ class Validator:
                     block_hash, missing_dispatchers, all_jobs, remaining_valis,
                 )
                 my_fallback = [j for j in fallback_jobs if j.dispatcher == my_uid]
+                fb_results: list = []
                 if my_fallback:
                     fb_extras = self._build_dispatch_extras(challenge, round_task)
                     fb_results = await self.coordinator.dispatch_jobs(
                         my_fallback, challenge, filtered, trainer_endpoints,
                         commitments=commitments,
                         extras=fb_extras,
-                    )
-                    await self.coordinator.write_dispatch_record(
-                        challenge.round_id, fb_results,
                     )
                     for r in fb_results:
                         if r.submission_id:
@@ -821,6 +825,13 @@ class Validator:
                     + Config.TRAINING_WINDOW_BLOCKS
                     + Config.FALLBACK_WINDOW_BLOCKS
                 )
+
+                # Publish fallback dispatch record AFTER the fallback training
+                # window closes — same anonymity reason as the primary record.
+                if fb_results:
+                    await self.coordinator.write_dispatch_record(
+                        challenge.round_id, fb_results,
+                    )
 
                 # Re-pull other validators' fallback dispatch records too.
                 try:
