@@ -12,7 +12,8 @@ RUN pip3 install --no-cache-dir \
 
 RUN pip3 install --no-cache-dir \
     bittensor cryptography sentencepiece \
-    fastapi uvicorn httpx boto3 safetensors pyarrow pandas
+    fastapi uvicorn httpx boto3 safetensors pyarrow pandas \
+    runpod
 
 # ── Generic harness ───────────────────────────────────────────────
 RUN mkdir -p /workspace/runner
@@ -20,6 +21,9 @@ COPY __init__.py /workspace/runner/__init__.py
 COPY harness.py /workspace/runner/harness.py
 COPY server.py /workspace/runner/server.py
 COPY server.py /workspace/server.py
+COPY launcher.py /workspace/runner/launcher.py
+COPY launcher.py /workspace/launcher.py
+COPY handler.py /workspace/runner/handler.py
 
 # ── Sandbox runner (untrusted miner code lives here) ──────────────
 COPY sandbox.py /workspace/runner/sandbox.py
@@ -98,6 +102,7 @@ RUN chmod 555 /usr/local/bin/radar-entrypoint.sh \
                  /workspace/_gen_hashes.py \
                  /workspace/_bootstrap_hashes.json \
                  /workspace/server.py \
+                 /workspace/launcher.py \
                  /workspace/sandbox_runner.py \
                  /workspace/harness.py /workspace/prepare.py \
                  /workspace/evaluate.py /workspace/flops.py \
@@ -106,6 +111,8 @@ RUN chmod 555 /usr/local/bin/radar-entrypoint.sh \
                  /workspace/runner/boot_proof.py \
                  /workspace/runner/harness.py \
                  /workspace/runner/server.py \
+                 /workspace/runner/launcher.py \
+                 /workspace/runner/handler.py \
                  /workspace/runner/sandbox.py \
                  /workspace/runner/uploads.py \
                  /workspace/runner/timeseries_forecast/__init__.py \

@@ -300,6 +300,97 @@ async def run_agent_on_pod(
 # ── Pod Verification (Basilica public metadata) ──────────────────
 
 
+def _parse_runpod_allowlist() -> set[str]:
+    """Comma-separated env-var → set. Empty means "any endpoint accepted"."""
+    from config import Config
+    raw = (Config.OFFICIAL_RUNPOD_ENDPOINTS or "").strip()
+    if not raw:
+        return set()
+    return {e.strip() for e in raw.split(",") if e.strip()}
+
+
+async def verify_runpod_endpoint(
+    endpoint_id: str,
+    expected_image_digest: str = "",
+    declared_image_digest: str = "",
+    *,
+    runpod_client=None,
+) -> tuple[bool, str]:
+    """Verify a miner's RunPod Serverless endpoint before accepting dispatch.
+
+    Mirrors ``verify_miner_pod`` for Basilica — one control-plane API
+    call, fast-fail on mismatch. The RunPod backend has no SSH/exec
+    surface and no per-job hardware attestation, so the trust model is:
+
+      1. The endpoint id must be on the subnet-owner allowlist (when one
+         is configured) — keeps a miner from pointing their relay at
+         some unrelated workload.
+      2. The endpoint's template image must pin to the official trainer
+         digest (when one is configured). Tag-form references aren't
+         verifiable; the helper returns False with a clear reason so
+         operators know to switch their template to digest-form.
+      3. The miner's self-declared digest in TrainerReady must match
+         the validator's expected digest (a sanity check that catches
+         operator misconfig before we even hit the RunPod API).
+
+    Boot-proof / mid-round re-verification are intentionally NOT
+    performed here — see CLAUDE.md "Targon migration" comparison; the
+    RunPod backend matches Basilica's verification depth.
+    """
+    if not endpoint_id:
+        return False, "no endpoint_id provided"
+
+    allowlist = _parse_runpod_allowlist()
+    if allowlist and endpoint_id not in allowlist:
+        return False, f"endpoint {endpoint_id} not in OFFICIAL_RUNPOD_ENDPOINTS allowlist"
+
+    # Cheap sanity check before hitting the API.
+    if (
+        expected_image_digest
+        and declared_image_digest
+        and declared_image_digest != expected_image_digest
+    ):
+        return False, (
+            f"declared digest {declared_image_digest} != expected {expected_image_digest}"
+        )
+
+    if runpod_client is None:
+        # Lazy default — keeps Basilica/Targon validators from importing
+        # the RunPod client / breaker.
+        from miner.runpod_lifecycle import make_runpod_client
+        try:
+            runpod_client = make_runpod_client()
+        except Exception as e:
+            return False, f"could not construct RunpodClient: {e}"
+
+    from shared.runpod_breaker import RunpodUnavailable
+    try:
+        info = await runpod_client.get_endpoint(endpoint_id)
+    except RunpodUnavailable as e:
+        # Caller treats this as the runpod_unavailable soft-fail path.
+        return False, f"runpod unavailable: {e}"
+    except Exception as e:
+        return False, f"endpoint metadata fetch failed: {e}"
+
+    if not info.template_id and not info.image_name:
+        return False, f"endpoint {endpoint_id} not visible on this account"
+
+    if expected_image_digest:
+        if not info.image_digest:
+            return False, (
+                f"endpoint template uses tag-form image {info.image_name!r}; "
+                "RunPod templates must reference @sha256:... for verification"
+            )
+        if info.image_digest != expected_image_digest:
+            return False, (
+                f"endpoint image digest {info.image_digest} != expected {expected_image_digest}"
+            )
+    if info.workers_max <= 0:
+        return False, f"endpoint {endpoint_id} has workers_max=0 (no capacity allocated)"
+
+    return True, "ok"
+
+
 def _parse_image_ref(image_ref: str) -> tuple[str, str]:
     """Split 'registry/repo:tag' into (image, tag). Empty tag if none."""
     if ":" in image_ref and not image_ref.endswith(":"):

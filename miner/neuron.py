@@ -28,6 +28,13 @@ from miner.hosting import (
     get_targon_registry_creds, teardown_basilica_sync,
     teardown_targon_with_retry, wait_for_trainer_ready,
 )
+from miner.hosting_runpod import (
+    RunpodReadinessTimeout, deploy_runpod, submit_dispatch_to_runpod,
+)
+from miner.runpod_lifecycle import (
+    cancel_jobs_for_round, make_runpod_client,
+    validate_credentials as validate_runpod_credentials,
+)
 from miner.targon_lifecycle import (
     HealthMonitorRegistry, install_shutdown_handlers,
     make_targon_client, validate_and_reap_orphans,
@@ -62,10 +69,30 @@ class Miner:
                 "Without a pinned digest validators cannot verify the deployed image — "
                 "set OFFICIAL_TRAINING_IMAGE_DIGEST=sha256:... to the subnet-owner-blessed value."
             )
+        # Same fail-fast for RunPod. The endpoint id is per-miner (RunPod
+        # endpoints are account-scoped) and must be pre-provisioned with
+        # the official trainer image; without it there's nothing to
+        # dispatch jobs into.
+        if Config.HOSTING_BACKEND == "runpod" and not os.environ.get("RUNPOD_API_KEY"):
+            raise RuntimeError(
+                "RADAR_HOSTING_BACKEND=runpod but RUNPOD_API_KEY is not set. "
+                "Issue an API key at https://www.runpod.io/console/user/settings."
+            )
+        if Config.HOSTING_BACKEND == "runpod" and not Config.RUNPOD_ENDPOINT_ID:
+            raise RuntimeError(
+                "RADAR_HOSTING_BACKEND=runpod but RADAR_RUNPOD_ENDPOINT_ID is empty. "
+                "Pre-provision a RunPod Serverless endpoint with the official trainer "
+                "image and set RADAR_RUNPOD_ENDPOINT_ID to its id."
+            )
 
         self.wallet = bt.Wallet(config=config)
         self.subtensor = bt.Subtensor(config=config)
         self._targon_client = None
+        self._runpod_client = None
+        # Per-round RunPod job ids the miner has submitted on behalf of
+        # validators. Cancelled at end-of-round / shutdown.
+        # round_id → list[job_id]
+        self._runpod_jobs: dict[int, list[str]] = {}
 
         # Cache metagraph — synced periodically in keep-alive loop
         self.metagraph = self.subtensor.metagraph(self.netuid)
@@ -165,8 +192,9 @@ class Miner:
     ):
         """POST signed TrainerReady to a validator's DB server.
 
-        Carries Targon hosting metadata when present; empty strings for
-        Basilica deploys keep the wire format backwards-compatible.
+        Carries backend-specific metadata when present; empty strings
+        for backends that don't use a given field keep the wire format
+        backwards-compatible.
         """
         hotkey = self.wallet.hotkey.ss58_address
         ready = TrainerReady(
@@ -178,6 +206,8 @@ class Miner:
             cvm_ip=deployment.cvm_ip,
             gpu_class=deployment.gpu_class,
             deployed_image_digest=deployment.deployed_image_digest,
+            runpod_endpoint_id=deployment.runpod_endpoint_id,
+            runpod_template_id=deployment.runpod_template_id,
         )
         body = ready.to_json().encode()
         headers = sign_request(self.wallet, body)
@@ -254,6 +284,11 @@ class Miner:
             deployment.targon_workload_uid or deployment.name,
             deployment.url, time.time() - deploy_start,
         )
+
+        # On RunPod: deploy_runpod() already polled the endpoint to
+        # readiness, no need for an extra wait_for here. The miner
+        # listener (deployment.url) was up before the request landed
+        # by definition.
 
         # On Targon: wait for /health and CVM evidence endpoint before
         # advertising the trainer. Tear down on timeout so we don't leak
@@ -347,7 +382,7 @@ class Miner:
     async def _deploy_one(
         self, request: TrainerRequest, hotkey: str, network: str, ttl: int,
     ) -> Deployment:
-        """Backend-agnostic deploy. Picks Basilica or Targon by Config.HOSTING_BACKEND."""
+        """Pick backend by Config.HOSTING_BACKEND: basilica | targon | runpod."""
         if Config.HOSTING_BACKEND == "targon":
             gpu_class = (Config.TRAINER_GPU_MODELS.split(",")[0].strip()
                          if Config.TRAINER_GPU_MODELS else "H200")
@@ -362,6 +397,21 @@ class Miner:
                 gpu_class=gpu_class,
                 registry=get_targon_registry_creds(),
             )
+        if Config.HOSTING_BACKEND == "runpod":
+            gpu_class = (Config.TRAINER_GPU_MODELS.split(",")[0].strip()
+                         if Config.TRAINER_GPU_MODELS else "")
+            # Listener URL is what the validator dispatches /train to;
+            # the listener relays into RunPod with the miner's API key.
+            listener_url = self._listener_external_url()
+            return await deploy_runpod(
+                runpod_client=self._get_runpod_client(),
+                endpoint_id=Config.RUNPOD_ENDPOINT_ID,
+                listener_url=listener_url,
+                deployed_image_digest=Config.OFFICIAL_TRAINING_IMAGE_DIGEST,
+                gpu_class=gpu_class,
+                request=request,
+                readiness_timeout_s=Config.RUNPOD_READINESS_TIMEOUT_S,
+            )
         return await deploy_basilica(
             request=request,
             image=self.trainer_image,
@@ -371,13 +421,25 @@ class Miner:
             ttl=ttl,
         )
 
+    def _listener_external_url(self) -> str:
+        host = self.external_ip or "0.0.0.0"
+        return f"http://{host}:{self.listener_port}"
+
     def _get_targon_client(self):
         if not getattr(self, "_targon_client", None):
             self._targon_client = make_targon_client()
         return self._targon_client
 
+    def _get_runpod_client(self):
+        if not getattr(self, "_runpod_client", None):
+            self._runpod_client = make_runpod_client()
+        return self._runpod_client
+
     async def _targon_startup_check(self) -> None:
         await validate_and_reap_orphans(self._get_targon_client())
+
+    async def _runpod_startup_check(self) -> None:
+        await validate_runpod_credentials(self._get_runpod_client())
 
     async def _teardown_all_active(self) -> None:
         """Synchronous-feeling teardown of every active deployment."""
@@ -411,15 +473,44 @@ class Miner:
 
         Targon path retries 3 times with exponential backoff — the workload
         bills by uptime, so quietly leaking it costs the operator real money.
+        RunPod path cancels any per-round jobs the miner submitted but
+        leaves the endpoint alive (endpoints persist across rounds).
         """
         if deployment.targon_workload_uid:
             await teardown_targon_with_retry(
                 self._get_targon_client(), deployment.targon_workload_uid,
             )
             return
+        if deployment.runpod_endpoint_id:
+            # Any in-flight jobs for this round get cancelled; the
+            # endpoint itself stays up because RunPod manages worker
+            # lifecycle and we'll reuse it next round.
+            jobs = self._collect_runpod_jobs_for_deployment(deployment)
+            if jobs:
+                await cancel_jobs_for_round(
+                    self._get_runpod_client(),
+                    deployment.runpod_endpoint_id,
+                    jobs,
+                )
+            return
         # Basilica deployment objects expose a sync .delete() — run in executor.
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, teardown_basilica_sync, deployment.raw)
+
+    def _collect_runpod_jobs_for_deployment(self, deployment: Deployment) -> list[str]:
+        """Pull job ids submitted under any round bound to this deployment.
+
+        Looks up `_runpod_jobs` by the deployment's round (encoded in the
+        instance name) — caller knows the round id, but `_teardown`
+        doesn't, so we walk and remove any bucket whose endpoint id
+        matches and whose name suffix matches.
+        """
+        jobs: list[str] = []
+        for rid in list(self._runpod_jobs.keys()):
+            entry = self.active_deployments.get(rid)
+            if isinstance(entry, tuple) and entry[0].name == deployment.name:
+                jobs.extend(self._runpod_jobs.pop(rid, []))
+        return jobs
 
     async def _teardown_prior_rounds(self, current_round_id: int):
         """Delete prior-round deployments whose TTL has elapsed."""
@@ -510,6 +601,90 @@ class Miner:
         def health():
             return {"status": "ok"}
 
+        @listener_app.post("/train")
+        async def train(request: Request):
+            """Relay /train into RunPod when the miner runs that backend.
+
+            Validators dispatch to ``deployment.url`` (the listener URL
+            for RunPod). The listener verifies the validator's Epistula
+            signature, submits the payload as ``input`` to the miner's
+            RunPod endpoint with the miner's API key, and returns 202.
+            The actual training runs on a RunPod worker; the worker
+            uploads to R2 via the presigned URLs in the payload, and
+            the validator polls R2 for completion just like Basilica /
+            Targon today.
+
+            This route is a no-op (404 from the validator's POV) for
+            Basilica / Targon backends — those dispatch to the trainer
+            pod directly, not the miner listener.
+            """
+            if Config.HOSTING_BACKEND != "runpod":
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": "miner listener does not relay /train for this backend"},
+                )
+            body = await request.body()
+            try:
+                ok, err, signed_by = verify_request(
+                    dict(request.headers), body, miner.metagraph,
+                )
+                if not ok:
+                    logger.warning("Auth failed on /train: %s", err)
+                    return JSONResponse(status_code=403, content={"error": err})
+            except Exception as exc:
+                logger.debug("Auth verification exception (allowing): %s", exc)
+                signed_by = ""
+
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
+
+            round_id = int(payload.get("round_id", 0))
+            entry = miner.active_deployments.get(round_id)
+            if not isinstance(entry, tuple):
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": f"no active RunPod deployment for round {round_id}"},
+                )
+            deployment, _ts, _ttl = entry
+            if not deployment.runpod_endpoint_id:
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": f"round {round_id} not running on RunPod"},
+                )
+
+            existing = miner._runpod_jobs.get(round_id, [])
+            if existing:
+                logger.info(
+                    "RunPod relay: round=%d already submitted job=%s — returning idempotently",
+                    round_id, existing[0],
+                )
+                return JSONResponse(
+                    status_code=202,
+                    content={"status": "accepted", "round_id": round_id, "job_id": existing[0]},
+                )
+
+            job_id = await submit_dispatch_to_runpod(
+                runpod_client=miner._get_runpod_client(),
+                endpoint_id=deployment.runpod_endpoint_id,
+                payload=payload,
+            )
+            if not job_id:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "RunPod unavailable", "reason": "submit_failed"},
+                )
+            miner._runpod_jobs.setdefault(round_id, []).append(job_id)
+            logger.info(
+                "RunPod relay: round=%d validator=%s job=%s",
+                round_id, (signed_by or "?")[:16], job_id,
+            )
+            return JSONResponse(
+                status_code=202,
+                content={"status": "accepted", "round_id": round_id, "job_id": job_id},
+            )
+
     def start_listener(self):
         """Start the listener HTTP server in a background thread."""
         self._setup_listener_routes()
@@ -531,6 +706,8 @@ class Miner:
         # a prior crashed process before we start subscribing to validators.
         if Config.HOSTING_BACKEND == "targon":
             await self._targon_startup_check()
+        elif Config.HOSTING_BACKEND == "runpod":
+            await self._runpod_startup_check()
 
         self._shutdown_event = asyncio.Event()
         install_shutdown_handlers(

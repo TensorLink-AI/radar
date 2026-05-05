@@ -162,23 +162,36 @@ class TrainerRequest:
 class TrainerReady:
     """Miner → Validator: my trainer pod is live at this URL.
 
-    The Targon-specific fields (``targon_workload_uid``, ``cvm_ip``,
-    ``gpu_class``, ``deployed_image_digest``) are populated only when
-    ``RADAR_HOSTING_BACKEND=targon``; on Basilica deploys they stay
-    empty strings. The miner signs the whole envelope via Epistula —
-    the validator trusts these per-round ephemeral fields because the
-    signature is bound to the on-chain hotkey.
+    Backend-specific fields stay empty on the other backends:
+
+    * ``targon_workload_uid``, ``cvm_ip`` are Targon-only.
+    * ``runpod_endpoint_id``, ``runpod_template_id`` are RunPod-only.
+    * ``gpu_class`` and ``deployed_image_digest`` are populated by both
+      Targon and RunPod (for image-pin validation), empty on Basilica.
+
+    The miner signs the whole envelope via Epistula — the validator
+    trusts these per-round ephemeral fields because the signature is
+    bound to the on-chain hotkey.
     """
     round_id: int = 0
     trainer_url: str = ""
     instance_name: str = ""
     miner_hotkey: str = ""
 
-    # Targon hosting metadata (empty on Basilica deploys).
+    # Targon hosting metadata (empty on Basilica / RunPod deploys).
     targon_workload_uid: str = ""
     cvm_ip: str = ""
+
+    # Shared by Targon + RunPod (empty on Basilica).
     gpu_class: str = ""               # "H100" | "H200" | "B200"
     deployed_image_digest: str = ""   # the digest the miner deployed
+
+    # RunPod hosting metadata (empty on Basilica / Targon deploys). The
+    # endpoint is account-scoped and the validator can't submit to it
+    # directly — it dispatches to ``trainer_url`` (the miner listener),
+    # which relays into RunPod with the miner's API key.
+    runpod_endpoint_id: str = ""
+    runpod_template_id: str = ""
 
     def to_json(self) -> str:
         return json.dumps({
@@ -190,6 +203,8 @@ class TrainerReady:
             "cvm_ip": self.cvm_ip,
             "gpu_class": self.gpu_class,
             "deployed_image_digest": self.deployed_image_digest,
+            "runpod_endpoint_id": self.runpod_endpoint_id,
+            "runpod_template_id": self.runpod_template_id,
         })
 
     @classmethod
