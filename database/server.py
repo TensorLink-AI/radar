@@ -380,13 +380,20 @@ async def auth_middleware(request: Request, call_next):
             miner_uid = int(miner_uid_str)
         except ValueError:
             miner_uid = -1
-        asyncio.create_task(_access_logger.log_access(
-            hotkey=miner_hotkey or "validator",
-            miner_uid=miner_uid,
-            endpoint=path,
-            experiment_ids=exp_ids,
-            method=request.method,
-        ))
+        # Await the write: asyncio.create_task gives the event loop only a
+        # weak reference, so the task can be GC'd before the INSERT runs and
+        # the heatmap stays empty. A single Postgres INSERT is cheap; any
+        # failure must not break the user-facing response.
+        try:
+            await _access_logger.log_access(
+                hotkey=miner_hotkey or "validator",
+                miner_uid=miner_uid,
+                endpoint=path,
+                experiment_ids=exp_ids,
+                method=request.method,
+            )
+        except Exception as e:
+            logger.warning("access_log write failed: %s", e)
 
     return response
 
