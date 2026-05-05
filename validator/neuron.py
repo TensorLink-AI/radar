@@ -440,6 +440,55 @@ class Validator:
                 "Cached %d training_meta blobs for round %d", cached, round_id,
             )
 
+    async def _publish_submission_reveal(
+        self,
+        round_id: int,
+        uid_to_sid: dict[int, str],
+        hotkeys: list[str],
+    ) -> None:
+        """Push the per-round submission_id → (miner_hotkey, miner_uid) map
+        to the centralised DB after Phase C closes.
+
+        Best-effort — if the cache write fails the dashboard simply falls
+        back to the historic ``miner_{hotkey}/`` paths it knows for older
+        rounds. Scoring never depends on this call. Only the dispatching
+        validator owns the truth for its submission_ids; idempotent
+        upsert in the DB merges across validators safely.
+        """
+        if not uid_to_sid:
+            return
+        entries = []
+        for uid, sid in uid_to_sid.items():
+            if not sid:
+                continue
+            hk = hotkeys[uid] if 0 <= uid < len(hotkeys) else ""
+            if not hk:
+                continue
+            entries.append({
+                "submission_id": sid,
+                "miner_hotkey": hk,
+                "miner_uid": int(uid),
+            })
+        if not entries:
+            return
+        try:
+            ok = await self.db_client.submit_submission_reveal(
+                round_id=round_id, entries=entries,
+            )
+            if ok:
+                logger.info(
+                    "Published submission reveal: round=%d entries=%d",
+                    round_id, len(entries),
+                )
+            else:
+                logger.warning(
+                    "Submission reveal returned non-OK: round=%d", round_id,
+                )
+        except Exception as e:
+            logger.warning(
+                "Submission reveal failed: round=%d err=%s", round_id, e,
+            )
+
     async def run_round(self):
         """Execute one full 3-phase round."""
         # ── SETUP ──────────────────────────────────────────────
@@ -670,7 +719,13 @@ class Validator:
                     r.arch_owner, r.trainer_uid, r.status, r.error,
                 )
 
-        await self.coordinator.write_dispatch_record(challenge.round_id, my_results)
+        # Build the uid → submission_id map. Start with my own jobs (in-memory
+        # source of truth for the submission_ids I just minted), then merge in
+        # other validators' submission_ids after Phase B closes.
+        uid_to_sid: dict[int, str] = {
+            r.arch_owner: r.submission_id
+            for r in my_results if r.submission_id
+        }
 
         if Config.SKIP_TRAINING_WAIT:
             logger.info("SKIP_TRAINING_WAIT enabled — skipping block wait after dispatch")
@@ -679,10 +734,29 @@ class Validator:
                 round_start + Config.SUBMISSION_WINDOW_BLOCKS + Config.TRAINING_WINDOW_BLOCKS
             )
 
+        # Publish the dispatch record AFTER the Phase B training window closes.
+        # The record carries the submission_id ↔ arch_owner mapping that lets
+        # other validators resolve checkpoints in Phase C. Hippius is public
+        # by design (decentralized object store), so writing the record any
+        # earlier would let a trainer-host fetch it mid-training and learn
+        # whose architecture they're running — defeating the anonymisation.
+        await self.coordinator.write_dispatch_record(challenge.round_id, my_results)
+
+        # Pull other validators' dispatch records so we can poll for their
+        # checkpoints too (Phase C requires every validator to evaluate every
+        # checkpoint, so we need the union of submission_ids).
+        try:
+            other_sids = await self.coordinator.collect_submission_map(challenge.round_id)
+            for uid, sid in other_sids.items():
+                uid_to_sid.setdefault(uid, sid)
+        except Exception as e:
+            logger.warning("Failed to collect cross-validator submission map: %s", e)
+
         # ── Checkpoint collection ─────────────────────────────
         training_metas = await self.coordinator.wait_for_checkpoints(
             challenge.round_id,
             expected_miners=list(filtered.keys()),
+            uid_to_submission_id=uid_to_sid,
             timeout=Config.EVAL_WINDOW_BLOCKS * 12,
         )
 
@@ -734,6 +808,7 @@ class Validator:
                     block_hash, missing_dispatchers, all_jobs, remaining_valis,
                 )
                 my_fallback = [j for j in fallback_jobs if j.dispatcher == my_uid]
+                fb_results: list = []
                 if my_fallback:
                     fb_extras = self._build_dispatch_extras(challenge, round_task)
                     fb_results = await self.coordinator.dispatch_jobs(
@@ -741,9 +816,9 @@ class Validator:
                         commitments=commitments,
                         extras=fb_extras,
                     )
-                    await self.coordinator.write_dispatch_record(
-                        challenge.round_id, fb_results,
-                    )
+                    for r in fb_results:
+                        if r.submission_id:
+                            uid_to_sid[r.arch_owner] = r.submission_id
 
                 await self._wait_until_block(
                     round_start + Config.SUBMISSION_WINDOW_BLOCKS
@@ -751,9 +826,29 @@ class Validator:
                     + Config.FALLBACK_WINDOW_BLOCKS
                 )
 
+                # Publish fallback dispatch record AFTER the fallback training
+                # window closes — same anonymity reason as the primary record.
+                if fb_results:
+                    await self.coordinator.write_dispatch_record(
+                        challenge.round_id, fb_results,
+                    )
+
+                # Re-pull other validators' fallback dispatch records too.
+                try:
+                    other_sids = await self.coordinator.collect_submission_map(
+                        challenge.round_id,
+                    )
+                    for uid, sid in other_sids.items():
+                        uid_to_sid.setdefault(uid, sid)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to collect fallback submission map: %s", e,
+                    )
+
                 fb_metas = await self.coordinator.wait_for_checkpoints(
                     challenge.round_id,
                     expected_miners=missing_trainers,
+                    uid_to_submission_id=uid_to_sid,
                     timeout=Config.FALLBACK_WINDOW_BLOCKS * 12,
                 )
                 training_metas.update(fb_metas)
@@ -794,6 +889,17 @@ class Validator:
         )
 
         logger.info("Phase C: evaluated %d checkpoints", len(eval_results))
+
+        # ── REVEAL: publish submission_id → miner_hotkey mapping ──
+        # Phase B is over and Phase C has read every checkpoint, so
+        # revealing the mapping no longer lets a trainer-host selectively
+        # sandbag a rival. The dashboard uses this map to render
+        # per-miner training history for past rounds.
+        await self._publish_submission_reveal(
+            round_id=challenge.round_id,
+            uid_to_sid=uid_to_sid,
+            hotkeys=self.metagraph.hotkeys or [],
+        )
         primary_obj = round_task.primary_objective
         primary_name = primary_obj.name if primary_obj else "metric"
         primary_default = primary_obj.default if primary_obj else float("inf")

@@ -239,7 +239,7 @@ def main() -> int:
     except Exception as e:
         _emit({
             "round_id": tc.round_id,
-            "miner_hotkey": tc.miner_hotkey,
+            "submission_id": tc.submission_id,
             "status": "failed",
             "error": f"sandbox: harness raised {type(e).__name__}: {e}",
         })

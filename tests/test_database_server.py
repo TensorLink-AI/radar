@@ -479,6 +479,8 @@ class _FakePool:
     def __init__(self):
         self.registry: dict[str, dict] = {}
         self.history: list[dict] = []
+        # (round_id, submission_id) -> {miner_hotkey, miner_uid}
+        self.round_submissions: dict[tuple[int, str], dict] = {}
 
     class _Conn:
         def __init__(self, parent):
@@ -486,6 +488,10 @@ class _FakePool:
 
         async def execute(self, sql, *params):
             self.parent._execute(sql, *params)
+
+        async def executemany(self, sql, args):
+            for row in args:
+                self.parent._execute(sql, *row)
 
         def transaction(self):
             parent = self.parent
@@ -529,6 +535,11 @@ class _FakePool:
                 "entry_point": ep, "r2_key": r2, "round_submitted": rs,
                 "timestamp": _time.time(),
             })
+        elif "insert into round_submissions" in sql_l:
+            round_id, sid, hk, uid = params
+            self.round_submissions[(int(round_id), sid)] = {
+                "miner_hotkey": hk, "miner_uid": int(uid),
+            }
 
     async def execute(self, sql, *params):
         self._execute(sql, *params)
@@ -670,4 +681,64 @@ def test_agent_code_by_hash_unknown_returns_404():
         assert exc.value.status_code == 404
     finally:
         srv._r2 = None
+        srv._pool = None
+
+
+def test_submission_reveal_persists_mapping():
+    """POST /round_submissions/reveal upserts (round_id, submission_id) rows."""
+    from database import server as srv
+    from database.server import (
+        SubmissionRevealRequest, SubmissionRevealEntry,
+        submit_submission_reveal,
+    )
+
+    fake_pool = _FakePool()
+    srv._pool = fake_pool
+    try:
+        req = SubmissionRevealRequest(
+            round_id=42,
+            entries=[
+                SubmissionRevealEntry(
+                    submission_id="sid_one", miner_hotkey="hk_a", miner_uid=3,
+                ),
+                SubmissionRevealEntry(
+                    submission_id="sid_two", miner_hotkey="hk_b", miner_uid=4,
+                ),
+            ],
+        )
+        result = _call_async(submit_submission_reveal(req))
+        assert result["status"] == "ok"
+        assert result["inserted"] == 2
+
+        assert fake_pool.round_submissions[(42, "sid_one")]["miner_hotkey"] == "hk_a"
+        assert fake_pool.round_submissions[(42, "sid_two")]["miner_uid"] == 4
+    finally:
+        srv._pool = None
+
+
+def test_submission_reveal_skips_empty_entries():
+    """Entries with empty submission_id or hotkey are dropped, not stored."""
+    from database import server as srv
+    from database.server import (
+        SubmissionRevealRequest, SubmissionRevealEntry,
+        submit_submission_reveal,
+    )
+
+    fake_pool = _FakePool()
+    srv._pool = fake_pool
+    try:
+        req = SubmissionRevealRequest(
+            round_id=99,
+            entries=[
+                SubmissionRevealEntry(submission_id="", miner_hotkey="hk_a"),
+                SubmissionRevealEntry(submission_id="sid", miner_hotkey=""),
+                SubmissionRevealEntry(submission_id="sid_ok", miner_hotkey="hk_ok", miner_uid=1),
+            ],
+        )
+        result = _call_async(submit_submission_reveal(req))
+        assert result["inserted"] == 1
+        assert (99, "sid_ok") in fake_pool.round_submissions
+        assert (99, "") not in fake_pool.round_submissions
+        assert (99, "sid") not in fake_pool.round_submissions
+    finally:
         srv._pool = None
