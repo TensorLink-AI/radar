@@ -34,7 +34,8 @@ from shared.db_client import DatabaseClient
 from shared.protocol import Proposal
 from shared.url_gate import parse_allowed_urls
 from validator.pod_manager import (
-    launch_agent_pod, pre_validate_agent_code, run_agent_on_pod,
+    cleanup_agent_env, launch_agent_pod, pre_validate_agent_code,
+    run_agent_on_pod,
 )
 
 logger = logging.getLogger(__name__)
@@ -234,15 +235,21 @@ async def _run_single_agent(
     except (json.JSONDecodeError, TypeError, ValueError):
         agent_timeout = Config.AGENT_TIMEOUT
 
-    agent_env = await launch_agent_pod(
-        image_url=Config.OFFICIAL_AGENT_IMAGE,
-        mem_limit="8192Mi",
-        agent_code=bundle,
-        allowed_urls=allowed_urls,
-    )
-
+    # Wrap launch + run in a single try/finally so a failure inside
+    # launch_agent_pod (or anywhere before cleanup) still triggers
+    # teardown. Each Basilica retry inside run_agent_on_pod can spawn a
+    # NEW deployment; cleanup_agent_env force-deletes every name we
+    # recorded, not just the latest, which prevents orphan accumulation
+    # on HTTP-error paths.
+    agent_env = None
     started_at = time.monotonic()
     try:
+        agent_env = await launch_agent_pod(
+            image_url=Config.OFFICIAL_AGENT_IMAGE,
+            mem_limit="8192Mi",
+            agent_code=bundle,
+            allowed_urls=allowed_urls,
+        )
         result = await run_agent_on_pod(
             agent_env, miner_challenge_json,
             timeout=agent_timeout,
@@ -298,10 +305,7 @@ async def _run_single_agent(
                 type(result).__name__, result_keys,
             )
     finally:
-        try:
-            await agent_env.cleanup()
-        except Exception:
-            pass
+        await cleanup_agent_env(agent_env)
     return None, _empty_meta()
 
 

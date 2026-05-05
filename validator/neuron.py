@@ -44,7 +44,7 @@ from validator.db_proxy import (
     set_hotkey_map, rotate_agent_token,
 )
 from validator.evaluator import evaluate_all_checkpoints
-from validator.pod_manager import pre_validate_code
+from validator.pod_manager import pre_validate_code, reap_orphan_agent_pods
 from validator.substrate_publisher import run_substrate_publish_step
 
 logger = logging.getLogger(__name__)
@@ -1132,6 +1132,15 @@ class Validator:
     async def run(self):
         """Main validator loop."""
         self.start_proxy_server()
+        # Reap any agent pods left over from a prior crash/redeploy
+        # before we start spawning new ones. Pure safety-net — never
+        # raises, never blocks startup on Basilica latency.
+        try:
+            await reap_orphan_agent_pods(
+                max_age_seconds=Config.AGENT_POD_REAP_MAX_AGE_S,
+            )
+        except Exception as e:
+            logger.warning("Startup orphan reap failed: %s", e)
         while True:
             try:
                 current_block = self.subtensor.block
@@ -1168,6 +1177,15 @@ class Validator:
                 self._last_completed_round = round_start
             except Exception:
                 logger.error("Round error:\n%s", traceback.format_exc())
+            # Sweep any agent pods that the round left behind — covers
+            # mid-round exceptions, retry-spawned pods cleanup missed,
+            # and load-shed scenarios.
+            try:
+                await reap_orphan_agent_pods(
+                    max_age_seconds=Config.AGENT_POD_REAP_MAX_AGE_S,
+                )
+            except Exception as e:
+                logger.debug("Post-round orphan reap failed: %s", e)
             await asyncio.sleep(60)
 
 

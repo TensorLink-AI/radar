@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from validator.pod_manager import (
     get_mode, pre_validate_code, verify_miner_pod, _parse_image_ref,
     _normalise_agent_code, _write_agent_code, launch_agent_pod,
-    run_agent_on_pod,
+    run_agent_on_pod, cleanup_agent_env, reap_orphan_agent_pods,
+    _record_deployment_name,
 )
 
 
@@ -369,3 +370,160 @@ class TestRunAgentOnPod:
         await run_agent_on_pod(mock_env, '{}', timeout=60)
         call_kwargs = mock_env.process_challenge.call_args.kwargs
         assert "task_id" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_records_deployment_names_across_retries(self):
+        """Each retry's deployment name is captured for cleanup."""
+        env = MagicMock(spec=["_agent_code", "_deployment_name", "process_challenge"])
+        env._agent_code = None
+        # Simulate Basilica re-naming the deployment on every retry
+        names = ["radar-agent-pc-1001", "radar-agent-pc-1002", "radar-agent-pc-1003"]
+
+        async def _proc(**kw):
+            env._deployment_name = names.pop(0)
+            if names:
+                raise RuntimeError("502 Bad Gateway")
+            return {"code": "x"}
+
+        env.process_challenge = _proc
+        with patch("config.Config.AGENT_POD_RETRIES", 2), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await run_agent_on_pod(env, '{}', timeout=60)
+        assert result == {"code": "x"}
+        assert env._radar_deployment_names == [
+            "radar-agent-pc-1001",
+            "radar-agent-pc-1002",
+            "radar-agent-pc-1003",
+        ]
+
+
+class TestRecordDeploymentName:
+    def test_picks_up_string_attr(self):
+        env = MagicMock(spec=["_deployment_name"])
+        env._deployment_name = "radar-agent-1"
+        _record_deployment_name(env)
+        assert env._radar_deployment_names == ["radar-agent-1"]
+
+    def test_dedupes_repeated_names(self):
+        env = MagicMock(spec=["deployment_name"])
+        env.deployment_name = "radar-agent-1"
+        _record_deployment_name(env)
+        _record_deployment_name(env)
+        assert env._radar_deployment_names == ["radar-agent-1"]
+
+    def test_falls_back_to_deployment_object(self):
+        dep = MagicMock()
+        dep.name = "radar-agent-deep"
+        env = MagicMock(spec=["_deployment"])
+        env._deployment = dep
+        _record_deployment_name(env)
+        assert env._radar_deployment_names == ["radar-agent-deep"]
+
+    def test_silent_when_no_name_available(self):
+        env = MagicMock(spec=[])
+        _record_deployment_name(env)
+        assert not hasattr(env, "_radar_deployment_names")
+
+
+class TestCleanupAgentEnv:
+    @pytest.mark.asyncio
+    async def test_none_env_is_noop(self):
+        await cleanup_agent_env(None)  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_calls_env_cleanup(self):
+        env = MagicMock()
+        env.cleanup = AsyncMock()
+        env._radar_deployment_names = []
+        await cleanup_agent_env(env)
+        env.cleanup.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_swallows_cleanup_exception(self):
+        env = MagicMock()
+        env.cleanup = AsyncMock(side_effect=RuntimeError("boom"))
+        env._radar_deployment_names = []
+        await cleanup_agent_env(env)  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_force_deletes_recorded_names(self):
+        """Every recorded deployment is force-deleted via BasilicaClient."""
+        env = MagicMock()
+        env.cleanup = AsyncMock()
+        env._radar_deployment_names = ["a", "b", "c"]
+
+        fake_client = MagicMock()
+        fake_client.delete_deployment = MagicMock()
+        fake_module = ModuleType("basilica")
+        fake_module.BasilicaClient = MagicMock(return_value=fake_client)
+        with patch.dict(sys.modules, {"basilica": fake_module}):
+            await cleanup_agent_env(env)
+
+        deleted = [c.args[0] for c in fake_client.delete_deployment.call_args_list]
+        assert deleted == ["a", "b", "c"]
+
+    @pytest.mark.asyncio
+    async def test_force_delete_failures_swallowed(self):
+        env = MagicMock()
+        env.cleanup = AsyncMock()
+        env._radar_deployment_names = ["a"]
+
+        fake_client = MagicMock()
+        fake_client.delete_deployment = MagicMock(side_effect=RuntimeError("404"))
+        fake_module = ModuleType("basilica")
+        fake_module.BasilicaClient = MagicMock(return_value=fake_client)
+        with patch.dict(sys.modules, {"basilica": fake_module}):
+            await cleanup_agent_env(env)  # must not raise
+
+
+class TestReapOrphanAgentPods:
+    @pytest.mark.asyncio
+    async def test_no_op_when_not_basilica_mode(self):
+        with patch("validator.pod_manager.get_mode", return_value="docker"):
+            n = await reap_orphan_agent_pods()
+        assert n == 0
+
+    @pytest.mark.asyncio
+    async def test_deletes_old_matching_deployments(self):
+        old = MagicMock()
+        old.name = "radar-agent-pc-old"
+        old.uptime_seconds = 4000  # > 1800
+
+        young = MagicMock()
+        young.name = "radar-agent-pc-young"
+        young.uptime_seconds = 60  # fresh
+
+        other = MagicMock()
+        other.name = "radar-trainer-x"
+        other.uptime_seconds = 9999  # wrong prefix
+
+        no_age = MagicMock()
+        no_age.name = "radar-agent-pc-noage"
+        no_age.uptime_seconds = None
+        no_age.created_at = None  # unparseable → skip
+
+        fake_client = MagicMock()
+        fake_client.list_deployments = MagicMock(
+            return_value=[old, young, other, no_age],
+        )
+        fake_client.delete_deployment = MagicMock()
+        fake_module = ModuleType("basilica")
+        fake_module.BasilicaClient = MagicMock(return_value=fake_client)
+
+        with patch("validator.pod_manager.get_mode", return_value="basilica"), \
+             patch.dict(sys.modules, {"basilica": fake_module}):
+            n = await reap_orphan_agent_pods(
+                prefix="radar-agent", max_age_seconds=1800,
+            )
+
+        assert n == 1
+        deleted = [c.args[0] for c in fake_client.delete_deployment.call_args_list]
+        assert deleted == ["radar-agent-pc-old"]
+
+    @pytest.mark.asyncio
+    async def test_basilica_sdk_missing_returns_zero(self):
+        with patch("validator.pod_manager.get_mode", return_value="basilica"), \
+             patch.dict(sys.modules, {"basilica": None}):
+            # Importing a module set to None raises ImportError
+            n = await reap_orphan_agent_pods()
+        assert n == 0
