@@ -522,10 +522,17 @@ class TrainingCoordinator:
                             uid, round_id, meta.get("round_id"),
                         )
                         continue
-                    if meta.get("submission_id") != sid:
+                    # The presigned PUT URL is path-locked to ``round_{id}/
+                    # submission_{sid}/training_meta.json``, so the meta is
+                    # already authenticated by its location. Older trainer
+                    # images upload metas without the field — accept them
+                    # rather than fail the round; reject only when the meta
+                    # explicitly disagrees with the expected submission_id.
+                    meta_sid = meta.get("submission_id")
+                    if meta_sid and meta_sid != sid:
                         logger.warning(
                             "Meta submission_id mismatch for UID %d: expected %s, got %s",
-                            uid, sid[:12], str(meta.get("submission_id"))[:12],
+                            uid, sid[:12], str(meta_sid)[:12],
                         )
                         continue
 

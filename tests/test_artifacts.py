@@ -333,3 +333,35 @@ def test_verify_uploaded_artifacts_submission_id_mismatch(mock_r2):
         assert "submission_id mismatch" in err
     finally:
         os.unlink(ckpt_path)
+
+
+def test_verify_uploaded_artifacts_legacy_meta_without_submission_id(mock_r2):
+    """Older trainer images upload metas without ``submission_id``.
+
+    The path is path-locked by the presigned PUT URL, so the meta is
+    already authenticated by its location. Accept it instead of failing
+    the round on a missing field.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".safetensors") as f:
+        f.write(b"data")
+        ckpt_path = f.name
+
+    try:
+        sid = "sid_legacy"
+        # Legacy meta dict — has miner_hotkey, no submission_id field
+        legacy_meta = {
+            "round_id": 9,
+            "miner_hotkey": "5HpLegacyHotkey",
+            "status": "success",
+            "flops_equivalent_size": 500_000,
+        }
+        ck = checkpoint_key(9, sid)
+        mk = meta_key(9, sid)
+        mock_r2.upload_file_from_disk(ckpt_path, ck)
+        mock_r2.upload_json(mk, legacy_meta)
+
+        ok, err = verify_uploaded_artifacts(mock_r2, 9, sid)
+        assert ok, f"expected legacy meta to verify, got error: {err}"
+        assert err == ""
+    finally:
+        os.unlink(ckpt_path)

@@ -281,10 +281,14 @@ def verify_uploaded_artifacts(
             f"Meta round_id mismatch: expected {round_id}, "
             f"got {meta_dict.get('round_id')}"
         )
-    if meta_dict.get("submission_id") != submission_id:
+    # The meta lives at a presigned-PUT, path-locked key, so its location
+    # already authenticates it. Older trainer images omit ``submission_id``
+    # from the JSON body — accept them; reject only on an explicit mismatch.
+    meta_sid = meta_dict.get("submission_id")
+    if meta_sid and meta_sid != submission_id:
         return False, (
             f"Meta submission_id mismatch: expected {submission_id}, "
-            f"got {meta_dict.get('submission_id')}"
+            f"got {meta_sid}"
         )
 
     return True, ""

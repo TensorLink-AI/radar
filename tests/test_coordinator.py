@@ -366,3 +366,83 @@ async def test_collect_submission_map_unions_dispatch_records():
         1: "sid_1_from_a",
         2: "sid_2_from_b",
     }
+
+
+# ── wait_for_checkpoints ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_wait_for_checkpoints_accepts_legacy_meta_without_submission_id():
+    """Older trainer images upload metas without ``submission_id``.
+
+    The presigned PUT URL is path-locked to ``round_{id}/submission_{sid}/
+    training_meta.json``, so the meta is already authenticated by its
+    location. wait_for_checkpoints must accept legacy metas — otherwise
+    every round with old trainer pods times out with 0/N collected.
+    """
+    sid_a = "sid_alpha"
+    sid_b = "sid_beta"
+    legacy_meta_a = {
+        "round_id": 7,
+        "miner_hotkey": "5HpLegacyA",  # OLD field, no submission_id
+        "status": "success",
+        "flops_equivalent_size": 500_000,
+    }
+    new_meta_b = {
+        "round_id": 7,
+        "submission_id": sid_b,  # NEW field present and matching
+        "status": "success",
+        "flops_equivalent_size": 500_000,
+    }
+
+    r2 = MagicMock()
+    r2.download_json = MagicMock(side_effect=lambda key: {
+        f"round_7/submission_{sid_a}/training_meta.json": legacy_meta_a,
+        f"round_7/submission_{sid_b}/training_meta.json": new_meta_b,
+    }.get(key))
+    r2.key_exists = MagicMock(return_value=True)
+
+    coordinator = TrainingCoordinator(
+        wallet=MagicMock(), metagraph=MagicMock(hotkeys=["", "hk1", "hk2"]),
+        r2=r2, my_uid=10,
+    )
+    results = await coordinator.wait_for_checkpoints(
+        round_id=7,
+        expected_miners=[1, 2],
+        uid_to_submission_id={1: sid_a, 2: sid_b},
+        timeout=1,
+    )
+
+    assert 1 in results and 2 in results
+    assert results[1]["status"] == "success"
+    assert results[2]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_checkpoints_rejects_explicit_submission_id_mismatch():
+    """A meta whose submission_id is present but disagrees is still rejected
+    (defends against a misrouted upload, even though path-locking should
+    prevent it)."""
+    sid = "sid_real"
+    bad_meta = {
+        "round_id": 7,
+        "submission_id": "sid_impostor",  # explicitly wrong
+        "status": "success",
+    }
+
+    r2 = MagicMock()
+    r2.download_json = MagicMock(return_value=bad_meta)
+    r2.key_exists = MagicMock(return_value=True)
+
+    coordinator = TrainingCoordinator(
+        wallet=MagicMock(), metagraph=MagicMock(hotkeys=["", "hk1"]),
+        r2=r2, my_uid=10,
+    )
+    results = await coordinator.wait_for_checkpoints(
+        round_id=7,
+        expected_miners=[1],
+        uid_to_submission_id={1: sid},
+        timeout=1,
+    )
+
+    assert results == {}
