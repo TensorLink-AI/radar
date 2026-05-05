@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import random
+import secrets
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
@@ -28,11 +29,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Job:
-    """A training job assignment."""
+    """A training job assignment.
+
+    ``submission_id`` is an opaque per-job ID minted by the dispatching
+    validator at dispatch time (left empty for jobs we don't dispatch).
+    It hides the architecture owner's hotkey from the trainer-host (which
+    is itself another miner's pod under cross-eval).
+    """
     arch_owner: int      # miner whose architecture is being trained
     trainer_uid: int     # miner whose trainer runs the job (self-training allowed)
     dispatcher: int      # validator UID responsible for dispatching
     round_id: int = 0
+    submission_id: str = ""
 
 
 @dataclass
@@ -49,6 +57,7 @@ class TrainingResult:
     training_time_seconds: float = 0.0
     checkpoint_key: str = ""
     architecture_key: str = ""
+    submission_id: str = ""
 
 
 def compute_assignments(
@@ -209,31 +218,35 @@ class TrainingCoordinator:
                     dispatcher=self.my_uid,
                     status="failed",
                     error="No trainer endpoint",
+                    submission_id=job.submission_id,
                 ))
                 continue
 
-            miner_hotkey = (
-                self.metagraph.hotkeys[job.arch_owner]
-                if job.arch_owner < len(self.metagraph.hotkeys)
-                else f"uid_{job.arch_owner}"
-            )
+            # Mint an opaque submission_id per job at dispatch time.
+            # The trainer-host receives only this ID — the miner's hotkey
+            # is never on the wire to the trainer or in the bucket path.
+            # `secrets.token_hex(16)` → 32-char unguessable hex.
+            if not job.submission_id:
+                job.submission_id = secrets.token_hex(16)
+            submission_id = job.submission_id
 
             # Generate presigned PUT URLs so trainer can upload without R2 creds.
             from shared.artifacts import generate_upload_urls
             presigned_ttl = int(os.getenv("RADAR_PRESIGNED_TTL", "5400"))
             upload_urls = generate_upload_urls(
-                self.r2, challenge.round_id, miner_hotkey, ttl=presigned_ttl,
+                self.r2, challenge.round_id, submission_id, ttl=presigned_ttl,
             )
 
             if not upload_urls.get("architecture"):
                 logger.error(
-                    "Missing architecture presigned URL for arch_owner=%d miner=%s",
-                    job.arch_owner, miner_hotkey[:16],
+                    "Missing architecture presigned URL for arch_owner=%d submission=%s",
+                    job.arch_owner, submission_id[:12],
                 )
             else:
                 logger.info(
-                    "Generated %d presigned URLs for arch_owner=%d: %s",
-                    len(upload_urls), job.arch_owner, list(upload_urls.keys()),
+                    "Generated %d presigned URLs for arch_owner=%d submission=%s: %s",
+                    len(upload_urls), job.arch_owner, submission_id[:12],
+                    list(upload_urls.keys()),
                 )
 
             task_name = challenge.task.get("name", "")
@@ -244,7 +257,7 @@ class TrainingCoordinator:
                 "round_id": challenge.round_id,
                 "min_flops_equivalent": challenge.min_flops_equivalent,
                 "max_flops_equivalent": challenge.max_flops_equivalent,
-                "miner_hotkey": miner_hotkey,
+                "submission_id": submission_id,
                 "time_budget": time_budget,
                 "upload_urls": upload_urls,
                 "task_name": task_name,
@@ -323,6 +336,7 @@ class TrainingCoordinator:
                             dispatcher=self.my_uid,
                             seed=challenge.seed,
                             status="already_running",
+                            submission_id=job.submission_id,
                         )
 
                     try:
@@ -340,6 +354,7 @@ class TrainingCoordinator:
                             dispatcher=self.my_uid,
                             status="failed",
                             error=f"Non-JSON response (HTTP {resp.status_code}): {body_preview}",
+                            submission_id=job.submission_id,
                         )
 
                     # 202 Accepted = trainer acknowledged, training in background
@@ -356,6 +371,7 @@ class TrainingCoordinator:
                             dispatcher=self.my_uid,
                             seed=challenge.seed,
                             status="accepted",
+                            submission_id=job.submission_id,
                         )
 
                     # Log HTTP errors with the response body for diagnostics
@@ -377,6 +393,7 @@ class TrainingCoordinator:
                         training_time_seconds=float(data.get("training_time_seconds", 0)),
                         checkpoint_key=data.get("checkpoint_key", ""),
                         architecture_key=data.get("architecture_key", ""),
+                        submission_id=job.submission_id,
                     )
                 except httpx.TimeoutException:
                     logger.error("Dispatch to trainer UID %d timed out", job.trainer_uid)
@@ -387,6 +404,7 @@ class TrainingCoordinator:
                         dispatcher=self.my_uid,
                         status="timeout",
                         error="Request timed out",
+                        submission_id=job.submission_id,
                     )
                 except Exception as e:
                     if attempt < max_retries:
@@ -405,12 +423,14 @@ class TrainingCoordinator:
                         dispatcher=self.my_uid,
                         status="failed",
                         error=str(e),
+                        submission_id=job.submission_id,
                     )
             # Should not reach here, but handle defensively
             return TrainingResult(
                 round_id=job.round_id, arch_owner=job.arch_owner,
                 trainer_uid=job.trainer_uid, dispatcher=self.my_uid,
                 status="failed", error="Retries exhausted",
+                submission_id=job.submission_id,
             )
 
         async with httpx.AsyncClient(timeout=job_timeout) as client:
@@ -426,34 +446,43 @@ class TrainingCoordinator:
         self,
         round_id: int,
         expected_miners: list[int],
+        uid_to_submission_id: dict[int, str],
         timeout: int = 300,
     ) -> dict[int, dict]:
-        """Poll R2 for training_meta.json from each miner.
+        """Poll R2/Hippius for training_meta.json by submission_id.
 
-        Uses direct key lookups (strongly consistent) instead of
-        list_objects (eventually consistent) to avoid missing recently
-        uploaded artifacts.
+        Artifacts live at ``round_{id}/submission_{sid}/...``. Resolution
+        from miner UID → submission_id comes from the dispatching
+        validator's in-memory job state plus other validators' published
+        dispatch records — assembled by the caller and passed in via
+        ``uid_to_submission_id``.
 
-        Performs post-upload verification: checks that the meta's round_id
-        and miner_hotkey match expectations, rejecting tampered artifacts.
+        UIDs missing from the mapping are skipped (no submission_id known
+        yet — typically jobs dispatched by another validator that hasn't
+        written its dispatch record). Successful collections include the
+        miner's hotkey/uid in the returned meta so the rest of the
+        validator pipeline keeps working unchanged.
         """
         from shared.artifacts import meta_key as mk_fn, checkpoint_key as ck_fn
 
         results: dict[int, dict] = {}
         deadline = asyncio.get_event_loop().time() + timeout
 
-        # Build uid→hotkey mapping
+        # Build uid→hotkey mapping for stamping the result so downstream
+        # scoring/eval still has the resolved hotkey.
         hotkeys = self.metagraph.hotkeys if hasattr(self.metagraph, "hotkeys") else []
-        uid_to_hotkey = {}
-        for uid in expected_miners:
-            hk = hotkeys[uid] if uid < len(hotkeys) else f"uid_{uid}"
-            uid_to_hotkey[uid] = hk
 
-        # Log expected R2 keys for debugging
-        for uid, hk in uid_to_hotkey.items():
+        # Log expected keys for debugging
+        for uid in expected_miners:
+            sid = uid_to_submission_id.get(uid, "")
+            if not sid:
+                logger.info(
+                    "UID %d: no submission_id known yet — skipping until reveal",
+                    uid,
+                )
+                continue
             logger.info(
-                "Expecting R2 meta key for UID %d: %s",
-                uid, mk_fn(round_id, hk),
+                "Expecting meta key for UID %d: %s", uid, mk_fn(round_id, sid),
             )
 
         poll_count = 0
@@ -464,11 +493,14 @@ class TrainingCoordinator:
                 "Checkpoint poll #%d: %d/%d collected, %.0fs remaining (round %d)",
                 poll_count, len(results), len(expected_miners), remaining, round_id,
             )
-            # Check each pending miner directly (strongly consistent)
-            for uid, hk in uid_to_hotkey.items():
+            for uid in expected_miners:
                 if uid in results:
                     continue
-                mk = mk_fn(round_id, hk)
+                sid = uid_to_submission_id.get(uid, "")
+                if not sid:
+                    continue
+                hk = hotkeys[uid] if uid < len(hotkeys) else f"uid_{uid}"
+                mk = mk_fn(round_id, sid)
                 try:
                     meta = self.r2.download_json(mk)
                     if not meta:
@@ -484,24 +516,19 @@ class TrainingCoordinator:
                         uid, mk, meta.get("status", "?"),
                     )
 
-                    # Verify meta fields match expectations
                     if meta.get("round_id") != round_id:
                         logger.warning(
                             "Meta round_id mismatch for UID %d: expected %d, got %s",
                             uid, round_id, meta.get("round_id"),
                         )
                         continue
-                    if meta.get("miner_hotkey") != hk:
+                    if meta.get("submission_id") != sid:
                         logger.warning(
-                            "Meta miner_hotkey mismatch for UID %d: expected %s, got %s",
-                            uid, hk[:16], str(meta.get("miner_hotkey"))[:16],
+                            "Meta submission_id mismatch for UID %d: expected %s, got %s",
+                            uid, sid[:12], str(meta.get("submission_id"))[:12],
                         )
                         continue
 
-                    # Failure statuses: collect the meta without requiring a checkpoint.
-                    # The trainer only uploads training_meta.json for failures
-                    # (no checkpoint is produced). Downstream scoring handles these
-                    # via penalties / size gate rejection.
                     _FAILURE_STATUSES = ("build_failed", "size_violation", "failed", "timeout")
                     meta_status = meta.get("status", "")
                     if meta_status in _FAILURE_STATUSES:
@@ -514,8 +541,7 @@ class TrainingCoordinator:
                         )
                         continue
 
-                    # Verify checkpoint file exists (only for success status)
-                    ck = ck_fn(round_id, hk)
+                    ck = ck_fn(round_id, sid)
                     if not self.r2.key_exists(ck):
                         logger.info(
                             "Meta exists but checkpoint missing for UID %d at %s (round %d)",
@@ -539,34 +565,46 @@ class TrainingCoordinator:
                 break
             await asyncio.sleep(30)
         else:
-            # On timeout, check what actually exists in R2 for this round
             round_prefix = f"round_{round_id}/"
             try:
                 existing_keys = self.r2.list_keys(round_prefix)
                 logger.warning(
                     "Checkpoint collection timed out: %d/%d collected after %ds (round %d). "
-                    "R2 keys under %s: %s",
+                    "Keys under %s: %s",
                     len(results), len(expected_miners), timeout, round_id,
                     round_prefix, existing_keys[:20] if existing_keys else "(none)",
                 )
             except Exception:
                 logger.warning(
                     "Checkpoint collection timed out: %d/%d collected after %ds (round %d). "
-                    "R2 list_keys also failed — check R2 connectivity",
+                    "list_keys also failed — check connectivity",
                     len(results), len(expected_miners), timeout, round_id,
                 )
 
         return results
 
     async def write_dispatch_record(self, round_id: int, results: list[TrainingResult]):
-        """Write dispatch record to R2 (and Hippius if dual-write enabled)."""
+        """Write dispatch record (and the submission_id reveal map for our jobs).
+
+        Each record carries (arch_owner, submission_id, miner_hotkey) so any
+        validator can resolve every checkpoint they need for Phase C eval
+        — the dispatching validator is the only entity that knows the
+        opaque submission_id minted at dispatch.
+        """
         hotkey = self.wallet.hotkey.ss58_address
         key = f"round_{round_id}/dispatch/vali_{hotkey}.json"
+        hotkeys = self.metagraph.hotkeys if hasattr(self.metagraph, "hotkeys") else []
         records = []
         for r in results:
+            arch_hk = (
+                hotkeys[r.arch_owner]
+                if 0 <= r.arch_owner < len(hotkeys) else ""
+            )
             records.append({
                 "arch_owner": r.arch_owner,
+                "arch_owner_hotkey": arch_hk,
                 "trainer_uid": r.trainer_uid,
+                "submission_id": r.submission_id,
                 "status": r.status,
                 "flops_equivalent_size": r.flops_equivalent_size,
                 "training_time_seconds": r.training_time_seconds,
@@ -580,6 +618,43 @@ class TrainingCoordinator:
             })
         else:
             self.r2.upload_json(key, body)
+
+    async def collect_submission_map(
+        self, round_id: int,
+    ) -> dict[int, str]:
+        """Read every validator's dispatch record for ``round_id`` and
+        assemble the union ``arch_owner_uid → submission_id`` map.
+
+        Used for Phase C cross-eval: every validator must independently
+        download every checkpoint, so each needs the submission_ids minted
+        by the *other* validators. Best-effort — missing records mean a
+        UID falls out of the map and its checkpoint is skipped this round.
+        """
+        prefix = f"round_{round_id}/dispatch/"
+        try:
+            keys = self.r2.list_keys(prefix)
+        except Exception as e:
+            logger.warning("Failed to list dispatch records for round %d: %s", round_id, e)
+            return {}
+        mapping: dict[int, str] = {}
+        for key in keys:
+            if not key.endswith(".json"):
+                continue
+            try:
+                body = self.r2.download_json(key)
+            except Exception as e:
+                logger.warning("Failed to read dispatch record %s: %s", key, e)
+                continue
+            if not isinstance(body, dict):
+                continue
+            for job in body.get("jobs", []) or []:
+                if not isinstance(job, dict):
+                    continue
+                sid = job.get("submission_id", "")
+                uid = job.get("arch_owner")
+                if isinstance(uid, int) and sid and uid not in mapping:
+                    mapping[uid] = sid
+        return mapping
 
     async def write_frontier(
         self, frontier_data: list[dict], task_name: str = "",

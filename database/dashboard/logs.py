@@ -3,6 +3,12 @@
 Wraps ``shared.r2_audit.R2AuditLog`` with a byte cap so the dashboard
 never streams pathologically large stdout blobs over HTTP. Callers that
 want the raw file use ``?direct=1`` to get a short-lived presigned URL.
+
+Artifacts live at ``round_{id}/submission_{sid}/...`` — the bucket path
+hides miner identities from the trainer-host during Phase B. The
+dashboard resolves ``(round_id, miner_hotkey) → submission_id`` via the
+``round_submissions`` reveal table that the validator populates after
+Phase C closes.
 """
 
 from __future__ import annotations
@@ -15,26 +21,65 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 
-def _stdout_key(round_id: int, hotkey: str) -> str:
-    return f"round_{round_id}/miner_{hotkey}/stdout.log"
+def _stdout_key_sid(round_id: int, submission_id: str) -> str:
+    return f"round_{round_id}/submission_{submission_id}/stdout.log"
 
 
-def _meta_key(round_id: int, hotkey: str) -> str:
-    return f"round_{round_id}/miner_{hotkey}/training_meta.json"
+def _meta_key_sid(round_id: int, submission_id: str) -> str:
+    return f"round_{round_id}/submission_{submission_id}/training_meta.json"
 
 
-def _arch_key(round_id: int, hotkey: str) -> str:
-    return f"round_{round_id}/miner_{hotkey}/architecture.py"
+def _arch_key_sid(round_id: int, submission_id: str) -> str:
+    return f"round_{round_id}/submission_{submission_id}/architecture.py"
 
 
-def fetch_meta(r2, round_id: int, hotkey: str) -> Optional[dict]:
-    """Return ``training_meta.json`` for a (round, miner) or None if missing."""
-    if r2 is None:
+async def submission_id_for(
+    pool, round_id: int, hotkey: str,
+) -> Optional[str]:
+    """Look up the opaque submission_id for ``(round_id, miner_hotkey)``.
+
+    Returns None when the validator hasn't yet published the reveal map
+    (Phase C still in progress, or this validator never dispatched a
+    job for that miner this round).
+    """
+    if pool is None or not hotkey:
         return None
     try:
-        return r2.download_json(_meta_key(round_id, hotkey))
+        row = await pool.fetchrow(
+            """
+            SELECT submission_id FROM round_submissions
+            WHERE round_id = $1 AND miner_hotkey = $2
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            int(round_id), hotkey,
+        )
     except Exception:
-        logger.exception("fetch_meta failed: round=%s hotkey=%s", round_id, hotkey[:16])
+        logger.exception(
+            "submission_id lookup failed: round=%s hotkey=%s",
+            round_id, hotkey[:16],
+        )
+        return None
+    return row["submission_id"] if row else None
+
+
+async def fetch_meta(pool, r2, round_id: int, hotkey: str) -> Optional[dict]:
+    """Return ``training_meta.json`` for a (round, miner) or None if missing.
+
+    Resolves the bucket path through the ``round_submissions`` reveal
+    table. Returns None when the reveal hasn't been published yet.
+    """
+    if r2 is None:
+        return None
+    sid = await submission_id_for(pool, round_id, hotkey)
+    if not sid:
+        return None
+    try:
+        return r2.download_json(_meta_key_sid(round_id, sid))
+    except Exception:
+        logger.exception(
+            "fetch_meta failed: round=%s hotkey=%s sid=%s",
+            round_id, hotkey[:16], sid[:12],
+        )
         return None
 
 
@@ -70,54 +115,64 @@ async def fetch_meta_cached_or_r2(
     meta = await cached_meta(pool, round_id, hotkey)
     if meta is not None:
         return meta
-    return fetch_meta(r2, round_id, hotkey)
+    return await fetch_meta(pool, r2, round_id, hotkey)
 
 
-def fetch_stdout(
+async def fetch_stdout(
+    pool,
     r2,
     round_id: int,
     hotkey: str,
     max_bytes: Optional[int] = None,
 ) -> Optional[dict]:
-    """Return ``{text, truncated, size}`` for the stdout file, or None.
-
-    ``text`` is capped at ``max_bytes`` (defaults to
-    ``Config.DASHBOARD_MAX_LOG_BYTES``). If the file is larger we take the
-    tail so operators see the most recent lines.
-    """
+    """Return ``{text, truncated, size}`` for the stdout file, or None."""
     if r2 is None:
+        return None
+    sid = await submission_id_for(pool, round_id, hotkey)
+    if not sid:
         return None
     cap = max_bytes if max_bytes is not None else Config.DASHBOARD_MAX_LOG_BYTES
     try:
-        raw = r2.download_text(_stdout_key(round_id, hotkey))
+        raw = r2.download_text(_stdout_key_sid(round_id, sid))
     except Exception:
-        logger.exception("fetch_stdout failed: round=%s hotkey=%s", round_id, hotkey[:16])
+        logger.exception(
+            "fetch_stdout failed: round=%s hotkey=%s sid=%s",
+            round_id, hotkey[:16], sid[:12],
+        )
         return None
     if raw is None:
         return None
     data = raw.encode("utf-8", errors="replace")
     size = len(data)
     if size > cap:
-        # Keep the tail — most recent lines are the useful ones
         tail = data[-cap:].decode("utf-8", errors="replace")
         return {"text": tail, "truncated": True, "size": size}
     return {"text": raw, "truncated": False, "size": size}
 
 
-def presigned_stdout_url(r2, round_id: int, hotkey: str, ttl: int = 900) -> str:
+async def presigned_stdout_url(
+    pool, r2, round_id: int, hotkey: str, ttl: int = 900,
+) -> str:
     """Return a 15-minute presigned GET URL for the stdout file."""
     if r2 is None:
         return ""
+    sid = await submission_id_for(pool, round_id, hotkey)
+    if not sid:
+        return ""
     try:
-        return r2.generate_presigned_get_url(_stdout_key(round_id, hotkey), ttl=ttl)
+        return r2.generate_presigned_get_url(
+            _stdout_key_sid(round_id, sid), ttl=ttl,
+        )
     except Exception:
         logger.exception(
-            "presigned_stdout_url failed: round=%s hotkey=%s", round_id, hotkey[:16],
+            "presigned_stdout_url failed: round=%s hotkey=%s sid=%s",
+            round_id, hotkey[:16], sid[:12],
         )
         return ""
 
 
-def fetch_architecture(
+async def fetch_architecture(
+    pool,
     r2,
     round_id: int,
     hotkey: str,
@@ -126,12 +181,16 @@ def fetch_architecture(
     """Return ``{text, truncated, size}`` for architecture.py, or None."""
     if r2 is None:
         return None
+    sid = await submission_id_for(pool, round_id, hotkey)
+    if not sid:
+        return None
     cap = max_bytes if max_bytes is not None else Config.DASHBOARD_MAX_LOG_BYTES
     try:
-        raw = r2.download_text(_arch_key(round_id, hotkey))
+        raw = r2.download_text(_arch_key_sid(round_id, sid))
     except Exception:
         logger.exception(
-            "fetch_architecture failed: round=%s hotkey=%s", round_id, hotkey[:16],
+            "fetch_architecture failed: round=%s hotkey=%s sid=%s",
+            round_id, hotkey[:16], sid[:12],
         )
         return None
     if raw is None:
@@ -144,21 +203,29 @@ def fetch_architecture(
     return {"text": raw, "truncated": False, "size": size}
 
 
-def presigned_architecture_url(r2, round_id: int, hotkey: str, ttl: int = 900) -> str:
+async def presigned_architecture_url(
+    pool, r2, round_id: int, hotkey: str, ttl: int = 900,
+) -> str:
     """Return a 15-minute presigned GET URL for architecture.py."""
     if r2 is None:
         return ""
+    sid = await submission_id_for(pool, round_id, hotkey)
+    if not sid:
+        return ""
     try:
-        return r2.generate_presigned_get_url(_arch_key(round_id, hotkey), ttl=ttl)
+        return r2.generate_presigned_get_url(
+            _arch_key_sid(round_id, sid), ttl=ttl,
+        )
     except Exception:
         logger.exception(
-            "presigned_architecture_url failed: round=%s hotkey=%s",
-            round_id, hotkey[:16],
+            "presigned_architecture_url failed: round=%s hotkey=%s sid=%s",
+            round_id, hotkey[:16], sid[:12],
         )
         return ""
 
 
 __all__ = [
+    "submission_id_for",
     "cached_meta",
     "fetch_architecture",
     "fetch_meta",

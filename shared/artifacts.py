@@ -1,10 +1,16 @@
 """Training artifact storage — upload, download, verify.
 
-Handles the R2 storage protocol for training artifacts:
-  round_{round_id}/miner_{hotkey}/checkpoint.safetensors
-  round_{round_id}/miner_{hotkey}/architecture.py
-  round_{round_id}/miner_{hotkey}/training_meta.json
-  round_{round_id}/miner_{hotkey}/stdout.log
+Handles the R2/Hippius storage protocol for training artifacts:
+  round_{round_id}/submission_{submission_id}/checkpoint.safetensors
+  round_{round_id}/submission_{submission_id}/architecture.py
+  round_{round_id}/submission_{submission_id}/training_meta.json
+  round_{round_id}/submission_{submission_id}/stdout.log
+
+`submission_id` is an opaque per-round per-job ID minted by the dispatching
+validator. It hides the miner's hotkey from the trainer-host (which is itself
+a miner's pod under cross-eval). The validator publishes the
+``submission_id → miner_hotkey`` reveal map after Phase C closes — see
+``database/server.py:/round_submissions/reveal``.
 
 Hash verification chain: training_meta.json contains sha256 hashes
 binding all artifact files together.
@@ -16,6 +22,7 @@ import hashlib
 import json
 import logging
 import os
+import re as _re
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
@@ -25,39 +32,53 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# ── R2 path helpers ──────────────────────────────────────────────
+# ── Path helpers ─────────────────────────────────────────────────
 
-import re as _re
+_SAFE_ID = _re.compile(r"^[A-Za-z0-9_-]+$")
 
-_SAFE_HOTKEY = _re.compile(r"^[A-Za-z0-9_-]+$")
+
+def _validate_submission_id(submission_id: str) -> str:
+    """Validate submission_id contains no path-traversal characters."""
+    if not submission_id or not _SAFE_ID.match(submission_id):
+        raise ValueError(f"Invalid submission_id (unsafe characters): {submission_id!r}")
+    return submission_id
 
 
 def _validate_hotkey(miner_hotkey: str) -> str:
     """Validate hotkey contains no path-traversal characters."""
-    if not _SAFE_HOTKEY.match(miner_hotkey):
+    if not _SAFE_ID.match(miner_hotkey):
         raise ValueError(f"Invalid miner_hotkey (unsafe characters): {miner_hotkey!r}")
     return miner_hotkey
 
 
-def checkpoint_key(round_id: int, miner_hotkey: str) -> str:
-    _validate_hotkey(miner_hotkey)
-    return f"round_{round_id}/miner_{miner_hotkey}/checkpoint.safetensors"
+def checkpoint_key(round_id: int, submission_id: str) -> str:
+    _validate_submission_id(submission_id)
+    return f"round_{round_id}/submission_{submission_id}/checkpoint.safetensors"
 
 
-def architecture_key(round_id: int, miner_hotkey: str) -> str:
-    return f"round_{round_id}/miner_{miner_hotkey}/architecture.py"
+def architecture_key(round_id: int, submission_id: str) -> str:
+    _validate_submission_id(submission_id)
+    return f"round_{round_id}/submission_{submission_id}/architecture.py"
 
 
-def meta_key(round_id: int, miner_hotkey: str) -> str:
-    return f"round_{round_id}/miner_{miner_hotkey}/training_meta.json"
+def meta_key(round_id: int, submission_id: str) -> str:
+    _validate_submission_id(submission_id)
+    return f"round_{round_id}/submission_{submission_id}/training_meta.json"
 
 
-def stdout_key(round_id: int, miner_hotkey: str) -> str:
-    return f"round_{round_id}/miner_{miner_hotkey}/stdout.log"
+def stdout_key(round_id: int, submission_id: str) -> str:
+    _validate_submission_id(submission_id)
+    return f"round_{round_id}/submission_{submission_id}/stdout.log"
 
 
 def scratchpad_key(miner_hotkey: str) -> str:
-    """R2 key for a miner's persistent scratchpad archive."""
+    """R2 key for a miner's persistent scratchpad archive.
+
+    Scratchpads stay keyed by hotkey — they're miner-private state the
+    miner reads/writes themselves through their own creds; no cross-miner
+    anonymity concern applies.
+    """
+    _validate_hotkey(miner_hotkey)
     return f"scratchpad/{miner_hotkey}/state.tar.gz"
 
 
@@ -83,9 +104,14 @@ def generate_scratchpad_urls(
 
 @dataclass
 class TrainingMeta:
-    """Metadata written alongside checkpoint after training."""
+    """Metadata written alongside checkpoint after training.
+
+    The trainer fills ``submission_id`` (from the dispatch payload). The
+    validator only resolves ``submission_id → miner_hotkey`` via its own
+    in-memory dispatch state and the post-Phase-C reveal map.
+    """
     round_id: int = 0
-    miner_hotkey: str = ""
+    submission_id: str = ""
     status: str = ""                    # success | failed | timeout | build_failed | size_violation
     error: str = ""
     flops_equivalent_size: int = 0
@@ -118,7 +144,7 @@ class TrainingMeta:
     def to_dict(self) -> dict:
         return {
             "round_id": self.round_id,
-            "miner_hotkey": self.miner_hotkey,
+            "submission_id": self.submission_id,
             "status": self.status,
             "error": self.error,
             "flops_equivalent_size": self.flops_equivalent_size,
@@ -170,25 +196,21 @@ def sha256_text(text: str) -> str:
 def upload_training_artifacts(
     r2: "R2AuditLog",
     round_id: int,
-    miner_hotkey: str,
+    submission_id: str,
     checkpoint_path: str,
     architecture_code: str,
     stdout_log: str,
     meta: TrainingMeta,
 ) -> bool:
-    """Upload all training artifacts to R2 with hash verification chain.
-
-    Computes sha256 of each artifact and stores in training_meta.json.
-    """
-    # Compute hashes
+    """Upload all training artifacts with hash verification chain."""
     meta.checkpoint_sha256 = sha256_file(checkpoint_path)
     meta.architecture_sha256 = sha256_text(architecture_code)
     meta.stdout_sha256 = sha256_text(stdout_log)
 
-    ck = checkpoint_key(round_id, miner_hotkey)
-    ak = architecture_key(round_id, miner_hotkey)
-    mk = meta_key(round_id, miner_hotkey)
-    sk = stdout_key(round_id, miner_hotkey)
+    ck = checkpoint_key(round_id, submission_id)
+    ak = architecture_key(round_id, submission_id)
+    mk = meta_key(round_id, submission_id)
+    sk = stdout_key(round_id, submission_id)
 
     ok = True
     ok = r2.upload_file_from_disk(checkpoint_path, ck) and ok
@@ -197,9 +219,9 @@ def upload_training_artifacts(
     ok = r2.upload_json(mk, meta.to_dict()) and ok
 
     if ok:
-        logger.info("Uploaded artifacts for round %d miner %s", round_id, miner_hotkey)
+        logger.info("Uploaded artifacts for round %d submission %s", round_id, submission_id[:12])
     else:
-        logger.error("Some artifacts failed to upload for round %d miner %s", round_id, miner_hotkey)
+        logger.error("Some artifacts failed to upload for round %d submission %s", round_id, submission_id[:12])
 
     return ok
 
@@ -207,21 +229,20 @@ def upload_training_artifacts(
 def generate_upload_urls(
     r2: "R2AuditLog",
     round_id: int,
-    miner_hotkey: str,
+    submission_id: str,
     ttl: int = 5400,
 ) -> dict[str, str]:
     """Generate pre-signed PUT URLs for all training artifacts.
 
     TTL defaults to 5400s (~90 min). URLs are path-locked to the specific
-    round/miner key.
-
-    Returns dict mapping artifact name to presigned URL.
+    round/submission key, so the trainer-host can only write into its
+    assigned opaque submission slot.
     """
     keys = {
-        "checkpoint": checkpoint_key(round_id, miner_hotkey),
-        "architecture": architecture_key(round_id, miner_hotkey),
-        "meta": meta_key(round_id, miner_hotkey),
-        "stdout": stdout_key(round_id, miner_hotkey),
+        "checkpoint": checkpoint_key(round_id, submission_id),
+        "architecture": architecture_key(round_id, submission_id),
+        "meta": meta_key(round_id, submission_id),
+        "stdout": stdout_key(round_id, submission_id),
     }
     urls = {}
     for name, key in keys.items():
@@ -236,25 +257,21 @@ def generate_upload_urls(
 def verify_uploaded_artifacts(
     r2: "R2AuditLog",
     round_id: int,
-    miner_hotkey: str,
+    submission_id: str,
 ) -> tuple[bool, str]:
-    """Verify that expected artifacts exist in R2 after training upload.
+    """Verify expected artifacts exist after training upload.
 
-    Checks that checkpoint and meta files exist at the expected keys.
-    This catches cases where a presigned URL was used to write to an
-    unexpected path (which S3 presigned URLs prevent, but defense-in-depth).
-
-    Returns (ok, error_message).
+    Checks that checkpoint and meta files exist at the expected keys, and
+    that the meta self-reports the same round_id and submission_id.
     """
-    ck = checkpoint_key(round_id, miner_hotkey)
-    mk = meta_key(round_id, miner_hotkey)
+    ck = checkpoint_key(round_id, submission_id)
+    mk = meta_key(round_id, submission_id)
 
     if not r2.key_exists(mk):
         return False, f"training_meta.json missing at {mk}"
     if not r2.key_exists(ck):
         return False, f"checkpoint missing at {ck}"
 
-    # Verify meta contains correct round_id and miner_hotkey
     meta_dict = r2.download_json(mk)
     if not meta_dict:
         return False, "Failed to download training_meta.json for verification"
@@ -264,10 +281,10 @@ def verify_uploaded_artifacts(
             f"Meta round_id mismatch: expected {round_id}, "
             f"got {meta_dict.get('round_id')}"
         )
-    if meta_dict.get("miner_hotkey") != miner_hotkey:
+    if meta_dict.get("submission_id") != submission_id:
         return False, (
-            f"Meta miner_hotkey mismatch: expected {miner_hotkey}, "
-            f"got {meta_dict.get('miner_hotkey')}"
+            f"Meta submission_id mismatch: expected {submission_id}, "
+            f"got {meta_dict.get('submission_id')}"
         )
 
     return True, ""
@@ -286,14 +303,12 @@ def upload_training_artifacts_presigned(
     """
     import httpx
 
-    # Compute hashes before upload
     meta.checkpoint_sha256 = sha256_file(checkpoint_path)
     meta.architecture_sha256 = sha256_text(architecture_code)
     meta.stdout_sha256 = sha256_text(stdout_log)
 
     ok = True
 
-    # Upload checkpoint (binary file)
     if "checkpoint" in presigned_urls:
         try:
             with open(checkpoint_path, "rb") as f:
@@ -306,7 +321,7 @@ def upload_training_artifacts_presigned(
         logger.error("No presigned URL for checkpoint")
         ok = False
 
-    # Upload architecture (text) — retry once on failure since this is critical for eval
+    # Architecture: retry once — eval depends on it.
     if "architecture" in presigned_urls:
         arch_bytes = architecture_code.encode()
         arch_uploaded = False
@@ -332,7 +347,6 @@ def upload_training_artifacts_presigned(
         logger.error("No presigned URL for architecture — upload_urls keys: %s", list(presigned_urls.keys()))
         ok = False
 
-    # Upload stdout (text)
     if "stdout" in presigned_urls:
         try:
             resp = httpx.put(presigned_urls["stdout"], content=stdout_log.encode(), timeout=30)
@@ -341,7 +355,6 @@ def upload_training_artifacts_presigned(
             logger.error("Presigned upload failed for stdout: %s", e)
             ok = False
 
-    # Upload meta (JSON) — must be last since it contains hashes
     if "meta" in presigned_urls:
         try:
             body = json.dumps(meta.to_dict(), indent=2).encode()
@@ -352,13 +365,13 @@ def upload_training_artifacts_presigned(
             ok = False
 
     if ok:
-        logger.info("Uploaded artifacts via presigned URLs for miner %s", meta.miner_hotkey)
+        logger.info("Uploaded artifacts via presigned URLs for submission %s", meta.submission_id[:12])
     return ok
 
 
 @dataclass
 class DownloadedArtifacts:
-    """All artifacts downloaded from R2 for a single miner's training run."""
+    """All artifacts downloaded for a single miner's training run."""
     meta: TrainingMeta
     checkpoint_path: str = ""    # local path where checkpoint was saved
     architecture_code: str = ""
@@ -370,57 +383,52 @@ class DownloadedArtifacts:
 def download_training_artifacts(
     r2: "R2AuditLog",
     round_id: int,
-    miner_hotkey: str,
+    submission_id: str,
     download_dir: str,
 ) -> Optional[DownloadedArtifacts]:
-    """Download all training artifacts from R2 and verify hashes.
+    """Download all training artifacts for a submission and verify hashes.
 
     Returns None if meta can't be downloaded.
     Sets verified=False with verification_error if hash mismatch.
     """
-    hk_short = miner_hotkey[:16]
-    logger.info("Downloading artifacts for miner %s... round %d", hk_short, round_id)
+    sid_short = submission_id[:12]
+    logger.info("Downloading artifacts for submission %s round %d", sid_short, round_id)
 
-    # Download meta
-    mk = meta_key(round_id, miner_hotkey)
+    mk = meta_key(round_id, submission_id)
     meta_dict = r2.download_json(mk)
     if not meta_dict:
-        logger.warning("No training_meta.json found for miner %s... round %d", hk_short, round_id)
+        logger.warning("No training_meta.json found for submission %s round %d", sid_short, round_id)
         return None
 
     meta = TrainingMeta.from_dict(meta_dict)
     logger.info(
-        "Training meta for %s...: status=%s steps=%d time=%.1fs params=%.2fM",
-        hk_short, meta.status, meta.num_steps,
+        "Training meta for %s: status=%s steps=%d time=%.1fs params=%.2fM",
+        sid_short, meta.status, meta.num_steps,
         meta.training_time_seconds, meta.num_params_M,
     )
 
-    # Download checkpoint
-    ck = checkpoint_key(round_id, miner_hotkey)
+    ck = checkpoint_key(round_id, submission_id)
     os.makedirs(download_dir, exist_ok=True)
-    local_checkpoint = os.path.join(download_dir, f"checkpoint_{miner_hotkey}.safetensors")
+    local_checkpoint = os.path.join(download_dir, f"checkpoint_{submission_id}.safetensors")
     if not r2.download_file_to_disk(ck, local_checkpoint):
-        logger.warning("Failed to download checkpoint for miner %s... round %d", hk_short, round_id)
+        logger.warning("Failed to download checkpoint for submission %s round %d", sid_short, round_id)
         return DownloadedArtifacts(
             meta=meta, verification_error="Failed to download checkpoint",
         )
 
     ckpt_size_mb = os.path.getsize(local_checkpoint) / (1024 * 1024)
-    logger.info("Checkpoint downloaded: %s... (%.2f MB)", hk_short, ckpt_size_mb)
+    logger.info("Checkpoint downloaded: %s (%.2f MB)", sid_short, ckpt_size_mb)
 
-    # Download architecture
-    ak = architecture_key(round_id, miner_hotkey)
+    ak = architecture_key(round_id, submission_id)
     architecture_code = r2.download_text(ak) or ""
 
-    # Download stdout
-    sk = stdout_key(round_id, miner_hotkey)
+    sk = stdout_key(round_id, submission_id)
     stdout_log = r2.download_text(sk) or ""
     logger.info(
-        "Artifacts downloaded for %s...: checkpoint=%.2fMB arch=%d bytes stdout=%d bytes",
-        hk_short, ckpt_size_mb, len(architecture_code), len(stdout_log),
+        "Artifacts downloaded for %s: checkpoint=%.2fMB arch=%d bytes stdout=%d bytes",
+        sid_short, ckpt_size_mb, len(architecture_code), len(stdout_log),
     )
 
-    # Verify hashes
     result = DownloadedArtifacts(
         meta=meta,
         checkpoint_path=local_checkpoint,
@@ -437,19 +445,19 @@ def download_training_artifacts(
     if meta.architecture_sha256 and architecture_code:
         actual = sha256_text(architecture_code)
         if actual != meta.architecture_sha256:
-            errors.append(f"architecture hash mismatch")
+            errors.append("architecture hash mismatch")
 
     if meta.stdout_sha256 and stdout_log:
         actual = sha256_text(stdout_log)
         if actual != meta.stdout_sha256:
-            errors.append(f"stdout hash mismatch")
+            errors.append("stdout hash mismatch")
 
     if errors:
         result.verification_error = "; ".join(errors)
-        logger.warning("Hash verification failed for %s...: %s", hk_short, result.verification_error)
+        logger.warning("Hash verification failed for %s: %s", sid_short, result.verification_error)
     else:
         result.verified = True
-        logger.info("All hashes verified for miner %s...", hk_short)
+        logger.info("All hashes verified for submission %s", sid_short)
 
     return result
 
@@ -458,16 +466,16 @@ def list_round_artifacts(
     r2: "R2AuditLog",
     round_id: int,
 ) -> list[str]:
-    """List all miner hotkeys that have training_meta.json for a round."""
+    """List all submission_ids that have training_meta.json for a round."""
     prefix = f"round_{round_id}/"
     keys = r2.list_keys(prefix)
 
-    hotkeys = set()
+    sids: set[str] = set()
     for key in keys:
-        # round_{id}/miner_{hotkey}/training_meta.json
+        # round_{id}/submission_{sid}/training_meta.json
         if key.endswith("/training_meta.json"):
             parts = key.split("/")
-            if len(parts) >= 3 and parts[1].startswith("miner_"):
-                hotkeys.add(parts[1][len("miner_"):])
+            if len(parts) >= 3 and parts[1].startswith("submission_"):
+                sids.add(parts[1][len("submission_"):])
 
-    return sorted(hotkeys)
+    return sorted(sids)

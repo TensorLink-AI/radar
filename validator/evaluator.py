@@ -225,11 +225,18 @@ async def evaluate_all_checkpoints(
         if meta.get("status") != "success":
             continue
 
+        submission_id = meta.get("submission_id", "")
+        if not submission_id:
+            logger.warning("UID %d: meta missing submission_id — skipping eval", uid)
+            continue
         miner_hotkey = meta.get("miner_hotkey", f"uid_{uid}")
-        logger.info("Evaluating UID %d (miner %s...) round %d", uid, miner_hotkey[:16], round_id)
+        logger.info(
+            "Evaluating UID %d (miner %s submission %s) round %d",
+            uid, miner_hotkey[:16], submission_id[:12], round_id,
+        )
 
-        # Download and verify all artifacts
-        artifacts = download_training_artifacts(r2, round_id, miner_hotkey, tmp_dir)
+        # Download and verify all artifacts (keyed by submission_id, not hotkey)
+        artifacts = download_training_artifacts(r2, round_id, submission_id, tmp_dir)
         if not artifacts:
             logger.warning("UID %d: failed to download artifacts", uid)
             continue

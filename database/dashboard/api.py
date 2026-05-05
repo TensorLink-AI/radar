@@ -206,8 +206,8 @@ async def loss_curve(index: int) -> dict:
     meta = _decode_jsonb(row["meta"], {}) or {}
     train, val = _aligned_train_val(meta)
     if not train and not val and row["round_id"] is not None and row["miner_hotkey"]:
-        r2_meta = log_helpers.fetch_meta(
-            state.r2, int(row["round_id"]), row["miner_hotkey"],
+        r2_meta = await log_helpers.fetch_meta(
+            state.pool, state.r2, int(row["round_id"]), row["miner_hotkey"],
         )
         if r2_meta:
             train, val = _aligned_train_val(r2_meta)
@@ -741,11 +741,13 @@ async def logs_meta_json(round_id: int, hotkey: str):
 async def logs_stdout_json(round_id: int, hotkey: str, direct: int = 0):
     state = get_state()
     if direct:
-        url = log_helpers.presigned_stdout_url(state.r2, round_id, hotkey)
+        url = await log_helpers.presigned_stdout_url(
+            state.pool, state.r2, round_id, hotkey,
+        )
         if not url:
             raise HTTPException(status_code=503, detail="R2 presign unavailable")
         return RedirectResponse(url=url, status_code=302)
-    payload = log_helpers.fetch_stdout(state.r2, round_id, hotkey)
+    payload = await log_helpers.fetch_stdout(state.pool, state.r2, round_id, hotkey)
     if payload is None:
         raise HTTPException(status_code=404, detail="No stdout.log in R2")
     return JSONResponse(payload)
@@ -755,11 +757,15 @@ async def logs_stdout_json(round_id: int, hotkey: str, direct: int = 0):
 async def logs_architecture_json(round_id: int, hotkey: str, direct: int = 0):
     state = get_state()
     if direct:
-        url = log_helpers.presigned_architecture_url(state.r2, round_id, hotkey)
+        url = await log_helpers.presigned_architecture_url(
+            state.pool, state.r2, round_id, hotkey,
+        )
         if not url:
             raise HTTPException(status_code=503, detail="R2 presign unavailable")
         return RedirectResponse(url=url, status_code=302)
-    payload = log_helpers.fetch_architecture(state.r2, round_id, hotkey)
+    payload = await log_helpers.fetch_architecture(
+        state.pool, state.r2, round_id, hotkey,
+    )
     if payload is None:
         raise HTTPException(status_code=404, detail="No architecture.py in R2")
     return JSONResponse(payload)

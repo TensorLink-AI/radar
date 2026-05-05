@@ -117,7 +117,7 @@ class TrainingConfig:
     round_id: int = 0
     min_flops: int = 0
     max_flops: int = 0
-    miner_hotkey: str = "unknown"
+    submission_id: str = "unknown"
     time_budget: int = 300
 
     @classmethod
@@ -222,7 +222,7 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
 
     return {
         "round_id": config.round_id,
-        "miner_hotkey": config.miner_hotkey,
+        "submission_id": config.submission_id,
         "status": "success",
         "flops_equivalent_size": flops_equiv,
         "training_time_seconds": time.time() - start,
@@ -733,7 +733,7 @@ def _check_size_gate(config: TrainingConfig, flops_equiv: int) -> dict | None:
 def _fail(config: TrainingConfig, status: str, error: str, **kw) -> dict:
     return {
         "round_id": config.round_id,
-        "miner_hotkey": config.miner_hotkey,
+        "submission_id": config.submission_id,
         "status": status,
         "error": error,
         **kw,

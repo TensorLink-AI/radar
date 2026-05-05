@@ -1,8 +1,13 @@
 """Artifact upload helpers for the trainer server.
 
 Split out of ``runner/server.py`` so the request-handling module stays
-under the 300-line file cap.  All functions assume the caller already
+under the 300-line file cap. All functions assume the caller already
 prefetched data and the sandbox already produced a ``result`` dict.
+
+The trainer never sees the architecture owner's hotkey — only the opaque
+``submission_id`` minted by the dispatching validator. Bucket paths and
+TrainingMeta live entirely in submission_id space until the validator
+publishes the post-Phase-C reveal map.
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ def _get_r2():
 
 def upload_failure_meta(
     round_id: int,
-    miner_hotkey: str,
+    submission_id: str,
     upload_urls: dict,
     result: dict,
 ) -> None:
@@ -35,7 +40,7 @@ def upload_failure_meta(
 
     meta = TrainingMeta(
         round_id=round_id,
-        miner_hotkey=miner_hotkey,
+        submission_id=submission_id,
         status=result.get("status", "failed"),
         error=result.get("error", ""),
         flops_equivalent_size=result.get("flops_equivalent_size", 0),
@@ -49,7 +54,10 @@ def upload_failure_meta(
         body = json.dumps(meta.to_dict(), indent=2).encode()
         resp = httpx.put(meta_url, content=body, timeout=30)
         resp.raise_for_status()
-        logger.info("Uploaded failure meta for round %d miner %s", round_id, miner_hotkey)
+        logger.info(
+            "Uploaded failure meta for round %d submission %s",
+            round_id, submission_id[:12],
+        )
     except Exception as e:
         logger.error("Failed to upload failure meta: %s", e)
 
@@ -58,22 +66,22 @@ def upload_artifacts(
     result: dict,
     architecture_code: str,
     round_id: int,
-    miner_hotkey: str,
+    submission_id: str,
     upload_urls: dict,
 ) -> dict:
-    """Upload checkpoint + architecture + meta to R2.  Mutates and returns ``result``."""
+    """Upload checkpoint + architecture + meta. Mutates and returns ``result``."""
     from shared.artifacts import (
         TrainingMeta, checkpoint_key as ck_fn, architecture_key as ak_fn,
     )
 
     checkpoint_path = result.get("checkpoint_path", "")
     stdout_log = result.get("stdout_log", "")
-    ck_str = ck_fn(round_id, miner_hotkey)
-    ak_str = ak_fn(round_id, miner_hotkey)
+    ck_str = ck_fn(round_id, submission_id)
+    ak_str = ak_fn(round_id, submission_id)
 
     meta = TrainingMeta(
         round_id=round_id,
-        miner_hotkey=miner_hotkey,
+        submission_id=submission_id,
         status="success",
         flops_equivalent_size=result.get("flops_equivalent_size", 0),
         training_time_seconds=result.get("training_time_seconds", 0),
@@ -108,7 +116,7 @@ def upload_artifacts(
             upload_ok = upload_training_artifacts(
                 r2=_get_r2(),
                 round_id=round_id,
-                miner_hotkey=miner_hotkey,
+                submission_id=submission_id,
                 checkpoint_path=checkpoint_path,
                 architecture_code=architecture_code,
                 stdout_log=stdout_log,
@@ -120,9 +128,11 @@ def upload_artifacts(
 
     status = "success" if upload_ok else "upload_failed"
     if not upload_ok:
-        logger.error("Artifact upload incomplete for round %d miner %s", round_id, miner_hotkey)
+        logger.error(
+            "Artifact upload incomplete for round %d submission %s",
+            round_id, submission_id[:12],
+        )
 
-    # Remove internal-only fields, add R2 keys
     result.pop("checkpoint_path", None)
     result.pop("stdout_log", None)
     result["status"] = status

@@ -105,6 +105,7 @@ class FakePool:
         agent_history: Optional[list[dict]] = None,
         agent_bundles: Optional[dict[str, dict]] = None,
         training_metas: Optional[dict[tuple[int, str], dict]] = None,
+        round_submissions: Optional[dict[tuple[int, str], str]] = None,
     ):
         self.elements = elements
         self.access_log = access_log or []
@@ -113,6 +114,8 @@ class FakePool:
         self.agent_bundles = agent_bundles or {}
         # (round_id, hotkey) -> meta dict (mirrors training_metas table)
         self.training_metas = training_metas or {}
+        # (round_id, miner_hotkey) -> submission_id (mirrors round_submissions table)
+        self.round_submissions = round_submissions or {}
 
     def _rows(self):
         return [self._row(e) for e in self.elements]
@@ -327,6 +330,12 @@ class FakePool:
             if meta is None:
                 return None
             return {"meta": json.dumps(meta)}
+        if "from round_submissions" in sql_l and "miner_hotkey = $2" in sql_l:
+            key = (int(params[0]), params[1])
+            sid = self.round_submissions.get(key)
+            if sid is None:
+                return None
+            return {"submission_id": sid}
         return None
 
 
@@ -430,7 +439,7 @@ def dashboard_client():
     # Round 7's meta lives in the Postgres cache; round 8's only in R2 — this
     # keeps the R2 fallback path covered while round 7 exercises the cache.
     cached_meta_round7 = {
-        "round_id": 7, "miner_hotkey": "hk_a",
+        "round_id": 7, "submission_id": "sid_round7_hka",
         "flops": 1234, "ok": True,
         "train_loss_history": [
             {"step": 10, "loss": 22.19}, {"step": 20, "loss": 14.71},
@@ -440,7 +449,7 @@ def dashboard_client():
         ],
     }
     r2_meta_round8 = {
-        "round_id": 8, "miner_hotkey": "hk_a",
+        "round_id": 8, "submission_id": "sid_round8_hka",
         "flops": 5678, "ok": True,
     }
     pool = FakePool(
@@ -453,24 +462,39 @@ def dashboard_client():
             # Element 2 (round 8, hk_b) has an empty experiments.loss_curve —
             # this meta exercises the training_metas fallback in loss_curve.json.
             (8, "hk_b"): {
-                "round_id": 8, "miner_hotkey": "hk_b",
+                "round_id": 8, "submission_id": "sid_round8_hkb",
                 "train_loss_history": [
                     {"step": 1, "loss": 3.3}, {"step": 2, "loss": 2.2},
                 ],
             },
         },
+        # Reveal map: dashboard resolves (round_id, miner_hotkey) → submission_id
+        # via this table, then fetches artifacts from
+        # round_{id}/submission_{sid}/... in R2.
+        round_submissions={
+            (7, "hk_a"): "sid_round7_hka",
+            (8, "hk_a"): "sid_round8_hka",
+            (8, "hk_b"): "sid_round8_hkb",
+        },
     )
     r2 = FakeR2()
     r2.upload_json("agents/hk_a/hash_v1.json", bundle_v1)
     r2.upload_json("agents/hk_a/hash_v2.json", bundle_v2)
-    # Seed a training log file so the log route has something to read.
-    r2.upload_text("round_7/miner_hk_a/stdout.log", "epoch 0 loss=2.0\nepoch 1 loss=1.5\n")
-    # Round 7 meta also goes to R2 so existing tests keep working — the cache
-    # is preferred when both exist.
-    r2.upload_json("round_7/miner_hk_a/training_meta.json", cached_meta_round7)
-    r2.upload_json("round_8/miner_hk_a/training_meta.json", r2_meta_round8)
+    # Seed training artifacts at the new submission_id-keyed path.
     r2.upload_text(
-        "round_7/miner_hk_a/architecture.py",
+        "round_7/submission_sid_round7_hka/stdout.log",
+        "epoch 0 loss=2.0\nepoch 1 loss=1.5\n",
+    )
+    r2.upload_json(
+        "round_7/submission_sid_round7_hka/training_meta.json",
+        cached_meta_round7,
+    )
+    r2.upload_json(
+        "round_8/submission_sid_round8_hka/training_meta.json",
+        r2_meta_round8,
+    )
+    r2.upload_text(
+        "round_7/submission_sid_round7_hka/architecture.py",
         "class Model:\n    def __init__(self):\n        self.name = 'unit-test-model'\n",
     )
 
