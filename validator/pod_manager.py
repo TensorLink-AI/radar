@@ -16,13 +16,21 @@ from __future__ import annotations
 
 import asyncio
 import ast
+import functools
 import json
 import logging
 import os
 import tempfile
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Default prefix used to identify validator-owned agent deployments on
+# Basilica. Anything matching this prefix that's older than the reap age
+# is assumed to be an orphan (the validator that created it crashed,
+# was redeployed, or hit an HTTP error path that skipped cleanup).
+_DEFAULT_AGENT_PREFIX = "radar-agent"
 
 
 def _af():
@@ -267,6 +275,7 @@ async def run_agent_on_pod(
     for attempt in range(1 + max_retries):
         try:
             result = await env.process_challenge(**call_kwargs)
+            _record_deployment_name(env)
             if attempt > 0:
                 logger.info(
                     "Agent pod succeeded on attempt %d/%d",
@@ -274,6 +283,11 @@ async def run_agent_on_pod(
                 )
             return result
         except Exception as e:
+            # Each Basilica retry spawns a NEW deployment (timestamp suffix
+            # in the name). Record whatever name was assigned this attempt
+            # so finally-block cleanup can delete every pod we created,
+            # not just the last one.
+            _record_deployment_name(env)
             err_str = str(e)
             is_502 = "502" in err_str
             if attempt < max_retries:
@@ -295,6 +309,186 @@ async def run_agent_on_pod(
                     1 + max_retries, type(e).__name__, e,
                 )
     return None
+
+
+# ── Cleanup ──────────────────────────────────────────────────────
+
+def _record_deployment_name(env) -> None:
+    """Capture the Basilica deployment name affinetes assigned to ``env``.
+
+    affinetes exposes the active deployment under one of a few attribute
+    names depending on backend version (``_deployment_name``,
+    ``deployment_name``, or a ``_deployment`` object with a ``.name``).
+    We accumulate every distinct name we observe across retries so
+    cleanup can hit them all.
+    """
+    name = None
+    for attr in ("_deployment_name", "deployment_name", "instance_name"):
+        candidate = getattr(env, attr, None)
+        if isinstance(candidate, str) and candidate:
+            name = candidate
+            break
+    if name is None:
+        dep = getattr(env, "_deployment", None) or getattr(env, "deployment", None)
+        candidate = getattr(dep, "name", None)
+        if isinstance(candidate, str) and candidate:
+            name = candidate
+    if not name:
+        return
+    seen = getattr(env, "_radar_deployment_names", None)
+    if seen is None:
+        seen = []
+        try:
+            env._radar_deployment_names = seen
+        except Exception:
+            return
+    if name not in seen:
+        seen.append(name)
+
+
+async def cleanup_agent_env(env) -> None:
+    """Best-effort teardown of every Basilica deployment tied to ``env``.
+
+    Calls ``env.cleanup()`` first (the affinetes path), then force-deletes
+    every deployment name we recorded during retries via the Basilica
+    SDK. Always swallows exceptions — this runs in ``finally`` blocks and
+    must never mask the original error.
+    """
+    if env is None:
+        return
+    cleanup = getattr(env, "cleanup", None)
+    if cleanup is not None:
+        try:
+            res = cleanup()
+            if asyncio.iscoroutine(res):
+                await res
+        except Exception as e:
+            logger.debug("env.cleanup() failed: %s", e)
+
+    names = list(getattr(env, "_radar_deployment_names", []) or [])
+    if not names:
+        return
+    try:
+        from basilica import BasilicaClient
+    except ImportError:
+        return
+    try:
+        client = BasilicaClient()
+    except Exception as e:
+        logger.debug("BasilicaClient init failed during cleanup: %s", e)
+        return
+    loop = asyncio.get_event_loop()
+    for name in names:
+        try:
+            await loop.run_in_executor(
+                None, functools.partial(client.delete_deployment, name),
+            )
+            logger.info("Force-deleted leaked agent deployment: %s", name)
+        except Exception as e:
+            logger.debug(
+                "Force-delete of %s failed (TTL will reap): %s", name, e,
+            )
+
+
+# ── Orphan Reaper ────────────────────────────────────────────────
+
+def _list_basilica_deployments(client):
+    """Call whichever list method the installed basilica SDK exposes.
+
+    Returns an iterable of deployment objects, or [] if no list API is
+    available (older SDKs). Each object is expected to have ``.name`` and
+    one of ``.created_at`` / ``.uptime_seconds`` we can use to age it.
+    """
+    for method in ("list_deployments", "deployments", "list"):
+        fn = getattr(client, method, None)
+        if callable(fn):
+            try:
+                return list(fn())
+            except Exception as e:
+                logger.debug("%s() failed: %s", method, e)
+                return []
+    return []
+
+
+def _deployment_age_seconds(dep) -> Optional[float]:
+    """Return the age of a Basilica deployment in seconds, or None.
+
+    Tries ``uptime_seconds`` first (a single number), then ``created_at``
+    (epoch or ISO 8601). Returns None when neither is parseable so the
+    caller can skip rather than mistakenly delete a fresh pod.
+    """
+    uptime = getattr(dep, "uptime_seconds", None)
+    if isinstance(uptime, (int, float)) and uptime >= 0:
+        return float(uptime)
+    created = getattr(dep, "created_at", None)
+    if isinstance(created, (int, float)):
+        return max(0.0, time.time() - float(created))
+    if isinstance(created, str):
+        try:
+            from datetime import datetime
+            ts = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            return max(0.0, time.time() - ts.timestamp())
+        except Exception:
+            return None
+    return None
+
+
+async def reap_orphan_agent_pods(
+    prefix: str = _DEFAULT_AGENT_PREFIX,
+    max_age_seconds: int = 1800,
+) -> int:
+    """Delete Basilica deployments matching ``prefix`` older than the cap.
+
+    Safety net for pods leaked by validator crashes, retry storms, or
+    cleanup paths that didn't run. Mirrors ``Miner._reap_stale_deployments``
+    on the miner side. Returns the number of deployments deleted.
+
+    Skips deployments whose age can't be determined to avoid deleting
+    fresh pods on SDK versions that don't expose timestamps.
+    """
+    if get_mode() != "basilica":
+        return 0
+    try:
+        from basilica import BasilicaClient
+    except ImportError:
+        return 0
+    try:
+        client = BasilicaClient()
+    except Exception as e:
+        logger.debug("BasilicaClient init failed during reap: %s", e)
+        return 0
+
+    loop = asyncio.get_event_loop()
+    try:
+        deps = await loop.run_in_executor(
+            None, functools.partial(_list_basilica_deployments, client),
+        )
+    except Exception as e:
+        logger.debug("Basilica list failed: %s", e)
+        return 0
+
+    deleted = 0
+    for dep in deps:
+        name = getattr(dep, "name", None) or getattr(dep, "instance_name", None)
+        if not isinstance(name, str) or not name.startswith(prefix):
+            continue
+        age = _deployment_age_seconds(dep)
+        if age is None or age < max_age_seconds:
+            continue
+        try:
+            await loop.run_in_executor(
+                None, functools.partial(client.delete_deployment, name),
+            )
+            deleted += 1
+            logger.info(
+                "Reaped orphan agent deployment %s (%.0f min old)",
+                name, age / 60,
+            )
+        except Exception as e:
+            logger.debug("Reap delete of %s failed: %s", name, e)
+    if deleted:
+        logger.info("Orphan reaper deleted %d agent deployments", deleted)
+    return deleted
 
 
 # ── Pod Verification (Basilica public metadata) ──────────────────
