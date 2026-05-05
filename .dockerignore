@@ -1,0 +1,49 @@
+# VCS
+.git
+.gitignore
+.github
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+env
+.pytest_cache
+.ruff_cache
+.mypy_cache
+*.egg-info
+
+# Editor / OS
+.vscode
+.idea
+.DS_Store
+*.swp
+
+# Secrets — MUST stay out of the image
+.env
+.env.*
+*.pem
+*.key
+wallets/
+.bittensor/
+
+# Docs and non-runtime artifacts
+docs/
+*.md
+!README.md
+
+# Tests (not needed at runtime)
+tests/
+
+# Training runner has its own image
+runner/Dockerfile
+
+# Local scratch / data dirs from .gitignore
+.radar/
+scratch/
+*.log
+*.backup
+data/
+experiments/

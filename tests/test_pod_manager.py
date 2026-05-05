@@ -346,3 +346,26 @@ class TestRunAgentOnPod:
             result = await run_agent_on_pod(mock_env, '{}', timeout=60)
         assert result is None
         assert mock_env.process_challenge.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_task_id_disambiguates_concurrent_calls(self):
+        """task_id is forwarded to process_challenge so affinetes can
+        generate unique Basilica deployment names for concurrent calls."""
+        mock_env = MagicMock()
+        mock_env._agent_code = None
+        mock_env.process_challenge = AsyncMock(return_value={"code": "x"})
+
+        await run_agent_on_pod(mock_env, '{}', timeout=60, task_id=7)
+        call_kwargs = mock_env.process_challenge.call_args.kwargs
+        assert call_kwargs["task_id"] == 7
+
+    @pytest.mark.asyncio
+    async def test_task_id_omitted_when_not_provided(self):
+        """Without task_id, the kwarg is not injected (backwards compat)."""
+        mock_env = MagicMock()
+        mock_env._agent_code = None
+        mock_env.process_challenge = AsyncMock(return_value={"code": "x"})
+
+        await run_agent_on_pod(mock_env, '{}', timeout=60)
+        call_kwargs = mock_env.process_challenge.call_args.kwargs
+        assert "task_id" not in call_kwargs

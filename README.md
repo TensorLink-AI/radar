@@ -12,7 +12,7 @@ Simple mutations exhaust fast, so over time the only miners earning are those ru
 
 ## Why Radar
 
-Radar is building an open, queryable map of how neural architectures perform across compute budgets, modalities, and data complexity, populated by a decentralised market of miner agents that read the map and extend it. The [litepaper]([AUTHOR INPUT NEEDED: insert URL]) covers the short version, the [whitepaper]([AUTHOR INPUT NEEDED: insert URL]) covers the operational and economic detail, the [technical paper]([AUTHOR INPUT NEEDED: insert URL]) covers the scientific framework, and this README is the developer-facing entry point.
+Radar is building an open, queryable map of how neural architectures perform across compute budgets, modalities, and data complexity, populated by a decentralised market of miner agents that read the map and extend it. This README is the developer-facing entry point.
 
 ## The Experiment Database
 
@@ -40,34 +40,16 @@ Structured records (experiments, provenance, access logs, frontier metadata) liv
 
 Four phases per round, each with a different trust property:
 
-```
-Phase A: DESIGN (~10 min, 50 blocks)
-  Validators fetch each miner's agent code (.py bundle) and inject it
-  into the subnet's official sandboxed agent container. Network egress
-  is allowlist-gated (iptables + GatedClient); the only reachable hosts
-  are the validator proxy, the subnet's LLM proxy, and presigned R2 URLs.
-  The agent reads the Challenge (size bucket, Pareto frontier, DB URL)
-  and writes a Proposal (PyTorch architecture code + training recipe).
+```mermaid
+flowchart LR
+    Start([Block hash<br/>→ size bucket])
+    A["<b>A · DESIGN</b><br/>~10 min · 50 blocks<br/><br/>Agent .py runs in<br/>sandboxed container<br/>(egress allowlist).<br/>Challenge → Proposal<br/>(arch + recipe)."]
+    B["<b>B · TRAINING</b><br/>~30 min · 150 blocks<br/><br/>Miner A's arch on<br/>Miner B's attested pod.<br/>Frozen image, digest<br/>verified on-chain.<br/>Checkpoint → R2."]
+    C["<b>C · EVAL</b><br/>~5 min · 25 blocks<br/><br/>Every validator:<br/>verify hash → frozen<br/>eval → CRPS, MASE,<br/>FLOPs.<br/><i>Trust anchor.</i>"]
+    D["<b>D · SCORING</b><br/>~10 min · 50 blocks<br/><br/>Re-dispatch stalled.<br/>softmax(0.1) → EMA(0.3)<br/>→ set_weights."]
+    End([275 blocks<br/>~55 min])
 
-Phase B: TRAINING (~30 min, 150 blocks, runs ONCE per submission)
-  Miner A's architecture trains on Miner B's attested trainer pod.
-  The pod runs the subnet's frozen training image on the pluggable GPU
-  backend; the image digest is cryptographically attested against the
-  on-chain commitment. Nobody can tamper with training. Checkpoints +
-  SHA-256 hashes are uploaded to shared R2 storage via time-limited
-  presigned URLs (no R2 credentials on trainer pods).
-
-Phase C: EVALUATION (~5 min, 25 blocks, EVERY validator independently)
-  Download checkpoint -> verify hashes -> load weights (safetensors) ->
-  run frozen eval -> CRPS, MASE, FLOPs verification.
-
-  This is the trust anchor: cheap (seconds on CPU), fully deterministic,
-  every validator produces identical scores from identical checkpoints.
-
-Phase D: FALLBACK / SCORING (~10 min, 50 blocks)
-  Re-dispatch any jobs whose trainer pod failed to the subnet owner's
-  fallback proxy, finalise scores, apply softmax + EMA, call set_weights
-  on chain. Total round: 275 blocks (~55 min) at default config.
+    Start --> A --> B --> C --> D --> End
 ```
 
 Each round targets a FLOPs size bucket derived deterministically from the block hash. Outside the bucket = zero score. Size buckets preserve diversity across model scales, analogous to MAP-Elites niches, ensuring agents explore architectures at every scale rather than converging on one size.
@@ -184,9 +166,15 @@ python validator/neuron.py --netuid <N> --subtensor.network <network> --wallet.n
 
 ### Infrastructure Requirements
 
-* **R2 storage** for checkpoint storage and artifact sharing. Set `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` env vars.
+* **Artifact storage** (S3-compatible) for checkpoints and cross-validator sharing. The default backend is **Hippius** (Substrate-based decentralized object store at `https://s3.hippius.com`); set `HIPPIUS_ACCESS_KEY_ID`, `HIPPIUS_SECRET_ACCESS_KEY`, `HIPPIUS_BUCKET`. Cloudflare R2 stays supported as a legacy fallback — if `HIPPIUS_*` is unset the client transparently reads `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` instead, so existing deployments keep working without an env-var change.
 * **CPU for Phase C eval.** Checkpoint evaluation runs on CPU by default (override with `RADAR_EVAL_DEVICE`). Each eval takes seconds. No GPU required for validators.
 * **DB proxy.** The validator runs a reverse-proxy FastAPI on `RADAR_PROXY_PORT` (default 8080). It forwards `/experiments/*`, `/challenge`, `/frontier`, `/provenance/*` to the subnet owner's centralised DB server, and hosts `/desearch/*` and `/llm/v1/*` locally with per-miner rate limits. The DB itself (Postgres) is run by the subnet owner, not the validator.
+* **DB server deployable modes.** The subnet-owner `database/neuron.py` binary supports three modes via `RADAR_NEURON_MODE`:
+  * `validator` — Epistula-authed write/read API for validators and miners, plus `/desearch/*` and `/llm/*` proxies. Runs the metagraph sync + round loop and requires a Bittensor wallet. Optionally also mounts the internal Jinja operator dashboard when `RADAR_DASHBOARD_ENABLED=true` (cookie-gated via `RADAR_DASHBOARD_KEY`).
+  * `dashboard` — Open public JSON API at `/dashboard/api/*` for the website SPA (`radarnet.io/dashboard/`). No wallet, no Epistula, no chain sync, no Jinja. CORS is configured via `RADAR_DASHBOARD_CORS_ORIGINS` (set to `https://radarnet.io` in production).
+  * `all` (default, dev/legacy) — every surface on one process.
+  The `/dashboard/api/*` endpoints are public by design; anyone on the internet can read agent source code, stdout logs, and experiments. Do not add fields there that shouldn't be world-readable. The internal Jinja pages at `/dashboard/*` remain operator-gated.
+* **Two processes locally.** For dev work, run `RADAR_NEURON_MODE=validator python database/neuron.py --port 8090` alongside `RADAR_NEURON_MODE=dashboard python database/neuron.py --port 8091` pointing at the same Postgres (`RADAR_PG_DSN`). Pool sizing and statement timeouts are controlled per-process via `RADAR_PG_POOL_MIN`, `RADAR_PG_POOL_MAX`, and `RADAR_PG_STATEMENT_TIMEOUT_MS`.
 * **Agent pods** on the subnet's pluggable GPU backend. Validators dispatch agent runs to attested pods using the subnet's official `radar-agent` image. Phase A runs up to `RADAR_AGENT_CONCURRENCY` (default 8) pods concurrently; each runs a miner's injected `.py` bundle.
 * **Bandwidth.** Validators download checkpoints (safetensors per miner per round) from R2 during Phase C.
 
@@ -203,13 +191,22 @@ python validator/neuron.py --netuid <N> --subtensor.network <network> --wallet.n
 
 Enable arxiv search for miner agents via Subnet 22: `RADAR_DESEARCH_ENABLED=true`, `RADAR_DESEARCH_SN22_URL=<url>`.
 
+### Database schema changes
+
+Schema changes go through `database/migrations/`. See the README there for the full convention. TL;DR:
+
+* Write a new `NNN_what_changed.sql` file using `CURRENT_SCHEMA` as the schema placeholder (the runner substitutes it with `testnet` or `mainnet`).
+* CI requires a migration file any time `shared/pg_schema.py` changes.
+* Migrations apply automatically at DB server startup, per-schema (testnet and mainnet track independently in `<schema>.schema_migrations`).
+* Destructive changes (`DROP TABLE` / `DROP COLUMN` / `ALTER COLUMN ... TYPE`) require `ALLOW_DESTRUCTIVE` in the PR description.
+
 ## Task System
 
 Task-agnostic by design. Every Pareto front and provenance record is task-scoped. Each task defines its own FLOPs size buckets, objectives, frozen files, and domain context in a YAML spec.
 
 The only task live on the default config is `ts_forecasting` (time series foundation models, multivariate forecasting scored on CRPS and MASE; models receive context windows and output probabilistic quantile predictions). Task specs for `nanogpt` and `ml_training` exist in `tasks/` but are not enabled by default (`RADAR_ENABLED_TASKS=ts_forecasting`).
 
-Roadmap: enabling additional tasks (nanogpt, ml_training), then broader modalities (vision, multimodal). Adding a new task is a YAML config + frozen harness + evaluation script. Agents produce raw PyTorch code (not configs), enabling unbounded architectural search within each domain. Data-complexity augmentations (e.g. spectral reshaping, noise-floor calibration), μP-style parameterisation, and an automatically fitted scaling-law surface over the experiment DB are all discussed in the whitepaper as roadmap items; none are in the deployed scoring path today.
+Roadmap: enabling additional tasks (nanogpt, ml_training), then broader modalities (vision, multimodal). Adding a new task is a YAML config + frozen harness + evaluation script. Agents produce raw PyTorch code (not configs), enabling unbounded architectural search within each domain. Data-complexity augmentations (e.g. spectral reshaping, noise-floor calibration), μP-style parameterisation, and an automatically fitted scaling-law surface over the experiment DB are all roadmap items; none are in the deployed scoring path today.
 
 ### FLOPs Size Buckets (ts_forecasting)
 
@@ -236,7 +233,7 @@ shared/                          Core libraries (validator + miner)
   protocol.py                      Challenge/Proposal wire format (JSON)
   auth.py                          Epistula signing/verification (SR25519)
   challenge.py                     Deterministic challenge + size buckets
-  r2_audit.py                      R2 storage, upload/download/hash verification
+  r2_audit.py                      Hippius/R2 artifact storage, upload/download/hash verification
   task.py                          TaskSpec + Objective, pluggable task definitions
   pg_schema.py                     Postgres DDL + row conversion
   pg_store.py                      Async Postgres experiment store

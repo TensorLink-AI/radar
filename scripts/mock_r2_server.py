@@ -1,20 +1,28 @@
 """Minimal S3-compatible server for localnet testing.
 
-Accepts PUT/GET/HEAD/LIST on any key, stores files on the local filesystem.
+Used as a stand-in for the production artifact backend (Hippius primary,
+Cloudflare R2 legacy) so localnet runs without external network. Accepts
+PUT/GET/HEAD/LIST on any key, stores files on the local filesystem.
 Generates "presigned" URLs that are just http://localhost:PORT/BUCKET/KEY.
 
 Usage:
     python scripts/mock_r2_server.py              # port 9000
     python scripts/mock_r2_server.py --port 9001  # custom port
 
-Configure the validator/trainer to use this by setting:
+Configure the validator/trainer to use this by setting EITHER the new
+Hippius vars or the legacy R2 vars (the client reads both, Hippius first):
+    export HIPPIUS_ACCESS_KEY_ID=test
+    export HIPPIUS_SECRET_ACCESS_KEY=test
+    export HIPPIUS_BUCKET=radar-test
+    # ... or, equivalently for legacy deployments:
     export R2_ACCOUNT_ID=local
     export R2_ACCESS_KEY_ID=test
     export R2_SECRET_ACCESS_KEY=test
     export R2_BUCKET=radar-test
 
-Then override the R2AuditLog endpoint to point here instead of Cloudflare.
-The test scripts handle this via MOCK_R2_ENDPOINT env var.
+Override the storage endpoint to point at this mock instead of Hippius/R2:
+    export MOCK_S3_ENDPOINT=http://127.0.0.1:9000   # preferred name
+    export MOCK_R2_ENDPOINT=http://127.0.0.1:9000   # legacy alias, also honoured
 """
 
 import argparse

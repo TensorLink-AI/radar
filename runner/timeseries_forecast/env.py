@@ -15,8 +15,16 @@ import time
 import zipfile
 
 
-# Env vars to strip from subprocess (secrets that miners must not access)
-_SECRET_KEYS = {"R2_PRESIGNED_URL", "R2_ACCESS_KEY", "R2_SECRET_KEY"}
+# Env vars to strip from subprocess (secrets that miners must not access).
+# Covers both the legacy R2 names and the new Hippius names that replaced
+# them — the harness must not leak either backend's credentials into the
+# user-supplied ``submission.py`` subprocess.
+_SECRET_KEYS = {
+    "R2_PRESIGNED_URL", "R2_ACCESS_KEY", "R2_SECRET_KEY",
+    "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_ACCOUNT_ID",
+    "HIPPIUS_ACCESS_KEY_ID", "HIPPIUS_SECRET_ACCESS_KEY",
+    "HIPPIUS_PRESIGNED_URL",
+}
 
 
 class Actor:

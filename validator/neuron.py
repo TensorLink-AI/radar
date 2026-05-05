@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import importlib.util
 import logging
 import os
 import random
@@ -32,7 +33,10 @@ from shared.database import DataElement
 from shared.db_client import DatabaseClient
 from shared.protocol import Challenge, Proposal
 from shared.provenance import detect_components
-from shared.scoring import score_round, scores_to_weights, ema_update, compute_penalties
+from shared.scoring import (
+    apply_round_metadata, compute_penalties, ema_update,
+    score_round, scores_to_weights,
+)
 from shared.task import TaskSpec, load_task, load_enabled_tasks
 from validator.collection import run_and_collect_agents
 from validator.coordinator import (
@@ -44,6 +48,7 @@ from validator.db_proxy import (
 )
 from validator.evaluator import evaluate_all_checkpoints
 from validator.pod_manager import pre_validate_code
+from validator.substrate_publisher import run_substrate_publish_step
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +129,20 @@ class Validator:
         self.config = config
         self.netuid = config.netuid
 
+        # Fail-fast on Targon misconfig — operator gets a clear error at
+        # startup instead of a stack trace mid-round when verify fires.
+        if Config.HOSTING_BACKEND == "targon" and not os.environ.get("TARGON_API_KEY"):
+            raise RuntimeError(
+                "RADAR_HOSTING_BACKEND=targon but TARGON_API_KEY is not set. "
+                "Validators need a Targon API key to verify image digests + attestations. "
+                "See https://docs.targon.com."
+            )
+        if Config.HOSTING_BACKEND == "targon" and not Config.OFFICIAL_TRAINING_IMAGE_DIGEST:
+            raise RuntimeError(
+                "RADAR_HOSTING_BACKEND=targon but OFFICIAL_TRAINING_IMAGE_DIGEST is empty. "
+                "Without a pinned digest the verify chain becomes a no-op — refusing to start."
+            )
+
         # Bittensor components
         self.wallet = bt.Wallet(config=config)
         self.subtensor = bt.Subtensor(config=config)
@@ -189,12 +208,57 @@ class Validator:
             except Exception as e:
                 logger.warning("Pretrain R2 unavailable: %s", e)
 
+        # Cognition-wiki R2 client (separate bucket for per-task markdown corpus)
+        self.cognition_wiki_r2 = None
+        if Config.COGNITION_WIKI_R2_BUCKET:
+            try:
+                from shared.cognition_wiki import build_wiki_r2
+                self.cognition_wiki_r2 = build_wiki_r2(
+                    bucket=Config.COGNITION_WIKI_R2_BUCKET,
+                )
+                if self.cognition_wiki_r2:
+                    logger.info(
+                        "Cognition-wiki R2 client initialized for bucket=%s prefix=%s",
+                        Config.COGNITION_WIKI_R2_BUCKET, Config.COGNITION_WIKI_R2_PREFIX,
+                    )
+            except Exception as e:
+                logger.warning("Cognition-wiki R2 unavailable: %s", e)
+
+        # Substrate publishing (best-effort, opt-in via Config.HIPPIUS_ENABLED).
+        # The Hippius client wrapper from TEN-242 isn't shipped yet, so the
+        # import is lazy and tolerant: with HIPPIUS_ENABLED=false (the default)
+        # nothing is imported and `self.hippius` stays None. Operators who
+        # opt in before the wrapper lands get a warning and the validator
+        # continues to run normally — substrate publishing is never a
+        # precondition for weight setting.
+        self.hippius = self._init_hippius()
+
+        # Dual-write artifact store (TEN-240 Phase 7). Constructed only
+        # when an operator has explicitly opted in via
+        # RADAR_DUAL_WRITE_ARTIFACTS — default deploy keeps the historical
+        # R2-only path. When None, coordinator/etc. fall back to direct
+        # R2 calls and behave exactly as before.
+        self.artifact_store = None
+        if Config.DUAL_WRITE_ARTIFACTS and (self.r2 or self.hippius):
+            from shared.artifact_store import ArtifactStore
+            self.artifact_store = ArtifactStore(
+                r2=self.r2, hippius=self.hippius,
+                dual_write=True,
+                allow_fallback=Config.HIPPIUS_ARTIFACT_FALLBACK,
+            )
+            logger.info(
+                "Artifact dual-write enabled (r2=%s, hippius=%s, fallback=%s)",
+                bool(self.r2), bool(self.hippius),
+                Config.HIPPIUS_ARTIFACT_FALLBACK,
+            )
+
         # Training coordinator
         my_uid = self._my_uid()
         if self.r2:
             self.coordinator = TrainingCoordinator(
                 wallet=self.wallet, metagraph=self.metagraph,
                 r2=self.r2, my_uid=my_uid,
+                artifact_store=self.artifact_store,
             )
         else:
             self.coordinator = None
@@ -226,6 +290,28 @@ class Validator:
         if hotkeys is not None and hotkey in hotkeys:
             return hotkeys.index(hotkey)
         return -1
+
+    def _init_hippius(self):
+        """Construct the Hippius client when opted in; return None otherwise."""
+        if not Config.HIPPIUS_ENABLED:
+            return None
+        try:
+            from shared.hippius_client import HippiusClient  # type: ignore
+        except ImportError:
+            logger.warning(
+                "HIPPIUS_ENABLED=true but shared.hippius_client is not "
+                "available yet (TEN-242). Substrate publishing disabled."
+            )
+            return None
+        try:
+            return HippiusClient(
+                ipfs_api_url=Config.HIPPIUS_IPFS_API_URL,
+                hippius_key=Config.HIPPIUS_KEY,
+                substrate_rpc=Config.HIPPIUS_SUBSTRATE_RPC,
+            )
+        except Exception as e:  # noqa: BLE001 — best-effort
+            logger.warning("Hippius client init failed: %s", e)
+            return None
 
     def _get_validator_uids(
         self,
@@ -268,6 +354,58 @@ class Validator:
             return urlunparse(parsed).rstrip("/")
         return ext
 
+    def _build_dispatch_extras(self, challenge, task) -> dict:
+        """Call the task's `dispatch.build_dispatch_extras` hook if present.
+
+        Loads `{runner_dir}/dispatch.py` by file path and invokes
+        `build_dispatch_extras` to produce any task-specific keys that
+        get merged into the trainer payload. Missing module returns {}.
+        File-path loading avoids depending on `runner` being on sys.path
+        (it isn't pip-installed).
+        """
+        runner_dir = ""
+        if isinstance(challenge.task, dict):
+            runner_dir = challenge.task.get("runner_dir", "")
+        if not runner_dir:
+            return {}
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        dispatch_path = os.path.join(project_root, runner_dir, "dispatch.py")
+        if not os.path.isfile(dispatch_path):
+            return {}
+        mod_name = f"_radar_dispatch_{runner_dir.replace('/', '_').replace('.', '_')}"
+        spec = importlib.util.spec_from_file_location(mod_name, dispatch_path)
+        if spec is None or spec.loader is None:
+            return {}
+        dispatch_mod = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(dispatch_mod)
+        except Exception as e:
+            logger.warning(
+                "Failed to load dispatch module for runner_dir=%s: %s",
+                runner_dir, e,
+            )
+            return {}
+        if not hasattr(dispatch_mod, "build_dispatch_extras"):
+            return {}
+        try:
+            return dispatch_mod.build_dispatch_extras(
+                task,
+                gift_r2=self.gift_r2,
+                pretrain_r2=self.pretrain_r2,
+                seed=challenge.seed,
+                shards_per_round=Config.PRETRAIN_SHARDS_PER_ROUND,
+                r2_prefixes={
+                    "gift": Config.GIFT_EVAL_R2_PREFIX,
+                    "pretrain": Config.PRETRAIN_R2_PREFIX,
+                },
+            )
+        except Exception as e:
+            logger.warning(
+                "build_dispatch_extras failed for runner_dir=%s: %s",
+                runner_dir, e,
+            )
+            return {}
+
     def start_proxy_server(self):
         """Start the reverse proxy server in a background thread."""
         def _run():
@@ -284,6 +422,40 @@ class Validator:
                 return
             remaining = (target_block - current) * 12
             await asyncio.sleep(min(remaining, 30))
+
+    async def _cache_training_metas(
+        self, round_id: int, metas: dict[int, dict],
+    ) -> None:
+        """Push training_meta blobs to the centralized DB so the public
+        dashboard can render loss curves without R2 access. Best-effort —
+        errors are logged but never raised, since scoring must proceed even
+        if the cache write fails."""
+        if not metas:
+            return
+        hotkeys = self.metagraph.hotkeys if hasattr(self.metagraph, "hotkeys") else []
+        cached = 0
+        for uid, meta in metas.items():
+            if not isinstance(meta, dict):
+                continue
+            hk = (
+                meta.get("miner_hotkey")
+                or (hotkeys[uid] if uid < len(hotkeys) else "")
+            )
+            if not hk:
+                continue
+            try:
+                ok = await self.db_client.submit_training_meta(round_id, hk, meta)
+                if ok:
+                    cached += 1
+            except Exception as e:
+                logger.warning(
+                    "training_meta cache failed: round=%d uid=%d err=%s",
+                    round_id, uid, e,
+                )
+        if cached:
+            logger.info(
+                "Cached %d training_meta blobs for round %d", cached, round_id,
+            )
 
     async def run_round(self):
         """Execute one full 3-phase round."""
@@ -342,6 +514,21 @@ class Validator:
         # Rotate agent token for this round — agents use it to auth proxy requests
         challenge.agent_token = rotate_agent_token()
 
+        # Per-task cognition wiki tarball (skipped silently if not configured
+        # or if the task has no wiki uploaded).
+        if self.cognition_wiki_r2 is not None:
+            try:
+                from shared.cognition_wiki import presign_wiki_url
+                challenge.cognition_wiki_url = presign_wiki_url(
+                    self.cognition_wiki_r2,
+                    task_name,
+                    prefix=Config.COGNITION_WIKI_R2_PREFIX,
+                    ttl=Config.COGNITION_WIKI_TTL,
+                )
+            except Exception as e:
+                logger.warning("Cognition-wiki URL generation failed: %s", e)
+                challenge.cognition_wiki_url = ""
+
         logger.info(
             "Round %d: size bucket [%d, %d], frontier points in range: %d",
             challenge.round_id, challenge.min_flops_equivalent,
@@ -392,7 +579,7 @@ class Validator:
             get_my_assignments_fn=get_my_assignments,
         )
 
-        dynamic_endpoints, (submissions, agent_logs) = await asyncio.gather(
+        dynamic_endpoints, (submissions, agent_meta) = await asyncio.gather(
             prepare_coro, collect_coro,
         )
 
@@ -431,9 +618,10 @@ class Validator:
         dispatch_validators = list(validator_uids)
         if my_uid >= 0 and my_uid not in dispatch_validators:
             logger.info(
-                "My UID %d not in validator_uids %s — will use safety-net dispatch",
+                "My UID %d not in validator_uids %s — adding self as safety-net dispatcher",
                 my_uid, dispatch_validators,
             )
+            dispatch_validators.append(my_uid)
 
         all_jobs = compute_assignments(
             block_hash, filtered,
@@ -462,49 +650,30 @@ class Validator:
                 "or trainer pods failed to deploy. Training will fail for all jobs."
             )
 
-        # Generate presigned GET URLs for GIFT-Eval data (evaluation)
-        gift_eval_urls = {}
-        if self.gift_r2:
-            try:
-                from shared.gift_eval import GiftEvalBenchmark
-                gift = GiftEvalBenchmark(
-                    r2=self.gift_r2,
-                    r2_prefix=Config.GIFT_EVAL_R2_PREFIX,
-                )
-                gift_eval_urls = gift.generate_presigned_get_urls()
-            except Exception as e:
-                logger.warning("Failed to generate GIFT-Eval presigned URLs: %s", e)
-
-        # Generate presigned GET URLs for pretrain shards (training + val)
-        pretrain_shard_urls: list[str] = []
-        pretrain_val_shard_urls: list[str] = []
-        if self.pretrain_r2:
-            try:
-                from shared.pretrain_data import PretrainBenchmark
-                pretrain = PretrainBenchmark(
-                    r2=self.pretrain_r2,
-                    r2_prefix=Config.PRETRAIN_R2_PREFIX,
-                )
-                shard_keys = pretrain.select_shards(
-                    seed=challenge.seed,
-                    n=Config.PRETRAIN_SHARDS_PER_ROUND,
-                )
-                pretrain_shard_urls = pretrain.generate_presigned_shard_urls(shard_keys)
-                val_shard_keys = pretrain.get_val_shard_keys()
-                if val_shard_keys:
-                    pretrain_val_shard_urls = pretrain.generate_presigned_shard_urls(
-                        val_shard_keys,
-                    )
-            except Exception as e:
-                logger.warning("Failed to generate pretrain shard URLs: %s", e)
+        # Task-specific dispatch extras (e.g. GIFT-Eval + pretrain shard URLs
+        # for ts_forecasting). Each task's runner_dir may ship a `dispatch`
+        # module exposing `build_dispatch_extras(task, ...)`. Missing module
+        # is fine — the extras dict stays empty.
+        extras = self._build_dispatch_extras(challenge, round_task)
 
         my_results = await self.coordinator.dispatch_jobs(
             my_jobs, challenge, filtered, trainer_endpoints,
             commitments=commitments,
-            gift_eval_urls=gift_eval_urls,
-            pretrain_shard_urls=pretrain_shard_urls,
-            pretrain_val_shard_urls=pretrain_val_shard_urls,
+            extras=extras,
         )
+        # Targon: schedule mid-round reverify of every accepted CVM at
+        # deterministic offsets within the training window. No-op for
+        # Basilica deployments. Tasks self-clean; release_trainers
+        # cancels stragglers.
+        try:
+            window_s = float(Config.TRAINING_WINDOW_BLOCKS * 12)
+            self.coordinator.schedule_mid_round_reverify(
+                challenge.round_id,
+                block_hash=block_hash,
+                training_window_seconds=window_s,
+            )
+        except Exception as e:
+            logger.warning("schedule_mid_round_reverify failed (round %d): %s", challenge.round_id, e)
         _OK_STATUSES = ("success", "accepted", "already_running")
         succeeded = sum(1 for r in my_results if r.status == "success")
         accepted = sum(1 for r in my_results if r.status in ("accepted", "already_running"))
@@ -578,6 +747,11 @@ class Validator:
         if missing_trainers:
             logger.info("Missing checkpoints from %d miners: %s", len(missing_trainers), missing_trainers)
 
+        # Cache training metas in Postgres so the public dashboard can render
+        # loss curves without R2 access. Best-effort: a failed cache write
+        # must not block scoring.
+        await self._cache_training_metas(challenge.round_id, training_metas)
+
         if Config.FALLBACK_ENABLED and missing_trainers:
             logger.info("Fallback enabled — reassigning %d missing jobs", len(missing_trainers))
             missing_dispatchers = list({
@@ -591,9 +765,11 @@ class Validator:
                 )
                 my_fallback = [j for j in fallback_jobs if j.dispatcher == my_uid]
                 if my_fallback:
+                    fb_extras = self._build_dispatch_extras(challenge, round_task)
                     fb_results = await self.coordinator.dispatch_jobs(
                         my_fallback, challenge, filtered, trainer_endpoints,
                         commitments=commitments,
+                        extras=fb_extras,
                     )
                     await self.coordinator.write_dispatch_record(
                         challenge.round_id, fb_results,
@@ -611,6 +787,7 @@ class Validator:
                     timeout=Config.FALLBACK_WINDOW_BLOCKS * 12,
                 )
                 training_metas.update(fb_metas)
+                await self._cache_training_metas(challenge.round_id, fb_metas)
 
         # ── Pre-cache GIFT-Eval data for Phase C ────────────────
         if self.gift_r2:
@@ -647,18 +824,35 @@ class Validator:
         )
 
         logger.info("Phase C: evaluated %d checkpoints", len(eval_results))
+        primary_obj = round_task.primary_objective
+        primary_name = primary_obj.name if primary_obj else "metric"
+        primary_default = primary_obj.default if primary_obj else float("inf")
         for uid, metrics in eval_results.items():
             logger.info(
-                "  UID %d: crps=%.6f flops=%d gate=%s error=%s",
-                uid,
-                metrics.get("crps", float("inf")),
+                "  UID %d: %s=%.6f flops=%d gate=%s error=%s",
+                uid, primary_name,
+                metrics.get(primary_name, primary_default),
                 metrics.get("flops_equivalent_size", 0),
                 metrics.get("passed_size_gate", False),
                 metrics.get("error", ""),
             )
 
         # ── SCORING ───────────────────────────────────────────
+        logger.info(
+            "Phase D (scoring): round %d, %d eval results, frontier size %d, bucket=[%d, %d]",
+            challenge.round_id, len(eval_results), len(feasible_frontier),
+            challenge.min_flops_equivalent, challenge.max_flops_equivalent,
+        )
         penalties = compute_penalties(training_metas, eval_results)
+        nonzero_penalties = {uid: p for uid, p in penalties.items() if p > 0}
+        if nonzero_penalties:
+            logger.info(
+                "Penalties applied to %d UIDs: %s",
+                len(nonzero_penalties),
+                {uid: f"{p:.2f}" for uid, p in sorted(nonzero_penalties.items())},
+            )
+        else:
+            logger.info("Penalties: none")
 
         # Track trainer reliability
         fallback_uids = (
@@ -712,6 +906,25 @@ class Validator:
             except Exception:
                 pass
 
+        # Best-effort: publish signed Phase C records to Hippius/substrate.
+        # Returns {miner_uid: bundle_cid} so the per-miner DB writes below
+        # can attach the CID. Empty dict when disabled, no client, or
+        # publish failed — never raises.
+        substrate_cids = await run_substrate_publish_step(
+            hippius=self.hippius, wallet=self.wallet,
+            challenge=challenge, eval_results=eval_results,
+            training_metas=training_metas, commitments=commitments,
+            metagraph=self.metagraph, my_uid=self._my_uid(),
+            current_block=current_block, task_name=task_name,
+            block_hash=block_hash, netuid=int(self.netuid),
+        )
+        if substrate_cids:
+            logger.info(
+                "Substrate published: round_id=%d cid=%s miners=%d",
+                challenge.round_id, next(iter(substrate_cids.values())),
+                len(substrate_cids),
+            )
+
         gate_passed = 0
         gate_failed = 0
         for uid, metrics in eval_results.items():
@@ -720,22 +933,32 @@ class Validator:
                 proposal = filtered.get(uid, Proposal())
 
                 miner_hk = self.metagraph.hotkeys[uid] if uid < len(self.metagraph.hotkeys) else ""
+                meta = agent_meta.get(uid, {})
                 element = DataElement(
                     name=f"round_{challenge.round_id}_miner_{uid}",
                     code=proposal.code,
-                    metric=metrics.get("crps"),
+                    metric=metrics.get(primary_name),
                     success=True,
                     objectives=metrics,
                     miner_uid=uid,
                     miner_hotkey=miner_hk,
                     motivation=proposal.motivation,
-                    trace=agent_logs.get(uid, ""),
+                    trace=meta.get("agent_log", ""),
+                    reasoning=meta.get("reasoning", "") or proposal.reasoning,
+                    tool_calls=meta.get("tool_calls", []) or proposal.tool_calls,
+                    agent_behavior=meta.get("agent_behavior", {}),
                     task=task_name,
                     round_id=challenge.round_id,
                 )
 
-                # Write to centralized DB
-                new_idx = await self.db_client.add_experiment(element.to_dict())
+                # Write to centralized DB. When this validator published
+                # a Phase C bundle this round, attach the CID so the row
+                # carries an audit-trail entry pointing at the bundle.
+                new_idx = await self.db_client.add_experiment(
+                    element.to_dict(),
+                    substrate_cid=substrate_cids.get(uid, ""),
+                    validator_hotkey=self.wallet.hotkey.ss58_address,
+                )
                 if new_idx is not None:
                     element.index = new_idx
                 pareto.update(element)
@@ -763,6 +986,23 @@ class Validator:
             training_metas=training_metas,
         )
 
+        # Apply Targon migration's hybrid-fallback policy: targon_unavailable
+        # gets a 0.5× multiplier (default), compromised UIDs zeroed entirely.
+        # No-op when round_metadata is empty (Basilica deployments, or
+        # Targon round with no flags fired).
+        round_metadata = (
+            self.coordinator.round_metadata(challenge.round_id)
+            if hasattr(self.coordinator, "round_metadata") else None
+        )
+        if round_metadata and (round_metadata.get("targon_unavailable") or round_metadata.get("compromised")):
+            logger.info(
+                "Applying Targon round metadata (round %d): unavailable=%s compromised=%s",
+                challenge.round_id,
+                round_metadata.get("targon_unavailable"),
+                round_metadata.get("compromised"),
+            )
+            round_scores = apply_round_metadata(round_scores, round_metadata)
+
         if round_scores:
             nonzero = {uid: s for uid, s in round_scores.items() if s > 0}
             logger.info(
@@ -776,6 +1016,12 @@ class Validator:
         # EMA on raw scores, softmax applied once in _set_weights()
         all_uids = list(range(self.metagraph.n))
         self.ema_scores = ema_update(self.ema_scores, round_scores, all_uids, Config.EMA_ALPHA)
+        nonzero_ema = {uid: s for uid, s in self.ema_scores.items() if s > 0}
+        logger.info(
+            "EMA updated (alpha=%.2f): %d UIDs nonzero — %s",
+            Config.EMA_ALPHA, len(nonzero_ema),
+            {uid: f"{s:.4f}" for uid, s in sorted(nonzero_ema.items())} if nonzero_ema else "all zero",
+        )
         self._set_weights()
 
         # Write frontier to centralized DB + R2

@@ -54,12 +54,62 @@ class Config:
     # Comma-separated list of enabled task names. Empty or "all" = all built-in tasks.
     ENABLED_TASKS: str = os.getenv("RADAR_ENABLED_TASKS", "ts_forecasting")
 
-    # ── R2 Audit Log ────────────────────────────────────────────────
+    # ── Artifact Storage (Hippius primary, R2 legacy fallback) ──────
+    # Primary backend is Hippius — the Substrate-based decentralized object
+    # store at https://s3.hippius.com. Cloudflare R2 stays supported as a
+    # legacy fallback during the migration: any unset HIPPIUS_* var falls
+    # back to its R2_* counterpart so existing deployments keep working
+    # without an env-var change.
+    HIPPIUS_ACCESS_KEY_ID: str = os.getenv("HIPPIUS_ACCESS_KEY_ID", "") \
+        or os.getenv("R2_ACCESS_KEY_ID", "")
+    HIPPIUS_SECRET_ACCESS_KEY: str = os.getenv("HIPPIUS_SECRET_ACCESS_KEY", "") \
+        or os.getenv("R2_SECRET_ACCESS_KEY", "")
+    HIPPIUS_BUCKET: str = os.getenv("HIPPIUS_BUCKET", "") \
+        or os.getenv("R2_BUCKET", "")
+    HIPPIUS_ENDPOINT_URL: str = os.getenv("HIPPIUS_ENDPOINT_URL", "")
+    HIPPIUS_REGION: str = os.getenv("HIPPIUS_REGION", "decentralized")
+    PRESIGNED_TTL: int = int(os.getenv("RADAR_PRESIGNED_TTL", "5400"))
+
+    # Legacy R2 names — read directly from env so an operator who has only
+    # set HIPPIUS_* vars sees these as empty (and code that gates on them
+    # behaves correctly). Code that needs "is artifact storage configured?"
+    # should consult HIPPIUS_BUCKET instead, since that's already the
+    # resolved value.
     R2_ACCOUNT_ID: str = os.getenv("R2_ACCOUNT_ID", "")
     R2_ACCESS_KEY_ID: str = os.getenv("R2_ACCESS_KEY_ID", "")
     R2_SECRET_ACCESS_KEY: str = os.getenv("R2_SECRET_ACCESS_KEY", "")
-    R2_BUCKET: str = os.getenv("R2_BUCKET", "")
+    R2_BUCKET: str = os.getenv("R2_BUCKET", "") or os.getenv("HIPPIUS_BUCKET", "")
     R2_PRESIGNED_TTL: int = int(os.getenv("RADAR_PRESIGNED_TTL", "5400"))
+
+    # ── Hippius / Substrate Phase C publishing ──────────────────────
+    # Phase 1 of the Hippius migration ships the signing/serialisation
+    # contract (`shared/substrate.py`) but leaves the publishing pipeline
+    # off by default — existing validators are not affected by merging
+    # this code. Operators opt in by setting HIPPIUS_ENABLED=true once the
+    # downstream phases (IPFS upload, on-chain extrinsic) are wired up.
+    HIPPIUS_ENABLED: bool = os.getenv("HIPPIUS_ENABLED", "false").lower() == "true"
+    HIPPIUS_IPFS_API_URL: str = os.getenv("HIPPIUS_IPFS_API_URL", "")
+    HIPPIUS_KEY: str = os.getenv("HIPPIUS_KEY", "")
+    HIPPIUS_SUBSTRATE_RPC: str = os.getenv("HIPPIUS_SUBSTRATE_RPC", "")
+    SUBSTRATE_APP_TAG: str = os.getenv("SUBSTRATE_APP_TAG", "radar")
+    SUBSTRATE_SCHEMA_VERSION: str = os.getenv(
+        "SUBSTRATE_SCHEMA_VERSION", "radar.substrate.v1",
+    )
+
+    # ── Hippius artifact dual-write (TEN-240 Phase 7) ───────────────
+    # When enabled, validator-side artifact writes (dispatch records,
+    # frontier snapshots, training_meta cache) fan out to both R2 and
+    # Hippius. Defaults off so existing deployments are unaffected by
+    # merging — operators flip in staging first. See docs/HIPPIUS_STORAGE.md.
+    DUAL_WRITE_ARTIFACTS: bool = (
+        os.getenv("RADAR_DUAL_WRITE_ARTIFACTS", "false").lower() == "true"
+    )
+    # When enabled, ArtifactStore.get_bytes falls back to the other backend
+    # when the primary one fails. Off by default during rollout so failures
+    # stay loud and we don't accidentally paper over a misconfiguration.
+    HIPPIUS_ARTIFACT_FALLBACK: bool = (
+        os.getenv("RADAR_HIPPIUS_ARTIFACT_FALLBACK", "false").lower() == "true"
+    )
 
     # ── Round Timing ───────────────────────────────────────────────
     #
@@ -139,6 +189,48 @@ class Config:
     # The validator proxy and presigned R2 URLs are added automatically.
     AGENT_ALLOWED_URLS: str = os.getenv("RADAR_AGENT_ALLOWED_URLS", "")
 
+    # ── Hosting Backend ────────────────────────────────────────
+    # "basilica" (default, legacy) or "targon" (TDX-attested confidential
+    # GPU pods). Both miner and validator must agree on the same backend
+    # for a deployment — set this consistently across the stack.
+    HOSTING_BACKEND: str = os.getenv("RADAR_HOSTING_BACKEND", "basilica").lower()
+
+    # Targon API endpoints.
+    TARGON_API_BASE_URL: str = os.getenv("RADAR_TARGON_API_BASE_URL", "https://api.targon.com")
+    # Tower verifies TDX quotes + NRAS GPU tokens.
+    TARGON_TOWER_URL: str = os.getenv("RADAR_TARGON_TOWER_URL", "https://tower.targon.com")
+    # Per-call HTTP timeout for Targon and tower endpoints.
+    TARGON_VERIFICATION_TIMEOUT: float = float(os.getenv("RADAR_TARGON_VERIFICATION_TIMEOUT", "5"))
+    # Consecutive failures before the breaker opens; reset window.
+    TARGON_CIRCUIT_BREAKER_THRESHOLD: int = int(os.getenv("RADAR_TARGON_BREAKER_THRESHOLD", "5"))
+    TARGON_CIRCUIT_BREAKER_RESET: float = float(os.getenv("RADAR_TARGON_BREAKER_RESET", "60"))
+    # Score multiplier applied to a miner's contribution when the round
+    # was tagged ``targon_unavailable=True`` (Targon API was down at
+    # verify time). Keeps the subnet alive without fully rewarding miners
+    # who can't be attested in real-time. See CLAUDE.md → Targon migration.
+    TARGON_UNAVAILABLE_SCORE_MULTIPLIER: float = float(
+        os.getenv("RADAR_TARGON_UNAVAILABLE_MULTIPLIER", "0.5")
+    )
+    # Number of mid-round re-verification checkpoints.
+    TARGON_REVERIFY_CHECKPOINTS: int = int(os.getenv("RADAR_TARGON_REVERIFY_CHECKPOINTS", "3"))
+    # Hard-fail when /boot_proof returns 503 / wrong hashes_root_sha256.
+    # Off until the hardened image is rolled out — TODO: flip to true once
+    # OFFICIAL_TRAINING_IMAGE_DIGEST points at a hardened image.
+    REQUIRE_BOOT_PROOF: bool = os.getenv("RADAR_REQUIRE_BOOT_PROOF", "false").lower() == "true"
+    # Expected sha256 of the canonical-encoded bootstrap hash table for the
+    # blessed image. Pinned by the subnet owner alongside
+    # OFFICIAL_TRAINING_IMAGE_DIGEST. Empty disables the root-hash cross-check
+    # (signature + signer-hotkey checks still run when boot proof is present).
+    EXPECTED_BOOT_HASHES_ROOT: str = os.getenv("RADAR_EXPECTED_BOOT_HASHES_ROOT", "")
+    # How long the miner polls the trainer's /health and the CVM's
+    # evidence endpoint after Targon's deploy_workload returns. TDX
+    # adds 60–120s on top of container start; 180s is comfortable.
+    TARGON_READINESS_TIMEOUT_S: float = float(os.getenv("RADAR_TARGON_READINESS_TIMEOUT", "180"))
+    # Health-monitor poll interval for the per-round background task.
+    # >2 consecutive minutes failed marks the round locally compromised.
+    TARGON_HEALTH_POLL_INTERVAL_S: float = float(os.getenv("RADAR_TARGON_HEALTH_POLL", "30"))
+    TARGON_HEALTH_FAIL_GRACE_S: float = float(os.getenv("RADAR_TARGON_HEALTH_FAIL_GRACE", "120"))
+
     # ── Warm-Standby Trainer ────────────────────────────────────
     TRAINER_PREPARE_TIMEOUT: int = int(os.getenv("RADAR_TRAINER_PREPARE_TIMEOUT", "600"))
     TRAINER_READY_POLL_INTERVAL: int = int(os.getenv("RADAR_TRAINER_READY_POLL", "15"))
@@ -187,10 +279,91 @@ class Config:
     PRETRAIN_SHARDS_PER_ROUND: int = int(os.getenv("RADAR_PRETRAIN_SHARDS", "8"))
     PRETRAIN_SHUFFLE_BUFFER: int = int(os.getenv("RADAR_PRETRAIN_SHUFFLE_BUFFER", "10000"))
 
+    # ── Cognition Wiki (Phase A agent reference corpus) ──────────
+    # Per-task markdown corpus packaged as a single tar.gz at
+    # <PREFIX>/<task_name>/wiki.tar.gz. The validator presigns that key
+    # each round and attaches the URL to challenge.cognition_wiki_url so
+    # the agent can pull and read pages while designing an architecture.
+    # Empty bucket disables the feature.
+    COGNITION_WIKI_R2_BUCKET: str = os.getenv("RADAR_COGNITION_WIKI_BUCKET", "")
+    COGNITION_WIKI_R2_PREFIX: str = os.getenv("RADAR_COGNITION_WIKI_PREFIX", "cognition_wiki/v1")
+    COGNITION_WIKI_TTL: int = int(os.getenv("RADAR_COGNITION_WIKI_TTL", "5400"))
+
     # ── Postgres ──────────────────────────────────────────────
     PG_DSN: str = os.getenv("RADAR_PG_DSN", "postgresql://radar:radar@localhost:5432/radar")
-    # Set to "require" for Supabase/managed Postgres, "" for local
+    # TLS mode for the asyncpg pool:
+    #   ""        → no TLS (local Docker)
+    #   "require" → TLS without verification. DEPRECATED: preserves the
+    #               historical behaviour that skipped hostname/cert checks,
+    #               kept for operators who rely on it. Emits a runtime
+    #               warning.  Prefer "verify" for any managed Postgres.
+    #   "verify"  → TLS with full hostname + certificate verification.
+    #               Required for Crunchy Bridge / any production
+    #               managed-Postgres deployment.
     PG_SSL: str = os.getenv("RADAR_PG_SSL", "")
+    # asyncpg pool sizing. Total max across all DB-server processes
+    # should stay under the cluster's max_connections. Validator mode
+    # typically wants larger pools (many concurrent writers); dashboard
+    # mode wants smaller pools paired with a statement_timeout so a slow
+    # public query can't pressure the shared cluster.
+    PG_POOL_MIN: int = int(os.getenv("RADAR_PG_POOL_MIN", "2"))
+    PG_POOL_MAX: int = int(os.getenv("RADAR_PG_POOL_MAX", "10"))
+    # Set to 0 when the DSN points at a transaction-mode pooler
+    # (Supabase Supavisor, PgBouncer) that forbids server-side
+    # prepared statements. Leave unset for direct connections.
+    PG_STATEMENT_CACHE_SIZE: str = os.getenv("RADAR_PG_STATEMENT_CACHE_SIZE", "")
+    # `SET statement_timeout` applied on every pool connection. 0 = no
+    # timeout. Set to 5000 (5s) on dashboard-mode deploys so a slow
+    # public query can't pressure the shared Crunchy cluster.
+    PG_STATEMENT_TIMEOUT_MS: int = int(os.getenv("RADAR_PG_STATEMENT_TIMEOUT_MS", "0"))
+
+    # Startup retry budget for the asyncpg bootstrap connect + pool
+    # create. Covers containers that come up before Postgres is ready
+    # (Railway / k8s sidecar cold start, Crunchy Bridge rolling restart,
+    # DNS propagation) so a transient ECONNREFUSED doesn't crash-loop
+    # the process. Defaults to 6 retries with 1s initial backoff doubling
+    # up to 30s, for roughly one minute of total grace before giving up.
+    PG_STARTUP_RETRIES: int = int(os.getenv("RADAR_PG_STARTUP_RETRIES", "6"))
+    PG_STARTUP_BACKOFF_INITIAL_S: float = float(
+        os.getenv("RADAR_PG_STARTUP_BACKOFF_INITIAL_S", "1.0")
+    )
+    PG_STARTUP_BACKOFF_MAX_S: float = float(
+        os.getenv("RADAR_PG_STARTUP_BACKOFF_MAX_S", "30.0")
+    )
+
+    # ── Network / Schema Isolation ────────────────────────────
+    # Which Bittensor network this DB process serves: "testnet" or "mainnet".
+    # A single Postgres database holds BOTH networks; isolation is enforced by
+    # Postgres *schemas* (NOT a `network` tag column, NOT separate DBs).
+    #
+    # Why schemas, not a tag column:
+    #   - zero changes to existing SQL (search_path handles qualification)
+    #   - impossible to accidentally leak cross-network rows via a forgotten
+    #     WHERE clause — the other schema's tables are simply invisible
+    #   - per-network backup / drop / restore is trivial (pg_dump --schema=...)
+    #   - per-schema sequences keep experiment IDs independent per network
+    #
+    # The value is embedded in `SET search_path` at connection time, so the
+    # allowlist regex in shared/pg_store.py is the *only* thing preventing
+    # SQL injection via this variable. Defaults to "testnet" for safety.
+    NETWORK: str = os.getenv("RADAR_NETWORK", "testnet")
+
+    # ── Neuron Mode ───────────────────────────────────────────
+    # RADAR_NEURON_MODE controls which surface this process serves.
+    #   validator  — Epistula-authed write/read API for validators + miners,
+    #                plus desearch/LLM proxies. Runs metagraph sync + round
+    #                loop. Requires a Bittensor wallet. Optionally also mounts
+    #                the internal Jinja dashboard when RADAR_DASHBOARD_ENABLED=true.
+    #   dashboard  — Open public JSON API at /dashboard/api/*. No wallet, no
+    #                proxies, no metagraph sync, no Jinja, no Epistula.
+    #                This is what gets deployed to Railway behind radarnet.io.
+    #   all        — Everything on one process (legacy / dev default).
+    NEURON_MODE: str = os.getenv("RADAR_NEURON_MODE", "all").lower()
+
+    # CORS origins for the public JSON API. Comma-separated, empty = no CORS
+    # (safe default for validator mode, which doesn't speak to browsers).
+    # In production dashboard mode set this to "https://radarnet.io".
+    DASHBOARD_CORS_ORIGINS: str = os.getenv("RADAR_DASHBOARD_CORS_ORIGINS", "")
 
     # ── Database API ──────────────────────────────────────────
     DB_API_URL: str = os.getenv("RADAR_DB_API_URL", "")
@@ -208,6 +381,7 @@ class Config:
 
     # ── Database Auth ─────────────────────────────────────────
     DB_VALI_RATE_LIMIT: int = int(os.getenv("RADAR_DB_VALI_RATE_LIMIT", "60"))
+    DB_IP_RATE_LIMIT: int = int(os.getenv("RADAR_DB_IP_RATE_LIMIT", "120"))
     # Shared subnet API key — lightweight gate before Epistula verification.
     # Subnet owner generates once, distributes to validators for reverse proxy auth.
     # Empty string = disabled (open access, Epistula-only).
@@ -223,3 +397,16 @@ class Config:
     # Max bytes of a log file streamed inline before falling back to presigned URL
     DASHBOARD_MAX_LOG_BYTES: int = int(os.getenv("RADAR_DASHBOARD_MAX_LOG_BYTES", "10485760"))
     DASHBOARD_PAGE_SIZE: int = int(os.getenv("RADAR_DASHBOARD_PAGE_SIZE", "50"))
+
+
+VALID_NEURON_MODES = frozenset({"validator", "dashboard", "all"})
+
+
+def validate_neuron_mode() -> None:
+    """Fail-fast check: RADAR_NEURON_MODE must be one of the known modes."""
+    mode = Config.NEURON_MODE
+    if mode not in VALID_NEURON_MODES:
+        raise ValueError(
+            f"Invalid RADAR_NEURON_MODE={mode!r}. "
+            f"Must be one of: {sorted(VALID_NEURON_MODES)}"
+        )

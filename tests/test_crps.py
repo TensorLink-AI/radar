@@ -79,18 +79,16 @@ def test_crps_returns_per_sample_not_scalar():
 # ── Bug B: Per-sample nCRPS ──
 
 
-def test_naive_crps_exists():
-    """_naive_crps helper must exist."""
+def test_seasonal_naive_forecast_exists():
+    """Replacement for _naive_crps: seasonal-naive baseline helper must exist."""
     source = _read_source()
-    assert "def _naive_crps" in source
+    assert "def _seasonal_naive_forecast" in source
 
 
-def test_naive_crps_returns_per_sample():
-    """_naive_crps must return per-sample (B,), not a scalar."""
-    fn_src = _get_function_source("_naive_crps")
-    assert fn_src, "_naive_crps not found"
-    assert ".mean()" not in fn_src, \
-        "_naive_crps uses .mean() which collapses batch dim — must use .mean(dim=...)"
+def test_wql_components_exists():
+    """Task-level wQL numerator/denominator helper must exist."""
+    source = _read_source()
+    assert "def _wql_components" in source
 
 
 def test_validate_returns_ncrps():
@@ -169,15 +167,16 @@ def test_validate_filters_inf_predictions():
 
 
 def test_validate_filters_inf_crps_samples():
-    """Per-sample CRPS values that are inf must be dropped before accumulating.
+    """Non-finite predictions/targets must be filtered before accumulating.
 
-    Even with finite predictions, numerical overflow can produce inf CRPS
-    in edge cases (e.g., very large float32 values near overflow boundary).
+    The _random_validate path still computes per-sample CRPS, so it filters
+    via isfinite(sample_crps). The _gift_eval_validate path (rolling-origin
+    with task-level wQL aggregation) filters pre-aggregation by masking
+    non-finite predictions/targets per batch.
     """
-    source = _read_source()
     fn_src = _get_function_source("_random_validate")
     assert "isfinite(sample_crps)" in fn_src, \
         "_random_validate must filter non-finite CRPS values"
-    fn_src2 = _get_function_source("_gift_eval_validate")
-    assert "isfinite(sample_crps)" in fn_src2, \
-        "_gift_eval_validate must filter non-finite CRPS values"
+    fn_src2 = _get_function_source("_eval_one_task")
+    assert "isfinite(predictions)" in fn_src2 and "isfinite(targets)" in fn_src2, \
+        "_eval_one_task must mask non-finite predictions and targets"

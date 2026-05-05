@@ -11,10 +11,11 @@ Rate-limited to RADAR_DESEARCH_MAX_QUERIES per miner per tempo.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections import defaultdict
-from typing import Optional
+from typing import Literal, Optional, get_args
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -31,11 +32,12 @@ DESEARCH_SEARCH_PATH = "/desearch/ai/search"
 # choose other tools (twitter, etc.) through this proxy.
 DESEARCH_TOOL_ARXIV = "arxiv"
 DESEARCH_TOOL_WEB = "web"
-ALLOWED_TOOLS = {DESEARCH_TOOL_ARXIV, DESEARCH_TOOL_WEB}
+ToolT = Literal["arxiv", "web"]
+ALLOWED_TOOLS = frozenset(get_args(ToolT))
 
-# Allowed values for the Desearch `date_filter` field.
-ALLOWED_DATE_FILTERS = {
-    "NONE",
+# Allowed values for the Desearch `date_filter` field. Desearch does not
+# accept "NONE"; PAST_2_YEARS is the broadest supported window.
+DateFilterT = Literal[
     "PAST_24_HOURS",
     "PAST_2_DAYS",
     "PAST_WEEK",
@@ -44,11 +46,17 @@ ALLOWED_DATE_FILTERS = {
     "PAST_2_MONTHS",
     "PAST_YEAR",
     "PAST_2_YEARS",
-}
+]
+ALLOWED_DATE_FILTERS = frozenset(get_args(DateFilterT))
+DEFAULT_DATE_FILTER: DateFilterT = "PAST_2_YEARS"
 
 # Desearch response shape we request. Gives us a list of link objects plus
 # a final summary string.
 DESEARCH_RESULT_TYPE = "LINKS_WITH_FINAL_SUMMARY"
+
+# Desearch requires `count >= 10` on /desearch/ai/search. We still let miners
+# ask for fewer results — the response is sliced to max_results before return.
+DESEARCH_MIN_COUNT = 10
 
 # Rate limit: max queries per miner per tempo
 MAX_QUERIES_PER_TEMPO = 20
@@ -62,8 +70,8 @@ class SearchQuery(BaseModel):
 
     query: str = Field(..., min_length=1, max_length=500)
     max_results: int = Field(default=5, ge=1, le=20)
-    tool: str = Field(default=DESEARCH_TOOL_ARXIV)
-    date_filter: str = Field(default="NONE")
+    tool: ToolT = Field(default=DESEARCH_TOOL_ARXIV)
+    date_filter: DateFilterT = Field(default=DEFAULT_DATE_FILTER)
 
 
 class SearchResult(BaseModel):
@@ -155,7 +163,7 @@ class DesearchProxy:
     async def search(
         self, miner_uid: int, query: str, max_results: int = 5,
         miner_hotkey: str = "", tool: str = DESEARCH_TOOL_ARXIV,
-        date_filter: str = "NONE",
+        date_filter: str = DEFAULT_DATE_FILTER,
     ) -> SearchResponse:
         """
         Search via the Desearch /desearch/ai/search endpoint.
@@ -184,12 +192,19 @@ class DesearchProxy:
         remaining -= 1
 
         headers = {"Authorization": self.api_key} if self.api_key else {}
+        # Desearch requires count >= DESEARCH_MIN_COUNT; we slice the response
+        # back down to max_results before returning to the miner.
+        upstream_count = max(DESEARCH_MIN_COUNT, max_results)
+        # streaming=False asks Desearch for a single JSON payload instead of
+        # an SSE event stream. Without it the upstream defaults to streaming
+        # and resp.json() fails on `data: {...}` lines.
         body = {
             "prompt": query,
             "tools": [tool],
             "date_filter": date_filter,
             "result_type": DESEARCH_RESULT_TYPE,
-            "count": max_results,
+            "count": upstream_count,
+            "streaming": False,
         }
 
         try:
@@ -201,13 +216,40 @@ class DesearchProxy:
                 timeout=30.0,
             )
             resp.raise_for_status()
-            data = resp.json()
         except httpx.HTTPStatusError as e:
-            logger.warning("SN22 returned error: %s", e.response.status_code)
-            raise HTTPException(status_code=502, detail="Desearch upstream error")
+            err_body = (e.response.text or "")[:500]
+            logger.warning(
+                "Desearch HTTP %d: %s", e.response.status_code, err_body,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Desearch upstream error: HTTP {e.response.status_code} — {err_body}".strip(),
+            )
         except (httpx.RequestError, httpx.TimeoutException) as e:
-            logger.warning("SN22 request failed: %s", e)
-            raise HTTPException(status_code=502, detail="Desearch upstream unreachable")
+            logger.warning("Desearch request failed: %s: %s", type(e).__name__, e)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Desearch upstream unreachable: {type(e).__name__}",
+            )
+
+        try:
+            data = resp.json()
+        except (json.JSONDecodeError, ValueError):
+            # Desearch sometimes returns SSE (`data: {...}\n\n` events) even
+            # when we ask for streaming=False. Parse the stream and extract
+            # the final payload before giving up.
+            text = resp.text or ""
+            data = _parse_sse_stream(text)
+            if data is None:
+                preview = text[:500]
+                logger.warning(
+                    "Desearch returned %d with non-JSON body: %s",
+                    resp.status_code, preview,
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Desearch upstream returned non-JSON body (HTTP {resp.status_code})",
+                )
 
         results = _parse_sn22_response(data)
 
@@ -223,6 +265,57 @@ class DesearchProxy:
     def reset_limits(self):
         """Reset all rate limits (e.g., at tempo boundary)."""
         self._query_counts.clear()
+
+
+def _parse_sse_stream(text: str) -> dict | list | None:
+    """Recover a Desearch result payload from an SSE event stream.
+
+    Desearch streams `data: {...}\\n\\n` events. Intermediate events have
+    type='flow' carrying progress (Description / Queries / status=in_progress).
+    The completed result events carry one of: a top-level dict with
+    links/results/papers, or a flow event whose inner `content` is a list of
+    paper/link dicts. We scan every event and return the richest payload.
+    """
+    best: dict | list | None = None
+    best_count = 0
+
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line.startswith("data:"):
+            continue
+        payload_str = line[5:].strip()
+        if not payload_str or payload_str == "[DONE]":
+            continue
+        try:
+            event = json.loads(payload_str)
+        except json.JSONDecodeError:
+            continue
+
+        # Case 1: a final non-flow event that already looks like a Desearch
+        # result payload (dict with links/results/papers, or a list of dicts).
+        if isinstance(event, list):
+            if len(event) > best_count:
+                best, best_count = event, len(event)
+            continue
+        if not isinstance(event, dict):
+            continue
+
+        for key in ("links", "results", "papers"):
+            value = event.get(key)
+            if isinstance(value, list) and len(value) > best_count:
+                best, best_count = event, len(value)
+                break
+
+        # Case 2: a flow event whose inner content is the actual list.
+        content = event.get("content")
+        if isinstance(content, dict):
+            inner = content.get("content")
+            if isinstance(inner, list) and inner and all(
+                isinstance(x, dict) for x in inner
+            ) and len(inner) > best_count:
+                best, best_count = inner, len(inner)
+
+    return best
 
 
 def _parse_sn22_response(data: dict | list) -> list[SearchResult]:

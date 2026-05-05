@@ -13,6 +13,7 @@ the challenge's runner_dir.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import os
@@ -21,6 +22,8 @@ import sys
 import tempfile
 from typing import Optional, TYPE_CHECKING
 
+from shared.eval_result import build_error_result
+
 if TYPE_CHECKING:
     import torch
     from shared.r2_audit import R2AuditLog
@@ -28,59 +31,53 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ── Runner registry for eval templates ───────────────────────────────
-# Maps runner_dir -> EVAL_TEMPLATE string
-_EVAL_TEMPLATES: dict[str, str] = {}
+_DEFAULT_RUNNER_DIR = "runner/timeseries_forecast"
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
-def _load_eval_templates():
-    """Lazy-load eval templates from runner directories.
+def _load_eval_template_from_path(runner_dir: str) -> Optional[str]:
+    """Load EVAL_TEMPLATE from `{project_root}/{runner_dir}/eval_template.py`.
 
-    Reads EVAL_TEMPLATE strings from runner train.py files by parsing
-    the source, rather than importing the module (which requires
-    Docker-only dependencies like torch, prepare, flops).
+    Uses file-based loading so we don't rely on the `runner` package being
+    importable — it isn't pip-installed and won't be on sys.path when the
+    validator runs from outside the project root.
+
+    Returns None if the file doesn't exist or lacks EVAL_TEMPLATE.
     """
-    if _EVAL_TEMPLATES:
-        return
-    import ast
-
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
-    # Load ts_forecasting eval template
-    train_path = os.path.join(project_root, "runner", "timeseries_forecast", "train.py")
-    template = _extract_eval_template(train_path)
-    if template:
-        _EVAL_TEMPLATES["runner/timeseries_forecast"] = template
-        _EVAL_TEMPLATES[""] = template  # default fallback
-    else:
-        logger.error("Failed to load eval template from %s", train_path)
-
-
-def _extract_eval_template(path: str) -> str | None:
-    """Extract EVAL_TEMPLATE string constant from a Python file via AST."""
-    import ast
-    try:
-        with open(path) as f:
-            tree = ast.parse(f.read())
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id == "EVAL_TEMPLATE":
-                        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-                            return node.value.value
-    except Exception as e:
-        logger.warning("Could not parse %s: %s", path, e)
-    return None
+    template_path = os.path.join(_PROJECT_ROOT, runner_dir, "eval_template.py")
+    if not os.path.isfile(template_path):
+        return None
+    mod_name = f"_radar_eval_template_{runner_dir.replace('/', '_').replace('.', '_')}"
+    spec = importlib.util.spec_from_file_location(mod_name, template_path)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return getattr(mod, "EVAL_TEMPLATE", None)
 
 
 def _get_eval_template(runner_dir: str) -> str:
-    """Get the eval template for a runner_dir."""
-    _load_eval_templates()
-    template = _EVAL_TEMPLATES.get(runner_dir)
-    if template is None:
-        logger.warning("No eval template for runner_dir=%s, using default", runner_dir)
-        template = _EVAL_TEMPLATES[""]
-    return template
+    """Load EVAL_TEMPLATE from the task's zero-dep `eval_template` module.
+
+    Each task exposes EVAL_TEMPLATE at module level in
+    `{runner_dir}/eval_template.py`. Falls back to ts_forecasting if the
+    task module isn't loadable.
+    """
+    effective = runner_dir or _DEFAULT_RUNNER_DIR
+    template = _load_eval_template_from_path(effective)
+    if template is not None:
+        return template
+    if effective != _DEFAULT_RUNNER_DIR:
+        logger.warning(
+            "No eval_template module for runner_dir=%s; falling back to %s",
+            runner_dir, _DEFAULT_RUNNER_DIR,
+        )
+        template = _load_eval_template_from_path(_DEFAULT_RUNNER_DIR)
+        if template is not None:
+            return template
+    raise ModuleNotFoundError(
+        f"eval_template not found at {runner_dir} or {_DEFAULT_RUNNER_DIR}"
+    )
 
 
 def evaluate_checkpoint(
@@ -90,6 +87,7 @@ def evaluate_checkpoint(
     device: str = "cpu",
     timeout: int = 120,
     runner_dir: str = "",
+    task: "TaskSpec | None" = None,
 ) -> dict:
     """Evaluate a single checkpoint in an isolated subprocess.
 
@@ -101,6 +99,9 @@ def evaluate_checkpoint(
         runner_dir: Relative path to the runner directory (e.g.
                     "runner/timeseries_forecast"). Falls back to
                     runner/timeseries_forecast if empty.
+        task: TaskSpec used to shape error-path result dicts. When None,
+              falls back to the legacy ts_forecasting shape so direct
+              unit-test callers keep working.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         # Copy checkpoint into subprocess temp dir so it's co-located
@@ -153,29 +154,21 @@ def evaluate_checkpoint(
                 cwd=tmpdir,
             )
             if result.returncode != 0:
-                return {
-                    "crps": float("inf"), "mase": float("inf"),
-                    "flops_equivalent_size": 0,
-                    "error": f"Eval subprocess failed: {result.stderr[:500]}",
-                }
+                return build_error_result(
+                    task, f"Eval subprocess failed: {result.stderr[:500]}",
+                )
             # Parse only the last non-empty line of stdout to avoid
             # spurious output from miner code (print statements, warnings).
-            return _parse_last_json_line(result.stdout)
+            return _parse_last_json_line(result.stdout, task=task)
         except subprocess.TimeoutExpired:
-            return {
-                "crps": float("inf"), "mase": float("inf"),
-                "flops_equivalent_size": 0,
-                "error": f"Eval subprocess timed out ({timeout}s)",
-            }
+            return build_error_result(
+                task, f"Eval subprocess timed out ({timeout}s)",
+            )
         except (OSError, json.JSONDecodeError) as e:
-            return {
-                "crps": float("inf"), "mase": float("inf"),
-                "flops_equivalent_size": 0,
-                "error": f"Eval subprocess error: {e}",
-            }
+            return build_error_result(task, f"Eval subprocess error: {e}")
 
 
-def _parse_last_json_line(stdout: str) -> dict:
+def _parse_last_json_line(stdout: str, task: "TaskSpec | None" = None) -> dict:
     """Parse JSON from the last non-empty line of subprocess stdout.
 
     Miner code loaded via importlib may produce print output during import.
@@ -183,22 +176,16 @@ def _parse_last_json_line(stdout: str) -> dict:
     """
     lines = [line.strip() for line in stdout.strip().splitlines() if line.strip()]
     if not lines:
-        return {
-            "crps": float("inf"), "mase": float("inf"),
-            "flops_equivalent_size": 0,
-            "error": "Eval subprocess produced no output",
-        }
+        return build_error_result(task, "Eval subprocess produced no output")
     # Try last line first (expected), then scan backwards
     for line in reversed(lines):
         try:
             return json.loads(line)
         except json.JSONDecodeError:
             continue
-    return {
-        "crps": float("inf"), "mase": float("inf"),
-        "flops_equivalent_size": 0,
-        "error": f"Eval subprocess returned no valid JSON line: {lines[-1][:200]}",
-    }
+    return build_error_result(
+        task, f"Eval subprocess returned no valid JSON line: {lines[-1][:200]}",
+    )
 
 
 async def evaluate_all_checkpoints(
@@ -249,18 +236,14 @@ async def evaluate_all_checkpoints(
 
         if not artifacts.verified:
             logger.warning("UID %d: artifact verification failed: %s", uid, artifacts.verification_error)
-            results[uid] = {
-                "crps": float("inf"), "mase": float("inf"),
-                "error": f"verification failed: {artifacts.verification_error}",
-            }
+            results[uid] = build_error_result(
+                task, f"verification failed: {artifacts.verification_error}",
+            )
             continue
 
         if not artifacts.architecture_code:
             logger.warning("UID %d: architecture code missing from R2 — skipping eval", uid)
-            results[uid] = {
-                "crps": float("inf"), "mase": float("inf"),
-                "error": "architecture code not found in R2",
-            }
+            results[uid] = build_error_result(task, "architecture code not found in R2")
             continue
 
         # Re-verify checkpoint hash immediately before eval (TOCTOU defense)
@@ -269,10 +252,9 @@ async def evaluate_all_checkpoints(
             actual_hash = sha256_file(artifacts.checkpoint_path)
             if actual_hash != artifacts.meta.checkpoint_sha256:
                 logger.warning("UID %d: checkpoint hash changed after download (TOCTOU)", uid)
-                results[uid] = {
-                    "crps": float("inf"), "mase": float("inf"),
-                    "error": "checkpoint hash mismatch at eval time",
-                }
+                results[uid] = build_error_result(
+                    task, "checkpoint hash mismatch at eval time",
+                )
                 continue
 
         # Evaluate
@@ -281,10 +263,9 @@ async def evaluate_all_checkpoints(
                 "UID %d: checkpoint file missing before eval: %s",
                 uid, artifacts.checkpoint_path,
             )
-            results[uid] = {
-                "crps": float("inf"), "mase": float("inf"),
-                "error": f"checkpoint file missing: {artifacts.checkpoint_path}",
-            }
+            results[uid] = build_error_result(
+                task, f"checkpoint file missing: {artifacts.checkpoint_path}",
+            )
             continue
 
         logger.info(
@@ -298,6 +279,7 @@ async def evaluate_all_checkpoints(
             eval_split_seed=challenge.eval_split_seed,
             device=device,
             runner_dir=runner_dir,
+            task=task,
         )
 
         # Verify FLOPs claim
@@ -309,11 +291,13 @@ async def evaluate_all_checkpoints(
         metrics["passed_size_gate"] = passes_size_gate(metrics, challenge)
 
         results[uid] = metrics
+        obj_summary = " ".join(
+            f"{o.name}={metrics.get(o.name, -1):.6f}" for o in task.objectives
+        ) if task.objectives else "(no objectives)"
         logger.info(
-            "UID %d eval: crps=%.6f mase=%.6f flops=%d gate=%s verified=%s",
-            uid, metrics.get("crps", -1), metrics.get("mase", -1),
-            validator_measured, metrics["passed_size_gate"],
-            artifacts.verified,
+            "UID %d eval: %s flops=%d gate=%s verified=%s",
+            uid, obj_summary, validator_measured,
+            metrics["passed_size_gate"], artifacts.verified,
         )
 
         # Cleanup checkpoint file

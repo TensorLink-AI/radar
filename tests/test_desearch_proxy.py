@@ -89,9 +89,10 @@ class TestDesearchProxy:
         assert kwargs["json"] == {
             "prompt": "attention",
             "tools": ["arxiv"],
-            "date_filter": "NONE",
+            "date_filter": "PAST_2_YEARS",
             "result_type": "LINKS_WITH_FINAL_SUMMARY",
-            "count": 7,
+            "count": 10,
+            "streaming": False,
         }
 
     @pytest.mark.asyncio
@@ -148,6 +149,112 @@ class TestDesearchProxy:
         with pytest.raises(HTTPException) as exc_info:
             await proxy.search(0, "x", date_filter="LAST_FRIDAY")
         assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_search_rejects_none_date_filter(self):
+        """Desearch rejects 'NONE'; the proxy must not forward it."""
+        proxy = DesearchProxy(max_queries=5)
+        with pytest.raises(HTTPException) as exc_info:
+            await proxy.search(0, "x", date_filter="NONE")
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_search_non_json_body_returns_502(self):
+        """Desearch sometimes returns 2xx with a non-JSON body (empty,
+        HTML error page, etc.). The proxy must convert that to a 502
+        instead of leaking a JSONDecodeError as a 500."""
+        import json as _json
+        proxy = DesearchProxy(max_queries=5, api_key="dt_testkey")
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.status_code = 200
+        mock_resp.text = ""
+
+        def _bad_json():
+            raise _json.JSONDecodeError("Expecting value", "", 0)
+
+        mock_resp.json = _bad_json
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
+            with pytest.raises(HTTPException) as exc_info:
+                await proxy.search(0, "x")
+        assert exc_info.value.status_code == 502
+
+    @pytest.mark.asyncio
+    async def test_search_recovers_from_sse_stream(self):
+        """When upstream ignores streaming=False and returns an SSE event
+        stream, the proxy must recover the final payload from `data:` events
+        instead of returning a 502."""
+        import json as _json
+        proxy = DesearchProxy(max_queries=5, api_key="dt_testkey")
+        sse_body = (
+            'data: {"type": "flow", "content": {"id": "1", "type": '
+            '"Description", "content": "Searching", "status": "in_progress"}}\n\n'
+            'data: {"type": "flow", "content": {"id": "1", "type": "Links", '
+            '"content": [{"title": "Paper A", "id": "2301.00001"}, '
+            '{"title": "Paper B", "id": "2301.00002"}], "status": "completed"}}\n\n'
+            'data: [DONE]\n\n'
+        )
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.status_code = 200
+        mock_resp.text = sse_body
+
+        def _bad_json():
+            raise _json.JSONDecodeError("Expecting value", sse_body, 0)
+
+        mock_resp.json = _bad_json
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
+            resp = await proxy.search(0, "x", max_results=5)
+        assert len(resp.results) == 2
+        assert resp.results[0].title == "Paper A"
+        assert resp.results[0].arxiv_id == "2301.00001"
+
+    @pytest.mark.asyncio
+    async def test_search_sse_stream_with_no_results_returns_502(self):
+        """An SSE stream that only carries in-progress flow events with no
+        recoverable payload should still produce a 502 (not a 500)."""
+        import json as _json
+        proxy = DesearchProxy(max_queries=5, api_key="dt_testkey")
+        sse_body = (
+            'data: {"type": "flow", "content": {"id": "1", "type": '
+            '"Description", "content": "Searching", "status": "in_progress"}}\n\n'
+        )
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.status_code = 200
+        mock_resp.text = sse_body
+
+        def _bad_json():
+            raise _json.JSONDecodeError("Expecting value", sse_body, 0)
+
+        mock_resp.json = _bad_json
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
+            with pytest.raises(HTTPException) as exc_info:
+                await proxy.search(0, "x")
+        assert exc_info.value.status_code == 502
+
+    @pytest.mark.asyncio
+    async def test_search_enforces_min_count(self):
+        """Desearch requires count >= 10, even when the miner asked for fewer.
+        Response is sliced back to max_results before returning."""
+        proxy = DesearchProxy(max_queries=5, api_key="dt_testkey")
+        upstream = [{"title": f"p{i}", "id": f"id{i}"} for i in range(10)]
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.json = lambda: upstream
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
+            resp = await proxy.search(0, "x", max_results=3)
+        _, kwargs = mock_client.post.call_args
+        assert kwargs["json"]["count"] == 10
+        assert len(resp.results) == 3
 
 
 # ── Unit tests for response parsing ─────────────────────────────────────────
@@ -261,3 +368,55 @@ class TestDesearchRoutes:
             headers={"X-Miner-UID": "0"},
         )
         assert r.status_code == 422  # Pydantic validation error
+
+    def test_search_route_rejects_none_date_filter(self):
+        """Posting date_filter='NONE' is rejected at the Pydantic boundary
+        (422), so the proxy never forwards it to Desearch."""
+        app, proxy = _make_app()
+        client = TestClient(app)
+        with patch.object(proxy, "_get_client", AsyncMock()) as mock_get:
+            r = client.post(
+                "/desearch/search",
+                json={"query": "x", "date_filter": "NONE"},
+                headers={"X-Miner-UID": "0"},
+            )
+        assert r.status_code == 422
+        mock_get.assert_not_called()
+
+    def test_search_route_rejects_unknown_tool(self):
+        """tool='twitter' is rejected at the Pydantic boundary (422)."""
+        app, proxy = _make_app()
+        client = TestClient(app)
+        with patch.object(proxy, "_get_client", AsyncMock()) as mock_get:
+            r = client.post(
+                "/desearch/search",
+                json={"query": "x", "tool": "twitter"},
+                headers={"X-Miner-UID": "0"},
+            )
+        assert r.status_code == 422
+        mock_get.assert_not_called()
+
+    def test_search_route_clamps_count_to_min(self):
+        """Even with max_results=1, the upstream POST carries count=10
+        (Desearch's hard minimum)."""
+        app, proxy = _make_app()
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.json = lambda: [{"title": f"p{i}"} for i in range(10)]
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        client = TestClient(app)
+        with patch.object(proxy, "_get_client", AsyncMock(return_value=mock_client)):
+            r = client.post(
+                "/desearch/search",
+                json={"query": "x", "max_results": 1},
+                headers={"X-Miner-UID": "0"},
+            )
+        assert r.status_code == 200
+        _, kwargs = mock_client.post.call_args
+        assert kwargs["json"]["count"] == 10
+        assert kwargs["json"]["date_filter"] in {
+            "PAST_24_HOURS", "PAST_2_DAYS", "PAST_WEEK", "PAST_2_WEEKS",
+            "PAST_MONTH", "PAST_2_MONTHS", "PAST_YEAR", "PAST_2_YEARS",
+        }
+        assert len(r.json()["results"]) == 1

@@ -98,8 +98,21 @@ class FakeStore:
 class FakePool:
     """Minimal asyncpg-like pool with pre-canned query responses."""
 
-    def __init__(self, elements: list[DataElement]):
+    def __init__(
+        self,
+        elements: list[DataElement],
+        access_log: Optional[list[dict]] = None,
+        agent_history: Optional[list[dict]] = None,
+        agent_bundles: Optional[dict[str, dict]] = None,
+        training_metas: Optional[dict[tuple[int, str], dict]] = None,
+    ):
         self.elements = elements
+        self.access_log = access_log or []
+        self.agent_history = agent_history or []
+        # code_hash -> bundle dict (mirrors the agent_bundles Postgres table)
+        self.agent_bundles = agent_bundles or {}
+        # (round_id, hotkey) -> meta dict (mirrors training_metas table)
+        self.training_metas = training_metas or {}
 
     def _rows(self):
         return [self._row(e) for e in self.elements]
@@ -141,6 +154,89 @@ class FakePool:
 
     async def fetch(self, sql: str, *params):
         sql_l = sql.lower()
+        # Benchmark: per-round aggregates for a task (with best_hotkey join)
+        if "group by round_id" in sql_l and "lateral" in sql_l:
+            task = params[0] if params else ""
+            limit = params[1] if len(params) > 1 else 100
+            matching = [e for e in self.elements if e.task == task and e.round_id >= 0]
+            per_round: dict[int, list] = {}
+            for e in matching:
+                per_round.setdefault(e.round_id, []).append(e)
+            out = []
+            for rid in sorted(per_round, reverse=True)[:limit]:
+                bucket = per_round[rid]
+                succ = [e for e in bucket if e.success and e.metric is not None]
+                best = min(succ, key=lambda e: e.metric) if succ else None
+                out.append({
+                    "round_id": rid,
+                    "total": len(bucket),
+                    "successes": len(succ),
+                    "best_metric": best.metric if best else None,
+                    "mean_metric": (
+                        sum(e.metric for e in succ) / len(succ) if succ else None
+                    ),
+                    "started_at": min(e.timestamp or 0.0 for e in bucket),
+                    "best_hotkey": best.miner_hotkey if best else None,
+                })
+            return out
+        # Provenance: miner × round activity
+        if "count(distinct ref)" in sql_l and "group by hotkey, round_id" in sql_l:
+            rounds_limit = params[0] if params else 30
+            distinct = sorted(
+                {a["round_id"] for a in self.access_log if a["round_id"] >= 0},
+                reverse=True,
+            )[:rounds_limit]
+            round_set = set(distinct)
+            agg: dict = {}
+            for a in self.access_log:
+                if a["round_id"] not in round_set:
+                    continue
+                key = (a["hotkey"], a["round_id"])
+                agg.setdefault(key, set()).update(a["experiment_ids"])
+            return [
+                {"hotkey": hk, "round_id": rid, "unique_queried": len(eids)}
+                for (hk, rid), eids in agg.items()
+            ]
+        # Provenance: top experiment counts
+        if "group by exp_id" in sql_l and "order by cnt desc" in sql_l:
+            top_k = params[0] if params else 20
+            counts: dict = {}
+            for a in self.access_log:
+                for eid in a["experiment_ids"]:
+                    counts[eid] = counts.get(eid, 0) + 1
+            sorted_items = sorted(counts.items(), key=lambda x: -x[1])[:top_k]
+            return [{"exp_id": eid, "cnt": cnt} for eid, cnt in sorted_items]
+        # Provenance: names lookup for top experiment ids
+        if (
+            "select id, name from experiments" in sql_l
+            and "= any" in sql_l
+        ):
+            ids = set(params[0]) if params else set()
+            return [
+                {"id": e.index, "name": e.name}
+                for e in self.elements if e.index in ids
+            ]
+        # Agent history for a hotkey
+        if "from agent_submission_history" in sql_l and "where hotkey = $1" in sql_l:
+            hk = params[0]
+            limit = params[1] if len(params) > 1 else 100
+            rows = [h for h in self.agent_history if h["hotkey"] == hk]
+            rows.sort(key=lambda h: h["timestamp"], reverse=True)
+            return rows[:limit]
+        # Provenance: miner × experiment matrix
+        if "group by hotkey, exp_id" in sql_l:
+            ids = set(params[0]) if params else set()
+            agg2: dict = {}
+            for a in self.access_log:
+                for eid in a["experiment_ids"]:
+                    if eid not in ids:
+                        continue
+                    key = (a["hotkey"], eid)
+                    agg2[key] = agg2.get(key, 0) + 1
+            return [
+                {"hotkey": hk, "exp_id": eid, "cnt": cnt}
+                for (hk, eid), cnt in agg2.items()
+            ]
         if "distinct round_id" in sql_l:
             rows = sorted({e.round_id for e in self.elements if e.round_id >= 0}, reverse=True)
             return [{"round_id": r} for r in rows]
@@ -184,11 +280,53 @@ class FakePool:
 
     async def fetchrow(self, sql: str, *params):
         sql_l = sql.lower()
+        if "loss_curve" in sql_l and "where e.id" in sql_l:
+            for e in self.elements:
+                if e.index == params[0]:
+                    meta = self.training_metas.get((e.round_id, e.miner_hotkey))
+                    return {
+                        "loss_curve": json.dumps(e.loss_curve),
+                        "round_id": e.round_id,
+                        "miner_hotkey": e.miner_hotkey,
+                        "meta": json.dumps(meta) if meta is not None else None,
+                    }
+            return None
         if "loss_curve" in sql_l and "where id" in sql_l:
             for e in self.elements:
                 if e.index == params[0]:
                     return {"loss_curve": json.dumps(e.loss_curve)}
             return None
+        if "max(round_id)" in sql_l and "max(timestamp)" in sql_l:
+            rounds = [e.round_id for e in self.elements if e.round_id >= 0]
+            stamps = [e.timestamp for e in self.elements if e.timestamp]
+            return {
+                "last_round": max(rounds) if rounds else None,
+                "last_at": max(stamps) if stamps else None,
+            }
+        if "from agent_submission_history" in sql_l and "code_hash = $1" in sql_l:
+            target = params[0]
+            matches = [h for h in self.agent_history if h["code_hash"] == target]
+            if not matches:
+                return None
+            matches.sort(key=lambda h: h["timestamp"], reverse=True)
+            return matches[0]
+        if "from agent_bundles" in sql_l and "code_hash = $1" in sql_l:
+            target = params[0]
+            bundle = self.agent_bundles.get(target)
+            if bundle is None:
+                return None
+            return {"bundle": json.dumps(bundle)}
+        if "select trace from experiments" in sql_l:
+            for e in self.elements:
+                if e.index == params[0]:
+                    return {"trace": e.trace}
+            return None
+        if "from training_metas" in sql_l and "round_id = $1" in sql_l:
+            key = (int(params[0]), params[1])
+            meta = self.training_metas.get(key)
+            if meta is None:
+                return None
+            return {"meta": json.dumps(meta)}
         return None
 
 
@@ -238,6 +376,7 @@ def _sample_elements() -> list[DataElement]:
             round_id=8, timestamp=2000.0,
             objectives={"flops_equivalent_size": 800_000},
             loss_curve=[1.5, 1.1, 0.9],
+            trace="agent: designing\nagent: done\n",
         ),
         DataElement(
             index=2, name="other", code="print(2)", success=False,
@@ -253,32 +392,121 @@ def dashboard_client():
     """Mount the dashboard once and reuse the client across tests."""
     elements = _sample_elements()
     store = FakeStore(elements)
-    pool = FakePool(elements)
+    access_log = [
+        {"hotkey": "hk_a", "round_id": 8, "experiment_ids": [0, 1]},
+        {"hotkey": "hk_a", "round_id": 8, "experiment_ids": [1]},
+        {"hotkey": "hk_b", "round_id": 8, "experiment_ids": [0]},
+        {"hotkey": "hk_a", "round_id": 7, "experiment_ids": [0]},
+    ]
+    agent_history = [
+        {
+            "hotkey": "hk_a", "miner_uid": 1,
+            "code_hash": "hash_v1" + ("0" * 50),
+            "entry_point": "agent.py",
+            "r2_key": "agents/hk_a/hash_v1.json",
+            "round_submitted": 6, "timestamp": 1500.0,
+        },
+        {
+            "hotkey": "hk_a", "miner_uid": 1,
+            "code_hash": "hash_v2" + ("0" * 50),
+            "entry_point": "agent.py",
+            "r2_key": "agents/hk_a/hash_v2.json",
+            "round_submitted": 8, "timestamp": 2500.0,
+        },
+    ]
+    # Bundle cache (Postgres ``agent_bundles`` table) — v1 lives here so the
+    # dashboard serves it from Postgres alone. v2 is intentionally absent so
+    # the R2 fallback path stays covered.
+    bundle_v1 = {
+        "files": {"agent.py": "def design_architecture():\n    return 'v1'\n"},
+        "entry_point": "agent.py",
+        "code_hash": "hash_v1" + ("0" * 50),
+    }
+    bundle_v2 = {
+        "files": {"agent.py": "def design_architecture():\n    return 'v2'\n"},
+        "entry_point": "agent.py",
+        "code_hash": "hash_v2" + ("0" * 50),
+    }
+    # Round 7's meta lives in the Postgres cache; round 8's only in R2 — this
+    # keeps the R2 fallback path covered while round 7 exercises the cache.
+    cached_meta_round7 = {
+        "round_id": 7, "miner_hotkey": "hk_a",
+        "flops": 1234, "ok": True,
+        "train_loss_history": [
+            {"step": 10, "loss": 22.19}, {"step": 20, "loss": 14.71},
+        ],
+        "val_loss_history": [
+            {"step": 10, "loss": 27.20}, {"step": 20, "loss": 21.28},
+        ],
+    }
+    r2_meta_round8 = {
+        "round_id": 8, "miner_hotkey": "hk_a",
+        "flops": 5678, "ok": True,
+    }
+    pool = FakePool(
+        elements,
+        access_log=access_log,
+        agent_history=agent_history,
+        agent_bundles={bundle_v1["code_hash"]: bundle_v1},
+        training_metas={
+            (7, "hk_a"): cached_meta_round7,
+            # Element 2 (round 8, hk_b) has an empty experiments.loss_curve —
+            # this meta exercises the training_metas fallback in loss_curve.json.
+            (8, "hk_b"): {
+                "round_id": 8, "miner_hotkey": "hk_b",
+                "train_loss_history": [
+                    {"step": 1, "loss": 3.3}, {"step": 2, "loss": 2.2},
+                ],
+            },
+        },
+    )
     r2 = FakeR2()
+    r2.upload_json("agents/hk_a/hash_v1.json", bundle_v1)
+    r2.upload_json("agents/hk_a/hash_v2.json", bundle_v2)
     # Seed a training log file so the log route has something to read.
     r2.upload_text("round_7/miner_hk_a/stdout.log", "epoch 0 loss=2.0\nepoch 1 loss=1.5\n")
-    r2.upload_json("round_7/miner_hk_a/training_meta.json", {"flops": 1234, "ok": True})
+    # Round 7 meta also goes to R2 so existing tests keep working — the cache
+    # is preferred when both exist.
+    r2.upload_json("round_7/miner_hk_a/training_meta.json", cached_meta_round7)
+    r2.upload_json("round_8/miner_hk_a/training_meta.json", r2_meta_round8)
+    r2.upload_text(
+        "round_7/miner_hk_a/architecture.py",
+        "class Model:\n    def __init__(self):\n        self.name = 'unit-test-model'\n",
+    )
 
     set_db(store)
 
     # Mount dashboard — idempotent guard in case a previous module already did it.
     from database.dashboard import mount_dashboard
     from database.dashboard import app as dash_app
+    # Custom buckets for the synthetic "ts" task: one tiny (≤500K), one small
+    # (500K–2M) so the test elements (flops 500K and 800K) fall into different
+    # buckets, exercising per-bucket frontier construction.
+    ts_buckets = [(100_000, 500_000), (500_001, 2_000_000)]
+    fake_get_challenge = lambda: {
+        "round_id": 42, "task": "ts", "size_bucket": "small",
+        "min_flops_equivalent": 500_001, "max_flops_equivalent": 2_000_000,
+    }
+    # Mirror the real resolver: known task → its YAML buckets, unknown/empty
+    # task → fall back to the global default so the dashboard always renders
+    # a sensible bucket layout.
+    from shared.challenge import SIZE_BUCKETS as _DEFAULT_SIZE_BUCKETS
+    fake_get_buckets = lambda task: ts_buckets if task == "ts" else list(_DEFAULT_SIZE_BUCKETS)
     if dash_app._state is None:
         mount_dashboard(
             app, store=store, pool=pool, r2=r2,
-            get_challenge=lambda: {"round_id": 42, "task": "ts", "size_bucket": "small"},
+            get_challenge=fake_get_challenge,
             get_frontier=lambda: [{"id": 1}, {"id": 0}],
+            get_task_buckets=fake_get_buckets,
         )
     else:
         # Refresh state for this test module
         dash_app._state.store = store
         dash_app._state.pool = pool
         dash_app._state.r2 = r2
-        dash_app._state.get_challenge = lambda: {
-            "round_id": 42, "task": "ts", "size_bucket": "small",
-        }
+        dash_app._state.get_challenge = fake_get_challenge
         dash_app._state.get_frontier = lambda: [{"id": 1}, {"id": 0}]
+        dash_app._state.get_task_buckets = fake_get_buckets
 
     return TestClient(app)
 
@@ -331,6 +559,29 @@ def test_overview_requires_auth(dashboard_client):
     r = fresh.get("/dashboard/", follow_redirects=False)
     assert r.status_code == 302
     assert "/dashboard/login" in r.headers["location"]
+
+
+def test_json_api_reachable_without_cookie(dashboard_client):
+    """The JSON API is public — a fresh client with no cookie gets 200."""
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    for path in (
+        "/dashboard/api/stats.json",
+        "/dashboard/api/tasks.json",
+        "/dashboard/api/miners.json",
+        "/dashboard/api/recent.json?n=5",
+        "/dashboard/api/challenge.json",
+        "/dashboard/api/rounds.json",
+        "/dashboard/api/tasks_stats.json",
+    ):
+        r = fresh.get(path)
+        assert r.status_code == 200, f"expected 200 for {path}, got {r.status_code}"
+
+
+def test_json_api_reachable_with_cookie(logged_in):
+    """Cookie-holding operators hit the same JSON API without being blocked."""
+    r = logged_in.get("/dashboard/api/stats.json")
+    assert r.status_code == 200
 
 
 def test_login_next_open_redirect_guard(dashboard_client):
@@ -389,25 +640,253 @@ def test_pareto_view_renders(logged_in):
     assert "pareto-scatter" in r.text
 
 
+def test_benchmark_view_renders(logged_in):
+    r = logged_in.get("/dashboard/benchmark")
+    assert r.status_code == 200
+    assert "Benchmark scores over time" in r.text
+    # Task auto-picks the first known task ("ts") so the table renders.
+    assert "0.9000" in r.text  # best metric from round 8
+    assert "1.2000" in r.text  # best metric from round 7
+    # Round IDs in the first column link into the browse view.
+    assert "round_id=8" in r.text and "round_id=7" in r.text
+
+
+def test_benchmark_view_unknown_task(logged_in):
+    r = logged_in.get("/dashboard/benchmark?task=nope")
+    assert r.status_code == 200
+    assert "No completed rounds yet" in r.text
+
+
 def test_pareto_json_flags_dominated(logged_in):
     r = logged_in.get("/dashboard/api/pareto.json")
     assert r.status_code == 200
     data = r.json()
     assert {p["id"] for p in data["points"]} == {0, 1}
-    # Index 1 dominates index 0 (lower metric, higher flops doesn't dominate
-    # — actually index 0 is smaller in FLOPs but has worse metric, so both
-    # should be on-frontier). Index 1 has better metric but higher flops,
-    # so neither dominates the other. Both should be on_frontier.
+    # No task selected → falls back to global SIZE_BUCKETS. Both elements land
+    # in different buckets (index 0 in the tiny [100K, 500K] bucket because
+    # flops=500K hits the upper edge first; index 1 in the small [500K, 2M]
+    # bucket). Each is sole member of its bucket frontier.
     frontier_ids = {p["id"] for p in data["points"] if p["on_frontier"]}
     assert frontier_ids == {0, 1}
+    by_id = {p["id"]: p for p in data["points"]}
+    assert by_id[0]["bucket_index"] != by_id[1]["bucket_index"]
+    assert data["selected_bucket"] is None
+    assert any(b.get("label") for b in data["buckets"])
+
+
+def test_pareto_json_per_bucket_frontier(logged_in):
+    """Two points in the same bucket: only the dominating one is on-frontier.
+
+    Lower metric **and** lower FLOPs → strict domination, so the worse point
+    must drop off its bucket's frontier even though it would have shown up as
+    "on_frontier" under the old global-frontier semantics (where it sits on
+    a different x).
+    """
+    from shared.database import DataElement
+    from database.dashboard import app as dash_app
+
+    elements = [
+        DataElement(
+            index=10, name="dominator", code="", success=True, metric=0.5,
+            task="ts", miner_hotkey="hk", miner_uid=1,
+            objectives={"flops_equivalent_size": 700_000},
+        ),
+        DataElement(
+            index=11, name="dominated", code="", success=True, metric=1.0,
+            task="ts", miner_hotkey="hk", miner_uid=1,
+            objectives={"flops_equivalent_size": 900_000},
+        ),
+    ]
+    original = dash_app._state.store
+    dash_app._state.store = FakeStore(elements)
+    try:
+        r = logged_in.get("/dashboard/api/pareto.json?task=ts")
+    finally:
+        dash_app._state.store = original
+    assert r.status_code == 200
+    data = r.json()
+    by_id = {p["id"]: p for p in data["points"]}
+    # Both share the same bucket (small) under ts_buckets.
+    assert by_id[10]["bucket_index"] == by_id[11]["bucket_index"]
+    assert by_id[10]["on_frontier"] is True
+    assert by_id[11]["on_frontier"] is False
+
+
+def test_pareto_json_filter_by_bucket(logged_in):
+    r = logged_in.get("/dashboard/api/pareto.json?task=ts&bucket=0")
+    assert r.status_code == 200
+    data = r.json()
+    # Only the tiny-bucket element (index 0, flops=500K) survives the filter.
+    assert {p["id"] for p in data["points"]} == {0}
+    assert data["selected_bucket"] == 0
+
+
+def test_pareto_json_active_bucket_resolves_from_challenge(logged_in):
+    r = logged_in.get("/dashboard/api/pareto.json?task=ts&bucket=active")
+    assert r.status_code == 200
+    data = r.json()
+    # Active challenge bounds (500_001, 2_000_000) match bucket index 1.
+    assert data["selected_bucket"] == 1
+    assert {p["id"] for p in data["points"]} == {1}
+
+
+def test_pareto_json_unknown_bucket_id_falls_back_to_all(logged_in):
+    r = logged_in.get("/dashboard/api/pareto.json?task=ts&bucket=999")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["selected_bucket"] is None
+    assert {p["id"] for p in data["points"]} == {0, 1}
+
+
+def test_buckets_json_returns_per_task_buckets(logged_in):
+    r = logged_in.get("/dashboard/api/buckets.json?task=ts")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["task"] == "ts"
+    assert [(b["min_flops"], b["max_flops"]) for b in data["buckets"]] == [
+        (100_000, 500_000), (500_001, 2_000_000),
+    ]
+    # Labels are human-friendly and round to K/M/B/T.
+    assert data["buckets"][0]["label"] == "100K – 500K"
+    assert data["buckets"][1]["label"] == "500.001K – 2M"
+
+
+def test_buckets_json_unknown_task_uses_default(logged_in):
+    r = logged_in.get("/dashboard/api/buckets.json?task=nope")
+    assert r.status_code == 200
+    data = r.json()
+    # Unknown task → global SIZE_BUCKETS (5 entries).
+    assert len(data["buckets"]) == 5
+
+
+def test_pareto_view_renders_bucket_selector(logged_in):
+    r = logged_in.get("/dashboard/pareto?task=ts")
+    assert r.status_code == 200
+    assert "Bucket" in r.text
+    assert "All buckets" in r.text
+    # The two ts buckets render as <option> labels.
+    assert "100K – 500K" in r.text
 
 
 def test_loss_curve_api(logged_in):
+    # Element 0 (round 7, hk_a) has both a legacy experiments.loss_curve and
+    # a training_metas row carrying train + val histories. We prefer the meta
+    # because only it carries the val series — emitting val_points here is
+    # what lets the experiment-detail "Training loss" tab render val.
     r = logged_in.get("/dashboard/api/loss_curve/0.json")
     assert r.status_code == 200
     data = r.json()
     assert data["index"] == 0
-    assert data["points"] == [2.0, 1.5, 1.2]
+    assert data["points"] == [22.19, 14.71]
+    assert data["loss_curve"] == [22.19, 14.71]
+    assert data["val_points"] == [27.20, 21.28]
+
+
+def test_loss_curve_api_falls_back_to_training_metas(logged_in):
+    # Element 2 has empty experiments.loss_curve but a training_metas row
+    # keyed on (round_id, miner_hotkey) — the endpoint extracts the loss
+    # series from train_loss_history so historical rounds still render.
+    # No val_loss_history in this row, so val_points is empty.
+    r = logged_in.get("/dashboard/api/loss_curve/2.json")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["index"] == 2
+    assert data["loss_curve"] == [3.3, 2.2]
+    assert data["points"] == [3.3, 2.2]
+    assert data["val_points"] == []
+
+
+def test_loss_curve_api_aligns_train_and_val_on_step_union():
+    """When val ran at a subset of train steps, the response keeps train and
+    val on a shared x-axis with ``None`` filling the slots where val didn't
+    run. Mirrors the alignment the public meta endpoint already does."""
+    from database.dashboard.api import _aligned_train_val, _downsample_pair
+
+    sparse = {
+        "train_loss_history": [
+            {"step": 10, "loss": 5.0},
+            {"step": 20, "loss": 4.0},
+            {"step": 40, "loss": 3.0},
+            {"step": 80, "loss": 2.0},
+        ],
+        "val_loss_history": [
+            {"step": 10, "loss": 6.0},
+            {"step": 80, "loss": 2.5},
+        ],
+    }
+    train, val = _aligned_train_val(sparse)
+    assert train == [5.0, 4.0, 3.0, 2.0]
+    assert val == [6.0, None, None, 2.5]
+
+    # _downsample_pair preserves the None placeholders so the SPA can render
+    # a continuous train line and a sparse dashed val line on a shared axis.
+    train_s, val_s = _downsample_pair(train, val)
+    assert train_s == [5.0, 4.0, 3.0, 2.0]
+    assert val_s == [6.0, None, None, 2.5]
+
+
+def test_aligned_train_val_handles_empty_and_legacy():
+    """No histories → empty arrays so callers fall through to legacy
+    ``loss_curve``; non-dict input is also tolerated."""
+    from database.dashboard.api import _aligned_train_val
+
+    assert _aligned_train_val({}) == ([], [])
+    assert _aligned_train_val(None) == ([], [])
+    assert _aligned_train_val({"loss_curve": [1.0, 2.0]}) == ([], [])
+
+
+def test_step_loss_pairs_tolerates_flops_key():
+    """Entries with the new {step, flops, loss} shape render identically to {step, loss}."""
+    from database.dashboard.api import _step_loss_pairs, _aligned_train_val, _meta_for_public
+
+    plain = [{"step": 10, "loss": 5.0}, {"step": 20, "loss": 4.0}]
+    augmented = [
+        {"step": 10, "flops": 6_000_000, "loss": 5.0},
+        {"step": 20, "flops": 12_000_000, "loss": 4.0},
+    ]
+    assert _step_loss_pairs(plain) == _step_loss_pairs(augmented)
+
+    # Mixing rows with and without the flops key is tolerated.
+    mixed = [
+        {"step": 10, "loss": 5.0},
+        {"step": 20, "flops": 12_000_000, "loss": 4.0},
+    ]
+    assert _step_loss_pairs(mixed) == _step_loss_pairs(plain)
+
+    # Whole-meta shaping output is also identical: train + val arrays match,
+    # and so do the scalar finals the public SPA reads.
+    plain_meta = {
+        "train_loss_history": plain,
+        "val_loss_history": [{"step": 20, "loss": 3.5}],
+    }
+    augmented_meta = {
+        "train_loss_history": augmented,
+        "val_loss_history": [{"step": 20, "flops": 12_000_000, "loss": 3.5}],
+    }
+    assert _aligned_train_val(plain_meta) == _aligned_train_val(augmented_meta)
+    assert _meta_for_public(plain_meta) == _meta_for_public(augmented_meta)
+
+
+def test_extract_loss_series_covers_all_shapes():
+    from database.dashboard.api import _extract_loss_series
+
+    assert _extract_loss_series({}) == []
+    assert _extract_loss_series(None) == []
+    # train_loss_history wins over val_loss_history
+    assert _extract_loss_series({
+        "train_loss_history": [{"step": 1, "loss": 3.0}, {"step": 2, "loss": 2.0}],
+        "val_loss_history":   [{"step": 1, "loss": 9.9}],
+    }) == [3.0, 2.0]
+    # val history is the fallback when train is empty/missing
+    assert _extract_loss_series({
+        "val_loss_history": [{"step": 1, "loss": 1.1}, {"step": 2, "loss": 0.9}],
+    }) == [1.1, 0.9]
+    # legacy bare-array loss_curve still works
+    assert _extract_loss_series({"loss_curve": [2.5, 1.5, 0.5]}) == [2.5, 1.5, 0.5]
+    # malformed entries are dropped
+    assert _extract_loss_series({
+        "train_loss_history": [{"step": 1}, {"loss": "bad"}, {"step": 2, "loss": 1.0}],
+    }) == [1.0]
 
 
 def test_miners_list(logged_in):
@@ -428,6 +907,252 @@ def test_miner_detail_missing(logged_in):
     assert r.status_code == 404
 
 
+# ── Provenance heatmap tests ──────────────────────────────────
+
+
+def test_provenance_view_renders(logged_in):
+    r = logged_in.get("/dashboard/provenance")
+    assert r.status_code == 200
+    assert "Provenance activity" in r.text
+    assert "heatmap-miner-rounds" in r.text
+    assert "heatmap-top-experiments" in r.text
+
+
+def test_provenance_miner_rounds_json(logged_in):
+    r = logged_in.get("/dashboard/api/provenance/miner_rounds.json")
+    assert r.status_code == 200
+    data = r.json()
+    assert set(data["rounds"]) == {7, 8}
+    # hk_a outranks hk_b in activity
+    assert data["miners"][0] == "hk_a"
+    assert "hk_b" in data["miners"]
+    # Unique-experiment count: hk_a round 8 accessed {0, 1} = 2
+    r8 = data["rounds"].index(8)
+    a = data["miners"].index("hk_a")
+    assert data["matrix"][a][r8] == 2
+
+
+def test_provenance_top_experiments_json(logged_in):
+    r = logged_in.get("/dashboard/api/provenance/top_experiments.json")
+    assert r.status_code == 200
+    data = r.json()
+    exp_ids = [e["id"] for e in data["experiments"]]
+    # Experiment 0 was referenced 3 times, experiment 1 twice → both in top-K
+    assert 0 in exp_ids and 1 in exp_ids
+    # Top-referenced first
+    assert exp_ids[0] == 0
+    # Matrix contains per-miner query counts
+    a = data["miners"].index("hk_a")
+    assert data["matrix"][a][exp_ids.index(0)] == 2  # hk_a queried exp 0 twice
+    assert data["matrix"][a][exp_ids.index(1)] == 2  # hk_a queried exp 1 twice
+
+
+def test_provenance_top_experiments_includes_names(logged_in):
+    r = logged_in.get("/dashboard/api/provenance/top_experiments.json")
+    data = r.json()
+    names = {e["id"]: e["name"] for e in data["experiments"]}
+    assert names[0] == "root"
+    assert names[1] == "child"
+
+
+# ── Per-experiment provenance public endpoints ───────────────
+
+
+class _FakeProvenance:
+    """Stand-in for ``PgProvenanceQuery`` in dashboard tests."""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    async def get_influences(self, experiment_id: int):
+        self.calls.append(("influences", experiment_id))
+        return [
+            {"source_id": 0, "evidence_type": "accessed",
+             "detail": {"round_id": 7}},
+            {"source_id": 0, "evidence_type": "shared_component",
+             "detail": {"component": "Attention"}},
+        ]
+
+    async def get_impact(self, experiment_id: int):
+        self.calls.append(("impact", experiment_id))
+        return [
+            {"target_id": 2, "evidence_type": "accessed_by",
+             "detail": {"round_id": 8}},
+        ]
+
+    async def get_similar(self, experiment_id: int, top_k: int = 10):
+        self.calls.append(("similar", experiment_id, top_k))
+        return [
+            {"target_id": 0, "jaccard": 0.9},
+            {"target_id": 2, "jaccard": 0.4},
+        ][:top_k]
+
+    async def get_experiment_graph(self, experiment_id: int, depth: int = 3):
+        self.calls.append(("graph", experiment_id, depth))
+        return {
+            "experiment_id": experiment_id,
+            "influences": await self.get_influences(experiment_id),
+            "impact": await self.get_impact(experiment_id),
+            "components": ["Attention", "LayerNorm"],
+        }
+
+
+@pytest.fixture
+def with_fake_provenance(logged_in):
+    """Attach a _FakeProvenance to the dashboard's store for one test.
+
+    Also clears the per-IP rate window — the dashboard suite shares a
+    single TestClient host across many tests, so by the time the
+    provenance block runs the window is near saturation and otherwise
+    bleeds 429s into later public-API tests.
+    """
+    from database import server as db_server
+    from database.dashboard import app as dash_app
+
+    db_server._ip_rate_window.clear()
+    state = dash_app._state
+    prev = state.store.provenance
+    fake = _FakeProvenance()
+    state.store.provenance = fake
+    try:
+        yield logged_in, fake
+    finally:
+        state.store.provenance = prev
+        db_server._ip_rate_window.clear()
+
+
+def test_provenance_influences_endpoint(with_fake_provenance):
+    client, fake = with_fake_provenance
+    r = client.get("/dashboard/api/provenance/1/influences.json")
+    assert r.status_code == 200
+    data = r.json()
+    assert isinstance(data, list)
+    assert any(item["source_id"] == 0 for item in data)
+    assert ("influences", 1) in fake.calls
+
+
+def test_provenance_impact_endpoint(with_fake_provenance):
+    client, fake = with_fake_provenance
+    r = client.get("/dashboard/api/provenance/1/impact.json")
+    assert r.status_code == 200
+    data = r.json()
+    assert data[0]["target_id"] == 2
+    assert ("impact", 1) in fake.calls
+
+
+def test_provenance_similar_endpoint(with_fake_provenance):
+    client, fake = with_fake_provenance
+    r = client.get("/dashboard/api/provenance/1/similar.json?top_k=1")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data) == 1
+    assert data[0]["target_id"] == 0
+    assert ("similar", 1, 1) in fake.calls
+
+
+def test_provenance_similar_clamps_top_k(with_fake_provenance):
+    client, fake = with_fake_provenance
+    # 9999 → clamped to 50
+    client.get("/dashboard/api/provenance/1/similar.json?top_k=9999")
+    assert ("similar", 1, 50) in fake.calls
+    # 0 → clamped to 1
+    client.get("/dashboard/api/provenance/1/similar.json?top_k=0")
+    assert ("similar", 1, 1) in fake.calls
+
+
+def test_provenance_graph_endpoint(with_fake_provenance):
+    client, fake = with_fake_provenance
+    r = client.get("/dashboard/api/provenance/1/graph.json")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["experiment_id"] == 1
+    assert "influences" in data and "impact" in data and "components" in data
+    assert ("graph", 1, 3) in fake.calls
+
+
+def test_provenance_endpoints_503_when_index_not_ready(logged_in):
+    """If ``store.provenance`` is None, all per-experiment endpoints 503.
+
+    This is the bootstrap state on a freshly-started dashboard process
+    before ``init_schema`` runs. The aggregate heatmap endpoints don't
+    depend on the index and remain available.
+    """
+    from database import server as db_server
+    from database.dashboard import app as dash_app
+
+    db_server._ip_rate_window.clear()
+    state = dash_app._state
+    prev = state.store.provenance
+    state.store.provenance = None
+    try:
+        for path in (
+            "/dashboard/api/provenance/1/influences.json",
+            "/dashboard/api/provenance/1/impact.json",
+            "/dashboard/api/provenance/1/similar.json",
+            "/dashboard/api/provenance/1/graph.json",
+        ):
+            r = logged_in.get(path)
+            assert r.status_code == 503, path
+        # Aggregates still work
+        r = logged_in.get("/dashboard/api/provenance/miner_rounds.json")
+        assert r.status_code == 200
+    finally:
+        state.store.provenance = prev
+
+
+# ── Agent bundle viewer + diff ────────────────────────────────
+
+
+def test_miner_detail_shows_agent_history(logged_in):
+    r = logged_in.get("/dashboard/miners/hk_a")
+    assert r.status_code == 200
+    assert "Agent code timeline" in r.text
+    # Both hash prefixes render, most recent first
+    v1_prefix = "hash_v1" + ("0" * 9)
+    v2_prefix = "hash_v2" + ("0" * 9)
+    assert v2_prefix in r.text and v1_prefix in r.text
+    # Diff link from v2 → v1 wired up
+    assert "/dashboard/agent_code/" in r.text
+    assert "/diff/" in r.text
+
+
+def test_agent_bundle_view_renders_files(logged_in):
+    hash_v1 = "hash_v1" + ("0" * 50)
+    r = logged_in.get(f"/dashboard/agent_code/{hash_v1}")
+    assert r.status_code == 200
+    # Bundle metadata + source code surfaced (quotes get HTML-escaped)
+    assert "hk_a" in r.text
+    assert "agent.py" in r.text
+    assert "return &#39;v1&#39;" in r.text
+    # The other hash appears in the compare picker
+    assert "hash_v2" in r.text
+
+
+def test_agent_bundle_view_unknown_hash_404(logged_in):
+    r = logged_in.get("/dashboard/agent_code/" + ("f" * 64))
+    assert r.status_code == 404
+
+
+def test_agent_bundle_diff_renders_unified_diff(logged_in):
+    hash_v1 = "hash_v1" + ("0" * 50)
+    hash_v2 = "hash_v2" + ("0" * 50)
+    r = logged_in.get(f"/dashboard/agent_code/{hash_v2}/diff/{hash_v1}")
+    assert r.status_code == 200
+    # Unified diff markers present (quotes are HTML-escaped in rendered text)
+    assert "language-diff" in r.text
+    assert "return &#39;v1&#39;" in r.text
+    assert "return &#39;v2&#39;" in r.text
+    # Unified-diff +/- prefixes on the changed lines
+    assert "-    return &#39;v1&#39;" in r.text
+    assert "+    return &#39;v2&#39;" in r.text
+
+
+def test_agent_bundle_diff_rejects_self(logged_in):
+    hash_v1 = "hash_v1" + ("0" * 50)
+    r = logged_in.get(f"/dashboard/agent_code/{hash_v1}/diff/{hash_v1}")
+    assert r.status_code == 400
+
+
 # ── Logs (R2) tests ───────────────────────────────────────────
 
 
@@ -441,7 +1166,9 @@ def test_logs_view_renders(logged_in):
 def test_logs_meta_json(logged_in):
     r = logged_in.get("/dashboard/logs/7/hk_a/meta")
     assert r.status_code == 200
-    assert r.json() == {"flops": 1234, "ok": True}
+    body = r.json()
+    assert body["flops"] == 1234
+    assert body["ok"] is True
 
 
 def test_logs_stdout_cap(logged_in):
@@ -468,3 +1195,388 @@ def test_logs_stdout_direct_redirect(logged_in):
     )
     assert r.status_code == 302
     assert r.headers["location"].startswith("https://fake-r2.example/")
+
+
+def test_logs_view_renders_architecture_and_loss_canvas(logged_in):
+    r = logged_in.get("/dashboard/logs/7/hk_a")
+    assert r.status_code == 200
+    # Architecture code is inlined into the page
+    assert "unit-test-model" in r.text
+    assert "architecture.py" in r.text
+    # Loss-history canvas is rendered when meta contains loss arrays
+    assert 'id="loss-history"' in r.text
+    assert 'data-round="7"' in r.text
+
+
+def test_logs_architecture_json(logged_in):
+    r = logged_in.get("/dashboard/logs/7/hk_a/architecture")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["truncated"] is False
+    assert "unit-test-model" in body["text"]
+
+
+def test_logs_architecture_direct_redirect(logged_in):
+    r = logged_in.get(
+        "/dashboard/logs/7/hk_a/architecture?direct=1", follow_redirects=False,
+    )
+    assert r.status_code == 302
+    assert r.headers["location"].startswith("https://fake-r2.example/")
+
+
+def test_logs_architecture_missing(logged_in):
+    r = logged_in.get("/dashboard/logs/99/hk_missing/architecture")
+    assert r.status_code == 404
+
+
+def test_logs_meta_includes_loss_history(logged_in):
+    # Cookie-gated route now reshapes to bare-number arrays + scalar finals
+    # to match the public API. Some SPA builds wired the loss-history panel
+    # against this URL — keeping the two routes in sync means val renders
+    # regardless of which one a deploy ends up hitting.
+    r = logged_in.get("/dashboard/logs/7/hk_a/meta")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["train_loss_history"] == [22.19, 14.71]
+    assert body["val_loss_history"] == [27.20, 21.28]
+    assert body["train_loss_final"] == 14.71
+    assert body["val_loss_final"] == 21.28
+
+
+# ── Public JSON endpoints for the SPA ─────────────────────────
+
+
+def test_public_tasks_stats_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/tasks_stats.json")
+    assert r.status_code == 200
+    assert "ts" in r.json()
+
+
+def test_public_tasks_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/tasks.json")
+    assert r.status_code == 200
+    assert "ts" in r.json()
+
+
+def test_public_miners_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/miners.json")
+    assert r.status_code == 200
+    hks = {m["miner_hotkey"] for m in r.json()}
+    assert {"hk_a", "hk_b"} <= hks
+
+
+def test_public_recent_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/recent.json?n=10")
+    assert r.status_code == 200
+    payload = r.json()
+    assert isinstance(payload, list)
+    assert len(payload) == 3  # 3 sample elements
+
+
+def test_public_challenge_json_nests_frontier_size(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/challenge.json")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["round_id"] == 42
+    assert body["task"] == "ts"
+    assert body["frontier_size"] == 2
+
+
+def test_public_rounds_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/rounds.json")
+    assert r.status_code == 200
+    assert set(r.json()) == {7, 8}
+
+
+def test_public_heartbeat_json(dashboard_client):
+    """Heartbeat exposes ``now``, ``last_submission_at``, and ``last_round_id``."""
+    from fastapi.testclient import TestClient
+    from database.dashboard import api as dash_api
+
+    # Reset the in-process cache so a previous test doesn't shadow this one.
+    dash_api._heartbeat_cache = None
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/heartbeat.json")
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"now", "last_submission_at", "last_round_id"}
+    assert body["last_round_id"] == 8
+    assert body["last_submission_at"] == 3000.0
+    assert body["now"] > 0
+
+
+def test_public_heartbeat_caches_in_process(dashboard_client):
+    """Repeated polls within the TTL share one cached payload."""
+    from fastapi.testclient import TestClient
+    from database.dashboard import api as dash_api
+
+    dash_api._heartbeat_cache = None
+    fresh = TestClient(app)
+    a = fresh.get("/dashboard/api/heartbeat.json").json()
+    b = fresh.get("/dashboard/api/heartbeat.json").json()
+    # ``now`` advances on every request, but the cached fields stay stable
+    # (and pinned to whatever was in the DB at the first call).
+    assert a["last_round_id"] == b["last_round_id"]
+    assert a["last_submission_at"] == b["last_submission_at"]
+    assert b["now"] >= a["now"]
+
+
+def test_public_benchmark_json(dashboard_client):
+    """Public benchmark endpoint mirrors the Jinja /dashboard/benchmark view."""
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/benchmark.json?task=ts&limit=100")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["task"] == "ts"
+    assert "ts" in body["tasks"]
+    by_round = {row["round_id"]: row for row in body["rows"]}
+    assert set(by_round) == {7, 8}
+    assert by_round[8]["best_metric"] == 0.9
+    assert by_round[7]["best_metric"] == 1.2
+
+
+def test_public_benchmark_json_defaults_to_first_task(dashboard_client):
+    """Omitting ``task`` falls back to the first known task (matches Jinja)."""
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/benchmark.json")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["task"] == "ts"
+    assert body["rows"]
+
+
+def test_public_benchmark_json_unknown_task(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/benchmark.json?task=nope")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["task"] == "nope"
+    assert body["rows"] == []
+
+
+def test_public_browse_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/browse.json?page=0&page_size=10")
+    assert r.status_code == 200
+    body = r.json()
+    assert "items" in body and "total" in body
+    assert "page" in body and "page_size" in body
+
+
+def test_public_experiment_by_index_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/experiments/1.json")
+    assert r.status_code == 200
+    assert r.json()["name"] == "child"
+
+    r2 = fresh.get("/dashboard/api/experiments/9999.json")
+    assert r2.status_code == 404
+
+
+def test_public_miner_submissions_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/miners/hk_a/submissions.json?limit=20")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["hotkey"] == "hk_a"
+    assert len(body["submissions"]) == 2
+    assert len(body["agent_history"]) == 2
+
+
+def test_public_experiment_trace_txt(dashboard_client):
+    from fastapi.testclient import TestClient
+    from database import server as db_server
+    db_server._ip_rate_window.clear()
+    fresh = TestClient(app)
+
+    r = fresh.get("/dashboard/api/experiments/1/trace.txt")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert "immutable" in r.headers.get("cache-control", "")
+    assert "agent: designing" in r.text
+
+    # Element with empty trace -> 404 (don't conflate "missing" with "empty")
+    empty = fresh.get("/dashboard/api/experiments/0/trace.txt")
+    assert empty.status_code == 404
+
+    missing = fresh.get("/dashboard/api/experiments/9999/trace.txt")
+    assert missing.status_code == 404
+
+
+def test_public_experiment_lineage_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/experiments/1/lineage.json")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["root"]["index"] == 1
+    assert isinstance(body["diffs"], list)
+
+
+def test_public_logs_endpoints(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    meta = fresh.get("/dashboard/api/logs/7/hk_a/meta.json")
+    assert meta.status_code == 200
+    assert meta.json()["flops"] == 1234
+
+    stdout = fresh.get("/dashboard/api/logs/7/hk_a/stdout.json")
+    assert stdout.status_code == 200
+    assert "epoch 0" in stdout.json()["text"]
+
+    arch = fresh.get("/dashboard/api/logs/7/hk_a/architecture.json")
+    assert arch.status_code == 200
+    assert "unit-test-model" in arch.json()["text"]
+
+
+def test_public_agent_code_json(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    hash_v1 = "hash_v1" + ("0" * 50)
+    r = fresh.get(f"/dashboard/api/agent_code/{hash_v1}.json")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["entry_point"] == "agent.py"
+    assert "agent.py" in body["files"]
+    assert "v1" in body["files"]["agent.py"]
+    # history excludes the requested hash
+    assert all(h["code_hash"] != hash_v1 for h in body["history"])
+
+
+def test_public_agent_code_unknown_returns_404(dashboard_client):
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/agent_code/" + ("f" * 64) + ".json")
+    assert r.status_code == 404
+
+
+def test_public_logs_meta_serves_from_postgres_cache_without_r2(dashboard_client):
+    """training_meta cached in Postgres is served even when R2 is unavailable.
+
+    Reproduces "training loss missing on the new dashboard": dashboard-mode
+    deploys (no R2) used to 404 the meta endpoint, hiding the loss curves.
+    """
+    from fastapi.testclient import TestClient
+    from database.dashboard import app as dash_app
+
+    saved_r2 = dash_app._state.r2
+    dash_app._state.r2 = None
+    try:
+        fresh = TestClient(app)
+        r = fresh.get("/dashboard/api/logs/7/hk_a/meta.json")
+        assert r.status_code == 200
+        meta = r.json()
+        # Public endpoint exposes index-aligned bare-number arrays so the
+        # radarnet.io chart can render train + val on a shared step axis.
+        assert meta["train_loss_history"] == [22.19, 14.71]
+        assert meta["val_loss_history"] == [27.20, 21.28]
+        assert meta["train_loss_final"] == 14.71
+        assert meta["val_loss_final"] == 21.28
+
+        # Round 8 only lives in R2, so without R2 it's a clean 404.
+        miss = fresh.get("/dashboard/api/logs/8/hk_a/meta.json")
+        assert miss.status_code == 404
+    finally:
+        dash_app._state.r2 = saved_r2
+
+
+def test_meta_for_public_aligns_train_and_val_on_step_union():
+    """Val that ran at a subset of train steps must appear at the right index
+    with ``None`` filling the slots where val didn't run — so the renderer
+    can draw a continuous train line and a sparse dashed val line on a
+    shared step axis."""
+    from database.dashboard.api import _meta_for_public
+
+    sparse = {
+        "round_id": 9, "miner_hotkey": "hk_a",
+        "train_loss_history": [
+            {"step": 10, "loss": 5.0},
+            {"step": 20, "loss": 4.0},
+            {"step": 40, "loss": 3.0},
+            {"step": 80, "loss": 2.0},
+        ],
+        "val_loss_history": [
+            {"step": 10, "loss": 6.0},
+            {"step": 80, "loss": 2.5},
+        ],
+    }
+    out = _meta_for_public(sparse)
+    assert out["train_loss_history"] == [5.0, 4.0, 3.0, 2.0]
+    assert out["val_loss_history"] == [6.0, None, None, 2.5]
+    assert out["train_loss_final"] == 2.0
+    assert out["val_loss_final"] == 2.5
+
+    # Val-only steps still show up in the union, with train null at those
+    # indices — ensures we don't silently drop late-stage val checks.
+    val_late = {
+        "train_loss_history": [{"step": 10, "loss": 5.0}],
+        "val_loss_history":   [{"step": 10, "loss": 6.0}, {"step": 100, "loss": 1.0}],
+    }
+    out = _meta_for_public(val_late)
+    assert out["train_loss_history"] == [5.0, None]
+    assert out["val_loss_history"] == [6.0, 1.0]
+    assert out["val_loss_final"] == 1.0
+    assert "train_loss_final" in out and out["train_loss_final"] == 5.0
+
+    # Empty histories: leave the field absent so the SPA falls through to
+    # ``loss_curve`` legacy rendering instead of drawing an empty chart.
+    legacy = {"loss_curve": [3.0, 2.0, 1.0]}
+    out = _meta_for_public(legacy)
+    assert "train_loss_history" not in out
+    assert "val_loss_final" not in out
+    assert out["loss_curve"] == [3.0, 2.0, 1.0]
+
+
+def test_public_logs_meta_falls_back_to_r2(dashboard_client):
+    """Rows that predate the cache are still served from R2."""
+    from fastapi.testclient import TestClient
+    fresh = TestClient(app)
+    r = fresh.get("/dashboard/api/logs/8/hk_a/meta.json")
+    assert r.status_code == 200
+    assert r.json()["flops"] == 5678
+
+
+def test_public_agent_code_json_works_without_r2(dashboard_client):
+    """Dashboard-mode deploys without R2 still serve bundles cached in Postgres.
+
+    Reproduces the original 503: drops the R2 client and confirms the cached
+    v1 bundle is served from the ``agent_bundles`` Postgres table alone.
+    """
+    from fastapi.testclient import TestClient
+    from database.dashboard import app as dash_app
+
+    saved_r2 = dash_app._state.r2
+    dash_app._state.r2 = None
+    try:
+        fresh = TestClient(app)
+        hash_v1 = "hash_v1" + ("0" * 50)
+        r = fresh.get(f"/dashboard/api/agent_code/{hash_v1}.json")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["files"]["agent.py"].endswith("'v1'\n")
+
+        # v2 isn't in the Postgres cache and there's no R2 fallback either —
+        # this should 404 rather than the legacy 503.
+        hash_v2 = "hash_v2" + ("0" * 50)
+        r2 = fresh.get(f"/dashboard/api/agent_code/{hash_v2}.json")
+        assert r2.status_code == 404
+    finally:
+        dash_app._state.r2 = saved_r2

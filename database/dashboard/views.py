@@ -169,10 +169,42 @@ async def experiment_lineage(request: Request, index: int):
 # ── Pareto ───────────────────────────────────────────────────
 
 @router.get("/pareto", response_class=HTMLResponse)
-async def pareto_view(request: Request, task: str = ""):
+async def pareto_view(request: Request, task: str = "", bucket: str = ""):
     state = get_state()
     tasks = await state.store.get_tasks()
-    return _html("pareto.html", request, task=task, tasks=tasks)
+    # Default to the first known task — the bucket selector is meaningless
+    # without one because tasks declare their own size_buckets in YAML.
+    if not task and tasks:
+        task = tasks[0]
+    from database.dashboard.api import _resolve_buckets
+    buckets = _resolve_buckets(task)
+    return _html(
+        "pareto.html",
+        request,
+        task=task,
+        tasks=tasks,
+        buckets=buckets,
+        selected_bucket=bucket,
+    )
+
+
+# ── Benchmark (eval score over time per task) ────────────────
+
+@router.get("/benchmark", response_class=HTMLResponse)
+async def benchmark_view(request: Request, task: str = ""):
+    state = get_state()
+    tasks = await state.store.get_tasks()
+    # Default to the first known task so the page is useful on first load.
+    if not task and tasks:
+        task = tasks[0]
+    rows = await q.benchmark_by_round(state.pool, task=task) if task else []
+    return _html(
+        "benchmark.html",
+        request,
+        task=task,
+        tasks=tasks,
+        rows=rows,
+    )
 
 
 # ── Miners ───────────────────────────────────────────────────
@@ -188,14 +220,97 @@ async def miners_list(request: Request):
 async def miner_detail(request: Request, hotkey: str):
     state = get_state()
     submissions = await q.miner_submissions(state.pool, hotkey, limit=200)
-    if not submissions:
+    agent_history = await q.miner_agent_history(state.pool, hotkey, limit=50)
+    if not submissions and not agent_history:
         raise HTTPException(status_code=404, detail="No submissions for this hotkey")
     return _html(
         "miner_detail.html",
         request,
         hotkey=hotkey,
         submissions=[e.to_api_dict() for e in submissions],
+        agent_history=agent_history,
     )
+
+
+# ── Agent code bundle viewer + diff ───────────────────────────
+
+async def _load_bundle(state, record: dict) -> Optional[dict]:
+    """Resolve bundle bytes for ``record`` — Postgres cache first, R2 fallback."""
+    bundle = await q.agent_bundle_blob(state.pool, record["code_hash"])
+    if bundle is not None:
+        return bundle
+    if state.r2 is None:
+        return None
+    try:
+        return state.r2.download_json(record["r2_key"])
+    except Exception:
+        return None
+
+
+@router.get("/agent_code/{code_hash}", response_class=HTMLResponse)
+async def agent_bundle_view(request: Request, code_hash: str):
+    state = get_state()
+    record = await q.agent_bundle_record(state.pool, code_hash)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Unknown code_hash")
+    bundle = await _load_bundle(state, record)
+    if not bundle:
+        raise HTTPException(status_code=404, detail="Bundle not found")
+    # History for the same hotkey powers the "compare to" picker
+    history = await q.miner_agent_history(state.pool, record["hotkey"], limit=50)
+    files = sorted((bundle.get("files") or {}).items())
+    return _html(
+        "agent_bundle.html",
+        request,
+        record=record,
+        entry_point=bundle.get("entry_point", record["entry_point"]),
+        files=files,
+        history=[h for h in history if h["code_hash"] != code_hash],
+    )
+
+
+@router.get("/agent_code/{code_hash}/diff/{other_hash}", response_class=HTMLResponse)
+async def agent_bundle_diff(request: Request, code_hash: str, other_hash: str):
+    import difflib
+    state = get_state()
+    if code_hash == other_hash:
+        raise HTTPException(status_code=400, detail="Cannot diff a bundle against itself")
+    rec_a = await q.agent_bundle_record(state.pool, other_hash)
+    rec_b = await q.agent_bundle_record(state.pool, code_hash)
+    if rec_a is None or rec_b is None:
+        raise HTTPException(status_code=404, detail="Unknown code_hash")
+    bundle_a = await _load_bundle(state, rec_a)
+    bundle_b = await _load_bundle(state, rec_b)
+    if not bundle_a or not bundle_b:
+        raise HTTPException(status_code=404, detail="Bundle not found")
+
+    files_a = bundle_a.get("files") or {}
+    files_b = bundle_b.get("files") or {}
+    all_names = sorted(set(files_a) | set(files_b))
+    diffs = []
+    for name in all_names:
+        src_a = (files_a.get(name) or "").splitlines(keepends=True)
+        src_b = (files_b.get(name) or "").splitlines(keepends=True)
+        diff_text = "".join(difflib.unified_diff(
+            src_a, src_b,
+            fromfile=f"{other_hash[:12]}/{name}",
+            tofile=f"{code_hash[:12]}/{name}",
+            lineterm="",
+        ))
+        diffs.append({"name": name, "diff": diff_text})
+    return _html(
+        "agent_bundle_diff.html",
+        request,
+        rec_a=rec_a, rec_b=rec_b,
+        diffs=diffs,
+    )
+
+
+# ── Provenance activity heatmaps ──────────────────────────────
+
+@router.get("/provenance", response_class=HTMLResponse)
+async def provenance_view(request: Request):
+    return _html("provenance.html", request)
 
 
 # ── Training logs (R2) ────────────────────────────────────────
@@ -203,8 +318,11 @@ async def miner_detail(request: Request, hotkey: str):
 @router.get("/logs/{round_id}/{hotkey}", response_class=HTMLResponse)
 async def logs_view(request: Request, round_id: int, hotkey: str):
     state = get_state()
-    meta = log_helpers.fetch_meta(state.r2, round_id, hotkey)
+    meta = await log_helpers.fetch_meta_cached_or_r2(
+        state.pool, state.r2, round_id, hotkey,
+    )
     stdout = log_helpers.fetch_stdout(state.r2, round_id, hotkey)
+    architecture = log_helpers.fetch_architecture(state.r2, round_id, hotkey)
     return _html(
         "logs.html",
         request,
@@ -212,16 +330,24 @@ async def logs_view(request: Request, round_id: int, hotkey: str):
         hotkey=hotkey,
         meta=meta,
         stdout=stdout,
+        architecture=architecture,
     )
 
 
 @router.get("/logs/{round_id}/{hotkey}/meta")
 async def logs_meta(round_id: int, hotkey: str):
     state = get_state()
-    meta = log_helpers.fetch_meta(state.r2, round_id, hotkey)
+    meta = await log_helpers.fetch_meta_cached_or_r2(
+        state.pool, state.r2, round_id, hotkey,
+    )
     if meta is None:
-        raise HTTPException(status_code=404, detail="No training_meta.json in R2")
-    return JSONResponse(meta)
+        raise HTTPException(status_code=404, detail="training_meta not found")
+    # Reshape to the same bare-number arrays + scalar finals the public API
+    # returns (see _meta_for_public). Some SPA builds wired the loss-history
+    # panel against this cookie-gated URL — keeping the two routes in sync
+    # means val renders regardless of which one a deploy ends up hitting.
+    from database.dashboard.api import _meta_for_public
+    return JSONResponse(_meta_for_public(meta))
 
 
 @router.get("/logs/{round_id}/{hotkey}/stdout")
@@ -235,4 +361,18 @@ async def logs_stdout(round_id: int, hotkey: str, direct: int = 0):
     payload = log_helpers.fetch_stdout(state.r2, round_id, hotkey)
     if payload is None:
         raise HTTPException(status_code=404, detail="No stdout.log in R2")
+    return JSONResponse(payload)
+
+
+@router.get("/logs/{round_id}/{hotkey}/architecture")
+async def logs_architecture(round_id: int, hotkey: str, direct: int = 0):
+    state = get_state()
+    if direct:
+        url = log_helpers.presigned_architecture_url(state.r2, round_id, hotkey)
+        if not url:
+            raise HTTPException(status_code=503, detail="R2 presign unavailable")
+        return RedirectResponse(url=url, status_code=302)
+    payload = log_helpers.fetch_architecture(state.r2, round_id, hotkey)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="No architecture.py in R2")
     return JSONResponse(payload)

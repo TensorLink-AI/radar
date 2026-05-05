@@ -23,6 +23,15 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from config import Config
+from miner.hosting import (
+    Deployment, TargonReadinessTimeout, deploy_basilica, deploy_targon,
+    get_targon_registry_creds, teardown_basilica_sync,
+    teardown_targon_with_retry, wait_for_trainer_ready,
+)
+from miner.targon_lifecycle import (
+    HealthMonitorRegistry, install_shutdown_handlers,
+    make_targon_client, validate_and_reap_orphans,
+)
 from shared.agent_code import bundle_from_directory, compute_code_hash
 from shared.auth import sign_request, verify_request
 from shared.commitment import ImageCommitment
@@ -40,8 +49,23 @@ class Miner:
         self.config = config
         self.netuid = config.netuid
 
+        # Fail-fast on Targon misconfig — operator gets a clear error at
+        # startup instead of a cryptic deploy failure on the first round.
+        if Config.HOSTING_BACKEND == "targon" and not os.environ.get("TARGON_API_KEY"):
+            raise RuntimeError(
+                "RADAR_HOSTING_BACKEND=targon but TARGON_API_KEY is not set. "
+                "Set the env var to the validator/miner's Targon account API key."
+            )
+        if Config.HOSTING_BACKEND == "targon" and not Config.OFFICIAL_TRAINING_IMAGE_DIGEST:
+            raise RuntimeError(
+                "RADAR_HOSTING_BACKEND=targon but OFFICIAL_TRAINING_IMAGE_DIGEST is empty. "
+                "Without a pinned digest validators cannot verify the deployed image — "
+                "set OFFICIAL_TRAINING_IMAGE_DIGEST=sha256:... to the subnet-owner-blessed value."
+            )
+
         self.wallet = bt.Wallet(config=config)
         self.subtensor = bt.Subtensor(config=config)
+        self._targon_client = None
 
         # Cache metagraph — synced periodically in keep-alive loop
         self.metagraph = self.subtensor.metagraph(self.netuid)
@@ -59,8 +83,12 @@ class Miner:
         self.listener_port = int(getattr(config, "listener_port", Config.MINER_LISTENER_PORT))
         self.external_ip = getattr(config, "external_ip", "") or "0.0.0.0"
 
-        # Active Basilica deployments: round_id → (deployment, created_at, ttl)
+        # Active deployments: round_id → (deployment, created_at, ttl)
         self.active_deployments: dict[int, tuple[object, float, int]] = {}
+        # Targon-only — defensive logging via HealthMonitor per round.
+        self._health_monitors = HealthMonitorRegistry()
+        # Set by SIGTERM/SIGINT so the run loop exits cleanly.
+        self._shutdown_event: asyncio.Event | None = None
 
         # Validator db_urls to notify when deployment completes: round_id → [urls]
         self._pending_notify: dict[int, list[str]] = {}
@@ -133,16 +161,23 @@ class Miner:
         logger.info("Committed to chain: code_hash=%s", code_hash[:24])
 
     async def _post_trainer_ready(
-        self, round_id: int, trainer_url: str,
-        instance_name: str, validator_db_url: str,
+        self, round_id: int, deployment: Deployment, validator_db_url: str,
     ):
-        """POST signed TrainerReady to a validator's DB server."""
+        """POST signed TrainerReady to a validator's DB server.
+
+        Carries Targon hosting metadata when present; empty strings for
+        Basilica deploys keep the wire format backwards-compatible.
+        """
         hotkey = self.wallet.hotkey.ss58_address
         ready = TrainerReady(
             round_id=round_id,
-            trainer_url=trainer_url,
-            instance_name=instance_name,
+            trainer_url=deployment.url,
+            instance_name=deployment.name,
             miner_hotkey=hotkey,
+            targon_workload_uid=deployment.targon_workload_uid,
+            cvm_ip=deployment.cvm_ip,
+            gpu_class=deployment.gpu_class,
+            deployed_image_digest=deployment.deployed_image_digest,
         )
         body = ready.to_json().encode()
         headers = sign_request(self.wallet, body)
@@ -171,14 +206,12 @@ class Miner:
         entry = self.active_deployments.get(request.round_id)
         if entry and entry != "pending":
             deployment, _ts, _ttl = entry
-            # Pod already deployed — just POST TrainerReady to this validator
             logger.info(
                 "Already deployed for round %d, notifying validator at %s",
                 request.round_id, request.validator_db_url,
             )
             await self._post_trainer_ready(
-                request.round_id, deployment.url, deployment.name,
-                request.validator_db_url,
+                request.round_id, deployment, request.validator_db_url,
             )
             return
         if entry == "pending":
@@ -195,190 +228,236 @@ class Miner:
         # Mark as in-progress to prevent duplicate deploys
         self.active_deployments[request.round_id] = "pending"
 
+        # TTL covers Phase A wait + training + upload buffer.
+        submission_wait = int(getattr(request, "submission_window_seconds", 0) or 600)
+        ttl = submission_wait + int(request.time_budget) + 600
+        hotkey = self.wallet.hotkey.ss58_address
+
+        network = os.environ.get("SUBTENSOR_NETWORK", "") or getattr(self.subtensor, "network", "") or ""
+
+        deploy_start = time.time()
         try:
-            from basilica import BasilicaClient
-            client = BasilicaClient()
-        except ImportError:
-            logger.error("basilica SDK not installed — cannot deploy trainer pod")
+            deployment = await self._deploy_one(request, hotkey, network, ttl)
+        except Exception as e:
+            logger.error(
+                "DEPLOY_FAILED round=%d backend=%s elapsed=%.1fs error=%s",
+                request.round_id, Config.HOSTING_BACKEND, time.time() - deploy_start, e,
+                exc_info=True,
+            )
+            self.active_deployments.pop(request.round_id, None)
+            self._pending_notify.pop(request.round_id, None)
             return
 
-        # TTL = Phase A window (wait for dispatch) + training + upload buffer
-        # The pod is created at Phase A start but dispatch doesn't arrive
-        # until Phase B, so the TTL must cover the full submission window.
-        # Pod auto-deletes after this even if release signal is missed.
-        submission_wait = int(getattr(request, "submission_window_seconds", 0) or 600)
-        ttl = submission_wait + int(request.time_budget) + 600  # window + training + 10 min buffer
-        deploy_timeout = 900  # 15 min max wait for GPU allocation
-        hotkey = self.wallet.hotkey.ss58_address
-        deploy_name = f"radar-trainer-{hotkey[:8]}-{request.round_id}"
+        logger.info(
+            "DEPLOY_OK round=%d backend=%s uid=%s url=%s elapsed=%.1fs",
+            request.round_id, Config.HOSTING_BACKEND,
+            deployment.targon_workload_uid or deployment.name,
+            deployment.url, time.time() - deploy_start,
+        )
+
+        # On Targon: wait for /health and CVM evidence endpoint before
+        # advertising the trainer. Tear down on timeout so we don't leak
+        # a half-ready workload.
+        if Config.HOSTING_BACKEND == "targon":
+            try:
+                ready_start = time.time()
+                await wait_for_trainer_ready(
+                    trainer_url=deployment.url,
+                    cvm_ip=deployment.cvm_ip,
+                    timeout_s=Config.TARGON_READINESS_TIMEOUT_S,
+                )
+                logger.info(
+                    "READINESS_OK round=%d uid=%s elapsed=%.1fs",
+                    request.round_id, deployment.targon_workload_uid,
+                    time.time() - ready_start,
+                )
+            except TargonReadinessTimeout as e:
+                logger.error(
+                    "READINESS_TIMEOUT round=%d uid=%s: %s — tearing down",
+                    request.round_id, deployment.targon_workload_uid, e,
+                )
+                await teardown_targon_with_retry(
+                    self._get_targon_client(), deployment.targon_workload_uid,
+                )
+                self.active_deployments.pop(request.round_id, None)
+                self._pending_notify.pop(request.round_id, None)
+                return
+
+        # Tear down the previous round's workload synchronously before
+        # we mark this one active. Targon bills by uptime; leaks cost
+        # real money.
+        await self._teardown_previous_round(request.round_id)
 
         try:
-            # Build env vars for the trainer pod
-            # No R2 credentials — trainer uses presigned URLs for uploads
-            pod_env = {}
-            # Propagate network settings: try env vars first, then fall back
-            # to the subtensor config (CLI args like --subtensor.network).
-            network = os.environ.get("SUBTENSOR_NETWORK", "")
-            if not network:
-                network = getattr(self.subtensor, "network", "") or ""
-            if network:
-                pod_env["SUBTENSOR_NETWORK"] = network
-
-            netuid = os.environ.get("NETUID", "")
-            if not netuid:
-                netuid = str(self.netuid)
-            if netuid:
-                pod_env["NETUID"] = netuid
-
-            logger.info(
-                "Deploying Basilica pod %s (image=%s, ttl=%ds, gpu=%d x %dGB min)",
-                deploy_name, self.trainer_image, ttl, request.gpu_count, request.min_gpu_memory_gb,
-            )
-
-            # Run blocking Basilica SDK calls in executor to avoid blocking event loop
-            import functools
-            loop = asyncio.get_event_loop()
-
-            deploy_kwargs = dict(
-                name=deploy_name,
-                image=self.trainer_image,
-                port=8081,
-                public=True,
-                replicas=1,
-                ttl_seconds=ttl,
-                gpu_count=request.gpu_count,
-                min_gpu_memory_gb=request.min_gpu_memory_gb,
-                memory=request.memory,
-                env=pod_env,
-                timeout=deploy_timeout,
-            )
-            # Pin to specific GPU models if configured
-            gpu_models_str = os.environ.get("RADAR_TRAINER_GPU_MODELS", "")
-            if gpu_models_str:
-                deploy_kwargs["gpu_models"] = [m.strip() for m in gpu_models_str.split(",") if m.strip()]
-
-            deployment = await loop.run_in_executor(
-                None, functools.partial(client.deploy, **deploy_kwargs),
-            )
-
-            trainer_url = deployment.url
-            logger.info(
-                "Basilica deployment ready: name=%s url=%s",
-                deployment.name, trainer_url,
-            )
-
-            # Enroll for public metadata so validators can verify the pod
-            try:
-                await loop.run_in_executor(
-                    None,
-                    functools.partial(
-                        client.enroll_metadata, deployment.name, enabled=True,
-                    ),
-                )
-                logger.info("Public metadata enrolled for %s", deployment.name)
-            except Exception as e:
-                logger.warning("Failed to enroll public metadata for %s: %s", deployment.name, e)
-
-            # POST signed TrainerReady back to requesting validator
             await self._post_trainer_ready(
-                request.round_id, trainer_url, deployment.name,
-                request.validator_db_url,
+                request.round_id, deployment, request.validator_db_url,
             )
-
             self.active_deployments[request.round_id] = (deployment, time.time(), ttl)
 
-            # Notify any validators that arrived while deployment was pending
-            pending_urls = self._pending_notify.pop(request.round_id, [])
-            for db_url in pending_urls:
+            for db_url in self._pending_notify.pop(request.round_id, []):
                 logger.info(
                     "Notifying queued validator at %s for round %d",
                     db_url, request.round_id,
                 )
-                await self._post_trainer_ready(
-                    request.round_id, trainer_url, deployment.name, db_url,
-                )
+                await self._post_trainer_ready(request.round_id, deployment, db_url)
             logger.info(
-                "Trainer ready for round %d at %s (instance=%s)",
-                request.round_id, deployment.url, deployment.name,
+                "TRAINER_READY round=%d uid=%s url=%s instance=%s backend=%s",
+                request.round_id,
+                deployment.targon_workload_uid or "-",
+                deployment.url, deployment.name, Config.HOSTING_BACKEND,
             )
+            if Config.HOSTING_BACKEND == "targon" and deployment.targon_workload_uid:
+                self._health_monitors.start(request.round_id, deployment)
         except Exception as e:
-            logger.error("Failed to deploy trainer for round %d: %s", request.round_id, e, exc_info=True)
-            # Clean up failed deployment so it doesn't consume quota
+            logger.error(
+                "POST_READY_FAILED round=%d uid=%s error=%s",
+                request.round_id, deployment.targon_workload_uid, e, exc_info=True,
+            )
             self.active_deployments.pop(request.round_id, None)
+            self._pending_notify.pop(request.round_id, None)
+
+    async def _teardown_previous_round(self, current_round_id: int) -> None:
+        """Tear down all rounds older than the current one. Sync, with retry on Targon."""
+        prior_rounds = [
+            rid for rid, entry in self.active_deployments.items()
+            if rid < current_round_id and entry != "pending"
+        ]
+        for rid in prior_rounds:
+            await self._health_monitors.stop(rid)
+            entry = self.active_deployments.pop(rid)
+            deployment, _ts, _ttl = entry
+            if deployment.targon_workload_uid:
+                ok = await teardown_targon_with_retry(
+                    self._get_targon_client(), deployment.targon_workload_uid,
+                )
+                if not ok:
+                    logger.error(
+                        "PRIOR_TEARDOWN_LEAK round=%d uid=%s — workload may bill until TTL",
+                        rid, deployment.targon_workload_uid,
+                    )
+            else:
+                try:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, teardown_basilica_sync, deployment.raw)
+                except Exception as e:
+                    logger.warning(
+                        "Prior-round Basilica teardown failed for round %d: %s", rid, e,
+                    )
+
+    async def _deploy_one(
+        self, request: TrainerRequest, hotkey: str, network: str, ttl: int,
+    ) -> Deployment:
+        """Backend-agnostic deploy. Picks Basilica or Targon by Config.HOSTING_BACKEND."""
+        if Config.HOSTING_BACKEND == "targon":
+            gpu_class = (Config.TRAINER_GPU_MODELS.split(",")[0].strip()
+                         if Config.TRAINER_GPU_MODELS else "H200")
+            return await deploy_targon(
+                targon_client=self._get_targon_client(),
+                request=request,
+                image=self.trainer_image,
+                deployed_image_digest=Config.OFFICIAL_TRAINING_IMAGE_DIGEST,
+                hotkey=hotkey,
+                netuid=self.netuid,
+                subtensor_network=network,
+                gpu_class=gpu_class,
+                registry=get_targon_registry_creds(),
+            )
+        return await deploy_basilica(
+            request=request,
+            image=self.trainer_image,
+            hotkey=hotkey,
+            netuid=self.netuid,
+            subtensor_network=network,
+            ttl=ttl,
+        )
+
+    def _get_targon_client(self):
+        if not getattr(self, "_targon_client", None):
+            self._targon_client = make_targon_client()
+        return self._targon_client
+
+    async def _targon_startup_check(self) -> None:
+        await validate_and_reap_orphans(self._get_targon_client())
+
+    async def _teardown_all_active(self) -> None:
+        """Synchronous-feeling teardown of every active deployment."""
+        active = list(self.active_deployments.items())
+        for rid, entry in active:
+            if entry == "pending":
+                self.active_deployments.pop(rid, None)
+                continue
+            deployment, _ts, _ttl = entry
+            self.active_deployments.pop(rid, None)
             try:
-                from basilica import BasilicaClient
-                BasilicaClient().delete_deployment(deploy_name)
-                logger.info("Cleaned up failed deployment %s", deploy_name)
-            except Exception:
-                pass  # may not exist or already deleted
+                await self._teardown(deployment)
+                logger.info("SHUTDOWN_TEARDOWN round=%d ok", rid)
+            except Exception as e:
+                logger.warning("SHUTDOWN_TEARDOWN round=%d failed: %s", rid, e)
 
     async def handle_release(self, round_id: int):
-        """Tear down the Basilica pod for a completed round."""
+        """Tear down the trainer pod for a completed round."""
+        await self._health_monitors.stop(round_id)
         entry = self.active_deployments.pop(round_id, None)
         if entry and entry != "pending":
             deployment = entry[0]
             try:
-                deployment.delete()
+                await self._teardown(deployment)
                 logger.info("Released trainer for round %d (deployment=%s)", round_id, deployment.name)
             except Exception as e:
                 logger.debug("Teardown failed: %s (TTL will clean up)", e)
 
-    async def _teardown_prior_rounds(self, current_round_id: int):
-        """Delete prior-round deployments whose TTL has elapsed.
+    async def _teardown(self, deployment: Deployment) -> None:
+        """Backend-aware teardown.
 
-        Only tears down pods that have exceeded their expected lifetime
-        (created_at + ttl), so pods still actively training are left alone.
-        Called at the start of handle_prepare when a new round arrives.
+        Targon path retries 3 times with exponential backoff — the workload
+        bills by uptime, so quietly leaking it costs the operator real money.
         """
+        if deployment.targon_workload_uid:
+            await teardown_targon_with_retry(
+                self._get_targon_client(), deployment.targon_workload_uid,
+            )
+            return
+        # Basilica deployment objects expose a sync .delete() — run in executor.
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, teardown_basilica_sync, deployment.raw)
+
+    async def _teardown_prior_rounds(self, current_round_id: int):
+        """Delete prior-round deployments whose TTL has elapsed."""
         now = time.time()
         expired = [
             rid for rid, entry in self.active_deployments.items()
             if rid != current_round_id
             and entry != "pending"
-            and now >= entry[1] + entry[2]  # created_at + ttl
+            and now >= entry[1] + entry[2]
         ]
         for rid in expired:
-            entry = self.active_deployments.pop(rid)
-            deployment, created, _ttl = entry
-            age_min = (now - created) / 60
+            deployment, created, _ttl = self.active_deployments.pop(rid)
             try:
-                deployment.delete()
+                await self._teardown(deployment)
                 logger.info(
                     "Tore down expired deployment: round %d (%s, %.0f min old)",
-                    rid, deployment.name, age_min,
+                    rid, deployment.name, (now - created) / 60,
                 )
             except Exception as e:
-                logger.debug(
-                    "Teardown failed for round %d: %s (TTL will clean up)",
-                    rid, e,
-                )
+                logger.debug("Teardown failed for round %d: %s (TTL will clean up)", rid, e)
 
     async def _reap_stale_deployments(self):
-        """Safety-net: delete any deployment whose TTL has elapsed.
-
-        Runs in the heartbeat loop to catch pods that linger when no new
-        round arrives to trigger ``_teardown_prior_rounds``.
-        """
+        """Heartbeat safety-net: delete any deployment past its TTL."""
         now = time.time()
         expired = [
             rid for rid, entry in self.active_deployments.items()
             if entry != "pending" and now >= entry[1] + entry[2]
         ]
         for rid in expired:
-            entry = self.active_deployments.pop(rid)
-            deployment, created, _ttl = entry
-            age_min = (now - created) / 60
+            deployment, created, _ttl = self.active_deployments.pop(rid)
             try:
-                deployment.delete()
+                await self._teardown(deployment)
                 logger.info(
                     "Reaped expired deployment for round %d (%s, %.0f min old)",
-                    rid, deployment.name, age_min,
+                    rid, deployment.name, (now - created) / 60,
                 )
             except Exception as e:
-                logger.debug(
-                    "Reap failed for round %d: %s (TTL will clean up)",
-                    rid, e,
-                )
+                logger.debug("Reap failed for round %d: %s (TTL will clean up)", rid, e)
 
     def _setup_listener_routes(self):
         """Register listener endpoints on the FastAPI app."""
@@ -448,6 +527,17 @@ class Miner:
 
     async def run(self):
         """Start listener, submit agent code, and keep alive."""
+        # Targon startup: validate creds + reap any leaked workloads from
+        # a prior crashed process before we start subscribing to validators.
+        if Config.HOSTING_BACKEND == "targon":
+            await self._targon_startup_check()
+
+        self._shutdown_event = asyncio.Event()
+        install_shutdown_handlers(
+            asyncio.get_event_loop(),
+            self._shutdown_event,
+            self._teardown_all_active,
+        )
         self.start_listener()
         await self.submit_agent_code()
         logger.info(
@@ -458,7 +548,18 @@ class Miner:
         )
 
         while True:
-            await asyncio.sleep(300)
+            try:
+                # Sleep up to 300s but wake immediately on shutdown signal.
+                if self._shutdown_event is not None:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=300)
+                else:
+                    await asyncio.sleep(300)
+                # Reaching here means the event fired — exit the loop.
+                logger.info("Shutdown event set — exiting run loop")
+                return
+            except asyncio.TimeoutError:
+                pass  # normal heartbeat tick
+
             try:
                 self.metagraph = self.subtensor.metagraph(self.netuid)
                 await self._reap_stale_deployments()

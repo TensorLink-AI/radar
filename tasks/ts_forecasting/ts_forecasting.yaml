@@ -16,6 +16,16 @@ eval_command: "python /workspace/frozen/evaluate.py"
 time_budget: 300
 kill_timeout: 600
 
+# FLOPs-equivalent size buckets for this task. Each round deterministically
+# picks one bucket from this list. Time-series forecasting models are small,
+# so the range tops out around 125M FLOPs per forward pass.
+size_buckets:
+  - [100000, 500000]         # tiny
+  - [500000, 2000000]        # small
+  - [2000000, 10000000]      # medium-small
+  - [10000000, 50000000]     # medium
+  - [50000000, 125000000]    # large
+
 runner_dir: runner/timeseries_forecast
 docker_memory: "8g"
 docker_cpus: "2"

@@ -92,9 +92,31 @@ class DatabaseClient:
         except Exception:
             return False
 
-    async def add_experiment(self, element_data: dict) -> Optional[int]:
-        """POST a DataElement dict to the database. Returns new index or None."""
-        result = await self._post("/experiments/add", {"data": element_data})
+    async def add_experiment(
+        self,
+        element_data: dict,
+        substrate_cid: str = "",
+        validator_hotkey: str = "",
+        artifact_cids: Optional[list[dict]] = None,
+    ) -> Optional[int]:
+        """POST a DataElement dict to the database. Returns new index or None.
+
+        When ``substrate_cid`` is non-empty the server appends a
+        ``{kind: "phase_c_record", validator_hotkey, cid, round_id}`` entry
+        to the row's ``substrate_cids`` audit list.
+
+        ``artifact_cids`` (TEN-240 Phase 7) supplies extra audit entries
+        for dual-written non-DB artifacts. Each element is appended to the
+        list verbatim — callers set the ``kind`` (``checkpoint``,
+        ``architecture``, ``training_meta``, …).
+        """
+        payload: dict = {"data": element_data}
+        if substrate_cid:
+            payload["substrate_cid"] = substrate_cid
+            payload["validator_hotkey"] = validator_hotkey
+        if artifact_cids:
+            payload["artifact_cids"] = artifact_cids
+        result = await self._post("/experiments/add", payload)
         if result and "index" in result:
             return result["index"]
         return None
@@ -156,6 +178,23 @@ class DatabaseClient:
         """GET a miner's agent code bundle from the DB server."""
         return await self._get(f"/agent_code/{hotkey}")
 
+    async def get_agent_code_history(
+        self, hotkey: str, limit: int = 100,
+    ) -> list[dict]:
+        """GET the full submission timeline for a hotkey (most recent first)."""
+        result = await self._get(
+            f"/agent_code/{hotkey}/history", params={"limit": limit},
+        )
+        if isinstance(result, dict):
+            subs = result.get("submissions")
+            if isinstance(subs, list):
+                return subs
+        return []
+
+    async def get_agent_code_by_hash(self, code_hash: str) -> Optional[dict]:
+        """GET an immutable agent bundle by its content hash."""
+        return await self._get(f"/agent_code/by_hash/{code_hash}")
+
     async def submit_agent_code(
         self, files: dict[str, str], entry_point: str = "agent.py",
     ) -> Optional[dict]:
@@ -163,6 +202,18 @@ class DatabaseClient:
         return await self._post("/agent_code", {
             "files": files, "entry_point": entry_point,
         })
+
+    async def submit_training_meta(
+        self, round_id: int, hotkey: str, meta: dict,
+    ) -> bool:
+        """POST a training_meta.json blob so the public dashboard can render
+        loss curves without R2 access. Idempotent on (round_id, hotkey)."""
+        result = await self._post("/training_metas", {
+            "round_id": int(round_id),
+            "hotkey": hotkey,
+            "meta": meta,
+        })
+        return result is not None
 
     async def close(self):
         """Close the underlying HTTP client."""

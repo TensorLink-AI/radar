@@ -17,6 +17,20 @@ from runner.harness import TaskRunner, TrainingConfig, run_training as generic_r
 logger = logging.getLogger(__name__)
 
 
+def _decode_json_list(raw: str) -> list[str] | None:
+    """Decode a JSON list from an env var. Returns None when unset/invalid/empty."""
+    import json
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(value, list) or not value:
+        return None
+    return value
+
+
 class TSForecastingRunner:
     """TaskRunner implementation for time-series forecasting."""
 
@@ -46,41 +60,49 @@ class TSForecastingRunner:
         import json
         import os
         from prepare import get_dataloader
+
         data_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "")
-        # Pretrain shard URLs passed via env var (JSON list of presigned URLs)
-        pretrain_urls_raw = os.environ.get("RADAR_PRETRAIN_SHARD_URLS", "")
+
+        # Local paths win — set by sandbox_runner.py from prefetched shards.
+        pretrain_shard_paths = _decode_json_list(
+            os.environ.get("RADAR_PRETRAIN_LOCAL_PATHS", ""),
+        )
+        # URLs are only consulted when local paths are absent (legacy /
+        # in-process path used by tests).
         pretrain_shard_urls = None
-        if pretrain_urls_raw:
-            try:
-                pretrain_shard_urls = json.loads(pretrain_urls_raw)
-            except (json.JSONDecodeError, TypeError):
-                pass
+        if not pretrain_shard_paths:
+            pretrain_shard_urls = _decode_json_list(
+                os.environ.get("RADAR_PRETRAIN_SHARD_URLS", ""),
+            )
+
         return get_dataloader(
             batch_size=batch_size,
             data_dir=data_dir if data_dir else None,
             pretrain_shard_urls=pretrain_shard_urls,
+            pretrain_shard_paths=pretrain_shard_paths,
         )
 
     def get_val_dataloader(self, batch_size: int):
         """Yield val batches from the reserved pretrain val shard.
 
-        Reads RADAR_PRETRAIN_VAL_SHARD_URLS (JSON list). Returns None if unset.
-        Val batches come from a shard that is fixed across rounds (the
-        coordinator presigns the same shard URL every round for val).
+        Reads ``RADAR_PRETRAIN_VAL_LOCAL_PATHS`` (set by the sandbox after
+        prefetch) or, as a fallback for direct in-process callers,
+        ``RADAR_PRETRAIN_VAL_SHARD_URLS``.  Returns None if neither is set.
+        Val batches come from a shard that is fixed across rounds.
 
         Contract: finite + deterministic — same batches in same order every call.
         """
-        import json
         import os
 
-        urls_raw = os.environ.get("RADAR_PRETRAIN_VAL_SHARD_URLS", "")
-        if not urls_raw:
-            return None
-        try:
-            shard_urls = json.loads(urls_raw)
-        except (json.JSONDecodeError, TypeError):
-            return None
-        if not shard_urls:
+        shard_paths = _decode_json_list(
+            os.environ.get("RADAR_PRETRAIN_VAL_LOCAL_PATHS", ""),
+        )
+        shard_urls = None
+        if not shard_paths:
+            shard_urls = _decode_json_list(
+                os.environ.get("RADAR_PRETRAIN_VAL_SHARD_URLS", ""),
+            )
+        if not (shard_paths or shard_urls):
             return None
 
         from pretrain_loader import pretrain_dataloader
@@ -94,6 +116,7 @@ class TSForecastingRunner:
             # function yields the same batches.
             loader = pretrain_dataloader(
                 shard_urls=shard_urls,
+                shard_paths=shard_paths,
                 batch_size=batch_size,
                 context_len=CONTEXT_LEN,
                 shuffle_buffer_size=1,
@@ -106,31 +129,117 @@ class TSForecastingRunner:
 
         return _val_iter()
 
+    @staticmethod
+    def _align_pred_target(predictions: Any, targets: Any):
+        """Truncate predictions/targets to a common forecast horizon.
+
+        Models always output PREDICTION_LEN=96 steps, but GIFT-Eval datasets
+        each have their own native prediction length (e.g. hourly=48).
+        Without this alignment, the loss call broadcasts 96 vs 48 at dim 1
+        and PyTorch raises a tensor-size mismatch that fails training.
+        """
+        p, t = predictions.shape[1], targets.shape[1]
+        if p == t:
+            return predictions, targets
+        n = min(p, t)
+        return predictions[:, :n], targets[:, :n]
+
     def default_loss(self, predictions: Any, targets: Any) -> Any:
         """Quantile loss (pinball) — the ts_forecasting default."""
         import torch
         c = self._load_constants()
         quantiles = c["quantiles"]
+        predictions, targets = self._align_pred_target(predictions, targets)
         target_expanded = targets.unsqueeze(-1)
         errors = target_expanded - predictions
         q = torch.tensor(quantiles, device=predictions.device)
         return torch.max(q * errors, (q - 1) * errors).mean()
+
+    def compute_val_metrics(
+        self, predictions: Any, targets: Any, inputs: Any,
+    ) -> dict[str, tuple[float, float]]:
+        """CRPS (weighted quantile loss) and MASE on the pretrain val shard.
+
+        Per-batch components ``(num_sum, den_sum)`` are returned; the harness
+        sums them across the val pass and reports ``num/den`` per metric.
+        Pretrain shards mix frequencies, so MASE uses season=1 (1-step naive
+        baseline scale).
+        """
+        import torch
+
+        c = self._load_constants()
+        quantiles = c["quantiles"]
+        median_idx = len(quantiles) // 2
+        predictions, targets = self._align_pred_target(predictions, targets)
+
+        finite = (
+            torch.isfinite(predictions).flatten(1).all(dim=1)
+            & torch.isfinite(targets).flatten(1).all(dim=1)
+        )
+        if not finite.any():
+            return {}
+        predictions = predictions[finite]
+        targets = targets[finite]
+        if inputs.shape[0] == finite.shape[0]:
+            inputs = inputs[finite]
+
+        device = predictions.device
+        quantiles_t = torch.tensor(quantiles, device=device)
+
+        # CRPS components (gluonts mean_weighted_sum_quantile_loss axis=None):
+        # num = (2/Q) Σ pinball(y, q_pred), den = Σ |y|.
+        target_expanded = targets.unsqueeze(-1)
+        errors = target_expanded - predictions
+        q_view = quantiles_t.view(1, 1, 1, -1)
+        pinball = torch.max(q_view * errors, (q_view - 1) * errors)
+        crps_num = float(((2.0 / quantiles_t.numel()) * pinball).sum().item())
+        crps_den = float(targets.abs().sum().item())
+
+        # MASE components, season=1 (mixed-freq pretrain windows have no
+        # known seasonality — fall back to the 1-step naive baseline).
+        median_pred = predictions[..., median_idx]              # (B, H, V)
+        H = targets.shape[1]
+        err = (targets - median_pred).abs().sum(dim=1)          # (B, V)
+        if inputs.shape[1] >= 2:
+            diffs = (inputs[:, 1:] - inputs[:, :-1]).abs()      # (B, ctx-1, V)
+            scale = diffs.mean(dim=1)                           # (B, V)
+        else:
+            scale = torch.ones_like(err)
+        valid = torch.isfinite(scale) & (scale > 0)
+        if valid.any():
+            mase_err = float(err[valid].sum().item())
+            mase_scale = float((H * scale[valid]).sum().item())
+        else:
+            mase_err, mase_scale = 0.0, 0.0
+
+        return {
+            "crps": (crps_num, crps_den),
+            "mase": (mase_err, mase_scale),
+        }
 
     def wrap_loss(self, sub_loss_fn):
         """Wrap miner's compute_loss for backward compat.
 
         Old ts_forecasting harness called compute_loss(preds, targets, QUANTILES).
         Generic harness calls loss_fn(preds, targets). This adapter handles both.
+        Also aligns prediction/target horizons so miners don't have to worry
+        about GIFT-Eval per-dataset prediction lengths.
         """
         c = self._load_constants()
         quantiles = c["quantiles"]
         sig = inspect.signature(sub_loss_fn)
+        align = self._align_pred_target
         if len(sig.parameters) >= 3:
             # Old-style 3-arg: compute_loss(preds, targets, quantiles)
             def wrapped(predictions, targets):
+                predictions, targets = align(predictions, targets)
                 return sub_loss_fn(predictions, targets, quantiles)
             return wrapped
-        return sub_loss_fn
+
+        def wrapped_2arg(predictions, targets):
+            predictions, targets = align(predictions, targets)
+            return sub_loss_fn(predictions, targets)
+        return wrapped_2arg
 
     def measure_flops(self, model: Any, device: str) -> int:
         try:
@@ -162,67 +271,6 @@ def run_training(architecture_code: str, config: dict) -> dict:
 
 
 # ── Eval template for Phase C ────────────────────────────────────────
-
-EVAL_TEMPLATE = '''
-import json
-import os
-import random
-import sys
-
-import torch
-from safetensors.torch import load_file
-
-from prepare import validate, CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES
-from flops import compute_flops_equivalent
-
-random.seed({eval_split_seed})
-torch.manual_seed({eval_split_seed})
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-
-arch_path = "{arch_path}"
-checkpoint_path = "{checkpoint_path}"
-device = "{device}"
-
-try:
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("submission", arch_path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    if not hasattr(mod, "build_model") or not callable(mod.build_model):
-        print(json.dumps({{"crps": float("inf"), "mase": float("inf"), "error": "Missing build_model()"}}))
-        sys.exit(0)
-
-    model = mod.build_model(CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES).to(device)
-    state_dict = load_file(checkpoint_path, device=device)
-    model.load_state_dict(state_dict)
-
-    flops_equiv = 0
-    try:
-        flops_equiv = compute_flops_equivalent(model, CONTEXT_LEN, NUM_VARIATES, device)
-    except Exception:
-        pass
-
-    param_count = sum(p.numel() for p in model.parameters())
-    if hasattr(model, "reset"):
-        model.reset()
-    model.eval()
-
-    data_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "")
-    metrics = validate(model, seed={eval_split_seed},
-                       data_dir=data_dir if data_dir else None)
-
-    result = {{
-        "crps": metrics["crps"],
-        "ncrps": metrics.get("ncrps", float("inf")),
-        "mase": metrics["mase"],
-        "flops_equivalent_size": flops_equiv,
-        "param_count": param_count,
-    }}
-    if "n_datasets" in metrics:
-        result["n_datasets"] = metrics["n_datasets"]
-    print(json.dumps(result))
-except Exception as e:
-    print(json.dumps({{"crps": float("inf"), "mase": float("inf"), "error": str(e)}}))
-'''
+# Kept in a zero-dep sibling module so the validator can load it via
+# importlib without pulling torch/prepare/flops.
+from runner.timeseries_forecast.eval_template import EVAL_TEMPLATE  # noqa: E402,F401

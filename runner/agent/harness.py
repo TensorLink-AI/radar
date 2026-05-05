@@ -20,6 +20,7 @@ blocks all egress except to allowed hosts.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -169,6 +170,12 @@ def main():
     miner_uid = challenge.get("miner_uid")
     if miner_uid is not None:
         default_headers["X-Miner-UID"] = str(miner_uid)
+    # Without X-Miner-Hotkey the DB server logs every agent request under the
+    # synthetic "validator" hotkey, collapsing per-miner provenance heatmaps
+    # into a single row.
+    miner_hotkey = challenge.get("miner_hotkey")
+    if miner_hotkey:
+        default_headers["X-Miner-Hotkey"] = str(miner_hotkey)
 
     client = GatedClient(allowed_prefixes, default_headers=default_headers)
     log(f"GatedClient initialised with {len(allowed_prefixes)} allowed prefixes")
@@ -188,40 +195,58 @@ def main():
     if agent_dir not in sys.path:
         sys.path.insert(0, agent_dir)
 
-    try:
-        agent_mod = _load_agent(agent_path)
-    except Exception as e:
-        log(f"Failed to load agent module: {e}")
-        log(traceback.format_exc())
-        print(json.dumps({"error": f"Agent load failed: {e}"}))
-        sys.exit(1)
+    # Redirect miner stdout → stderr. Stdout is reserved for the final JSON
+    # proposal; without this, any plain print() inside miner code either
+    # silently vanishes or corrupts the JSON the caller tries to parse. Errors
+    # are emitted to the real stdout via sys.__stdout__.
+    result: dict | None = None
+    with contextlib.redirect_stdout(sys.stderr):
+        try:
+            agent_mod = _load_agent(agent_path)
+        except Exception as e:
+            log(f"Failed to load agent module: {e}")
+            log(traceback.format_exc())
+            print(json.dumps({"error": f"Agent load failed: {e}"}), file=sys.__stdout__)
+            sys.exit(1)
 
-    if not hasattr(agent_mod, "design_architecture") or not callable(agent_mod.design_architecture):
-        print(json.dumps({"error": "Agent module missing design_architecture()"}))
-        sys.exit(1)
+        if not hasattr(agent_mod, "design_architecture") or not callable(agent_mod.design_architecture):
+            print(json.dumps({"error": "Agent module missing design_architecture()"}), file=sys.__stdout__)
+            sys.exit(1)
 
-    # 4. Inject scratchpad helpers into the module namespace
-    agent_mod.load_scratchpad = lambda ch, local_dir="/tmp/scratchpad": load_scratchpad(ch, client, local_dir)
-    agent_mod.save_scratchpad = lambda ch, local_dir="/tmp/scratchpad": save_scratchpad(ch, client, local_dir)
+        # 4. Inject scratchpad helpers into the module namespace
+        agent_mod.load_scratchpad = lambda ch, local_dir="/tmp/scratchpad": load_scratchpad(ch, client, local_dir)
+        agent_mod.save_scratchpad = lambda ch, local_dir="/tmp/scratchpad": save_scratchpad(ch, client, local_dir)
 
-    # 5. Call the miner's agent
-    try:
-        result = agent_mod.design_architecture(challenge, client)
-    except Exception as e:
-        log(f"design_architecture() failed: {e}")
-        log(traceback.format_exc())
-        print(json.dumps({"error": f"Agent failed: {e}"}))
-        sys.exit(1)
+        # 5. Call the miner's agent
+        try:
+            result = agent_mod.design_architecture(challenge, client)
+        except Exception as e:
+            log(f"design_architecture() failed: {e}")
+            log(traceback.format_exc())
+            print(json.dumps({"error": f"Agent failed: {e}"}), file=sys.__stdout__)
+            sys.exit(1)
 
     # 6. Validate and output
     if not isinstance(result, dict) or "code" not in result:
         print(json.dumps({"error": "design_architecture() must return dict with 'code' key"}))
         sys.exit(1)
 
+    # Pass through optional self-reported reasoning trace and tool-call log
+    # if the agent populated them. Both are open-schema; the harness does
+    # not validate or normalise contents — that's the validator's job.
+    reasoning = result.get("reasoning", "")
+    tool_calls = result.get("tool_calls", [])
+    if not isinstance(reasoning, str):
+        reasoning = str(reasoning)
+    if not isinstance(tool_calls, list):
+        tool_calls = []
+
     proposal = {
         "code": result.get("code", ""),
         "name": result.get("name", ""),
         "motivation": result.get("motivation", ""),
+        "reasoning": reasoning,
+        "tool_calls": tool_calls,
     }
     print(json.dumps(proposal))
 

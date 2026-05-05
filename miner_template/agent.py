@@ -17,11 +17,33 @@ on-chain, and validators fetch + run it every round.
 
 Your agent module MUST define:
     design_architecture(challenge: dict, client: GatedClient) -> dict
-        Returns {"code": str, "name": str, "motivation": str}
+        Returns {"code": str, "name": str, "motivation": str,
+                 "reasoning": str (optional), "tool_calls": list (optional)}
 
 The ``code`` field should be a Python module that defines:
     build_model(context_len, prediction_len, num_variates, quantiles) -> nn.Module
     build_optimizer(model) -> torch.optim.Optimizer
+
+``reasoning`` and ``tool_calls`` are exposed verbatim on the public dashboard
+and saved with the experiment. They're self-reported, so don't expect them to
+count for trust — pair them with the validator-observed proxy access logs if
+you want a story that holds up under scrutiny.
+
+Optional architecture conventions (all opt-in, harness-side):
+  * ``model._aux_losses``: if your ``forward()`` appends differentiable scalar
+    tensors to this list (e.g. ``self._aux_losses.append(0.01 * entropy_term)``
+    for an MoE load-balancing penalty, sparsity term, or KL regularizer), the
+    harness sums them, adds the sum to the main loss before backprop, then
+    clears the list. Non-finite aux totals are dropped silently. Architectures
+    that never touch ``_aux_losses`` train identically to the previous harness.
+  * ``on_step_begin(model, optimizer, step, total_steps, loss_value)``: called
+    after ``loss.backward()`` and before ``optimizer.step()`` on every
+    accumulated optim step. Useful for gradient surgery (PCGrad), per-group
+    grad clipping, EMA-teacher updates, or progressive freezing. Mirrors the
+    existing ``on_step_end`` signature; failures are logged and swallowed.
+  * Time budget: the harness sqrt-scales ``time_budget`` by ``max_flops`` (10M
+    FLOPs anchor, clamped to ``[base, 4×base]``) so larger architectures get
+    proportionally more wallclock without unbounded round drift.
 """
 
 import json
@@ -150,8 +172,14 @@ def design_architecture(challenge: dict, client) -> dict:
             Use client.get_json(url), client.post_json(url, payload), etc.
 
     Returns:
-        dict with keys: code, name, motivation
+        dict with keys: code, name, motivation, reasoning, tool_calls
     """
+    # Self-reported reasoning trace + tool call log. The validator copies
+    # these straight onto the experiment row, so anything you append here
+    # shows up on the public dashboard. Append entries as you go.
+    reasoning_steps: list[str] = []
+    tool_calls: list[dict] = []
+
     # Load persistent state from previous rounds
     scratch_dir = load_scratchpad(challenge)
 
@@ -159,6 +187,10 @@ def design_architecture(challenge: dict, client) -> dict:
     min_flops = challenge.get("min_flops_equivalent", 0)
     max_flops = challenge.get("max_flops_equivalent", 0)
     log(f"Designing for FLOPs range [{min_flops}, {max_flops}], frontier size: {len(frontier)}")
+    reasoning_steps.append(
+        f"Round target: FLOPs [{min_flops}, {max_flops}], "
+        f"frontier has {len(frontier)} entries."
+    )
 
     # Example: search arxiv for relevant papers
     # papers = _search_arxiv(client, challenge, "time series forecasting transformer")
@@ -176,6 +208,15 @@ def design_architecture(challenge: dict, client) -> dict:
 
     hp = _pick_hyperparams(min_flops, max_flops)
     log(f"Selected hyperparams: {hp}")
+    reasoning_steps.append(
+        f"Picked preset {hp} targeting ~60% of FLOPs cap to stay in range."
+    )
+    tool_calls.append({
+        "tool": "internal",
+        "name": "_pick_hyperparams",
+        "input": {"min_flops": min_flops, "max_flops": max_flops},
+        "output": hp,
+    })
 
     if frontier:
         best = min(frontier, key=lambda x: x.get("metric", float("inf")))
@@ -183,10 +224,16 @@ def design_architecture(challenge: dict, client) -> dict:
             f"Improving on frontier best (metric={best.get('metric', '?')}). "
             f"Target FLOPs range: [{min_flops}, {max_flops}]"
         )
+        reasoning_steps.append(
+            f"Frontier present; aiming to beat best metric={best.get('metric', '?')}."
+        )
     else:
         motivation = (
             f"No frontier in size range [{min_flops}, {max_flops}]. "
             f"Exploring with baseline transformer."
+        )
+        reasoning_steps.append(
+            "No frontier in this bucket; submitting baseline transformer to bootstrap."
         )
 
     d_model = hp["d_model"]
@@ -234,4 +281,6 @@ def build_optimizer(model):
         "code": code,
         "name": f"transformer_d{d_model}_l{num_layers}_ff{dim_feedforward}",
         "motivation": motivation,
+        "reasoning": "\n".join(reasoning_steps),
+        "tool_calls": tool_calls,
     }

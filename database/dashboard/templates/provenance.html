@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Radar — Provenance{% endblock %}
+{% block content %}
+<h1>Provenance activity</h1>
+<p class="muted">
+    What each miner's agent has queried. Sourced from <code>miner_access_log</code>.
+    Rows are miners (top by total activity); darker cells = higher activity.
+</p>
+
+<section>
+    <h2>Miner &times; round — unique experiments queried</h2>
+    <div class="heatmap" id="heatmap-miner-rounds"
+         data-endpoint="/dashboard/api/provenance/miner_rounds.json"
+         data-col-label="round"
+         data-col-link="/dashboard/experiments?round_id={col}"
+         data-row-link="/dashboard/miners/{row}"></div>
+</section>
+
+<section>
+    <h2>Miner &times; top-20 experiments — query counts</h2>
+    <div class="heatmap" id="heatmap-top-experiments"
+         data-endpoint="/dashboard/api/provenance/top_experiments.json"
+         data-col-label="experiment"
+         data-col-link="/dashboard/experiments/{col}"
+         data-row-link="/dashboard/miners/{row}"></div>
+</section>
+{% endblock %}

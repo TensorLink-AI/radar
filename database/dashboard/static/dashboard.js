@@ -45,35 +45,106 @@
             .catch((err) => console.warn("loss curve fetch failed:", err));
     }
 
-    // ── Pareto scatter ──
+    // ── Pareto scatter (per-bucket frontiers) ──
     const scatter = document.getElementById("pareto-scatter");
     if (scatter) {
         const task = scatter.dataset.task || "";
-        const qs = task ? `?task=${encodeURIComponent(task)}` : "";
-        fetch(`/dashboard/api/pareto.json${qs}`)
+        const bucket = scatter.dataset.bucket || "";
+        const qs = new URLSearchParams();
+        if (task) qs.set("task", task);
+        if (bucket !== "" && bucket !== "None") qs.set("bucket", bucket);
+        const url = `/dashboard/api/pareto.json${qs.toString() ? "?" + qs.toString() : ""}`;
+
+        // One color per bucket index — cycle through if a task declares more
+        // than 6 buckets. Distinct hues so the chart legend doubles as the
+        // bucket key.
+        const BUCKET_COLORS = [
+            "#6ea8fe", // tiny     (blue)
+            "#48c78e", // small    (green)
+            "#f0b429", // mid-low  (amber)
+            "#f78da7", // mid-high (rose)
+            "#b18cf0", // large    (purple)
+            "#5fd2c5", // xl       (teal)
+        ];
+        const colorFor = (i) => BUCKET_COLORS[((i % BUCKET_COLORS.length) + BUCKET_COLORS.length) % BUCKET_COLORS.length];
+
+        fetch(url)
             .then((r) => r.json())
             .then((data) => {
                 const pts = data.points || [];
-                const frontier = pts.filter((p) => p.on_frontier);
-                const dominated = pts.filter((p) => !p.on_frontier);
+                const buckets = data.buckets || [];
+
+                // Group points by bucket; out-of-range points (bucket -1) get
+                // their own muted dataset so operators can still see them.
+                const byBucket = new Map();
+                for (const p of pts) {
+                    const k = (p.bucket_index === undefined || p.bucket_index === null) ? -1 : p.bucket_index;
+                    if (!byBucket.has(k)) byBucket.set(k, []);
+                    byBucket.get(k).push(p);
+                }
+
+                const datasets = [];
+                const fmt = (n) => {
+                    if (n >= 1e12) return (n / 1e12) + "T";
+                    if (n >= 1e9)  return (n / 1e9)  + "B";
+                    if (n >= 1e6)  return (n / 1e6)  + "M";
+                    if (n >= 1e3)  return (n / 1e3)  + "K";
+                    return String(n);
+                };
+
+                for (const b of buckets) {
+                    const items = byBucket.get(b.index) || [];
+                    if (!items.length) continue;
+                    const color = colorFor(b.index);
+                    const frontier = items.filter((p) => p.on_frontier)
+                        .sort((a, b) => a.flops - b.flops);
+                    const dominated = items.filter((p) => !p.on_frontier);
+                    if (dominated.length) {
+                        datasets.push({
+                            label: `${b.label} dominated (${dominated.length})`,
+                            data: dominated.map((p) => ({x: p.flops, y: p.metric, id: p.id, name: p.name})),
+                            backgroundColor: color + "55", // ~33% alpha
+                            borderColor: color + "55",
+                            pointRadius: 3,
+                            showLine: false,
+                        });
+                    }
+                    if (frontier.length) {
+                        datasets.push({
+                            label: `${b.label} frontier (${frontier.length})`,
+                            data: frontier.map((p) => ({x: p.flops, y: p.metric, id: p.id, name: p.name})),
+                            backgroundColor: color,
+                            borderColor: color,
+                            pointRadius: 5,
+                            showLine: frontier.length > 1,
+                            borderWidth: 2,
+                            tension: 0,
+                        });
+                    }
+                }
+
+                const outOfRange = byBucket.get(-1) || [];
+                if (outOfRange.length) {
+                    datasets.push({
+                        label: `outside any bucket (${outOfRange.length})`,
+                        data: outOfRange.map((p) => ({x: p.flops, y: p.metric, id: p.id, name: p.name})),
+                        backgroundColor: "rgba(138,143,153,0.4)",
+                        pointRadius: 3,
+                        showLine: false,
+                    });
+                }
+
+                if (!datasets.length) {
+                    scatter.replaceWith(Object.assign(document.createElement("p"), {
+                        className: "muted",
+                        textContent: "No experiments with FLOPs + metric in this view.",
+                    }));
+                    return;
+                }
+
                 new Chart(scatter, {
                     type: "scatter",
-                    data: {
-                        datasets: [
-                            {
-                                label: `frontier (${frontier.length})`,
-                                data: frontier.map((p) => ({x: p.flops, y: p.metric, id: p.id, name: p.name})),
-                                backgroundColor: "#6ea8fe",
-                                pointRadius: 5,
-                            },
-                            {
-                                label: `dominated (${dominated.length})`,
-                                data: dominated.map((p) => ({x: p.flops, y: p.metric, id: p.id, name: p.name})),
-                                backgroundColor: "rgba(138,143,153,0.5)",
-                                pointRadius: 3,
-                            },
-                        ],
-                    },
+                    data: {datasets},
                     options: {
                         scales: {
                             x: {
@@ -92,7 +163,7 @@
                                 callbacks: {
                                     label: (ctx) => {
                                         const p = ctx.raw;
-                                        return `#${p.id} ${p.name || ""} — ${p.y.toFixed(4)} @ ${p.x}`;
+                                        return `#${p.id} ${p.name || ""} — ${p.y.toFixed(4)} @ ${fmt(p.x)} FLOPs`;
                                     },
                                 },
                             },
@@ -106,9 +177,171 @@
                         },
                     },
                 });
+
+                const legend = document.getElementById("pareto-legend");
+                if (legend) {
+                    if (buckets.length) {
+                        const sel = data.selected_bucket;
+                        const note = (sel === null || sel === undefined)
+                            ? `Showing all ${buckets.length} buckets — each frontier is computed independently.`
+                            : `Showing one bucket: ${(buckets.find((b) => b.index === sel) || {}).label || sel}.`;
+                        legend.textContent = note;
+                    } else {
+                        legend.textContent = "No buckets defined for this task — using global defaults.";
+                    }
+                }
             })
             .catch((err) => console.warn("pareto fetch failed:", err));
     }
+
+    // ── Loss history on logs page (train + val) ──
+    const lossHist = document.getElementById("loss-history");
+    if (lossHist) {
+        const round = lossHist.dataset.round;
+        const hk = lossHist.dataset.hotkey;
+        fetch(`/dashboard/logs/${round}/${encodeURIComponent(hk)}/meta`)
+            .then((r) => r.json())
+            .then((meta) => {
+                // Accepts both shapes the route may return: the raw
+                // [{step, loss}, ...] form and the reshaped bare-number /
+                // null arrays (see _meta_for_public). Bare numbers fall back
+                // to using the array index as x, which matches how the
+                // public SPA charts the same payload.
+                const toXY = (arr) => (arr || [])
+                    .map((p, i) => {
+                        if (p == null) return null;
+                        if (typeof p === "number") return {x: i, y: p};
+                        return {x: p.step, y: p.loss};
+                    })
+                    .filter((p) => p && Number.isFinite(p.x) && Number.isFinite(p.y));
+                const train = toXY(meta.train_loss_history);
+                const val = toXY(meta.val_loss_history);
+                // Legacy fallback: loss_curve is a bare array of floats
+                const legacy = Array.isArray(meta.loss_curve)
+                    ? meta.loss_curve.map((y, i) => ({x: i, y})).filter((p) => Number.isFinite(p.y))
+                    : [];
+
+                const datasets = [];
+                if (train.length) datasets.push({
+                    label: "train", data: train,
+                    borderColor: "#6ea8fe", backgroundColor: "rgba(110,168,254,0.15)",
+                    tension: 0.15, pointRadius: 0, borderWidth: 2,
+                });
+                if (val.length) datasets.push({
+                    label: "val", data: val,
+                    borderColor: "#f0b429", backgroundColor: "rgba(240,180,41,0.12)",
+                    tension: 0.15, pointRadius: 0, borderWidth: 2,
+                });
+                if (!datasets.length && legacy.length) datasets.push({
+                    label: "loss", data: legacy,
+                    borderColor: "#6ea8fe", backgroundColor: "rgba(110,168,254,0.15)",
+                    tension: 0.15, pointRadius: 0, borderWidth: 2,
+                });
+                if (!datasets.length) {
+                    lossHist.replaceWith(Object.assign(document.createElement("p"), {
+                        className: "muted",
+                        textContent: "No loss history recorded.",
+                    }));
+                    return;
+                }
+                new Chart(lossHist, {
+                    type: "line",
+                    data: {datasets},
+                    options: {
+                        parsing: false,
+                        plugins: { legend: { labels: { color: "#e6e6e6" } } },
+                        scales: {
+                            x: {
+                                type: "linear",
+                                title: { display: true, text: "step", color: "#8a8f99" },
+                                ticks: { color: "#8a8f99" },
+                            },
+                            y: {
+                                title: { display: true, text: "loss", color: "#8a8f99" },
+                                ticks: { color: "#8a8f99" },
+                            },
+                        },
+                    },
+                });
+            })
+            .catch((err) => console.warn("loss history fetch failed:", err));
+    }
+
+    // ── Heatmaps (provenance page) ──
+    const renderHeatmap = (el, data) => {
+        const rows = data.miners || [];
+        const cols = data.rounds || (data.experiments || []).map((e) => e.id);
+        const colLabels = data.rounds
+            ? cols.map((c) => String(c))
+            : (data.experiments || []).map((e) => `#${e.id}`);
+        const matrix = data.matrix || [];
+        if (!rows.length || !cols.length) {
+            el.innerHTML = '<div class="hm-empty">No access log activity yet.</div>';
+            return;
+        }
+        let max = 0;
+        for (const r of matrix) for (const v of r) if (v > max) max = v;
+
+        const colLinkTpl = el.dataset.colLink || "";
+        const rowLinkTpl = el.dataset.rowLink || "";
+        const shade = (v) => {
+            if (!v || max === 0) return "#12151b";
+            const t = Math.log1p(v) / Math.log1p(max);
+            const alpha = 0.12 + t * 0.88;
+            return `rgba(110, 168, 254, ${alpha.toFixed(3)})`;
+        };
+
+        const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({
+            "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+        }[c]));
+        const shortRow = (s) => (s.length > 18 ? s.slice(0, 16) + "…" : s);
+
+        const head = ["<thead><tr><th></th>"];
+        cols.forEach((c, j) => {
+            const label = colLabels[j];
+            const href = colLinkTpl ? colLinkTpl.replace("{col}", encodeURIComponent(c)) : "";
+            head.push(
+                href
+                    ? `<th class="hm-col"><a href="${esc(href)}">${esc(label)}</a></th>`
+                    : `<th class="hm-col">${esc(label)}</th>`,
+            );
+        });
+        head.push("</tr></thead>");
+
+        const body = ["<tbody>"];
+        rows.forEach((hk, i) => {
+            const rowHref = rowLinkTpl ? rowLinkTpl.replace("{row}", encodeURIComponent(hk)) : "";
+            body.push(
+                rowHref
+                    ? `<tr><th class="hm-row"><a href="${esc(rowHref)}" title="${esc(hk)}">${esc(shortRow(hk))}</a></th>`
+                    : `<tr><th class="hm-row" title="${esc(hk)}">${esc(shortRow(hk))}</th>`,
+            );
+            cols.forEach((c, j) => {
+                const v = (matrix[i] && matrix[i][j]) || 0;
+                const bg = shade(v);
+                const colorStyle = v && max && v / max > 0.55 ? "color:#0b0d11" : "color:var(--muted)";
+                const cellLabel = v ? String(v) : "";
+                const title = `${hk} × ${colLabels[j]}: ${v}`;
+                body.push(
+                    `<td class="hm-cell" style="background:${bg};${colorStyle}" title="${esc(title)}">${esc(cellLabel)}</td>`,
+                );
+            });
+            body.push("</tr>");
+        });
+        body.push("</tbody>");
+
+        el.innerHTML = `<table>${head.join("")}${body.join("")}</table>`;
+    };
+
+    document.querySelectorAll(".heatmap[data-endpoint]").forEach((el) => {
+        fetch(el.dataset.endpoint)
+            .then((r) => r.json())
+            .then((data) => renderHeatmap(el, data))
+            .catch((err) => {
+                console.warn("heatmap fetch failed:", err);
+                el.innerHTML = '<div class="hm-empty">Failed to load activity data.</div>';
+            });
+    });
 
     // ── Highlight HTMX-swapped diffs with Prism ──
     document.body.addEventListener("htmx:afterSwap", () => {

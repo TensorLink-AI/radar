@@ -44,6 +44,11 @@ class Challenge:
     scratchpad_put_url: str = ""   # presigned PUT URL for scratchpad.tar.gz
     scratchpad_max_mb: int = 10    # size limit enforced by agent
 
+    # Per-task cognition-wiki tarball — presigned GET to a markdown corpus
+    # the agent can fetch and read while designing an architecture.
+    # Empty string = no wiki configured for this round.
+    cognition_wiki_url: str = ""
+
     def to_json(self) -> str:
         return json.dumps({
             "challenge_id": self.challenge_id,
@@ -62,6 +67,7 @@ class Challenge:
             "scratchpad_get_url": self.scratchpad_get_url,
             "scratchpad_put_url": self.scratchpad_put_url,
             "scratchpad_max_mb": self.scratchpad_max_mb,
+            "cognition_wiki_url": self.cognition_wiki_url,
         })
 
     @classmethod
@@ -72,17 +78,31 @@ class Challenge:
 
 @dataclass
 class Proposal:
-    """Returned by a miner in response to a Challenge."""
+    """Returned by a miner in response to a Challenge.
+
+    ``reasoning`` and ``tool_calls`` are *self-reported* — the agent author
+    populates them. They are useful for explainability but trivially
+    fakeable; pair with validator-observed signals (proxy access logs,
+    pod wall-clock) for adversarial use.
+    """
 
     code: str = ""
     name: str = ""
     motivation: str = ""
+    # Free-form prose the agent emits to explain its design choice.
+    reasoning: str = ""
+    # List of dicts the agent self-reports about external calls it made
+    # (e.g. {"tool": "llm", "prompt": "...", "summary": "..."}). Schema is
+    # intentionally open so different agents can use different shapes.
+    tool_calls: list = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps({
             "code": self.code,
             "name": self.name,
             "motivation": self.motivation,
+            "reasoning": self.reasoning,
+            "tool_calls": self.tool_calls,
         })
 
     @classmethod
@@ -140,11 +160,25 @@ class TrainerRequest:
 
 @dataclass
 class TrainerReady:
-    """Miner → Validator: my trainer pod is live at this URL."""
+    """Miner → Validator: my trainer pod is live at this URL.
+
+    The Targon-specific fields (``targon_workload_uid``, ``cvm_ip``,
+    ``gpu_class``, ``deployed_image_digest``) are populated only when
+    ``RADAR_HOSTING_BACKEND=targon``; on Basilica deploys they stay
+    empty strings. The miner signs the whole envelope via Epistula —
+    the validator trusts these per-round ephemeral fields because the
+    signature is bound to the on-chain hotkey.
+    """
     round_id: int = 0
     trainer_url: str = ""
     instance_name: str = ""
     miner_hotkey: str = ""
+
+    # Targon hosting metadata (empty on Basilica deploys).
+    targon_workload_uid: str = ""
+    cvm_ip: str = ""
+    gpu_class: str = ""               # "H100" | "H200" | "B200"
+    deployed_image_digest: str = ""   # the digest the miner deployed
 
     def to_json(self) -> str:
         return json.dumps({
@@ -152,6 +186,10 @@ class TrainerReady:
             "trainer_url": self.trainer_url,
             "instance_name": self.instance_name,
             "miner_hotkey": self.miner_hotkey,
+            "targon_workload_uid": self.targon_workload_uid,
+            "cvm_ip": self.cvm_ip,
+            "gpu_class": self.gpu_class,
+            "deployed_image_digest": self.deployed_image_digest,
         })
 
     @classmethod

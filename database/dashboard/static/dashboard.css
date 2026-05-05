@@ -120,6 +120,51 @@ pre.stdout { font-size: 12px; }
 
 .pager { margin-top: 16px; display: flex; gap: 16px; }
 
+/* heatmap */
+.heatmap {
+    overflow-x: auto;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+}
+.heatmap .hm-empty { color: var(--muted); padding: 8px 4px; }
+.heatmap table { border-collapse: separate; border-spacing: 2px; }
+.heatmap th, .heatmap td {
+    font-size: 11px;
+    text-align: center;
+    white-space: nowrap;
+}
+.heatmap th.hm-col {
+    color: var(--muted);
+    font-weight: 500;
+    transform: rotate(-60deg);
+    transform-origin: left bottom;
+    height: 60px;
+    width: 24px;
+    padding: 0 0 2px 2px;
+}
+.heatmap th.hm-row {
+    color: var(--muted);
+    font-weight: 500;
+    text-align: right;
+    padding: 0 8px;
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.heatmap th.hm-row a { color: inherit; }
+.heatmap th.hm-row a:hover { color: var(--accent); }
+.heatmap td.hm-cell {
+    width: 22px;
+    height: 22px;
+    border-radius: 3px;
+    background: #12151b;
+    color: #0b0d11;
+}
+.heatmap td.hm-cell.hm-has-link { cursor: pointer; }
+.heatmap td.hm-cell.hm-has-link:hover { outline: 1px solid var(--accent); }
+
 /* login */
 body.login {
     display: flex; align-items: center; justify-content: center;

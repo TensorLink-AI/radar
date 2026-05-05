@@ -14,6 +14,9 @@ CREATE TABLE IF NOT EXISTS experiments (
     code TEXT NOT NULL DEFAULT '',
     motivation TEXT NOT NULL DEFAULT '',
     trace TEXT NOT NULL DEFAULT '',
+    reasoning TEXT NOT NULL DEFAULT '',
+    tool_calls JSONB NOT NULL DEFAULT '[]',
+    agent_behavior JSONB NOT NULL DEFAULT '{}',
     metric DOUBLE PRECISION,
     success BOOLEAN NOT NULL DEFAULT FALSE,
     analysis TEXT NOT NULL DEFAULT '',
@@ -29,12 +32,20 @@ CREATE TABLE IF NOT EXISTS experiments (
     timestamp DOUBLE PRECISION NOT NULL DEFAULT 0.0,
     round_id BIGINT,
     task TEXT NOT NULL DEFAULT '',
+    -- Substrate audit trail (TEN-240). One element per validator that
+    -- published a Phase C Hippius bundle covering this experiment.
+    substrate_cids JSONB NOT NULL DEFAULT '[]',
     search_vector tsvector
 );
 -- Migration: round_id is derived from ``seed_int % 2**32`` in
 -- ``shared.challenge.generate_challenge`` and can exceed INT32's 2.1B max.
 -- Widen existing deployments to BIGINT; no-op if already BIGINT.
 ALTER TABLE experiments ALTER COLUMN round_id TYPE BIGINT;
+-- Migration (TEN-240): substrate_cids was added to the CREATE TABLE above
+-- after deployments already had an experiments table, so the IF NOT EXISTS
+-- table-create is a no-op and the column is missing. Add it explicitly.
+ALTER TABLE experiments
+    ADD COLUMN IF NOT EXISTS substrate_cids JSONB NOT NULL DEFAULT '[]';
 """
 
 SCHEMA_INDEX_DDL = """
@@ -57,6 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_task_success ON experiments(task, success);
 CREATE INDEX IF NOT EXISTS idx_task_metric ON experiments(task, metric)
     WHERE metric IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_search ON experiments USING GIN(search_vector);
+CREATE INDEX IF NOT EXISTS idx_substrate_cids ON experiments USING GIN(substrate_cids);
 """
 
 FTS_FUNCTION_DDL = """
@@ -71,10 +83,20 @@ END;
 $$ LANGUAGE plpgsql;
 """
 
+# The IF NOT EXISTS guard must be scoped to the current schema's experiments
+# table because tgname is unique per-relation, not globally. Under multi-
+# network deployments (testnet + mainnet schemas in the same database) an
+# unqualified ``tgname = 'experiments_search_trigger'`` check matches the
+# OTHER schema's trigger and silently skips creation here, leaving this
+# schema's experiments without the FTS trigger. Casting ``'experiments'`` to
+# ``regclass`` resolves it via the session's search_path, so each schema
+# gets its own trigger.
 FTS_TRIGGER_DDL = """
 DO $$ BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM pg_trigger WHERE tgname = 'experiments_search_trigger'
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'experiments_search_trigger'
+          AND tgrelid = 'experiments'::regclass
     ) THEN
         CREATE TRIGGER experiments_search_trigger
             BEFORE INSERT OR UPDATE ON experiments
@@ -140,6 +162,52 @@ CREATE TABLE IF NOT EXISTS agent_submissions (
 ALTER TABLE agent_submissions ALTER COLUMN round_submitted TYPE BIGINT;
 CREATE INDEX IF NOT EXISTS idx_agent_hotkey ON agent_submissions(hotkey);
 CREATE INDEX IF NOT EXISTS idx_agent_hash ON agent_submissions(code_hash);
+
+-- Append-only history of every agent submission. Unlike agent_submissions
+-- (one row per hotkey, overwritten on each upload), this preserves the full
+-- timeline so we can answer "which exact bytes was miner X running at
+-- round N?" — join miner_access_log entries to the most recent history
+-- row where round_submitted <= round_id.
+CREATE TABLE IF NOT EXISTS agent_submission_history (
+    id SERIAL PRIMARY KEY,
+    hotkey TEXT NOT NULL,
+    miner_uid INTEGER NOT NULL DEFAULT -1,
+    code_hash TEXT NOT NULL,
+    entry_point TEXT NOT NULL DEFAULT 'agent.py',
+    r2_key TEXT NOT NULL,
+    round_submitted BIGINT NOT NULL DEFAULT -1,
+    timestamp DOUBLE PRECISION NOT NULL DEFAULT 0.0
+);
+CREATE INDEX IF NOT EXISTS idx_ash_hotkey ON agent_submission_history(hotkey);
+CREATE INDEX IF NOT EXISTS idx_ash_hash ON agent_submission_history(code_hash);
+CREATE INDEX IF NOT EXISTS idx_ash_round ON agent_submission_history(round_submitted);
+CREATE INDEX IF NOT EXISTS idx_ash_hotkey_round
+    ON agent_submission_history(hotkey, round_submitted DESC);
+
+-- Content-addressed cache of agent bundle bytes. Keyed by code_hash so
+-- repeated submissions of the same bundle (common when a miner re-submits
+-- the same code across rounds) share a single row. Lets the public
+-- dashboard JSON API serve bundles without an R2 round-trip — and, more
+-- importantly, without R2 credentials at all, so dashboard-mode deploys
+-- (Railway) don't need write access to the bucket.
+CREATE TABLE IF NOT EXISTS agent_bundles (
+    code_hash TEXT PRIMARY KEY,
+    bundle JSONB NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL DEFAULT extract(epoch from now())
+);
+
+-- Cache of training_meta.json (loss histories, status, flops, …) keyed by
+-- (round_id, hotkey). Validators write this after Phase B so the public
+-- dashboard JSON API can serve training-loss curves without R2 access.
+CREATE TABLE IF NOT EXISTS training_metas (
+    round_id BIGINT NOT NULL,
+    hotkey TEXT NOT NULL,
+    meta JSONB NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL DEFAULT extract(epoch from now()),
+    PRIMARY KEY (round_id, hotkey)
+);
+CREATE INDEX IF NOT EXISTS idx_tm_round ON training_metas(round_id);
+CREATE INDEX IF NOT EXISTS idx_tm_hotkey ON training_metas(hotkey);
 """
 
 ACCESS_LOG_SCHEMA = """
@@ -210,12 +278,33 @@ def row_to_element(row) -> DataElement:
     ``_decode_jsonb`` so callers always get dict/list regardless of whether
     the asyncpg connection has a JSONB codec registered.
     """
+    # New columns may be missing on rows produced by older schemas (e.g. a
+    # query against a yet-to-migrate replica). asyncpg Records raise on
+    # ``row[name]`` for missing keys, so probe via ``keys()``.
+    row_keys = set(row.keys()) if hasattr(row, "keys") else set()
+    reasoning = row["reasoning"] if "reasoning" in row_keys else ""
+    tool_calls = (
+        _decode_jsonb(row["tool_calls"], [])
+        if "tool_calls" in row_keys else []
+    )
+    agent_behavior = (
+        _decode_jsonb(row["agent_behavior"], {})
+        if "agent_behavior" in row_keys else {}
+    )
+    substrate_cids = (
+        _decode_jsonb(row["substrate_cids"], [])
+        if "substrate_cids" in row_keys else []
+    )
+
     return DataElement(
         index=row["id"],
         name=row["name"],
         code=row["code"],
         motivation=row["motivation"],
         trace=row["trace"],
+        reasoning=reasoning,
+        tool_calls=tool_calls,
+        agent_behavior=agent_behavior,
         metric=_finite_or(row["metric"], None),
         success=bool(row["success"]),
         analysis=row["analysis"],
@@ -231,6 +320,7 @@ def row_to_element(row) -> DataElement:
         timestamp=row["timestamp"],
         task=row["task"],
         round_id=row["round_id"] if row["round_id"] is not None else -1,
+        substrate_cids=substrate_cids,
     )
 
 
@@ -257,12 +347,13 @@ def _jsonb(value) -> str:
 
 
 def element_to_params(element: DataElement, next_id: int) -> tuple:
-    """Convert a DataElement to a positional tuple for INSERT ($1..$20).
+    """Convert a DataElement to a positional tuple for INSERT ($1..$24).
 
-    JSONB columns (loss_curve, generated_samples, objectives) are explicitly
-    serialised with ``json.dumps`` so asyncpg sends a valid JSON string
-    regardless of statement-cache or connection-pooler settings.  Float
-    ``inf``/``nan`` are replaced with ``null`` to keep PostgreSQL happy.
+    JSONB columns (loss_curve, generated_samples, objectives, tool_calls,
+    agent_behavior, substrate_cids) are explicitly serialised with
+    ``json.dumps`` so asyncpg sends a valid JSON string regardless of
+    statement-cache or connection-pooler settings.  Float ``inf``/``nan``
+    are replaced with ``null`` to keep PostgreSQL happy.
     """
     round_id = element.round_id if element.round_id >= 0 else None
     return (
@@ -286,6 +377,10 @@ def element_to_params(element: DataElement, next_id: int) -> tuple:
         element.timestamp,
         round_id,
         element.task,
+        element.reasoning,
+        _jsonb(element.tool_calls),
+        _jsonb(element.agent_behavior),
+        _jsonb(element.substrate_cids),
     )
 
 
@@ -294,12 +389,14 @@ INSERT INTO experiments (
     id, name, code, motivation, trace, metric, success, analysis,
     parent_index, generation, score, miner_uid, miner_hotkey,
     loss_curve, manifest_sha256, generated_samples, objectives,
-    timestamp, round_id, task
+    timestamp, round_id, task,
+    reasoning, tool_calls, agent_behavior, substrate_cids
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8,
     $9, $10, $11, $12, $13,
     $14, $15, $16, $17,
-    $18, $19, $20
+    $18, $19, $20,
+    $21, $22, $23, $24
 )
 """
 

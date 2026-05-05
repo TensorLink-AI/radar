@@ -5,7 +5,7 @@ import math
 from shared.database import DataElement
 from shared.pareto import ParetoFront
 from shared.scoring import (
-    passes_size_gate, score_round, compute_penalties,
+    apply_round_metadata, passes_size_gate, score_round, compute_penalties,
     scores_to_weights, ema_update,
 )
 
@@ -243,3 +243,105 @@ def test_score_round_regression_scores_zero():
     }
     scores = score_round(eval_results, _MockChallenge(), frontier, _objectives(), {})
     assert scores[0] == 0.0
+
+
+# ── Generalized-objective tests (primary.lower_is_better = False) ──
+
+
+def _higher_is_better_objectives():
+    from shared.task import Objective
+    return [
+        Objective(
+            name="accuracy", pattern=r"accuracy:\s*([\d.]+)",
+            lower_is_better=False, primary=True, default=0.0,
+        ),
+    ]
+
+
+def test_score_round_higher_is_better_bootstrapping():
+    """Primary lower_is_better=False → higher accuracy wins bootstrap ranking."""
+    eval_results = {
+        0: {"accuracy": 0.80, "flops_equivalent_size": 200_000, "passed_size_gate": True},
+        1: {"accuracy": 0.95, "flops_equivalent_size": 300_000, "passed_size_gate": True},
+    }
+    scores = score_round(
+        eval_results, _MockChallenge(), _pareto(), _higher_is_better_objectives(), {},
+    )
+    # UID 1 has higher accuracy → higher score
+    assert scores[1] > scores[0]
+
+
+def test_score_round_higher_is_better_improvement():
+    """Improvement direction flips for higher-is-better primary."""
+    from shared.database import DataElement
+    # Frontier seeded with accuracy=0.80; new submission at 0.95 beats it
+    elem = DataElement(
+        metric=0.80, success=True,
+        objectives={"accuracy": 0.80, "flops_equivalent_size": 200_000},
+    )
+    frontier = _pareto([elem])
+    eval_results = {
+        0: {"accuracy": 0.95, "flops_equivalent_size": 200_000, "passed_size_gate": True},
+    }
+    scores = score_round(
+        eval_results, _MockChallenge(), frontier, _higher_is_better_objectives(), {},
+    )
+    assert scores[0] > 0.0
+    # And a submission WORSE than frontier scores zero
+    eval_results_regress = {
+        0: {"accuracy": 0.60, "flops_equivalent_size": 200_000, "passed_size_gate": True},
+    }
+    regress_scores = score_round(
+        eval_results_regress, _MockChallenge(), frontier, _higher_is_better_objectives(), {},
+    )
+    assert regress_scores[0] == 0.0
+
+
+def test_score_round_no_objectives_scores_all_zero():
+    """With no Objectives, every UID gets 0 instead of crashing."""
+    eval_results = {
+        0: {"crps": 0.5, "flops_equivalent_size": 200_000, "passed_size_gate": True},
+    }
+    scores = score_round(eval_results, _MockChallenge(), _pareto(), [], {})
+    assert scores == {0: 0.0}
+
+
+# ── Targon migration: round-metadata multiplier / exclusion ──────────
+
+
+class TestApplyRoundMetadata:
+    def test_no_metadata_passthrough(self):
+        out = apply_round_metadata({1: 0.7, 2: 0.3}, None)
+        assert out == {1: 0.7, 2: 0.3}
+
+    def test_empty_metadata_passthrough(self):
+        out = apply_round_metadata({1: 0.7}, {})
+        assert out == {1: 0.7}
+
+    def test_targon_unavailable_applies_multiplier(self):
+        # Default Config.TARGON_UNAVAILABLE_SCORE_MULTIPLIER = 0.5
+        scores = {1: 1.0, 2: 0.4}
+        out = apply_round_metadata(scores, {"targon_unavailable": [1]})
+        assert out[1] == 0.5
+        assert out[2] == 0.4
+
+    def test_compromised_zeroes_score(self):
+        scores = {1: 1.0, 2: 0.4}
+        out = apply_round_metadata(scores, {"compromised": [1]})
+        assert out[1] == 0.0
+        assert out[2] == 0.4
+
+    def test_compromised_overrides_unavailable(self):
+        # If both flags fire, compromise wins (security > availability).
+        scores = {1: 1.0}
+        out = apply_round_metadata(
+            scores,
+            {"targon_unavailable": [1], "compromised": [1]},
+        )
+        assert out[1] == 0.0
+
+    def test_does_not_mutate_input(self):
+        scores = {1: 1.0, 2: 0.4}
+        snapshot = dict(scores)
+        _ = apply_round_metadata(scores, {"targon_unavailable": [1]})
+        assert scores == snapshot

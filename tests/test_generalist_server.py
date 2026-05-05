@@ -1,13 +1,13 @@
 """Tests for the generalist runner/server.py — one server, all tasks.
 
-Covers: task routing, unknown task rejection, runner registration,
+Covers: task routing, unknown task rejection, sandbox dispatch,
 health endpoint, auth/rate-limit (inherited from shared logic).
 """
 
 import asyncio
 import json
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -20,7 +20,6 @@ def _reset_server_state():
     srv._metagraph_last_refresh = 0.0
     srv._hotkey_last_request.clear()
     srv._train_semaphore = asyncio.Semaphore(1)
-    srv._RUNNERS.clear()
     yield
 
 
@@ -37,11 +36,24 @@ def _make_body(**overrides):
     return json.dumps(data).encode()
 
 
+def _success_result():
+    return ({
+        "status": "success",
+        "round_id": 1,
+        "miner_hotkey": "miner_abc",
+        "flops_equivalent_size": 100000,
+        "training_time_seconds": 5.0,
+        "num_steps": 10,
+        "num_params_M": 0.5,
+        "peak_vram_mb": 100.0,
+        "checkpoint_path": "/var/radar/sandbox/checkpoints/model.safetensors",
+    }, "")
+
+
 class TestTaskRouting:
-    """Generalist server routes to the correct runner by task_name."""
+    """Generalist server routes through the sandbox by task_name."""
 
     def test_unknown_task_returns_400(self):
-        """Requesting an unknown task returns 400."""
         import runner.server as srv
         from fastapi.testclient import TestClient
 
@@ -52,98 +64,94 @@ class TestTaskRouting:
         assert resp.status_code == 400
         assert "Unknown task" in resp.json()["error"]
 
-    def test_routes_to_registered_runner(self):
-        """Valid task_name dispatches to the registered runner."""
+    def test_accepts_known_task(self):
+        """Valid task_name returns 202 Accepted (background task spawned)."""
         import runner.server as srv
         from fastapi.testclient import TestClient
 
-        mock_runner = MagicMock(return_value={
-            "status": "success",
-            "round_id": 1,
-            "miner_hotkey": "miner_abc",
-            "flops_equivalent_size": 100000,
-            "training_time_seconds": 5.0,
-            "num_steps": 10,
-            "num_params_M": 0.5,
-            "peak_vram_mb": 100.0,
-            "checkpoint_path": "/workspace/checkpoints/model.safetensors",
-        })
-        srv._RUNNERS["ts_forecasting"] = mock_runner
-        srv._RUNNERS["ml_training"] = mock_runner
-
+        mock_sandbox = AsyncMock(return_value=_success_result())
         with patch.dict(os.environ, {"RADAR_LOCALNET": "true"}), \
-             patch("runner.server._upload_artifacts", return_value={"status": "success"}):
+             patch("runner.server.run_sandbox", mock_sandbox), \
+             patch("runner.server.upload_artifacts", return_value={"status": "success"}):
             client = TestClient(srv.app)
             resp = client.post("/train", content=_make_body(task_name="ts_forecasting"))
 
-        assert resp.status_code == 200
-        mock_runner.assert_called_once()
-        call_args = mock_runner.call_args
-        assert call_args[0][0] == "def build_model(c, p, n, q): pass\ndef build_optimizer(m): pass"
-        assert call_args[0][1]["seed"] == 42
+        assert resp.status_code == 202
+        assert resp.json() == {"status": "accepted", "round_id": 1}
 
     def test_defaults_to_ts_forecasting(self):
         """Missing task_name defaults to ts_forecasting."""
         import runner.server as srv
         from fastapi.testclient import TestClient
 
-        mock_runner = MagicMock(return_value={
-            "status": "success", "round_id": 1, "miner_hotkey": "miner_abc",
-            "checkpoint_path": "/tmp/ckpt",
-        })
-        srv._RUNNERS["ts_forecasting"] = mock_runner
-
         body = _make_body()
         data = json.loads(body)
         del data["task_name"]
         body = json.dumps(data).encode()
 
+        mock_sandbox = AsyncMock(return_value=_success_result())
         with patch.dict(os.environ, {"RADAR_LOCALNET": "true"}), \
-             patch("runner.server._upload_artifacts", return_value={"status": "success"}):
+             patch("runner.server.run_sandbox", mock_sandbox), \
+             patch("runner.server.upload_artifacts", return_value={"status": "success"}):
             client = TestClient(srv.app)
             resp = client.post("/train", content=body)
 
-        assert resp.status_code == 200
-        mock_runner.assert_called_once()
+        assert resp.status_code == 202
 
-    def test_failed_training_returns_without_upload(self):
-        """If runner returns build_failed, no R2 upload attempted."""
+    def test_train_and_upload_dispatches_sandbox(self):
+        """The background coroutine forwards architecture + config into run_sandbox."""
         import runner.server as srv
-        from fastapi.testclient import TestClient
 
-        mock_runner = MagicMock(return_value={
+        mock_sandbox = AsyncMock(return_value=_success_result())
+        mock_upload = MagicMock(return_value={"status": "success"})
+        config = {
+            "seed": 42, "round_id": 1, "miner_hotkey": "miner_abc",
+            "min_flops": 0, "max_flops": 0, "time_budget": 5,
+            "task_name": "ts_forecasting",
+        }
+        with patch("runner.server.run_sandbox", mock_sandbox), \
+             patch("runner.server.upload_artifacts", mock_upload), \
+             patch("runner.server.prefetch_shards", AsyncMock(return_value=[])), \
+             patch("runner.server.prefetch_gift_eval", AsyncMock(return_value=None)):
+            asyncio.run(srv._train_and_upload(
+                "def build_model(c, p, n, q): pass\ndef build_optimizer(m): pass",
+                config, upload_urls={}, gift_eval_urls={},
+                pretrain_shard_urls=[], pretrain_val_shard_urls=[],
+            ))
+
+        mock_sandbox.assert_awaited_once()
+        sandbox_config = mock_sandbox.call_args[0][0]
+        assert sandbox_config["task_name"] == "ts_forecasting"
+        assert sandbox_config["architecture_code"].startswith("def build_model")
+        assert sandbox_config["seed"] == 42
+        mock_upload.assert_called_once()
+
+    def test_train_and_upload_failed_sandbox_skips_upload(self):
+        """If the sandbox reports build_failed, no artifact upload runs."""
+        import runner.server as srv
+
+        mock_sandbox = AsyncMock(return_value=({
             "status": "build_failed", "error": "Missing build_model()",
             "round_id": 1, "miner_hotkey": "miner_abc",
-        })
-        srv._RUNNERS["ts_forecasting"] = mock_runner
+        }, ""))
+        mock_upload = MagicMock()
+        mock_failure = MagicMock()
+        with patch("runner.server.run_sandbox", mock_sandbox), \
+             patch("runner.server.upload_artifacts", mock_upload), \
+             patch("runner.server.upload_failure_meta", mock_failure), \
+             patch("runner.server.prefetch_shards", AsyncMock(return_value=[])), \
+             patch("runner.server.prefetch_gift_eval", AsyncMock(return_value=None)):
+            asyncio.run(srv._train_and_upload(
+                "code", {
+                    "seed": 0, "round_id": 1, "miner_hotkey": "miner_abc",
+                    "min_flops": 0, "max_flops": 0, "time_budget": 5,
+                    "task_name": "ts_forecasting",
+                },
+                upload_urls={"meta": "https://x"}, gift_eval_urls={},
+            ))
 
-        with patch.dict(os.environ, {"RADAR_LOCALNET": "true"}), \
-             patch("runner.server._upload_artifacts") as mock_upload:
-            client = TestClient(srv.app)
-            resp = client.post("/train", content=_make_body())
-
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "build_failed"
         mock_upload.assert_not_called()
-
-
-class TestRunnerRegistry:
-    """Runner registration and lazy loading."""
-
-    def test_register_runners_populates_registry(self):
-        """_register_runners() loads ts_forecasting and ml_training."""
-        import runner.server as srv
-        srv._register_runners()
-        assert "ts_forecasting" in srv._RUNNERS
-        assert "ml_training" in srv._RUNNERS
-
-    def test_register_runners_idempotent(self):
-        """Calling _register_runners() twice doesn't double-register."""
-        import runner.server as srv
-        srv._register_runners()
-        first = dict(srv._RUNNERS)
-        srv._register_runners()
-        assert srv._RUNNERS == first
+        mock_failure.assert_called_once()
 
 
 class TestGeneralistHealth:
@@ -164,7 +172,6 @@ class TestGeneralistAuth:
         from fastapi.testclient import TestClient
 
         srv._metagraph_cache = None
-        srv._RUNNERS["ts_forecasting"] = MagicMock()
 
         with patch.dict(os.environ, {"RADAR_LOCALNET": ""}), \
              patch.object(srv, "_load_metagraph", return_value=None):
@@ -177,7 +184,6 @@ class TestGeneralistAuth:
         import runner.server as srv
         from fastapi.testclient import TestClient
 
-        srv._RUNNERS["ts_forecasting"] = MagicMock()
         loop = asyncio.new_event_loop()
         loop.run_until_complete(srv._train_semaphore.acquire())
 

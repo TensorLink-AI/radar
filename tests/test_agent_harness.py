@@ -76,6 +76,15 @@ class TestBuildAgentEnvVars:
             assert "R2_ACCESS_KEY_ID" not in env
             assert "R2_SECRET_ACCESS_KEY" not in env
 
+    def test_no_hippius_credentials(self):
+        with patch.dict(os.environ, {
+            "HIPPIUS_ACCESS_KEY_ID": "key",
+            "HIPPIUS_SECRET_ACCESS_KEY": "secret",
+        }):
+            env = _build_agent_env_vars()
+            assert "HIPPIUS_ACCESS_KEY_ID" not in env
+            assert "HIPPIUS_SECRET_ACCESS_KEY" not in env
+
     def test_forwards_subtensor(self):
         with patch.dict(os.environ, {
             "SUBTENSOR_NETWORK": "finney",
