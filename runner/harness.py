@@ -253,7 +253,13 @@ _DEFAULTS = {
     "grad_clip": 1.0,
     "log_every_n_steps": 10,
     "val_base_step": 10,
-    "val_base_flops": 1e15,
+    # First val triggers at this many cumulative FLOPs, then doubles each
+    # time (val_growth=2.0). 1e10 gives ~10 log-spaced val points across the
+    # full bucket range (Tiny ≈ 1e13 cumulative → ~10 vals; Large ≈ 1e16 →
+    # ~20 vals). The previous 1e15 default was so high that Phase B runs
+    # never crossed it for any bucket but Large, leaving val_loss_history
+    # with only the end-of-run flush — unrenderable as a curve.
+    "val_base_flops": 1e10,
     "val_growth": 2.0,
 }
 _CLAMPS = {
@@ -262,7 +268,7 @@ _CLAMPS = {
     "grad_clip": (0.0, 100.0),
     "log_every_n_steps": (1, 1000),
     "val_base_step": (1, 10000),
-    "val_base_flops": (1e12, 1e22),
+    "val_base_flops": (1e8, 1e22),
     "val_growth": (1.1, 10.0),
 }
 _VAL_SCHEDULES = ("logarithmic", "fixed", "none")
