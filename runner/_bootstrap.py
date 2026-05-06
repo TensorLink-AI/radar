@@ -4,12 +4,15 @@ Runs as the immediate child of /usr/local/bin/radar-entrypoint.sh. Reads
 the build-time hash table at /workspace/_bootstrap_hashes.json, verifies
 every load-bearing file matches, refuses to start on any mismatch or any
 unexpected file in a protected directory, writes /tmp/boot_proof.json,
-then exec's /workspace/server.py.
+then exec's /workspace/launcher.py — which in turn picks FastAPI server
+(Basilica / Targon) or RunPod handler based on env vars. One image,
+one digest, two runtime modes; the bootstrap chain stays unchanged.
 
-Stdlib-only by design — must not import torch / fastapi / shared.* /
-anything else that could be redirected by a miner-supplied PYTHONPATH.
-The entrypoint script already refuses to start with PYTHONPATH set, but
-the bootstrap is the second line of defence and must not depend on it.
+Stdlib-only by design — must not import torch / fastapi / runpod /
+shared.* / anything else that could be redirected by a miner-supplied
+PYTHONPATH. The entrypoint script already refuses to start with
+PYTHONPATH set, but the bootstrap is the second line of defence and
+must not depend on it.
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ from typing import Iterable
 BOOTSTRAP_VERSION = "1"
 HASHES_PATH = "/workspace/_bootstrap_hashes.json"
 BOOT_PROOF_PATH = "/tmp/boot_proof.json"
-SERVER_PATH = "/workspace/server.py"
+LAUNCHER_PATH = "/workspace/launcher.py"
 
 
 def _die(msg: str, code: int = 1) -> None:
@@ -162,9 +165,12 @@ def run(root: str = "/", *, exec_target: bool = True) -> dict:
         f.write(json.dumps(proof))
 
     if exec_target:
-        # Replace the bootstrap process with the real server. The server
-        # inherits the cleansed environment and PID 1's process tree.
-        os.execvp("python3", ["python3", _resolve(root, SERVER_PATH)])
+        # Replace the bootstrap process with the launcher. The launcher
+        # inherits the cleansed environment and PID 1's process tree,
+        # then branches to either uvicorn(server) or runpod.serverless
+        # based on env. Either way the integrity check above already
+        # ran for the same image bytes.
+        os.execvp("python3", ["python3", _resolve(root, LAUNCHER_PATH)])
     return proof
 
 

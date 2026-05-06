@@ -190,9 +190,13 @@ class Config:
     AGENT_ALLOWED_URLS: str = os.getenv("RADAR_AGENT_ALLOWED_URLS", "")
 
     # ── Hosting Backend ────────────────────────────────────────
-    # "basilica" (default, legacy) or "targon" (TDX-attested confidential
-    # GPU pods). Both miner and validator must agree on the same backend
-    # for a deployment — set this consistently across the stack.
+    # One of "basilica" (default, legacy long-lived pod), "targon" (TDX-
+    # attested confidential GPU pods), or "runpod" (RunPod Serverless —
+    # job-queue, no SSH/exec into the running container). Both miner and
+    # validator must agree on the same backend for a deployment — set
+    # this consistently across the stack. The miner listener is the
+    # trainer URL for RunPod (it relays POST /train to RunPod's
+    # serverless API using the miner's account-scoped API key).
     HOSTING_BACKEND: str = os.getenv("RADAR_HOSTING_BACKEND", "basilica").lower()
 
     # Targon API endpoints.
@@ -230,6 +234,41 @@ class Config:
     # >2 consecutive minutes failed marks the round locally compromised.
     TARGON_HEALTH_POLL_INTERVAL_S: float = float(os.getenv("RADAR_TARGON_HEALTH_POLL", "30"))
     TARGON_HEALTH_FAIL_GRACE_S: float = float(os.getenv("RADAR_TARGON_HEALTH_FAIL_GRACE", "120"))
+
+    # ── RunPod Serverless Backend ───────────────────────────────
+    # RunPod account-scoped API key. Required when RADAR_HOSTING_BACKEND=runpod.
+    # Issue from https://www.runpod.io/console/user/settings.
+    RUNPOD_API_KEY: str = os.getenv("RUNPOD_API_KEY", "")
+    # The miner's serverless endpoint id (one per miner — endpoints are
+    # account-scoped, so cross-account submission isn't possible). The
+    # endpoint must be pre-provisioned by the miner with the official
+    # trainer image and the miner's wallet env vars.
+    RUNPOD_ENDPOINT_ID: str = os.getenv("RADAR_RUNPOD_ENDPOINT_ID", "")
+    # API host. Override only for staging / regional endpoints.
+    RUNPOD_API_BASE_URL: str = os.getenv("RADAR_RUNPOD_API_BASE_URL", "https://api.runpod.ai")
+    # Per-call HTTP timeout for RunPod control-plane calls (template
+    # fetch, job submit, status poll, cancel). Job *execution* time is
+    # bounded by the endpoint's executionTimeoutMs, not this.
+    RUNPOD_VERIFICATION_TIMEOUT: float = float(os.getenv("RADAR_RUNPOD_VERIFICATION_TIMEOUT", "10"))
+    # Circuit breaker — same shape as Targon's. Five consecutive control-
+    # plane failures within RESET seconds opens the breaker; rounds with
+    # an open breaker get RUNPOD_UNAVAILABLE_SCORE_MULTIPLIER applied.
+    RUNPOD_CIRCUIT_BREAKER_THRESHOLD: int = int(os.getenv("RADAR_RUNPOD_BREAKER_THRESHOLD", "5"))
+    RUNPOD_CIRCUIT_BREAKER_RESET: float = float(os.getenv("RADAR_RUNPOD_BREAKER_RESET", "60"))
+    RUNPOD_UNAVAILABLE_SCORE_MULTIPLIER: float = float(
+        os.getenv("RADAR_RUNPOD_UNAVAILABLE_MULTIPLIER", "0.5")
+    )
+    # Status poll interval for the per-round RunPod job watcher.
+    RUNPOD_STATUS_POLL_INTERVAL_S: float = float(os.getenv("RADAR_RUNPOD_STATUS_POLL", "30"))
+    # How long the miner waits for the endpoint to report a non-empty
+    # worker pool after creating it (cold endpoints take a minute or so
+    # to spin up the first worker on RunPod).
+    RUNPOD_READINESS_TIMEOUT_S: float = float(os.getenv("RADAR_RUNPOD_READINESS_TIMEOUT", "180"))
+    # Allowlist of endpoint ids the validator considers blessed by the
+    # subnet owner. Empty = accept any endpoint that matches the expected
+    # template digest (testnet-friendly default; flip to a comma-separated
+    # list once the canonical endpoint pool is known).
+    OFFICIAL_RUNPOD_ENDPOINTS: str = os.getenv("RADAR_OFFICIAL_RUNPOD_ENDPOINTS", "")
 
     # ── Warm-Standby Trainer ────────────────────────────────────
     TRAINER_PREPARE_TIMEOUT: int = int(os.getenv("RADAR_TRAINER_PREPARE_TIMEOUT", "600"))

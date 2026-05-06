@@ -1,9 +1,11 @@
-"""Miner-side trainer deployment — Basilica or Targon, picked by config.
+"""Miner-side trainer deployment — Basilica, Targon, or RunPod, by config.
 
 Keeps ``miner/neuron.py`` slim. Each backend exposes the same shape
 of return (a ``Deployment`` dataclass with the fields the
 TrainerReady envelope cares about) so ``handle_prepare`` can be
-backend-agnostic.
+backend-agnostic. RunPod-specific deploy / teardown lives in
+``miner/hosting_runpod.py`` to keep this file focused on the
+long-lived-pod backends.
 """
 
 from __future__ import annotations
@@ -27,13 +29,22 @@ class Deployment:
 
     name: str
     url: str
-    # Targon-only — empty for Basilica deploys.
+    # Targon-only — empty for Basilica / RunPod deploys.
     targon_workload_uid: str = ""
     cvm_ip: str = ""
+    # Targon + RunPod populate these; Basilica leaves them empty.
     gpu_class: str = ""
     deployed_image_digest: str = ""      # what the miner actually deployed
-    # The backend's native handle (basilica deployment object, or
-    # the WorkloadHandle from targon_client). Used for teardown.
+    # RunPod-only — empty for Basilica / Targon deploys. The endpoint
+    # persists across rounds (RunPod manages worker lifecycle); jobs
+    # are submitted lazily when the validator dispatches /train.
+    runpod_endpoint_id: str = ""
+    runpod_template_id: str = ""
+    # The backend's native handle:
+    #   basilica → BasilicaClient.Deployment object (has ``.delete()``)
+    #   targon   → ``WorkloadHandle`` from targon_client
+    #   runpod   → ``EndpointInfo`` from runpod_client (no per-round
+    #              teardown — endpoints persist; jobs cancel separately)
     raw: object = None
 
 
