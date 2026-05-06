@@ -491,7 +491,12 @@ def test_read_config_default_val_cadence_unit_is_flops():
     sub = types.ModuleType("s")
     cfg = _read_config(sub)
     assert cfg["val_cadence_unit"] == "flops"
-    assert cfg["val_base_flops"] == 1e15
+    # 1e10 produces ~10 log-spaced val samples across the full size-bucket
+    # range. The original 1e15 default was so high that Phase B runs in any
+    # bucket but Large never crossed it — val_loss_history stayed empty
+    # except for the end-of-run flush, so the dashboard chart had nothing
+    # to draw.
+    assert cfg["val_base_flops"] == 1e10
     # Step-based defaults are unchanged so mixed-cadence runs stay comparable.
     assert cfg["val_base_step"] == 10
     assert cfg["val_growth"] == 2.0
@@ -517,9 +522,9 @@ def test_read_config_invalid_val_cadence_unit_falls_back():
 
 def test_read_config_clamps_val_base_flops():
     sub = types.ModuleType("s")
-    sub.training_config = lambda: {"val_base_flops": 1.0}  # well below 1e12
+    sub.training_config = lambda: {"val_base_flops": 1.0}  # well below the floor
     cfg = _read_config(sub)
-    assert cfg["val_base_flops"] == 1e12
+    assert cfg["val_base_flops"] == 1e8
 
 
 # ── FLOPs-keyed val cadence ───────────────────────────────────────

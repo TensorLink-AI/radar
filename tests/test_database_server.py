@@ -324,11 +324,6 @@ def test_access_log_captures_ids_from_experiment_detail():
         assert r.status_code == 200
         # Body should still be delivered intact
         assert r.json()["name"] == "exp_0"
-        # asyncio.create_task was scheduled — give it a tick to run
-        import asyncio as _asyncio
-        loop = _asyncio.new_event_loop()
-        loop.run_until_complete(_asyncio.sleep(0.05))
-        loop.close()
         assert logger.calls, "middleware did not log the request"
         call = logger.calls[-1]
         assert 0 in call["experiment_ids"]
@@ -345,10 +340,6 @@ def test_access_log_captures_ids_from_list_response():
         r = client.get("/experiments/recent?n=2")
         assert r.status_code == 200
         assert len(r.json()) == 2
-        import asyncio as _asyncio
-        loop = _asyncio.new_event_loop()
-        loop.run_until_complete(_asyncio.sleep(0.05))
-        loop.close()
         # Captured IDs match the response payload
         payload_ids = {item["index"] for item in r.json()}
         captured = set(logger.calls[-1]["experiment_ids"])
@@ -369,10 +360,6 @@ def test_access_log_skips_non_experiment_paths():
         client = TestClient(app)
         r = client.get("/provenance/component_stats")
         assert r.status_code == 200
-        import asyncio as _asyncio
-        loop = _asyncio.new_event_loop()
-        loop.run_until_complete(_asyncio.sleep(0.05))
-        loop.close()
         # Still logs the access. The aggregate /provenance/component_stats
         # response carries no per-experiment IDs and the path itself isn't
         # an /provenance/{id} shape, so nothing gets extracted.
@@ -396,10 +383,6 @@ def test_access_log_captures_id_from_provenance_path():
         client = TestClient(app)
         r = client.get("/provenance/0/influences")
         assert r.status_code == 200
-        import asyncio as _asyncio
-        loop = _asyncio.new_event_loop()
-        loop.run_until_complete(_asyncio.sleep(0.05))
-        loop.close()
         assert logger.calls, "middleware did not log /provenance/0/influences"
         assert 0 in logger.calls[-1]["experiment_ids"]
         assert logger.calls[-1]["endpoint"] == "/provenance/0/influences"
@@ -435,10 +418,6 @@ def test_access_log_runs_on_proxy_api_key_path():
             },
         )
         assert r.status_code == 200
-        import asyncio as _asyncio
-        loop = _asyncio.new_event_loop()
-        loop.run_until_complete(_asyncio.sleep(0.05))
-        loop.close()
         assert logger.calls, "proxy path did not reach access logger"
         call = logger.calls[-1]
         assert call["hotkey"] == "miner_hk_abc"
@@ -447,6 +426,37 @@ def test_access_log_runs_on_proxy_api_key_path():
     finally:
         Config.DB_API_KEY = prev_key
         _uninstall_access_logger()
+
+
+def test_access_log_is_awaited_not_fire_and_forget():
+    """Regression: middleware used to schedule log_access via
+    asyncio.create_task, which the event loop only weakly references — under
+    load the task could be GC'd before the INSERT ran and the heatmap stayed
+    empty. The write must complete before the response returns.
+    """
+    _setup()
+
+    class _SlowLogger:
+        def __init__(self):
+            self.completed = False
+
+        async def log_access(self, **kw):
+            import asyncio as _a
+            await _a.sleep(0.02)
+            self.completed = True
+
+    from database import server as srv
+    slow = _SlowLogger()
+    srv._access_logger = slow
+    try:
+        client = TestClient(app)
+        r = client.get("/experiments/0")
+        assert r.status_code == 200
+        # If the write were fire-and-forget, .completed would still be False
+        # at the moment the response is observed by the client.
+        assert slow.completed, "access log write was not awaited"
+    finally:
+        srv._access_logger = None
 
 
 # ── Agent code submission history ──────────────────────────────

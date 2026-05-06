@@ -253,7 +253,13 @@ _DEFAULTS = {
     "grad_clip": 1.0,
     "log_every_n_steps": 10,
     "val_base_step": 10,
-    "val_base_flops": 1e15,
+    # Absolute floor for the first-val FLOPs threshold. The actual
+    # threshold is max(this, flops_per_optim_step * val_base_step) so the
+    # curve stays log-spaced across model sizes — see the cadence-init
+    # block in _training_loop. The previous 1e15 default was so high that
+    # Phase B runs never crossed it for any bucket but Large, leaving
+    # val_loss_history with only the end-of-run flush.
+    "val_base_flops": 1e10,
     "val_growth": 2.0,
 }
 _CLAMPS = {
@@ -262,7 +268,7 @@ _CLAMPS = {
     "grad_clip": (0.0, 100.0),
     "log_every_n_steps": (1, 1000),
     "val_base_step": (1, 10000),
-    "val_base_flops": (1e12, 1e22),
+    "val_base_flops": (1e8, 1e22),
     "val_growth": (1.1, 10.0),
 }
 _VAL_SCHEDULES = ("logarithmic", "fixed", "none")
@@ -437,7 +443,19 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
 
             if val_enabled and use_flops_cadence_requested:
                 if flops_per_optim_step > 0:
-                    next_val_flops = int(cfg["val_base_flops"])
+                    # Anchor the first val to roughly val_base_step optim
+                    # steps' worth of FLOPs so the cadence stays log-spaced
+                    # across model sizes. With a fixed absolute threshold,
+                    # high-FLOPs/step models overshoot it on the first batch
+                    # and then fire val on every consecutive step until
+                    # next_val_flops's doublings outpace cumulative_flops —
+                    # producing a dense early cluster instead of a log axis.
+                    # Mirroring val_base_step here keeps the first val at
+                    # ~step val_base_step for every bucket.
+                    next_val_flops = max(
+                        int(cfg["val_base_flops"]),
+                        flops_per_optim_step * cfg["val_base_step"],
+                    )
                 else:
                     next_val = cfg["val_base_step"]
 
