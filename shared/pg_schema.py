@@ -208,6 +208,25 @@ CREATE TABLE IF NOT EXISTS training_metas (
 );
 CREATE INDEX IF NOT EXISTS idx_tm_round ON training_metas(round_id);
 CREATE INDEX IF NOT EXISTS idx_tm_hotkey ON training_metas(hotkey);
+
+-- Post-Phase-C reveal of the opaque submission_id -> miner_hotkey map.
+-- During Phase B the trainer-host only sees submission_id; once Phase C
+-- closes, validators publish this mapping so:
+--   1. miners can verify the submission they queued was the one trained
+--   2. the public dashboard can resolve historical bucket paths
+--      (``round_{id}/submission_{sid}/...``) back to miner identities
+--      for loss-curve / log views.
+CREATE TABLE IF NOT EXISTS round_submissions (
+    round_id BIGINT NOT NULL,
+    submission_id TEXT NOT NULL,
+    miner_hotkey TEXT NOT NULL,
+    miner_uid INTEGER NOT NULL DEFAULT -1,
+    created_at DOUBLE PRECISION NOT NULL DEFAULT extract(epoch from now()),
+    PRIMARY KEY (round_id, submission_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rs_round_hotkey
+    ON round_submissions(round_id, miner_hotkey);
+CREATE INDEX IF NOT EXISTS idx_rs_hotkey ON round_submissions(miner_hotkey);
 """
 
 ACCESS_LOG_SCHEMA = """

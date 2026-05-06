@@ -28,7 +28,7 @@ def _make_body(**overrides):
         "architecture": "def build_model(c, p, n, q): pass\ndef build_optimizer(m): pass",
         "seed": 42,
         "round_id": 1,
-        "miner_hotkey": "miner_abc",
+        "submission_id": "miner_abc",
         "time_budget": 10,
         "task_name": "ts_forecasting",
     }
@@ -40,7 +40,7 @@ def _success_result():
     return ({
         "status": "success",
         "round_id": 1,
-        "miner_hotkey": "miner_abc",
+        "submission_id": "miner_abc",
         "flops_equivalent_size": 100000,
         "training_time_seconds": 5.0,
         "num_steps": 10,
@@ -105,7 +105,7 @@ class TestTaskRouting:
         mock_sandbox = AsyncMock(return_value=_success_result())
         mock_upload = MagicMock(return_value={"status": "success"})
         config = {
-            "seed": 42, "round_id": 1, "miner_hotkey": "miner_abc",
+            "seed": 42, "round_id": 1, "submission_id": "miner_abc",
             "min_flops": 0, "max_flops": 0, "time_budget": 5,
             "task_name": "ts_forecasting",
         }
@@ -132,7 +132,7 @@ class TestTaskRouting:
 
         mock_sandbox = AsyncMock(return_value=({
             "status": "build_failed", "error": "Missing build_model()",
-            "round_id": 1, "miner_hotkey": "miner_abc",
+            "round_id": 1, "submission_id": "miner_abc",
         }, ""))
         mock_upload = MagicMock()
         mock_failure = MagicMock()
@@ -143,7 +143,7 @@ class TestTaskRouting:
              patch("runner.server.prefetch_gift_eval", AsyncMock(return_value=None)):
             asyncio.run(srv._train_and_upload(
                 "code", {
-                    "seed": 0, "round_id": 1, "miner_hotkey": "miner_abc",
+                    "seed": 0, "round_id": 1, "submission_id": "miner_abc",
                     "min_flops": 0, "max_flops": 0, "time_budget": 5,
                     "task_name": "ts_forecasting",
                 },

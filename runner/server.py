@@ -163,7 +163,9 @@ async def train(request: Request):
         "round_id": data.get("round_id", 0),
         "min_flops": data.get("min_flops_equivalent", 0),
         "max_flops": data.get("max_flops_equivalent", 0),
-        "miner_hotkey": data.get("miner_hotkey", "unknown"),
+        # Opaque submission_id from the dispatching validator; the
+        # trainer-host never sees the architecture owner's hotkey.
+        "submission_id": data.get("submission_id", "unknown"),
         "time_budget": data.get("time_budget", 300),
         "task_name": task_name,
     }
@@ -180,8 +182,8 @@ async def train(request: Request):
     ))
 
     logger.info(
-        "Training job accepted: round=%d miner=%s task=%s",
-        training_config["round_id"], training_config["miner_hotkey"], task_name,
+        "Training job accepted: round=%d submission=%s task=%s",
+        training_config["round_id"], training_config["submission_id"][:12], task_name,
     )
     return JSONResponse(
         status_code=202,
@@ -208,10 +210,10 @@ async def _train_and_upload(
     credentials and no network-capable Python imports.
     """
     round_id = training_config["round_id"]
-    miner_hotkey = training_config["miner_hotkey"]
+    submission_id = training_config["submission_id"]
     logger.info(
-        "Starting train+upload: round=%d miner=%s upload_url_keys=%s",
-        round_id, miner_hotkey, sorted(upload_urls.keys()) if upload_urls else "(none)",
+        "Starting train+upload: round=%d submission=%s upload_url_keys=%s",
+        round_id, submission_id[:12], sorted(upload_urls.keys()) if upload_urls else "(none)",
     )
     try:
         # ── Prefetch data with the parent's network credentials ──
@@ -251,41 +253,45 @@ async def _train_and_upload(
         if sandbox_log:
             tail = sandbox_log[-4096:]
             logger.info(
-                "Sandbox stderr tail (round %d miner %s):\n%s",
-                round_id, miner_hotkey, tail,
+                "Sandbox stderr tail (round %d submission %s):\n%s",
+                round_id, submission_id[:12], tail,
             )
 
         logger.info(
-            "Training complete: round=%d miner=%s status=%s elapsed=%.1fs",
-            round_id, miner_hotkey, result.get("status", "?"), elapsed,
+            "Training complete: round=%d submission=%s status=%s elapsed=%.1fs",
+            round_id, submission_id[:12], result.get("status", "?"), elapsed,
         )
 
         if result.get("status") in ("build_failed", "size_violation", "failed", "timeout"):
             logger.warning(
-                "Training failed for round %d miner %s: %s — %s",
-                round_id, miner_hotkey, result.get("status"), result.get("error", ""),
+                "Training failed for round %d submission %s: %s — %s",
+                round_id, submission_id[:12], result.get("status"), result.get("error", ""),
             )
-            # Upload a failure meta so the validator knows what happened
-            upload_failure_meta(round_id, miner_hotkey, upload_urls, result)
+            upload_failure_meta(round_id, submission_id, upload_urls, result)
             return
 
-        # Upload artifacts to R2
-        upload_artifacts(result, architecture_code, round_id, miner_hotkey, upload_urls)
+        upload_artifacts(result, architecture_code, round_id, submission_id, upload_urls)
     except Exception as e:
         logger.error(
-            "Background train+upload failed for round %d miner %s: %s",
-            round_id, miner_hotkey, e, exc_info=True,
+            "Background train+upload failed for round %d submission %s: %s",
+            round_id, submission_id[:12], e, exc_info=True,
         )
         try:
-            upload_failure_meta(round_id, miner_hotkey, upload_urls, {
+            upload_failure_meta(round_id, submission_id, upload_urls, {
                 "status": "failed",
                 "error": f"Unhandled exception: {e}",
             })
         except Exception:
-            logger.error("Failed to upload failure meta for round %d miner %s", round_id, miner_hotkey)
+            logger.error(
+                "Failed to upload failure meta for round %d submission %s",
+                round_id, submission_id[:12],
+            )
     finally:
         _train_semaphore.release()
-        logger.info("Training semaphore released (round %d miner %s)", round_id, miner_hotkey)
+        logger.info(
+            "Training semaphore released (round %d submission %s)",
+            round_id, submission_id[:12],
+        )
 
 
 @app.get("/health")

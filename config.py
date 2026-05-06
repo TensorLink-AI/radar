@@ -171,7 +171,18 @@ class Config:
     # `agent_seconds` in the task YAML; this is the fallback when a task
     # doesn't set one. Must fit within SUBMISSION_WINDOW_BLOCKS × 12s.
     AGENT_TIMEOUT: int = int(os.getenv("RADAR_AGENT_TIMEOUT", "600"))
-    AGENT_POD_RETRIES: int = int(os.getenv("RADAR_AGENT_POD_RETRIES", "3"))
+    # Each retry on Basilica spawns a brand-new deployment (timestamp
+    # suffix in the name), so a high retry count multiplies pod cost
+    # under transient HTTP errors. Default to 1 retry — anything more
+    # rarely succeeds and reliably leaks pods until the orphan reaper
+    # cleans them.
+    AGENT_POD_RETRIES: int = int(os.getenv("RADAR_AGENT_POD_RETRIES", "1"))
+    # Max age (seconds) for orphan agent pods picked up by the reaper.
+    # A round's full agent budget is AGENT_TIMEOUT (default 600s); 1800s
+    # is 3x that, so anything older was definitely abandoned.
+    AGENT_POD_REAP_MAX_AGE_S: int = int(
+        os.getenv("RADAR_AGENT_POD_REAP_MAX_AGE_S", "1800"),
+    )
 
     # Max number of agent pods this validator runs concurrently in Phase A.
     # Each pod is on a separate Basilica node so there's no local resource

@@ -246,10 +246,22 @@ class SubmitTrainingMetaRequest(BaseModel):
     meta: dict
 
 
+class SubmissionRevealEntry(BaseModel):
+    submission_id: str
+    miner_hotkey: str
+    miner_uid: int = -1
+
+
+class SubmissionRevealRequest(BaseModel):
+    """Post-Phase-C reveal of submission_id -> miner_hotkey for a round."""
+    round_id: int
+    entries: list[SubmissionRevealEntry]
+
+
 # Routes that only validators (hotkeys with permit) may call
 _VALIDATOR_ONLY_PREFIXES = (
     "/experiments/add", "/frontier/update", "/provenance/record",
-    "/training_metas",
+    "/training_metas", "/round_submissions/reveal",
 )
 
 
@@ -300,6 +312,7 @@ async def auth_middleware(request: Request, call_next):
         or path.startswith("/agent_code")
         or path.startswith("/desearch")
         or path.startswith("/llm")
+        or path.startswith("/round_submissions")
     )
     if needs_auth:
         # ── Reject oversized bodies before reading fully ──
@@ -367,13 +380,20 @@ async def auth_middleware(request: Request, call_next):
             miner_uid = int(miner_uid_str)
         except ValueError:
             miner_uid = -1
-        asyncio.create_task(_access_logger.log_access(
-            hotkey=miner_hotkey or "validator",
-            miner_uid=miner_uid,
-            endpoint=path,
-            experiment_ids=exp_ids,
-            method=request.method,
-        ))
+        # Await the write: asyncio.create_task gives the event loop only a
+        # weak reference, so the task can be GC'd before the INSERT runs and
+        # the heatmap stays empty. A single Postgres INSERT is cheap; any
+        # failure must not break the user-facing response.
+        try:
+            await _access_logger.log_access(
+                hotkey=miner_hotkey or "validator",
+                miner_uid=miner_uid,
+                endpoint=path,
+                experiment_ids=exp_ids,
+                method=request.method,
+            )
+        except Exception as e:
+            logger.warning("access_log write failed: %s", e)
 
     return response
 
@@ -636,6 +656,85 @@ async def submit_training_meta(req: SubmitTrainingMetaRequest):
         )
         raise HTTPException(status_code=500, detail="Failed to cache training meta")
     return {"status": "ok"}
+
+
+@validator_router.post("/round_submissions/reveal")
+async def submit_submission_reveal(req: SubmissionRevealRequest):
+    """Validator publishes the per-round submission_id -> miner_hotkey map.
+
+    Idempotent — every entry upserts on (round_id, submission_id), so two
+    validators that both happen to dispatch the same UID (e.g. fallback
+    paths) won't conflict. Only the dispatching validator owns the truth
+    for its submission_ids; another dispatcher's entries are appended
+    without overwrite.
+    """
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="DB pool not configured")
+    if not req.entries:
+        return {"status": "ok", "inserted": 0}
+
+    # Defensive cap so a misbehaving caller can't bloat the table.
+    if len(req.entries) > 1024:
+        raise HTTPException(status_code=400, detail="Too many reveal entries")
+
+    rows = [
+        (int(req.round_id), e.submission_id, e.miner_hotkey, int(e.miner_uid))
+        for e in req.entries
+        if e.submission_id and e.miner_hotkey
+    ]
+    if not rows:
+        return {"status": "ok", "inserted": 0}
+
+    try:
+        async with _pool.acquire() as conn:
+            await conn.executemany(
+                """
+                INSERT INTO round_submissions
+                    (round_id, submission_id, miner_hotkey, miner_uid)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (round_id, submission_id) DO UPDATE SET
+                    miner_hotkey = EXCLUDED.miner_hotkey,
+                    miner_uid    = EXCLUDED.miner_uid
+                """,
+                rows,
+            )
+    except Exception as e:
+        logger.error("submission reveal write failed: round=%s err=%s", req.round_id, e)
+        raise HTTPException(status_code=500, detail="Failed to persist reveal")
+    return {"status": "ok", "inserted": len(rows)}
+
+
+@validator_router.get("/round_submissions/{round_id}")
+async def get_round_submissions(round_id: int):
+    """Return the reveal map for a round.
+
+    Validator-authed (matches the rest of the validator surface). The
+    public dashboard reads this through ``/dashboard/api/...`` helpers
+    which resolve via the same Postgres rows server-side.
+    """
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="DB pool not configured")
+    rows = await _pool.fetch(
+        """
+        SELECT submission_id, miner_hotkey, miner_uid, created_at
+        FROM round_submissions
+        WHERE round_id = $1
+        ORDER BY created_at ASC
+        """,
+        int(round_id),
+    )
+    return {
+        "round_id": int(round_id),
+        "entries": [
+            {
+                "submission_id": r["submission_id"],
+                "miner_hotkey": r["miner_hotkey"],
+                "miner_uid": int(r["miner_uid"]),
+                "created_at": float(r["created_at"]),
+            }
+            for r in rows
+        ],
+    }
 
 
 @validator_router.post("/frontier/update")

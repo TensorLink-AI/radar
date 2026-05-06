@@ -324,11 +324,6 @@ def test_access_log_captures_ids_from_experiment_detail():
         assert r.status_code == 200
         # Body should still be delivered intact
         assert r.json()["name"] == "exp_0"
-        # asyncio.create_task was scheduled — give it a tick to run
-        import asyncio as _asyncio
-        loop = _asyncio.new_event_loop()
-        loop.run_until_complete(_asyncio.sleep(0.05))
-        loop.close()
         assert logger.calls, "middleware did not log the request"
         call = logger.calls[-1]
         assert 0 in call["experiment_ids"]
@@ -345,10 +340,6 @@ def test_access_log_captures_ids_from_list_response():
         r = client.get("/experiments/recent?n=2")
         assert r.status_code == 200
         assert len(r.json()) == 2
-        import asyncio as _asyncio
-        loop = _asyncio.new_event_loop()
-        loop.run_until_complete(_asyncio.sleep(0.05))
-        loop.close()
         # Captured IDs match the response payload
         payload_ids = {item["index"] for item in r.json()}
         captured = set(logger.calls[-1]["experiment_ids"])
@@ -369,10 +360,6 @@ def test_access_log_skips_non_experiment_paths():
         client = TestClient(app)
         r = client.get("/provenance/component_stats")
         assert r.status_code == 200
-        import asyncio as _asyncio
-        loop = _asyncio.new_event_loop()
-        loop.run_until_complete(_asyncio.sleep(0.05))
-        loop.close()
         # Still logs the access. The aggregate /provenance/component_stats
         # response carries no per-experiment IDs and the path itself isn't
         # an /provenance/{id} shape, so nothing gets extracted.
@@ -396,10 +383,6 @@ def test_access_log_captures_id_from_provenance_path():
         client = TestClient(app)
         r = client.get("/provenance/0/influences")
         assert r.status_code == 200
-        import asyncio as _asyncio
-        loop = _asyncio.new_event_loop()
-        loop.run_until_complete(_asyncio.sleep(0.05))
-        loop.close()
         assert logger.calls, "middleware did not log /provenance/0/influences"
         assert 0 in logger.calls[-1]["experiment_ids"]
         assert logger.calls[-1]["endpoint"] == "/provenance/0/influences"
@@ -435,10 +418,6 @@ def test_access_log_runs_on_proxy_api_key_path():
             },
         )
         assert r.status_code == 200
-        import asyncio as _asyncio
-        loop = _asyncio.new_event_loop()
-        loop.run_until_complete(_asyncio.sleep(0.05))
-        loop.close()
         assert logger.calls, "proxy path did not reach access logger"
         call = logger.calls[-1]
         assert call["hotkey"] == "miner_hk_abc"
@@ -447,6 +426,37 @@ def test_access_log_runs_on_proxy_api_key_path():
     finally:
         Config.DB_API_KEY = prev_key
         _uninstall_access_logger()
+
+
+def test_access_log_is_awaited_not_fire_and_forget():
+    """Regression: middleware used to schedule log_access via
+    asyncio.create_task, which the event loop only weakly references — under
+    load the task could be GC'd before the INSERT ran and the heatmap stayed
+    empty. The write must complete before the response returns.
+    """
+    _setup()
+
+    class _SlowLogger:
+        def __init__(self):
+            self.completed = False
+
+        async def log_access(self, **kw):
+            import asyncio as _a
+            await _a.sleep(0.02)
+            self.completed = True
+
+    from database import server as srv
+    slow = _SlowLogger()
+    srv._access_logger = slow
+    try:
+        client = TestClient(app)
+        r = client.get("/experiments/0")
+        assert r.status_code == 200
+        # If the write were fire-and-forget, .completed would still be False
+        # at the moment the response is observed by the client.
+        assert slow.completed, "access log write was not awaited"
+    finally:
+        srv._access_logger = None
 
 
 # ── Agent code submission history ──────────────────────────────
@@ -479,6 +489,8 @@ class _FakePool:
     def __init__(self):
         self.registry: dict[str, dict] = {}
         self.history: list[dict] = []
+        # (round_id, submission_id) -> {miner_hotkey, miner_uid}
+        self.round_submissions: dict[tuple[int, str], dict] = {}
 
     class _Conn:
         def __init__(self, parent):
@@ -486,6 +498,10 @@ class _FakePool:
 
         async def execute(self, sql, *params):
             self.parent._execute(sql, *params)
+
+        async def executemany(self, sql, args):
+            for row in args:
+                self.parent._execute(sql, *row)
 
         def transaction(self):
             parent = self.parent
@@ -529,6 +545,11 @@ class _FakePool:
                 "entry_point": ep, "r2_key": r2, "round_submitted": rs,
                 "timestamp": _time.time(),
             })
+        elif "insert into round_submissions" in sql_l:
+            round_id, sid, hk, uid = params
+            self.round_submissions[(int(round_id), sid)] = {
+                "miner_hotkey": hk, "miner_uid": int(uid),
+            }
 
     async def execute(self, sql, *params):
         self._execute(sql, *params)
@@ -670,4 +691,64 @@ def test_agent_code_by_hash_unknown_returns_404():
         assert exc.value.status_code == 404
     finally:
         srv._r2 = None
+        srv._pool = None
+
+
+def test_submission_reveal_persists_mapping():
+    """POST /round_submissions/reveal upserts (round_id, submission_id) rows."""
+    from database import server as srv
+    from database.server import (
+        SubmissionRevealRequest, SubmissionRevealEntry,
+        submit_submission_reveal,
+    )
+
+    fake_pool = _FakePool()
+    srv._pool = fake_pool
+    try:
+        req = SubmissionRevealRequest(
+            round_id=42,
+            entries=[
+                SubmissionRevealEntry(
+                    submission_id="sid_one", miner_hotkey="hk_a", miner_uid=3,
+                ),
+                SubmissionRevealEntry(
+                    submission_id="sid_two", miner_hotkey="hk_b", miner_uid=4,
+                ),
+            ],
+        )
+        result = _call_async(submit_submission_reveal(req))
+        assert result["status"] == "ok"
+        assert result["inserted"] == 2
+
+        assert fake_pool.round_submissions[(42, "sid_one")]["miner_hotkey"] == "hk_a"
+        assert fake_pool.round_submissions[(42, "sid_two")]["miner_uid"] == 4
+    finally:
+        srv._pool = None
+
+
+def test_submission_reveal_skips_empty_entries():
+    """Entries with empty submission_id or hotkey are dropped, not stored."""
+    from database import server as srv
+    from database.server import (
+        SubmissionRevealRequest, SubmissionRevealEntry,
+        submit_submission_reveal,
+    )
+
+    fake_pool = _FakePool()
+    srv._pool = fake_pool
+    try:
+        req = SubmissionRevealRequest(
+            round_id=99,
+            entries=[
+                SubmissionRevealEntry(submission_id="", miner_hotkey="hk_a"),
+                SubmissionRevealEntry(submission_id="sid", miner_hotkey=""),
+                SubmissionRevealEntry(submission_id="sid_ok", miner_hotkey="hk_ok", miner_uid=1),
+            ],
+        )
+        result = _call_async(submit_submission_reveal(req))
+        assert result["inserted"] == 1
+        assert (99, "sid_ok") in fake_pool.round_submissions
+        assert (99, "") not in fake_pool.round_submissions
+        assert (99, "sid") not in fake_pool.round_submissions
+    finally:
         srv._pool = None

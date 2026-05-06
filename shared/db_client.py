@@ -215,6 +215,21 @@ class DatabaseClient:
         })
         return result is not None
 
+    async def submit_submission_reveal(
+        self, round_id: int, entries: list[dict],
+    ) -> bool:
+        """POST the per-round submission_id -> miner_hotkey reveal map.
+
+        Called after Phase C closes. Each entry is a dict with keys
+        ``submission_id``, ``miner_hotkey``, ``miner_uid``. Idempotent on
+        (round_id, submission_id).
+        """
+        result = await self._post("/round_submissions/reveal", {
+            "round_id": int(round_id),
+            "entries": entries,
+        })
+        return result is not None
+
     async def close(self):
         """Close the underlying HTTP client."""
         if self._client and not self._client.is_closed:

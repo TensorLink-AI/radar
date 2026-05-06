@@ -239,8 +239,9 @@ async def run_sandbox(
     cmd = _build_command(config_path)
 
     logger.info(
-        "Spawning sandbox: cmd=%s timeout=%ds (round=%s miner=%s)",
-        cmd[0], timeout, config.get("round_id"), config.get("miner_hotkey", "?")[:16],
+        "Spawning sandbox: cmd=%s timeout=%ds (round=%s submission=%s)",
+        cmd[0], timeout, config.get("round_id"),
+        config.get("submission_id", "?")[:12],
     )
 
     try:
@@ -312,7 +313,7 @@ async def run_sandbox(
         return (
             {
                 "round_id": config.get("round_id", 0),
-                "miner_hotkey": config.get("miner_hotkey", "unknown"),
+                "submission_id": config.get("submission_id", "unknown"),
                 "status": "failed",
                 "error": f"sandbox timed out after {timeout}s",
             },
@@ -323,7 +324,7 @@ async def run_sandbox(
         return (
             {
                 "round_id": config.get("round_id", 0),
-                "miner_hotkey": config.get("miner_hotkey", "unknown"),
+                "submission_id": config.get("submission_id", "unknown"),
                 "status": "failed",
                 "error": "sandbox killed: " + ", ".join(sorted(overflow.values())),
             },
@@ -336,7 +337,7 @@ async def run_sandbox(
         return (
             {
                 "round_id": config.get("round_id", 0),
-                "miner_hotkey": config.get("miner_hotkey", "unknown"),
+                "submission_id": config.get("submission_id", "unknown"),
                 "status": "failed",
                 "error": (
                     f"sandbox produced no JSON result (exit={proc.returncode}); "
