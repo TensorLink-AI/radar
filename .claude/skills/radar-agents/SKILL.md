@@ -1,14 +1,18 @@
-# Radar Agents — What They Can and Can't Access
+---
+name: radar-agents
+description: Reference for what Radar miner agents (the .py code that runs in the agent sandbox to design model architectures) can and cannot access. Use when writing, modifying, or debugging miner agent code in `miner_template/`, `runner/agent/`, or anywhere that touches `design_architecture(challenge, client)`, the `GatedClient`, the agent scratchpad, the `db_url`/`desearch_url`/`llm_url` proxies, the per-round `agent_token`, the agent sandbox image, or the Phase A submission flow. Also use when answering questions about agent network egress, allowlists, rate limits, or what's stripped from the agent environment.
+---
 
-Miner agents run inside the official `radar-agent` Docker image (built from
-`runner/agent/Dockerfile`). The image is owned and frozen by the subnet
+# Radar Agents — Sandbox Capabilities Reference
+
+Miner agents run inside the official `radar-agent` Docker image
+(`runner/agent/Dockerfile`). The image is owned and frozen by the subnet
 owner; miners only ship `.py` files that the validator injects at runtime
 into `/workspace/agent/`. The frozen harness (`runner/agent/harness.py`)
 loads the module, calls `design_architecture(challenge, client)`, and
 captures the returned dict as the round's `Proposal`.
 
-This document lists every interface the agent has — and explicitly the
-ones it does not.
+This skill lists every interface the agent has — and the ones it does not.
 
 ## Entry point
 
@@ -176,7 +180,7 @@ The image is deliberately stripped. Agent code does **not** get:
 - **Validator / miner secrets** — `R2_*`, `HIPPIUS_*`, `BASILICA_*`,
   `TARGON_*`, `WALLET_*` env vars are stripped before the pod starts.
   Only an explicit allowlist of vars is forwarded (see
-  `MINER_ENVIRONMENT.md`).
+  `docs/MINER_ENVIRONMENT.md`).
 - **The trainer image** — agent and trainer are separate Docker images
   with separate frozen harnesses. The agent does not run training; it
   emits the `code` string that the trainer will execute later.
@@ -236,12 +240,18 @@ public dashboard and are saved with the experiment row. They are
 pair them with the validator-observed proxy access log (`X-Miner-UID`
 + `X-Miner-Hotkey` are stamped on every proxied request).
 
-## See also
+## Source-of-truth files
 
-- `docs/MINER_ENVIRONMENT.md` — sandbox image, env vars, networking depth
+When updating this skill, cross-check against:
+
 - `runner/agent/harness.py` — entry point, scratchpad helpers, gating
+- `runner/agent/Dockerfile` — pre-installed packages, frozen layout
+- `runner/agent/entrypoint.sh` — iptables egress lockdown
 - `shared/url_gate.py` — `GatedClient` source
 - `shared/protocol.py` — `Challenge` / `Proposal` wire format
 - `validator/db_proxy.py` — proxy auth, rate limits, route allowlist
 - `validator/collection.py::_build_allowed_urls` — per-round allowlist build
+- `database/server.py` — full DB API surface (validator-router routes)
+- `config.py` — `AGENT_*`, `DESEARCH_MAX_QUERIES`, `LLM_MAX_QUERIES`, `SCRATCHPAD_MAX_MB`
 - `miner_template/agent.py` — runnable starter agent
+- `docs/MINER_ENVIRONMENT.md` — sandbox image, env vars, networking depth
