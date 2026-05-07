@@ -317,3 +317,54 @@ async def test_shutdown_tears_down_all_active(monkeypatch):
     assert fake.teardown_workload.await_count == 2
     called = {c.args[0] for c in fake.teardown_workload.await_args_list}
     assert called == {"wl_1", "wl_2"}
+
+
+# ── heartbeat listener self-check ───────────────────────────────────
+
+
+def _build_miner(monkeypatch):
+    monkeypatch.delenv("TARGON_API_KEY", raising=False)
+    from miner import neuron as mn
+    monkeypatch.setattr(mn.Config, "HOSTING_BACKEND", "basilica")
+    stub_cfg = MagicMock(netuid=1, listener_port=8066)
+    with patch.object(mn, "bt") as bt_mock:
+        bt_mock.Subtensor.return_value.metagraph.return_value = MagicMock(n=1)
+        m = mn.Miner(stub_cfg)
+    return mn, m
+
+
+@pytest.mark.asyncio
+async def test_probe_listener_returns_true_on_200(monkeypatch):
+    mn, m = _build_miner(monkeypatch)
+    resp = MagicMock(status_code=200)
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.get = AsyncMock(return_value=resp)
+    with patch.object(mn.httpx, "AsyncClient", return_value=client):
+        assert await m._probe_listener() is True
+    client.get.assert_awaited_once()
+    assert "127.0.0.1:8066/health" in client.get.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_probe_listener_returns_false_on_non_200(monkeypatch):
+    mn, m = _build_miner(monkeypatch)
+    resp = MagicMock(status_code=503)
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.get = AsyncMock(return_value=resp)
+    with patch.object(mn.httpx, "AsyncClient", return_value=client):
+        assert await m._probe_listener() is False
+
+
+@pytest.mark.asyncio
+async def test_probe_listener_returns_false_on_connection_error(monkeypatch):
+    mn, m = _build_miner(monkeypatch)
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.get = AsyncMock(side_effect=ConnectionError("refused"))
+    with patch.object(mn.httpx, "AsyncClient", return_value=client):
+        assert await m._probe_listener() is False

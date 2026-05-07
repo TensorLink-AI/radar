@@ -532,6 +532,23 @@ class Miner:
             except Exception as e:
                 logger.debug("Teardown failed for round %d: %s (TTL will clean up)", rid, e)
 
+    async def _probe_listener(self) -> bool:
+        """Hit the local listener's /health to verify it's actually serving.
+
+        The uvicorn worker runs on a daemon thread; if it dies the rest of
+        the miner keeps logging happy heartbeats while validators get no
+        response on /prepare. Probing here turns that silent failure into
+        a loud WARNING in the heartbeat output.
+        """
+        url = f"http://127.0.0.1:{self.listener_port}/health"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url)
+            return resp.status_code == 200
+        except Exception as e:
+            logger.debug("Listener probe failed: %s", e)
+            return False
+
     async def _reap_stale_deployments(self):
         """Heartbeat safety-net: delete any deployment past its TTL."""
         now = time.time()
@@ -740,13 +757,25 @@ class Miner:
             try:
                 self.metagraph = self.subtensor.metagraph(self.netuid)
                 await self._reap_stale_deployments()
-                logger.info(
-                    "Heartbeat: metagraph synced (%d neurons). "
-                    "Active deployments: %d. Listening on port %d.",
-                    self.metagraph.n,
-                    len(self.active_deployments),
-                    self.listener_port,
-                )
+                listener_ok = await self._probe_listener()
+                if listener_ok:
+                    logger.info(
+                        "Heartbeat: metagraph synced (%d neurons). "
+                        "Active deployments: %d. Listening on port %d.",
+                        self.metagraph.n,
+                        len(self.active_deployments),
+                        self.listener_port,
+                    )
+                else:
+                    logger.warning(
+                        "Heartbeat: metagraph synced (%d neurons), "
+                        "active deployments: %d, but LISTENER NOT RESPONDING "
+                        "on port %d — validator /prepare requests will time "
+                        "out. Check the uvicorn thread / port binding.",
+                        self.metagraph.n,
+                        len(self.active_deployments),
+                        self.listener_port,
+                    )
                 # Retry if DB server was unreachable at startup
                 if not self._code_hash:
                     await self.submit_agent_code()
