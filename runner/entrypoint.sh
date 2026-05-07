@@ -28,7 +28,16 @@ fi
 
 # Refuse to run if any preload / import-path-altering env var is set.
 # PYTHONNOUSERSITE is handled separately below (we always set it).
-for var in LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT PYTHONUSERBASE; do
+#
+# LD_LIBRARY_PATH is NOT in this list because the nvidia/cuda base image
+# bakes it into the image (LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+# so the NVIDIA Container Toolkit's bind-mounted driver libs are
+# resolvable). Refusing on that broke every container off the new
+# hardened image. Instead the allow-list strip below drops whatever
+# value reached us (operator-supplied or inherited), and we re-export
+# the canonical NVIDIA path right before exec — attacker overrides
+# never make it through, CUDA still works.
+for var in LD_PRELOAD LD_AUDIT PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT PYTHONUSERBASE; do
     eval "val=\${$var:-}"
     if [ -n "$val" ]; then
         echo "radar-entrypoint: refusing to run — banned env var $var is set" >&2
@@ -65,5 +74,14 @@ done
 : "${LANG:=C.UTF-8}"
 : "${LC_ALL:=C.UTF-8}"
 export PATH HOME LANG LC_ALL
+
+# Re-export the canonical NVIDIA driver-library path. The allow-list
+# strip above unset whatever value reached us, so this overwrites any
+# operator-injected LD_LIBRARY_PATH while keeping CUDA usable. The
+# value matches what nvidia/cuda:12.4.1-*-ubuntu22.04 bakes into the
+# base image; if you bump the base image and that value drifts, change
+# it here too.
+LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+export LD_LIBRARY_PATH
 
 exec python3 /workspace/_bootstrap.py

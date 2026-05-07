@@ -53,7 +53,6 @@ def test_entrypoint_refuses_args():
 
 @pytest.mark.parametrize("var", [
     "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
     "LD_AUDIT",
     "PYTHONPATH",
     "PYTHONHOME",
@@ -66,6 +65,37 @@ def test_entrypoint_refuses_dangerous_env(var):
     assert proc.returncode == 101, f"{var}: rc={proc.returncode} stderr={proc.stderr}"
     assert var in proc.stderr
     assert "banned env var" in proc.stderr
+
+
+def test_entrypoint_overwrites_ld_library_path(tmp_path):
+    """Operator-injected LD_LIBRARY_PATH gets dropped and replaced with the
+    canonical NVIDIA path.
+
+    LD_LIBRARY_PATH can't be on the banned list because the nvidia/cuda
+    base image bakes it into the image — refusing on it bricked every
+    container. Instead the allow-list strip wipes the inherited / injected
+    value and we explicitly re-export the safe canonical path before exec.
+    """
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    dump_path = tmp_path / "env.json"
+    real_python = sys.executable
+    stub = stub_dir / "python3"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"exec {real_python} -c 'import json,os; "
+        f'open({json.dumps(str(dump_path))}, "w").write(json.dumps(dict(os.environ)))\'\n'
+    )
+    stub.chmod(0o755)
+
+    env = {
+        "PATH": f"{stub_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+        "LD_LIBRARY_PATH": "/evil/path:/usr/local/nvidia/lib64",
+    }
+    proc = _run_entrypoint([], env=env)
+    assert proc.returncode == 0, proc.stderr
+    captured = json.loads(dump_path.read_text())
+    assert captured.get("LD_LIBRARY_PATH") == "/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
 
 
 def test_entrypoint_strips_unknown_env(tmp_path):

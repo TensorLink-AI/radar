@@ -292,13 +292,18 @@ our harness:
 1. **`/usr/local/bin/radar-entrypoint.sh`** (chmod 555) is the Docker
    ENTRYPOINT. Refuses to run if `$# > 0` (any operator-supplied
    `command`/`args`), refuses if any preload-style env var is set
-   (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `PYTHONPATH`,
-   `PYTHONHOME`, `PYTHONSTARTUP`, `PYTHONINSPECT`, `PYTHONUSERBASE`),
-   pins `PYTHONNOUSERSITE=1`, unsets every env var not on the
+   (`LD_PRELOAD`, `LD_AUDIT`, `PYTHONPATH`, `PYTHONHOME`,
+   `PYTHONSTARTUP`, `PYTHONINSPECT`, `PYTHONUSERBASE`), pins
+   `PYTHONNOUSERSITE=1`, unsets every env var not on the
    allow-list (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, CUDA vars,
    trainer config, plus `WALLET_*` / `BT_*` / `RADAR_*` / `R2_*` /
-   `S3_*` / `AWS_*` / `HIPPIUS_*` / `MOCK_*` prefixes), and
-   `exec`s `python3 /workspace/_bootstrap.py`.
+   `S3_*` / `AWS_*` / `HIPPIUS_*` / `MOCK_*` prefixes),
+   re-exports `LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64`
+   (the canonical NVIDIA path — operator-injected values are dropped
+   by the allow-list strip and replaced with this constant so the
+   container toolkit's bind-mounted driver libs stay reachable, while
+   attacker paths never make it through), and `exec`s
+   `python3 /workspace/_bootstrap.py`.
 2. **`/workspace/_bootstrap.py`** (chmod 444) reads
    `/workspace/_bootstrap_hashes.json`, sha256-verifies every
    load-bearing file, refuses if any hash mismatches, refuses if any
