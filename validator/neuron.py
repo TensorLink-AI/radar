@@ -18,11 +18,18 @@ import logging
 import os
 import random
 import threading
+import time
 import traceback
 from typing import Optional
 
-import bittensor as bt
 import uvicorn
+
+# Bittensor is only needed in competitive mode.  Make it optional so
+# RADAR_NONCOMPETITIVE=true deployments don't need the dependency at all.
+try:
+    import bittensor as bt
+except ImportError:  # pragma: no cover — only fires in noncompetitive deploys
+    bt = None  # type: ignore[assignment]
 
 from config import Config
 from shared.challenge import (
@@ -155,6 +162,12 @@ class Validator:
             self.subtensor = None
             self.metagraph = None
         else:
+            if bt is None:
+                raise RuntimeError(
+                    "competitive mode requires the bittensor package; "
+                    "install with `pip install bittensor` or run with "
+                    "RADAR_NONCOMPETITIVE=true."
+                )
             self.wallet = bt.Wallet(config=config)
             self.subtensor = bt.Subtensor(config=config)
             self.metagraph = self.subtensor.metagraph(self.netuid)
@@ -528,17 +541,25 @@ class Validator:
     async def run_round(self):
         """Execute one full 3-phase round."""
         # ── SETUP ──────────────────────────────────────────────
-        self.metagraph.sync()
-        set_metagraph(self.metagraph)
-        hotkeys = self.metagraph.hotkeys or []
-        hotkey_map = {
-            hotkeys[uid]: uid
-            for uid in range(self.metagraph.n)
-            if uid < len(hotkeys)
-        }
-        set_hotkey_map(hotkey_map)
-        current_block = self.subtensor.block
-        round_start = round_start_block(current_block, Config.ROUND_INTERVAL_BLOCKS)
+        if Config.NONCOMPETITIVE:
+            # No chain — round_start is a wall-clock-derived integer so
+            # the deterministic seed stays stable for ~12s like a block.
+            current_block = int(time.time() // 12)
+            round_start = round_start_block(current_block, Config.ROUND_INTERVAL_BLOCKS)
+            set_metagraph(None)
+            set_hotkey_map({})
+        else:
+            self.metagraph.sync()
+            set_metagraph(self.metagraph)
+            hotkeys = self.metagraph.hotkeys or []
+            hotkey_map = {
+                hotkeys[uid]: uid
+                for uid in range(self.metagraph.n)
+                if uid < len(hotkeys)
+            }
+            set_hotkey_map(hotkey_map)
+            current_block = self.subtensor.block
+            round_start = round_start_block(current_block, Config.ROUND_INTERVAL_BLOCKS)
         block_hash = hashlib.sha256(str(round_start).encode()).hexdigest()
 
         # Select task for this round (deterministic from block hash)
@@ -1174,6 +1195,9 @@ class Validator:
 
     def _set_weights(self):
         """Set weights on chain — softmax on EMA scores."""
+        if Config.NONCOMPETITIVE:
+            logger.debug("NONCOMPETITIVE: skipping weight set")
+            return
         if not self.ema_scores:
             logger.warning("No EMA scores — skipping weight setting")
             return
@@ -1260,12 +1284,15 @@ class Validator:
             await asyncio.sleep(60)
 
 
-def get_config() -> bt.Config:
+def get_config():
     parser = argparse.ArgumentParser(description="Radar Validator")
     parser.add_argument("--netuid", type=int, default=1)
     parser.add_argument("--task", type=str, default="ml_training")
     parser.add_argument("--db_dir", type=str, default="./experiments")
     parser.add_argument("--db_port", type=int, default=Config.PROXY_PORT)
+    if Config.NONCOMPETITIVE or bt is None:
+        # Plain argparse Namespace — no wallet / subtensor flags needed.
+        return parser.parse_args()
     bt.Wallet.add_args(parser)
     bt.Subtensor.add_args(parser)
     return bt.Config(parser)
