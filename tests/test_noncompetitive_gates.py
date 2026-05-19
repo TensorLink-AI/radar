@@ -135,3 +135,77 @@ def test_database_client_signs_with_bearer_when_key_set():
     c = DatabaseClient("http://x", api_key="rdrk_abc")
     headers = c._sign(b"")
     assert headers == {"Authorization": "Bearer rdrk_abc"}
+
+
+def test_substrate_module_loads_without_bittensor():
+    """shared/substrate.py uses TYPE_CHECKING + lazy _bt() so it loads
+    even when bittensor is missing from the environment."""
+    src = open("/home/user/radar/shared/substrate.py").read()
+    assert "if TYPE_CHECKING" in src
+    assert "import bittensor as bt" in src  # in the TYPE_CHECKING block
+    # The runtime path goes through _bt() — verify the helper exists.
+    assert "def _bt():" in src
+    # No bare top-level import outside TYPE_CHECKING.
+    lines = src.splitlines()
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("import bittensor") or stripped.startswith(
+            "from bittensor"
+        ):
+            # Walk up to see if we're inside a TYPE_CHECKING block.
+            context = "\n".join(lines[max(0, i - 5):i + 1])
+            assert (
+                "TYPE_CHECKING" in context
+                or "def " in context  # inside a function = lazy
+            ), f"bare bittensor import at line {i + 1}: {line}"
+
+
+def test_validator_neuron_imports_without_bittensor(monkeypatch):
+    """validator/neuron.py + its transitive graph load when bittensor
+    is missing.  Smoke test — confirms the chain-free deployment path
+    doesn't blow up at import time."""
+    monkeypatch.setenv("RADAR_NONCOMPETITIVE", "true")
+    monkeypatch.setenv("RADAR_SERVICE_KEY", "a" * 64)
+    monkeypatch.setenv("RADAR_DB_API_URL", "http://localhost:8090")
+    import importlib
+    import config
+    importlib.reload(config)
+    import validator.neuron
+    importlib.reload(validator.neuron)
+    # bt is None when bittensor isn't installed; ImportError was caught
+    # at top-level by the try/except.  In this container it IS None
+    # (bittensor not in pip set).
+    # The important assertion: the module loaded.
+    assert validator.neuron is not None
+    assert hasattr(validator.neuron, "Validator")
+
+
+def test_no_top_level_bittensor_imports_in_main_code():
+    """Sweep guard: no top-level ``import bittensor`` in code/, only
+    inside functions or under ``if TYPE_CHECKING:``."""
+    import pathlib
+
+    root = pathlib.Path("/home/user/radar")
+    bad: list[str] = []
+    for path in root.rglob("*.py"):
+        if any(part in {"tests", "scripts"} for part in path.parts):
+            continue
+        text = path.read_text()
+        lines = text.splitlines()
+        for i, raw in enumerate(lines):
+            stripped = raw.lstrip()
+            if not (
+                stripped.startswith("import bittensor")
+                or stripped.startswith("from bittensor")
+            ):
+                continue
+            indent = len(raw) - len(stripped)
+            # Anything indented is inside a function / try block → lazy.
+            if indent > 0:
+                continue
+            # Top-level — must be guarded by TYPE_CHECKING or try/except.
+            ctx = "\n".join(lines[max(0, i - 4):i])
+            if "TYPE_CHECKING" in ctx or "try:" in ctx:
+                continue
+            bad.append(f"{path}:{i + 1}: {raw}")
+    assert not bad, "unguarded top-level bittensor imports:\n" + "\n".join(bad)
