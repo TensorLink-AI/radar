@@ -84,6 +84,12 @@ class Proposal:
     populates them. They are useful for explainability but trivially
     fakeable; pair with validator-observed signals (proxy access logs,
     pod wall-clock) for adversarial use.
+
+    ``prompt_id`` is opaque to the operator — it's a miner-local
+    identifier (UUID by default) for the prompt variant that produced
+    this architecture.  Round-tripped back via
+    ``experiments.prompt_id`` so the miner's GEPA/random_mutate loop
+    can correlate Phase C scores with the variant.
     """
 
     code: str = ""
@@ -95,6 +101,9 @@ class Proposal:
     # (e.g. {"tool": "llm", "prompt": "...", "summary": "..."}). Schema is
     # intentionally open so different agents can use different shapes.
     tool_calls: list = field(default_factory=list)
+    # Miner-local prompt-variant id; surfaced on the experiments row so
+    # the miner CLI's optimizer can attribute Phase C scores back.
+    prompt_id: str = ""
 
     def to_json(self) -> str:
         return json.dumps({
@@ -103,6 +112,7 @@ class Proposal:
             "motivation": self.motivation,
             "reasoning": self.reasoning,
             "tool_calls": self.tool_calls,
+            "prompt_id": self.prompt_id,
         })
 
     @classmethod
