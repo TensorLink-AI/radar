@@ -17,7 +17,13 @@
 -- partial indexes keep the table footprint sparse for rows without
 -- a prompt_id (every existing row + every competitive-mode write).
 --
--- All DDL is idempotent — safe under partial re-runs.
+-- All DDL is idempotent — safe under partial re-runs.  The
+-- experiments ALTER + its indexes are wrapped in an information_schema
+-- guard (same pattern as 002_substrate_cids.sql) because CI exercises
+-- the migration runner against an empty schema before init_schema()
+-- has bootstrapped the experiments table.  On a fresh deploy the base
+-- CREATE TABLE in shared/pg_schema.py already declares prompt_id, so
+-- the guarded block is a no-op there.
 
 CREATE TABLE IF NOT EXISTS CURRENT_SCHEMA.miners (
     miner_id TEXT PRIMARY KEY,
@@ -51,14 +57,21 @@ CREATE INDEX IF NOT EXISTS idx_miner_api_keys_hash
 CREATE INDEX IF NOT EXISTS idx_miner_api_keys_miner
     ON CURRENT_SCHEMA.miner_api_keys(miner_id);
 
--- ``prompt_id`` column — purely additive, NULL on every existing row.
-ALTER TABLE CURRENT_SCHEMA.experiments
-    ADD COLUMN IF NOT EXISTS prompt_id TEXT;
-
-CREATE INDEX IF NOT EXISTS idx_experiments_prompt_id
-    ON CURRENT_SCHEMA.experiments(prompt_id)
-    WHERE prompt_id IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_experiments_miner_prompt
-    ON CURRENT_SCHEMA.experiments(miner_hotkey, prompt_id)
-    WHERE prompt_id IS NOT NULL;
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = 'CURRENT_SCHEMA'
+          AND table_name = 'experiments'
+    ) THEN
+        ALTER TABLE CURRENT_SCHEMA.experiments
+            ADD COLUMN IF NOT EXISTS prompt_id TEXT;
+        CREATE INDEX IF NOT EXISTS idx_experiments_prompt_id
+            ON CURRENT_SCHEMA.experiments(prompt_id)
+            WHERE prompt_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_experiments_miner_prompt
+            ON CURRENT_SCHEMA.experiments(miner_hotkey, prompt_id)
+            WHERE prompt_id IS NOT NULL;
+    END IF;
+END $$;
