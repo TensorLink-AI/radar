@@ -772,9 +772,23 @@ def get_config() -> bt.Config:
 
 
 def main():
+    import sys
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    # Subcommand router: ``results`` / ``optimize`` / ``prompts`` go to
+    # ``miner/cli.py``.  Anything else (or no args) falls through to the
+    # legacy ``run`` behavior so existing deployments keep working.
+    from miner import cli
+    if cli.is_subcommand(sys.argv):
+        sys.exit(cli.dispatch(sys.argv))
+    # Optional explicit ``run`` token for clarity; strip it before the
+    # bittensor argparse kicks in.
+    if len(sys.argv) >= 2 and sys.argv[1] == "run":
+        del sys.argv[1]
+
     config = get_config()
     miner = Miner(config)
     asyncio.run(miner.run())
