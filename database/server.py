@@ -334,18 +334,42 @@ async def auth_middleware(request: Request, call_next):
                 status_code=413, content={"error": "Request body too large"},
             )
 
-        # ── Validator API key: trusted proxy, skip Epistula ──
+        # ── Validator API key: trusted proxy, fast path ──
         proxy_authed = False
         if Config.DB_API_KEY:
             import secrets as _secrets
             provided = request.headers.get("X-Radar-API-Key", "")
             if provided and _secrets.compare_digest(provided, Config.DB_API_KEY):
-                # Trusted validator proxy — rate-limit by IP instead of hotkey
                 if not _check_rate_limit(client_ip):
                     return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
                 proxy_authed = True
 
-        # ── Epistula auth: miners and validators without API key ──
+        # ── HMAC service-key auth (non-competitive default) ──
+        if not proxy_authed:
+            import os as _os
+            service_key = _os.getenv("RADAR_SERVICE_KEY", "").strip()
+            if service_key:
+                from shared.auth import (
+                    hmac_verify_request, static_key_lookup,
+                )
+                expected_kid = _os.getenv("RADAR_SERVICE_KEY_ID", "operator")
+                ok, err, kid = hmac_verify_request(
+                    dict(request.headers), body,
+                    static_key_lookup(expected_kid, service_key.encode()),
+                )
+                if ok:
+                    request.state.caller_hotkey = kid
+                    if not _check_rate_limit(kid):
+                        return JSONResponse(
+                            status_code=429,
+                            content={"error": "Rate limit exceeded"},
+                        )
+                    proxy_authed = True
+                elif _metagraph is None:
+                    # No Epistula fallback configured — reject.
+                    return JSONResponse(status_code=403, content={"error": err})
+
+        # ── Legacy Epistula path (dual-stack period) ──
         if not proxy_authed and _metagraph:
             from shared.auth import verify_request
             ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)

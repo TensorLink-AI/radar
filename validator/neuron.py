@@ -143,10 +143,21 @@ class Validator:
                 "Without a pinned digest the verify chain becomes a no-op — refusing to start."
             )
 
-        # Bittensor components
-        self.wallet = bt.Wallet(config=config)
-        self.subtensor = bt.Subtensor(config=config)
-        self.metagraph = self.subtensor.metagraph(self.netuid)
+        # Bittensor components — skipped entirely in non-competitive mode
+        if Config.NONCOMPETITIVE:
+            if not Config.SERVICE_KEY:
+                raise RuntimeError(
+                    "RADAR_NONCOMPETITIVE=true requires RADAR_SERVICE_KEY "
+                    "to be set (shared HMAC secret for service-to-service "
+                    "auth)."
+                )
+            self.wallet = None
+            self.subtensor = None
+            self.metagraph = None
+        else:
+            self.wallet = bt.Wallet(config=config)
+            self.subtensor = bt.Subtensor(config=config)
+            self.metagraph = self.subtensor.metagraph(self.netuid)
 
         # Tasks — load all enabled tasks for multi-task rounds
         self.tasks = load_enabled_tasks(Config.ENABLED_TASKS)
@@ -162,10 +173,18 @@ class Validator:
                 "RADAR_DB_API_URL is not set. Validators must point to the "
                 "centralized DB server (e.g. http://<db-host>:8090)."
             )
-        self.db_client = DatabaseClient(
-            db_url=Config.DB_API_URL, wallet=self.wallet,
-            api_key=Config.DB_API_KEY,
-        )
+        if Config.NONCOMPETITIVE:
+            self.db_client = DatabaseClient(
+                db_url=Config.DB_API_URL,
+                service_secret=Config.SERVICE_KEY.encode(),
+                key_id=Config.SERVICE_KEY_ID,
+                api_key=Config.DB_API_KEY,
+            )
+        else:
+            self.db_client = DatabaseClient(
+                db_url=Config.DB_API_URL, wallet=self.wallet,
+                api_key=Config.DB_API_KEY,
+            )
 
         # EMA scores per UID
         self.ema_scores: dict[int, float] = {}
