@@ -1055,6 +1055,11 @@ class Validator:
                     agent_behavior=meta.get("agent_behavior", {}),
                     task=task_name,
                     round_id=challenge.round_id,
+                    prompt_id=(
+                        meta.get("prompt_id", "")
+                        or getattr(proposal, "prompt_id", "")
+                        or ""
+                    ),
                 )
 
                 # Write to centralized DB. When this validator published

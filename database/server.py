@@ -304,6 +304,12 @@ async def auth_middleware(request: Request, call_next):
 
     path = request.url.path
 
+    # Bearer-auth surface for the non-competitive feedback API.  Handled
+    # before the Epistula path because tokens use Authorization: Bearer
+    # headers, not the X-Epistula-* set.
+    if path.startswith("/miners/me/"):
+        return await _bearer_auth_then_call(request, call_next)
+
     needs_auth = (
         path.startswith("/experiments")
         or path.startswith("/challenge")
@@ -1059,9 +1065,57 @@ def include_validator_routes(target_app: FastAPI) -> None:
     target_app.include_router(validator_router)
 
 
+async def _bearer_auth_then_call(request: Request, call_next):
+    """Resolve a bearer token against ``miner_api_keys`` and attach the
+    identity to ``request.state`` for the route handler.
+
+    401 if the token is missing / unknown / revoked, 503 if the asyncpg
+    pool isn't wired up yet (dashboard-only mode that accidentally
+    received bearer traffic, or pre-startup race).
+    """
+    from shared.auth import extract_bearer
+    from shared.miner_auth import lookup_bearer
+
+    token = extract_bearer(dict(request.headers))
+    if not token:
+        return JSONResponse(
+            status_code=401, content={"error": "Bearer token required"},
+        )
+    if _pool is None:
+        return JSONResponse(
+            status_code=503, content={"error": "DB pool not ready"},
+        )
+    try:
+        ident = await lookup_bearer(_pool, token)
+    except Exception as e:
+        logger.warning("bearer lookup failed: %s", e)
+        return JSONResponse(
+            status_code=503, content={"error": "auth lookup failed"},
+        )
+    if ident is None:
+        return JSONResponse(
+            status_code=403, content={"error": "Unknown or revoked token"},
+        )
+    request.state.miner_identity = ident
+    return await call_next(request)
+
+
+def include_miner_feedback_routes(target_app: FastAPI) -> None:
+    """Mount the bearer-auth ``/miners/me/*`` + public per-task frontier
+    routes onto ``target_app``.  Idempotent."""
+    from database.miner_feedback import (
+        include_miner_feedback_routes as _mount,
+    )
+    _mount(target_app)
+
+
 # Legacy auto-mount: keep the validator surface on ``app`` at import time
 # unless this process is running in ``dashboard`` mode. Preserves backward
 # compatibility for tests that import ``app`` directly and expect every
 # route to be reachable.
 if Config.NEURON_MODE != "dashboard":
     include_validator_routes(app)
+# Miner feedback routes are mounted unconditionally — they need bearer
+# auth (no chain dependency) and are useful in both validator and
+# dashboard deployments.
+include_miner_feedback_routes(app)

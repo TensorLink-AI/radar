@@ -265,6 +265,7 @@ async def _run_single_agent(
                     result.get("reasoning", "") or "", _REASONING_MAX_BYTES,
                 ),
                 tool_calls=_normalise_tool_calls(result.get("tool_calls", [])),
+                prompt_id=str(result.get("prompt_id", "") or "")[:64],
             )
             agent_log = _truncate_text(
                 result.get("agent_log", "") or "", _TRACE_MAX_BYTES,
@@ -275,6 +276,7 @@ async def _run_single_agent(
                 "reasoning": proposal.reasoning,
                 "tool_calls": proposal.tool_calls,
                 "agent_behavior": agent_behavior,
+                "prompt_id": proposal.prompt_id,
             }
             r2.upload_json(
                 f"round_{round_id}/proposals/{uid}.json",
@@ -284,6 +286,7 @@ async def _run_single_agent(
                     "motivation": proposal.motivation,
                     "reasoning": proposal.reasoning,
                     "tool_calls": proposal.tool_calls,
+                    "prompt_id": proposal.prompt_id,
                     "agent_log": agent_log,
                     "agent_behavior": agent_behavior,
                 },
@@ -459,6 +462,9 @@ async def run_and_collect_agents(
                             tool_calls=_normalise_tool_calls(
                                 data.get("tool_calls", []),
                             ),
+                            prompt_id=str(
+                                data.get("prompt_id", "") or ""
+                            )[:64],
                         )
                         agent_meta[uid] = {
                             "agent_log": _truncate_text(
@@ -467,6 +473,7 @@ async def run_and_collect_agents(
                             ),
                             "reasoning": proposals[uid].reasoning,
                             "tool_calls": proposals[uid].tool_calls,
+                            "prompt_id": proposals[uid].prompt_id,
                             "agent_behavior": data.get("agent_behavior", {})
                                 if isinstance(data.get("agent_behavior"), dict)
                                 else {},

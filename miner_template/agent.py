@@ -56,6 +56,34 @@ def log(msg: str):
     print(msg, file=sys.stderr)
 
 
+def _load_active_prompt(round_id: int) -> dict:
+    """Return ``{id, template}`` for the prompt variant this round will
+    use, or ``{"id": "", "template": ""}`` if the miner hasn't run the
+    optimizer yet.  Reads from ``prompts/active.json`` next to the
+    miner's working dir; override via ``MINER_PROMPTS_DIR``.
+
+    Kept import-light so the sandbox doesn't need the full
+    ``miner_template`` package — the agent runs in a stripped image.
+    """
+    prompts_dir = os.getenv("MINER_PROMPTS_DIR", "prompts")
+    path = os.path.join(prompts_dir, "active.json")
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"id": "", "template": ""}
+    rows = payload.get("prompts") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list) or not rows:
+        return {"id": "", "template": ""}
+    pick = rows[round_id % len(rows)]
+    if not isinstance(pick, dict):
+        return {"id": "", "template": ""}
+    return {
+        "id": str(pick.get("id", "")),
+        "template": str(pick.get("template", "")),
+    }
+
+
 def _pick_hyperparams(min_flops: int, max_flops: int) -> dict:
     """Pick d_model, nhead, num_layers, dim_feedforward to fit the FLOPs range.
 
@@ -183,6 +211,18 @@ def design_architecture(challenge: dict, client) -> dict:
     # Load persistent state from previous rounds
     scratch_dir = load_scratchpad(challenge)
 
+    # Pull the active prompt variant for this round.  If the miner is
+    # running the optimizer (e.g. ``miner/neuron.py optimize --watch``)
+    # this rotates through the current population; otherwise it's empty
+    # and the agent falls back to its hardcoded heuristic.
+    round_id = int(challenge.get("round_id", 0) or 0)
+    prompt = _load_active_prompt(round_id)
+    if prompt["id"]:
+        reasoning_steps.append(
+            f"Using prompt variant {prompt['id'][:8]}… "
+            f"(rotating round_id={round_id} into population)."
+        )
+
     frontier = challenge.get("feasible_frontier", [])
     min_flops = challenge.get("min_flops_equivalent", 0)
     max_flops = challenge.get("max_flops_equivalent", 0)
@@ -283,4 +323,5 @@ def build_optimizer(model):
         "motivation": motivation,
         "reasoning": "\n".join(reasoning_steps),
         "tool_calls": tool_calls,
+        "prompt_id": prompt["id"],
     }
