@@ -316,11 +316,12 @@ class Validator:
         )
 
     def _my_uid(self) -> int:
-        """Get this validator's UID."""
-        hotkey = self.wallet.hotkey.ss58_address
-        hotkeys = self.metagraph.hotkeys
-        if hotkeys is not None and hotkey in hotkeys:
-            return hotkeys.index(hotkey)
+        """Get this validator's UID.
+
+        No chain / no metagraph in this deployment — UID is meaningless,
+        so always return -1. Callers already handle the negative case
+        by falling back to their single-validator path.
+        """
         return -1
 
     def _init_hippius(self):
