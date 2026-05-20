@@ -1,49 +1,74 @@
-"""Miner neuron — stubbed out.
+"""Miner neuron — lightweight, config-driven peer refresh loop.
 
-The chain-coupled miner loop has been removed. This module is kept only
-so existing imports of `miner.neuron` don't break. `main()` exits with an
-error.
+The chain-coupled miner that used to live here has been removed.
+What remains is a small process that:
+
+  * Periodically reloads ``MINERS_CONFIG_PATH`` so the miner can see
+    when its own ``endpoint`` / ``hotkey`` entries change.
+  * Wires HMAC shared-secret auth via ``shared.auth.set_auth``.
+
+Real miner operation (submitting agent code, hosting a trainer-ready
+listener) is performed by separate scripts; this module is the canonical
+entry point for ``python miner/neuron.py``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+import signal
+
+from shared.auth import set_auth
+from shared.peers import load_peers
 
 logger = logging.getLogger(__name__)
 
-
-class Miner:
-    """Stub miner — chain layer has been removed."""
-
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError(
-            "Miner neuron has been removed."
-        )
-
-    async def submit_agent_code(self):
-        raise NotImplementedError
-
-    async def handle_prepare(self, request):
-        raise NotImplementedError
-
-    async def handle_release(self, round_id: int):
-        raise NotImplementedError
-
-    async def run(self):
-        raise NotImplementedError
+PEER_REFRESH_INTERVAL_SECONDS = int(os.getenv("RADAR_PEER_REFRESH_INTERVAL", "60"))
 
 
-def get_config():
-    raise NotImplementedError(
-        "Miner chain configuration has been removed."
-    )
+async def _peer_refresh_loop(interval: int):
+    while True:
+        try:
+            peers = load_peers(force_reload=True)
+            logger.debug("peer refresh: %d peers loaded", len(peers))
+        except Exception as e:  # pragma: no cover — defensive
+            logger.warning("peer refresh failed: %s", e)
+        await asyncio.sleep(interval)
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-    raise SystemExit(
-        "miner/neuron.py: chain integration removed — nothing to run."
+    logging.basicConfig(
+        level=os.getenv("RADAR_LOG_LEVEL", "INFO"),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+    set_auth()
+    peers = load_peers(force_reload=True)
+    logger.info("Miner starting: %d peers loaded from miners config", len(peers))
+
+    loop = asyncio.new_event_loop()
+    stopped = asyncio.Event()
+
+    def _stop(*_):
+        loop.call_soon_threadsafe(stopped.set)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _stop)
+        except NotImplementedError:  # pragma: no cover — Windows fallback
+            signal.signal(sig, _stop)
+
+    async def _run():
+        task = asyncio.create_task(
+            _peer_refresh_loop(PEER_REFRESH_INTERVAL_SECONDS),
+        )
+        await stopped.wait()
+        task.cancel()
+
+    try:
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
 
 
 if __name__ == "__main__":

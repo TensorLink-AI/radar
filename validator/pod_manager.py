@@ -41,12 +41,21 @@ def get_mode() -> str:
 
 
 def _build_env_vars() -> dict[str, str]:
-    """Build env vars to pass into containers."""
+    """Build env vars to pass into trainer/agent containers."""
     env_vars = {}
     # Forward Basilica auth
     token = os.getenv("BASILICA_API_TOKEN", "")
     if token:
         env_vars["BASILICA_API_TOKEN"] = token
+    # Forward the HMAC shared secret so the trainer pod can verify
+    # incoming /train requests, and the static peer registry path so
+    # callers can resolve hotkeys → endpoints.
+    secret = os.getenv("RADAR_SHARED_SECRET", "")
+    if secret:
+        env_vars["RADAR_SHARED_SECRET"] = secret
+    miners_path = os.getenv("MINERS_CONFIG_PATH", "")
+    if miners_path:
+        env_vars["MINERS_CONFIG_PATH"] = miners_path
     # Note: R2 credentials are NOT forwarded to pods. Trainer pods
     # receive presigned URLs in the dispatch payload instead.
     # Forward user-specified vars

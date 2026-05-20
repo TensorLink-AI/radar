@@ -76,7 +76,12 @@ class TestTaskRouting:
             client = TestClient(srv.app)
             resp = client.post("/train", content=_make_body(task_name="ts_forecasting"))
 
-        assert resp.status_code == 200
+        assert resp.status_code in (200, 202)
+        # Background dispatch — give the event loop a chance to run.
+        for _ in range(20):
+            if mock_runner.called:
+                break
+            asyncio.run(asyncio.sleep(0.05))
         mock_runner.assert_called_once()
         call_args = mock_runner.call_args
         assert call_args[0][0] == "def build_model(c, p, n, q): pass\ndef build_optimizer(m): pass"
@@ -103,7 +108,11 @@ class TestTaskRouting:
             client = TestClient(srv.app)
             resp = client.post("/train", content=body)
 
-        assert resp.status_code == 200
+        assert resp.status_code in (200, 202)
+        for _ in range(20):
+            if mock_runner.called:
+                break
+            asyncio.run(asyncio.sleep(0.05))
         mock_runner.assert_called_once()
 
     def test_failed_training_returns_without_upload(self):
@@ -122,9 +131,74 @@ class TestTaskRouting:
             client = TestClient(srv.app)
             resp = client.post("/train", content=_make_body())
 
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "build_failed"
+        # /train is async-accept: 202 immediately, training runs in background.
+        assert resp.status_code in (200, 202)
+        # Let the background task finish so we can assert no upload occurred.
+        for _ in range(40):
+            if mock_runner.called:
+                asyncio.run(asyncio.sleep(0.05))
+                break
+            asyncio.run(asyncio.sleep(0.05))
         mock_upload.assert_not_called()
+
+
+class TestSharedSecretAuth:
+    """HMAC shared-secret auth on /train."""
+
+    def test_missing_signature_returns_401_when_secret_set(self, monkeypatch):
+        import runner.server as srv
+        from fastapi.testclient import TestClient
+
+        srv._RUNNERS["ts_forecasting"] = MagicMock()
+        monkeypatch.delenv("RADAR_LOCALNET", raising=False)
+        monkeypatch.setenv("RADAR_SHARED_SECRET", "test-secret")
+        srv._dev_mode_warned = False
+
+        client = TestClient(srv.app)
+        resp = client.post("/train", content=_make_body())
+        assert resp.status_code == 401
+
+    def test_valid_signature_accepted_when_secret_set(self, monkeypatch):
+        import runner.server as srv
+        from fastapi.testclient import TestClient
+        from shared.auth import sign_request_hmac
+
+        srv._RUNNERS["ts_forecasting"] = MagicMock(return_value={
+            "status": "success", "round_id": 1, "miner_hotkey": "m",
+            "checkpoint_path": "/tmp/ckpt",
+        })
+        monkeypatch.delenv("RADAR_LOCALNET", raising=False)
+        monkeypatch.setenv("RADAR_SHARED_SECRET", "test-secret")
+        srv._dev_mode_warned = False
+
+        body = _make_body()
+        sig = sign_request_hmac(body, "test-secret")
+
+        with patch("runner.server._upload_artifacts", return_value={"status": "success"}):
+            client = TestClient(srv.app)
+            resp = client.post(
+                "/train", content=body,
+                headers={"X-Radar-Signature": sig},
+            )
+        assert resp.status_code in (200, 202)
+
+    def test_unset_secret_runs_in_dev_mode(self, monkeypatch):
+        import runner.server as srv
+        from fastapi.testclient import TestClient
+
+        srv._RUNNERS["ts_forecasting"] = MagicMock(return_value={
+            "status": "success", "round_id": 1, "miner_hotkey": "m",
+            "checkpoint_path": "/tmp/ckpt",
+        })
+        monkeypatch.delenv("RADAR_LOCALNET", raising=False)
+        monkeypatch.delenv("RADAR_SHARED_SECRET", raising=False)
+        srv._dev_mode_warned = False
+
+        with patch("runner.server._upload_artifacts", return_value={"status": "success"}):
+            client = TestClient(srv.app)
+            resp = client.post("/train", content=_make_body())
+        # Unsigned but no secret configured → dev mode accept.
+        assert resp.status_code in (200, 202)
 
 
 class TestRunnerRegistry:

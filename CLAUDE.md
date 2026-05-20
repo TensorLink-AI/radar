@@ -55,7 +55,8 @@ scripts/         Localnet test script + Postgres startup
 | File | Purpose |
 |------|---------|
 | `shared/protocol.py` | Challenge/Proposal wire format (JSON serializable) |
-| `shared/auth.py` | Epistula signing/verification |
+| `shared/auth.py` | HMAC-SHA256 signing/verification keyed by `RADAR_SHARED_SECRET` |
+| `shared/peers.py` | Static peer registry loaded from `MINERS_CONFIG_PATH` (`miners.json`) |
 | `shared/challenge.py` | Deterministic challenge generation, phase timing, size buckets |
 | `shared/task.py` | TaskSpec, Objective, YAML loader |
 | `shared/database.py` | DataElement dataclass + deprecated ExperimentDB (JSON) |
@@ -104,11 +105,19 @@ python -m pytest tests/ -v
 # Start database server (subnet owner)
 python database/neuron.py
 
-# Start validator
-python validator/neuron.py
+# Point everything at a JSON peer registry and a shared HMAC secret
+export MINERS_CONFIG_PATH=$PWD/miners.json   # see miners.example.json
+export RADAR_SHARED_SECRET="$(openssl rand -hex 32)"
 
-# Start miner
-python miner/neuron.py --agent_image myagent:latest --agent_url <url> --trainer_url <url>
+# Start validator (peer-refresh loop) + proxy
+python validator/neuron.py &
+uvicorn validator.db_proxy:app --host 0.0.0.0 --port 8080
+
+# Start miner (peer-refresh loop)
+python miner/neuron.py
+
+# Start the runner that hosts /train (used by trainer pods)
+python -m runner.server
 
 # Build trainer image
 docker build -t ts-runner:latest runner/timeseries_forecast/
@@ -191,7 +200,8 @@ frontier/latest.json                                        # Current Pareto fro
 ## What's Done
 
 - [x] Phase-split validation pipeline (A -> B -> C)
-- [x] Epistula authentication (`shared/auth.py`)
+- [x] HMAC shared-secret authentication (`shared/auth.py`, `RADAR_SHARED_SECRET`)
+- [x] Static peer registry (`shared/peers.py`, `MINERS_CONFIG_PATH`)
 - [x] Deterministic challenge generation with size buckets (`shared/challenge.py`)
 - [x] Size-gated Pareto frontier scoring (`shared/scoring.py`)
 - [x] FLOPs-equivalent wallclock calibration (`runner/timeseries_forecast/flops.py`)

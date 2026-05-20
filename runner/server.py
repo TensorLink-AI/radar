@@ -31,10 +31,11 @@ app = FastAPI(title="Radar Trainer", lifespan=_lifespan)
 # R2 client (initialized on first use, only for localnet fallback)
 _r2 = None
 
-# ── Auth cache (chain layer removed — kept as no-op placeholder) ─────
+# ── Auth cache (kept for tests that patch this slot directly) ────────
 _auth_cache = None
 _auth_lock = threading.Lock()
 _auth_last_refresh: float = 0.0
+_dev_mode_warned: bool = False
 
 # ── Rate limiting ────────────────────────────────────────────────────
 _train_semaphore = asyncio.Semaphore(1)  # max 1 concurrent /train
@@ -80,16 +81,43 @@ async def train(request: Request):
 
     body = await request.body()
 
-    # 1. Auth — chain layer removed. Honor the legacy localnet/test flag
-    #    so tests that simulate a missing chain still see a 503.
+    # 1. Auth — HMAC-shared-secret scheme. If RADAR_SHARED_SECRET is unset
+    #    we log once and allow the request through (dev mode); when it is
+    #    set we require a matching X-Radar-Signature on every request.
+    #    The legacy RADAR_LOCALNET flag is still honoured for test setups
+    #    that exercise the auth-bypass path explicitly.
     localnet = os.getenv("RADAR_LOCALNET", "").lower() in ("1", "true")
+    secret = os.getenv("RADAR_SHARED_SECRET", "")
     if localnet:
         sender = "localnet"
+    elif not secret:
+        global _dev_mode_warned
+        if not _dev_mode_warned:
+            logger.warning(
+                "RADAR_SHARED_SECRET is unset — running trainer in dev mode "
+                "(requests will NOT be authenticated)",
+            )
+            _dev_mode_warned = True
+        sender = "dev-mode"
     else:
-        if _load_auth() is None:
-            logger.error("Auth backend unavailable — rejecting request (fail closed)")
-            return JSONResponse(status_code=503, content={"error": "Auth unavailable, try again later"})
-        sender = "anonymous"
+        from shared.auth import verify_request_hmac
+        signature = (
+            request.headers.get("X-Radar-Signature", "")
+            or request.headers.get("x-radar-signature", "")
+        )
+        if not signature or not verify_request_hmac(body, signature):
+            logger.warning(
+                "Rejecting /train request: missing or invalid X-Radar-Signature",
+            )
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Invalid or missing signature"},
+            )
+        sender = (
+            request.headers.get("X-Miner-Hotkey", "")
+            or request.headers.get("x-miner-hotkey", "")
+            or "signed"
+        )
 
     # 2. Per-hotkey rate limit (check only — timestamp recorded after semaphore)
     with _hotkey_lock:

@@ -28,6 +28,15 @@ import json
 import os
 import sys
 
+# When a miner needs to make authenticated requests back to the
+# validator / database server it should use the HMAC helper from
+# ``shared.auth`` (with the ``RADAR_SHARED_SECRET`` env var) instead of
+# the removed chain-based wallet signing.
+try:
+    from shared.auth import sign_request as _hmac_sign_request  # noqa: F401
+except Exception:  # pragma: no cover — template runs in sandboxes without the SDK
+    _hmac_sign_request = None
+
 
 def log(msg: str):
     """Write reasoning trace to stderr (captured by validator)."""

@@ -22,7 +22,8 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from shared.auth import sign_request
+from shared.auth import sign_request, verify_request_hmac
+from shared.protocol import TrainerReady
 
 logger = logging.getLogger(__name__)
 
@@ -374,8 +375,59 @@ def health():
 
 @app.post("/trainer/ready")
 async def trainer_ready(request: Request):
-    """Stub — chain-coupled trainer registration has been removed."""
-    raise HTTPException(status_code=410, detail="trainer/ready endpoint removed")
+    """Record that a miner's trainer pod is up and ready to accept jobs.
+
+    Body: JSON-encoded ``TrainerReady`` payload (round_id, uid, hotkey,
+    trainer_url, ...). Authenticated via HMAC over the raw body — caller
+    must include ``X-Radar-Signature`` keyed by ``RADAR_SHARED_SECRET``.
+    """
+    import os as _os
+    import json as _json
+    from shared.peers import get_peer_by_hotkey
+
+    body = await request.body()
+
+    secret = _os.getenv("RADAR_SHARED_SECRET", "")
+    if secret:
+        signature = (
+            request.headers.get("X-Radar-Signature", "")
+            or request.headers.get("x-radar-signature", "")
+        )
+        if not signature or not verify_request_hmac(body, signature):
+            raise HTTPException(status_code=401, detail="Invalid signature")
+    else:
+        logger.warning(
+            "trainer_ready: RADAR_SHARED_SECRET unset — accepting unsigned request (dev mode)",
+        )
+
+    try:
+        data = _json.loads(body) if body else {}
+    except _json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    round_id = int(data.get("round_id", 0))
+    hotkey = str(data.get("miner_hotkey", "") or data.get("hotkey", ""))
+    trainer_url = str(data.get("trainer_url", ""))
+    instance_name = str(data.get("instance_name", ""))
+
+    uid = data.get("miner_uid")
+    if uid is None:
+        peer = get_peer_by_hotkey(hotkey)
+        uid = peer.uid if peer else _hotkey_to_uid.get(hotkey, -1)
+    uid = int(uid)
+
+    ready = TrainerReady(
+        round_id=round_id,
+        miner_hotkey=hotkey,
+        trainer_url=trainer_url,
+        instance_name=instance_name,
+    )
+    _trainer_ready.setdefault(round_id, {})[uid] = ready
+    logger.info(
+        "trainer_ready: round=%d uid=%d hotkey=%s url=%s",
+        round_id, uid, hotkey[:16], trainer_url,
+    )
+    return JSONResponse(status_code=200, content={"status": "ok"})
 
 
 # ── Proxied routes ───────────────────────────────────────

@@ -19,10 +19,57 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
+from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def signed_request_headers(body: bytes, hotkey: str = "") -> dict:
+    """Build HMAC-signed headers for a miner → validator request.
+
+    Replaces the old chain-wallet signing flow. Uses
+    ``RADAR_SHARED_SECRET`` from the env (matching what validators
+    configure on their side).
+    """
+    from shared.auth import sign_request
+    headers = sign_request(None, body)
+    if hotkey:
+        headers["X-Miner-Hotkey"] = hotkey
+    headers.setdefault("Content-Type", "application/json")
+    return headers
+
+
+def post_trainer_ready(
+    validator_url: str,
+    round_id: int,
+    hotkey: str,
+    trainer_url: str,
+    instance_name: str = "",
+) -> Optional[int]:
+    """Notify the validator's proxy that a miner trainer pod is up.
+
+    Returns the HTTP status code, or None on transport error.
+    """
+    import httpx
+    payload = json.dumps({
+        "round_id": round_id,
+        "miner_hotkey": hotkey,
+        "trainer_url": trainer_url,
+        "instance_name": instance_name,
+    }).encode()
+    headers = signed_request_headers(payload, hotkey=hotkey)
+    try:
+        resp = httpx.post(
+            validator_url.rstrip("/") + "/trainer/ready",
+            content=payload, headers=headers, timeout=15,
+        )
+        return resp.status_code
+    except Exception as e:  # pragma: no cover — diagnostic
+        logger.warning("Failed to post trainer_ready: %s", e)
+        return None
 
 
 def main():

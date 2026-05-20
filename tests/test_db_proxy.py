@@ -1,10 +1,12 @@
 """Tests for validator/db_proxy.py — reverse proxy for miners."""
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
+from shared.auth import sign_request_hmac
 from validator.db_proxy import (
     app, set_config, rotate_agent_token, get_agent_token,
     get_ready_trainers, clear_ready_trainers, _trainer_ready,
@@ -85,6 +87,60 @@ def test_per_category_rate_limits():
 
     # "desearch" still independent
     assert _check_rate_limit(identity, "desearch") is True
+
+
+def test_trainer_ready_endpoint(monkeypatch, tmp_path):
+    """POST /trainer/ready records the ready record, verifies HMAC."""
+    # Configure peer registry so the endpoint can resolve hotkey -> uid.
+    miners = tmp_path / "miners.json"
+    miners.write_text(json.dumps({
+        "miners": [{"uid": 7, "hotkey": "hk7", "endpoint": ""}],
+    }))
+    monkeypatch.setenv("MINERS_CONFIG_PATH", str(miners))
+    monkeypatch.setenv("RADAR_SHARED_SECRET", "test-secret")
+    from shared import peers
+    peers.reset_cache()
+
+    _setup_proxy()
+    _trainer_ready.clear()
+
+    body = json.dumps({
+        "round_id": 42,
+        "miner_hotkey": "hk7",
+        "trainer_url": "http://trainer:8081",
+        "instance_name": "pod-x",
+    }).encode()
+    sig = sign_request_hmac(body, "test-secret")
+
+    client = TestClient(app)
+    # Unsigned request is rejected.
+    r1 = client.post("/trainer/ready", content=body)
+    assert r1.status_code == 401
+
+    # Signed request succeeds and the record is stored.
+    r2 = client.post(
+        "/trainer/ready",
+        content=body,
+        headers={"X-Radar-Signature": sig},
+    )
+    assert r2.status_code == 200
+    ready = get_ready_trainers(42)
+    assert 7 in ready
+    assert ready[7].trainer_url == "http://trainer:8081"
+    clear_ready_trainers(42)
+
+
+def test_trainer_ready_dev_mode_accepts_unsigned(monkeypatch):
+    """When RADAR_SHARED_SECRET is unset the endpoint accepts unsigned reqs."""
+    monkeypatch.delenv("RADAR_SHARED_SECRET", raising=False)
+    _setup_proxy()
+    _trainer_ready.clear()
+    body = json.dumps({
+        "round_id": 1, "miner_hotkey": "hkA", "trainer_url": "http://x",
+    }).encode()
+    client = TestClient(app)
+    r = client.post("/trainer/ready", content=body)
+    assert r.status_code == 200
 
 
 @pytest.mark.asyncio

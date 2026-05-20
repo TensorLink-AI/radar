@@ -18,7 +18,7 @@ Radar is building an open, queryable map of how neural architectures perform acr
 
 The database is RADAR's flywheel. Every round adds validated results: architecture code, metrics, lineage, loss curves, component analysis. Agents query it to inform their next proposal.
 
-What agents can query (20+ endpoints, Epistula-authenticated, 10 req/min):
+What agents can query (20+ endpoints, HMAC shared-secret authenticated, 10 req/min):
 
 * Pareto front members per size bucket
 * Lineage chains with diffs between generations
@@ -178,8 +178,28 @@ See `miner_template/` for a starter agent.
 
 ```bash
 pip install -e .
-python validator/neuron.py
+
+# 1. Point at a JSON file listing the known miners. Schema:
+#      {"miners": [{"uid": 0, "hotkey": "miner0",
+#                   "endpoint": "http://miner0:8000", "stake": 1.0}, ...]}
+#    See miners.example.json in the repo root.
+cp miners.example.json miners.json
+export MINERS_CONFIG_PATH=$PWD/miners.json
+
+# 2. Set the HMAC shared secret used by validators, miners, and trainers.
+#    Required in production; if unset the runner falls back to dev mode
+#    and logs a warning.
+export RADAR_SHARED_SECRET="$(openssl rand -hex 32)"
+
+# 3. Start the validator peer-refresh process and (separately) the proxy.
+python validator/neuron.py &
+uvicorn validator.db_proxy:app --host 0.0.0.0 --port 8080
 ```
+
+A miner runs `python miner/neuron.py` with the same `MINERS_CONFIG_PATH`
+and `RADAR_SHARED_SECRET`; the runner container starts
+`python -m runner.server` with the same env vars and is reachable by
+validators at the `endpoint` from `miners.json`.
 
 ### Infrastructure Requirements
 
@@ -233,7 +253,8 @@ database/                        Centralised Postgres DB server (subnet owner)
 
 shared/                          Core libraries (validator + miner)
   protocol.py                      Challenge/Proposal wire format (JSON)
-  auth.py                          Epistula signing/verification (SR25519)
+  auth.py                          HMAC-SHA256 signing/verification (RADAR_SHARED_SECRET)
+  peers.py                         Static peer registry loaded from MINERS_CONFIG_PATH
   challenge.py                     Deterministic challenge + size buckets
   r2_audit.py                      R2 storage, upload/download/hash verification
   task.py                          TaskSpec + Objective, pluggable task definitions
@@ -272,7 +293,7 @@ runner/agent/                    Official sandboxed agent image (subnet-owner)
 
 ### Wire Protocol
 
-HTTP + Epistula (SR25519 signing). No Synapse/Axon/Dendrite.
+HTTP + HMAC-SHA256 signing using `RADAR_SHARED_SECRET`. The signature is sent in the `X-Radar-Signature` header.
 
 **Challenge** (dict passed to the agent's `design_architecture(challenge, client)`): feasible frontier, task spec, DB URL, proxy URL, LLM URL, seed, FLOPs range, round ID, scratchpad URLs, short-lived agent token.
 
@@ -280,7 +301,7 @@ HTTP + Epistula (SR25519 signing). No Synapse/Axon/Dendrite.
 
 ### Experiment DB API
 
-FastAPI with Epistula auth, 10 req/miner/min:
+FastAPI with HMAC shared-secret auth, 10 req/miner/min:
 
 | Endpoint | Description |
 |----------|-------------|

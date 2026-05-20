@@ -17,13 +17,20 @@ from typing import Optional, TYPE_CHECKING
 import httpx
 
 from shared.auth import sign_request
+from shared.peers import get_hotkey_for_uid
 from shared.protocol import Proposal, TrainerRequest, TrainerReady, TrainerRelease
 
 if TYPE_CHECKING:
     from shared.r2_audit import R2AuditLog
 
 
-class ImageCommitment:  # minimal local placeholder; chain commitments removed
+@dataclass
+class ImageCommitment:
+    """Minimal placeholder for the old on-chain image commitment.
+
+    Carries the bits the rest of the validator still cares about
+    (code hash, miner identity, optional listener URL).
+    """
     code_hash: str = ""
     miner_uid: int = 0
     hotkey: str = ""
@@ -209,7 +216,7 @@ class TrainingCoordinator:
                 ))
                 continue
 
-            miner_hotkey = f"uid_{job.arch_owner}"
+            miner_hotkey = get_hotkey_for_uid(job.arch_owner)
 
             # Generate presigned PUT URLs so trainer can upload without R2 creds.
             from shared.artifacts import generate_upload_urls
@@ -440,8 +447,8 @@ class TrainingCoordinator:
         results: dict[int, dict] = {}
         deadline = asyncio.get_event_loop().time() + timeout
 
-        # Build uid→hotkey mapping (chain hotkeys removed; use uid placeholders)
-        uid_to_hotkey = {uid: f"uid_{uid}" for uid in expected_miners}
+        # Build uid → hotkey mapping from the static peer registry.
+        uid_to_hotkey = {uid: get_hotkey_for_uid(uid) for uid in expected_miners}
 
         # Log expected R2 keys for debugging
         for uid, hk in uid_to_hotkey.items():
@@ -734,7 +741,7 @@ class TrainingCoordinator:
                 try:
                     release = TrainerRelease(
                         round_id=round_id,
-                        miner_hotkey=f"uid_{uid}",
+                        miner_hotkey=get_hotkey_for_uid(uid),
                     )
                     body = release.to_json().encode()
                     headers = sign_request(self.wallet, body)

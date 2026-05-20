@@ -238,7 +238,8 @@ async def evaluate_all_checkpoints(
         if meta.get("status") != "success":
             continue
 
-        miner_hotkey = meta.get("miner_hotkey", f"uid_{uid}")
+        from shared.peers import get_hotkey_for_uid
+        miner_hotkey = meta.get("miner_hotkey", get_hotkey_for_uid(uid))
         logger.info("Evaluating UID %d (miner %s...) round %d", uid, miner_hotkey[:16], round_id)
 
         # Download and verify all artifacts
