@@ -10,7 +10,7 @@ RUN pip3 install --no-cache-dir \
     torch==2.4.0 --index-url https://download.pytorch.org/whl/cu124
 
 RUN pip3 install --no-cache-dir \
-    bittensor cryptography sentencepiece \
+    substrate-interface cryptography \
     fastapi uvicorn httpx boto3 safetensors pyarrow pandas
 
 # ── Generic harness ───────────────────────────────────────────────

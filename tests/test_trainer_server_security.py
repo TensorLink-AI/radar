@@ -1,6 +1,6 @@
 """Tests for trainer server security hardening.
 
-Covers: fail-closed auth, rate limiting, concurrency gate, metagraph caching.
+Covers: fail-closed auth, rate limiting, concurrency gate.
 
 Tests the generalist runner/server.py (the deployed server).
 """
@@ -8,7 +8,6 @@ Tests the generalist runner/server.py (the deployed server).
 import asyncio
 import json
 import os
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,8 +20,6 @@ os.environ.setdefault("RADAR_LOCALNET", "")
 def _reset_server_state():
     """Reset module-level state between tests."""
     import runner.server as srv
-    srv._metagraph_cache = None
-    srv._metagraph_last_refresh = 0.0
     srv._hotkey_last_request.clear()
     # Reset semaphore to unlocked
     srv._train_semaphore = asyncio.Semaphore(1)
@@ -44,23 +41,7 @@ def _make_body(**overrides):
 
 
 class TestFailClosed:
-    """Auth must reject when metagraph is unavailable."""
-
-    def test_rejects_when_metagraph_unavailable(self):
-        """With no metagraph and not localnet, should return 503."""
-        import runner.server as srv
-        from fastapi.testclient import TestClient
-
-        srv._metagraph_cache = None
-        srv._RUNNERS["ts_forecasting"] = MagicMock()
-
-        with patch.dict(os.environ, {"RADAR_LOCALNET": ""}), \
-             patch.object(srv, "_load_metagraph", return_value=None):
-            client = TestClient(srv.app)
-            resp = client.post("/train", content=_make_body())
-
-        assert resp.status_code == 503
-        assert "Auth unavailable" in resp.json()["error"]
+    """Auth must reject requests without a valid signature."""
 
     def test_localnet_skips_auth(self):
         """RADAR_LOCALNET=true should skip auth (for local dev)."""
@@ -78,23 +59,58 @@ class TestFailClosed:
             client = TestClient(srv.app)
             resp = client.post("/train", content=_make_body())
 
-        assert resp.status_code == 200
+        assert resp.status_code == 202
 
-    def test_rejects_invalid_auth(self):
-        """Bad Epistula headers should return 403."""
+    def test_rejects_missing_headers(self):
+        """No Epistula headers → 403 (signature-only auth, fail closed)."""
         import runner.server as srv
         from fastapi.testclient import TestClient
 
         srv._RUNNERS["ts_forecasting"] = MagicMock()
-        fake_mg = MagicMock()
-        mock_verify = MagicMock(return_value=(False, "Invalid signature", ""))
         with patch.dict(os.environ, {"RADAR_LOCALNET": ""}):
-            with patch.object(srv, "_load_metagraph", return_value=fake_mg):
-                with patch.dict("sys.modules", {"shared.auth": MagicMock(verify_request=mock_verify)}):
-                    client = TestClient(srv.app)
-                    resp = client.post("/train", content=_make_body())
+            client = TestClient(srv.app)
+            resp = client.post("/train", content=_make_body())
 
         assert resp.status_code == 403
+
+    def test_rejects_invalid_auth(self):
+        """verify_request returning ok=False → 403."""
+        import runner.server as srv
+        from fastapi.testclient import TestClient
+
+        srv._RUNNERS["ts_forecasting"] = MagicMock()
+        mock_verify = MagicMock(return_value=(False, "Invalid signature", ""))
+        with patch.dict(os.environ, {"RADAR_LOCALNET": ""}):
+            with patch.dict("sys.modules", {"shared.auth": MagicMock(verify_request=mock_verify)}):
+                client = TestClient(srv.app)
+                resp = client.post("/train", content=_make_body())
+
+        assert resp.status_code == 403
+
+    def test_allowlist_rejects_unknown_hotkey(self):
+        """When RADAR_TRAINER_ALLOWED_HOTKEYS is set, unknown hotkey → 403."""
+        import runner.server as srv
+        from fastapi.testclient import TestClient
+
+        srv._RUNNERS["ts_forecasting"] = MagicMock()
+        # verify_request will receive allowed_hotkeys={"hk_good"} and the
+        # default mock returns the value we wire here.
+        captured = {}
+
+        def fake_verify(headers, body, metagraph=None, require_stake=False, allowed_hotkeys=None):
+            captured["allowed"] = set(allowed_hotkeys or [])
+            return False, "Hotkey not in allowlist", ""
+
+        with patch.dict(os.environ, {
+            "RADAR_LOCALNET": "",
+            "RADAR_TRAINER_ALLOWED_HOTKEYS": "hk_good",
+        }):
+            with patch.dict("sys.modules", {"shared.auth": MagicMock(verify_request=fake_verify)}):
+                client = TestClient(srv.app)
+                resp = client.post("/train", content=_make_body())
+
+        assert resp.status_code == 403
+        assert captured["allowed"] == {"hk_good"}
 
 
 class TestRateLimiting:
@@ -145,62 +161,18 @@ class TestConcurrencyGate:
         loop.close()
 
 
-class TestMetagraphCache:
-    """Metagraph caching behavior."""
+class TestAllowlistLoader:
+    """RADAR_TRAINER_ALLOWED_HOTKEYS parsing."""
 
-    def test_returns_cached_within_interval(self):
-        """Should not re-fetch if cache is fresh."""
+    def test_unset_returns_none(self):
         import runner.server as srv
+        with patch.dict(os.environ, {"RADAR_TRAINER_ALLOWED_HOTKEYS": ""}):
+            assert srv._load_allowed_hotkeys() is None
 
-        fake_mg = MagicMock()
-        fake_mg.n = 10
-        srv._metagraph_cache = fake_mg
-        srv._metagraph_last_refresh = time.time()
-
-        result = srv._load_metagraph()
-        assert result is fake_mg
-
-    def test_refreshes_after_interval(self):
-        """Should re-fetch if cache is stale."""
+    def test_csv_parsed_to_set(self):
         import runner.server as srv
-
-        old_mg = MagicMock()
-        old_mg.n = 10
-        srv._metagraph_cache = old_mg
-        srv._metagraph_last_refresh = time.time() - srv.METAGRAPH_REFRESH_INTERVAL - 1
-
-        new_mg = MagicMock()
-        new_mg.n = 20
-
-        with patch("bittensor.Subtensor") as mock_sub:
-            mock_sub.return_value.metagraph.return_value = new_mg
-            result = srv._load_metagraph()
-
-        assert result is new_mg
-        assert srv._metagraph_cache is new_mg
-
-    def test_returns_stale_on_refresh_failure(self):
-        """If refresh fails but stale cache exists, should return stale."""
-        import runner.server as srv
-
-        old_mg = MagicMock()
-        old_mg.n = 10
-        srv._metagraph_cache = old_mg
-        srv._metagraph_last_refresh = time.time() - srv.METAGRAPH_REFRESH_INTERVAL - 1
-
-        with patch("bittensor.Subtensor", side_effect=Exception("chain down")):
-            result = srv._load_metagraph()
-
-        assert result is old_mg
-
-    def test_returns_none_on_first_failure(self):
-        """If no cache and refresh fails, should return None."""
-        import runner.server as srv
-
-        with patch("bittensor.Subtensor", side_effect=Exception("chain down")):
-            result = srv._load_metagraph()
-
-        assert result is None
+        with patch.dict(os.environ, {"RADAR_TRAINER_ALLOWED_HOTKEYS": "hk_a, hk_b ,hk_c"}):
+            assert srv._load_allowed_hotkeys() == {"hk_a", "hk_b", "hk_c"}
 
 
 class TestHealthEndpoint:

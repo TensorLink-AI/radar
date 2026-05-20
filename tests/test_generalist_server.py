@@ -16,8 +16,6 @@ import pytest
 def _reset_server_state():
     """Reset module-level state between tests."""
     import runner.server as srv
-    srv._metagraph_cache = None
-    srv._metagraph_last_refresh = 0.0
     srv._hotkey_last_request.clear()
     srv._train_semaphore = asyncio.Semaphore(1)
     srv._RUNNERS.clear()
@@ -76,7 +74,7 @@ class TestTaskRouting:
             client = TestClient(srv.app)
             resp = client.post("/train", content=_make_body(task_name="ts_forecasting"))
 
-        assert resp.status_code == 200
+        assert resp.status_code == 202
         mock_runner.assert_called_once()
         call_args = mock_runner.call_args
         assert call_args[0][0] == "def build_model(c, p, n, q): pass\ndef build_optimizer(m): pass"
@@ -103,7 +101,7 @@ class TestTaskRouting:
             client = TestClient(srv.app)
             resp = client.post("/train", content=body)
 
-        assert resp.status_code == 200
+        assert resp.status_code == 202
         mock_runner.assert_called_once()
 
     def test_failed_training_returns_without_upload(self):
@@ -118,12 +116,14 @@ class TestTaskRouting:
         srv._RUNNERS["ts_forecasting"] = mock_runner
 
         with patch.dict(os.environ, {"RADAR_LOCALNET": "true"}), \
-             patch("runner.server._upload_artifacts") as mock_upload:
+             patch("runner.server._upload_artifacts") as mock_upload, \
+             patch("runner.server._upload_failure_meta"):
             client = TestClient(srv.app)
             resp = client.post("/train", content=_make_body())
 
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "build_failed"
+        # Server returns 202 immediately; training runs in background.
+        assert resp.status_code == 202
+        assert resp.json()["status"] == "accepted"
         mock_upload.assert_not_called()
 
 
@@ -159,19 +159,18 @@ class TestGeneralistHealth:
 class TestGeneralistAuth:
     """Auth on generalist server mirrors per-task server."""
 
-    def test_rejects_when_metagraph_unavailable(self):
+    def test_rejects_unsigned_requests(self):
+        """No Epistula headers and not localnet → 403 (signature-only auth)."""
         import runner.server as srv
         from fastapi.testclient import TestClient
 
-        srv._metagraph_cache = None
         srv._RUNNERS["ts_forecasting"] = MagicMock()
 
-        with patch.dict(os.environ, {"RADAR_LOCALNET": ""}), \
-             patch.object(srv, "_load_metagraph", return_value=None):
+        with patch.dict(os.environ, {"RADAR_LOCALNET": ""}):
             client = TestClient(srv.app)
             resp = client.post("/train", content=_make_body())
 
-        assert resp.status_code == 503
+        assert resp.status_code == 403
 
     def test_concurrency_gate(self):
         import runner.server as srv

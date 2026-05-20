@@ -12,7 +12,6 @@ import logging
 import os
 import threading
 import time
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -20,30 +19,22 @@ from fastapi.responses import JSONResponse
 logger = logging.getLogger(__name__)
 
 
-@asynccontextmanager
-async def _lifespan(app: FastAPI):
-    """Preload metagraph at startup so /train doesn't block on first request."""
-    localnet = os.getenv("RADAR_LOCALNET", "").lower() in ("1", "true")
-    if not localnet:
-        logger.info("Preloading metagraph at startup...")
-        mg = await asyncio.to_thread(_load_metagraph)
-        if mg is not None:
-            logger.info("Metagraph preloaded (%d neurons)", mg.n)
-        else:
-            logger.warning("Metagraph preload failed — will retry on first request")
-    yield
-
-
-app = FastAPI(title="Radar Trainer", lifespan=_lifespan)
+app = FastAPI(title="Radar Trainer")
 
 # R2 client (initialized on first use, only for localnet fallback)
 _r2 = None
 
-# ── Metagraph cache ──────────────────────────────────────────────────
-_metagraph_cache = None
-_metagraph_lock = threading.Lock()
-_metagraph_last_refresh: float = 0.0
-METAGRAPH_REFRESH_INTERVAL = float(os.getenv("METAGRAPH_REFRESH_INTERVAL", "300"))
+# ── Auth allowlist (optional) ────────────────────────────────────────
+# Comma-separated validator hotkeys. When set, only signed requests from
+# these hotkeys are accepted. When unset, any valid Epistula signature is
+# accepted — fine for trainers fronted by a trusted proxy or running in
+# a private network.
+def _load_allowed_hotkeys() -> set[str] | None:
+    raw = os.getenv("RADAR_TRAINER_ALLOWED_HOTKEYS", "").strip()
+    if not raw:
+        return None
+    return {h.strip() for h in raw.split(",") if h.strip()}
+
 
 # ── Rate limiting ────────────────────────────────────────────────────
 _train_semaphore = asyncio.Semaphore(1)  # max 1 concurrent /train
@@ -95,13 +86,12 @@ async def train(request: Request):
         logger.info("Localnet mode: skipping auth")
         sender = "localnet"
     else:
-        metagraph = _load_metagraph()
-        if metagraph is None:
-            logger.error("Metagraph unavailable — rejecting request (fail closed)")
-            return JSONResponse(status_code=503, content={"error": "Auth unavailable, try again later"})
         try:
             from shared.auth import verify_request
-            ok, err, sender = verify_request(dict(request.headers), body, metagraph, require_stake=True)
+            ok, err, sender = verify_request(
+                dict(request.headers), body,
+                allowed_hotkeys=_load_allowed_hotkeys(),
+            )
             if not ok:
                 return JSONResponse(status_code=403, content={"error": err})
         except Exception as e:
@@ -383,33 +373,6 @@ def _download_gift_eval_from_urls(urls: dict[str, str]):
 @app.get("/health")
 async def health():
     return {"status": "ok", "gift_eval_ready": _gift_eval_ready}
-
-
-def _load_metagraph():
-    """Load metagraph with caching. Returns None if never reachable."""
-    global _metagraph_cache, _metagraph_last_refresh
-    now = time.time()
-    if _metagraph_cache is not None and (now - _metagraph_last_refresh) < METAGRAPH_REFRESH_INTERVAL:
-        return _metagraph_cache
-    with _metagraph_lock:
-        if _metagraph_cache is not None and (now - _metagraph_last_refresh) < METAGRAPH_REFRESH_INTERVAL:
-            return _metagraph_cache
-        try:
-            import bittensor as bt
-            netuid = int(os.getenv("NETUID", "1"))
-            network = os.getenv("SUBTENSOR_NETWORK", "finney")
-            subtensor = bt.Subtensor(network=network)
-            mg = subtensor.metagraph(netuid)
-            _metagraph_cache = mg
-            _metagraph_last_refresh = time.time()
-            logger.info("Metagraph refreshed (%d neurons)", mg.n)
-            return mg
-        except Exception as e:
-            logger.warning("Metagraph refresh failed: %s", e)
-            if _metagraph_cache is not None:
-                logger.info("Using stale metagraph cache")
-                return _metagraph_cache
-            return None
 
 
 if __name__ == "__main__":
