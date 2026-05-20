@@ -16,7 +16,6 @@ import hashlib
 import importlib.util
 import logging
 import os
-import random
 import threading
 import time
 import traceback
@@ -24,27 +23,18 @@ from typing import Optional
 
 import uvicorn
 
-# Bittensor is only needed in competitive mode.  Make it optional so
-# RADAR_NONCOMPETITIVE=true deployments don't need the dependency at all.
-try:
-    import bittensor as bt
-except ImportError:  # pragma: no cover — only fires in noncompetitive deploys
-    bt = None  # type: ignore[assignment]
-
 from config import Config
 from shared.challenge import (
     generate_challenge, round_start_block, current_phase, select_task,
 )
-from shared.commitment import read_miner_commitments
 from shared.database import DataElement
 from shared.db_client import DatabaseClient
-from shared.protocol import Challenge, Proposal
+from shared.protocol import Proposal
 from shared.provenance import detect_components
 from shared.scoring import (
-    apply_round_metadata, compute_penalties, ema_update,
-    score_round, scores_to_weights,
+    apply_round_metadata, compute_penalties, ema_update, score_round,
 )
-from shared.task import TaskSpec, load_task, load_enabled_tasks
+from shared.task import load_enabled_tasks
 from validator.collection import run_and_collect_agents
 from validator.coordinator import (
     TrainingCoordinator, compute_assignments, compute_fallback,
@@ -60,81 +50,25 @@ from validator.substrate_publisher import run_substrate_publish_step
 logger = logging.getLogger(__name__)
 
 
-def compute_live_validator_uids(
-    metagraph,
-    miner_uids: Optional[set[int]] = None,
-    current_block: Optional[int] = None,
-    stale_blocks: int = 600,
-) -> list[int]:
-    """Filter ``metagraph.validator_permit`` to live, non-miner validators.
-
-    A UID counts as a live validator iff:
-      * it has ``validator_permit=True`` on chain, AND
-      * it is not running as a miner this round (no commitment), AND
-      * its on-chain ``last_update`` is within ``stale_blocks`` of
-        ``current_block``.
-
-    ``miner_uids`` / ``current_block`` are optional; when absent, the
-    corresponding check is skipped. A ``last_update`` of 0 is treated as
-    "never updated" and is not filtered (bootstrap case).
-    """
-    permits = getattr(metagraph, "validator_permit", None)
-    if permits is None:
-        return []
-
-    last_update = getattr(metagraph, "last_update", None)
-    miners = miner_uids or set()
-    result: list[int] = []
-    for uid in range(metagraph.n):
-        if uid >= len(permits) or not permits[uid]:
-            continue
-        if uid in miners:
-            continue
-        if (
-            current_block is not None
-            and last_update is not None
-            and uid < len(last_update)
-        ):
-            try:
-                last = int(last_update[uid])
-            except (TypeError, ValueError):
-                last = 0
-            if last > 0 and current_block - last > stale_blocks:
-                continue
-        result.append(uid)
-    return result
-
-
 def get_my_assignments(
     all_uids: list[int],
     validator_uids: list[int],
     my_uid: int,
     seed: int,
 ) -> list[int]:
-    """Deterministic assignment of UIDs to validators.
+    """Single-validator deployment: this validator owns every UID.
 
-    Shuffle all_uids with seed, round-robin across sorted validator_uids.
-    Returns the UIDs assigned to my_uid.
+    Kept as a stub so collection.py's pass-through still works.
     """
-    if not validator_uids or my_uid not in validator_uids:
-        return list(all_uids)
-
-    rng = random.Random(seed)
-    shuffled = list(all_uids)
-    rng.shuffle(shuffled)
-
-    sorted_validators = sorted(validator_uids)
-    my_idx = sorted_validators.index(my_uid)
-
-    return [uid for i, uid in enumerate(shuffled) if i % len(sorted_validators) == my_idx]
+    return list(all_uids)
 
 
 class Validator:
-    """Radar subnet validator — 3-phase pipeline."""
+    """Radar validator — 3-phase pipeline (off-chain, single-validator)."""
 
-    def __init__(self, config: bt.Config):
+    def __init__(self, config):
         self.config = config
-        self.netuid = config.netuid
+        self.netuid = getattr(config, "netuid", 0)
 
         # Fail-fast on Targon misconfig — operator gets a clear error at
         # startup instead of a stack trace mid-round when verify fires.
@@ -150,27 +84,11 @@ class Validator:
                 "Without a pinned digest the verify chain becomes a no-op — refusing to start."
             )
 
-        # Bittensor components — skipped entirely in non-competitive mode
-        if Config.NONCOMPETITIVE:
-            if not Config.SERVICE_KEY:
-                raise RuntimeError(
-                    "RADAR_NONCOMPETITIVE=true requires RADAR_SERVICE_KEY "
-                    "to be set (shared HMAC secret for service-to-service "
-                    "auth)."
-                )
-            self.wallet = None
-            self.subtensor = None
-            self.metagraph = None
-        else:
-            if bt is None:
-                raise RuntimeError(
-                    "competitive mode requires the bittensor package; "
-                    "install with `pip install bittensor` or run with "
-                    "RADAR_NONCOMPETITIVE=true."
-                )
-            self.wallet = bt.Wallet(config=config)
-            self.subtensor = bt.Subtensor(config=config)
-            self.metagraph = self.subtensor.metagraph(self.netuid)
+        if not Config.SERVICE_KEY:
+            raise RuntimeError(
+                "RADAR_SERVICE_KEY must be set (shared HMAC secret for "
+                "service-to-service auth)."
+            )
 
         # Tasks — load all enabled tasks for multi-task rounds
         self.tasks = load_enabled_tasks(Config.ENABLED_TASKS)
@@ -186,18 +104,12 @@ class Validator:
                 "RADAR_DB_API_URL is not set. Validators must point to the "
                 "centralized DB server (e.g. http://<db-host>:8090)."
             )
-        if Config.NONCOMPETITIVE:
-            self.db_client = DatabaseClient(
-                db_url=Config.DB_API_URL,
-                service_secret=Config.SERVICE_KEY.encode(),
-                key_id=Config.SERVICE_KEY_ID,
-                api_key=Config.DB_API_KEY,
-            )
-        else:
-            self.db_client = DatabaseClient(
-                db_url=Config.DB_API_URL, wallet=self.wallet,
-                api_key=Config.DB_API_KEY,
-            )
+        self.db_client = DatabaseClient(
+            db_url=Config.DB_API_URL,
+            service_secret=Config.SERVICE_KEY.encode(),
+            key_id=Config.SERVICE_KEY_ID,
+            api_key=Config.DB_API_KEY,
+        )
 
         # EMA scores per UID
         self.ema_scores: dict[int, float] = {}
@@ -285,11 +197,10 @@ class Validator:
             )
 
         # Training coordinator
-        my_uid = self._my_uid()
         if self.r2:
             self.coordinator = TrainingCoordinator(
-                wallet=self.wallet, metagraph=self.metagraph,
-                r2=self.r2, my_uid=my_uid,
+                wallet=None, metagraph=None,
+                r2=self.r2, my_uid=-1,
                 artifact_store=self.artifact_store,
             )
         else:
@@ -304,8 +215,8 @@ class Validator:
         # Configure proxy
         set_proxy_config(
             db_api_url=Config.DB_API_URL,
-            wallet=self.wallet,
-            metagraph=self.metagraph,
+            wallet=None,
+            metagraph=None,
             api_key=Config.DB_API_KEY,
         )
 
@@ -314,14 +225,6 @@ class Validator:
             list(self.tasks.keys()), Config.DB_API_URL,
             "enabled" if self.r2 else "disabled",
         )
-
-    def _my_uid(self) -> int:
-        """Get this validator's UID."""
-        hotkey = self.wallet.hotkey.ss58_address
-        hotkeys = self.metagraph.hotkeys
-        if hotkeys is not None and hotkey in hotkeys:
-            return hotkeys.index(hotkey)
-        return -1
 
     def _init_hippius(self):
         """Construct the Hippius client when opted in; return None otherwise."""
@@ -344,19 +247,6 @@ class Validator:
         except Exception as e:  # noqa: BLE001 — best-effort
             logger.warning("Hippius client init failed: %s", e)
             return None
-
-    def _get_validator_uids(
-        self,
-        miner_uids: Optional[set[int]] = None,
-        current_block: Optional[int] = None,
-    ) -> list[int]:
-        """Instance wrapper for :func:`compute_live_validator_uids`."""
-        return compute_live_validator_uids(
-            self.metagraph,
-            miner_uids=miner_uids,
-            current_block=current_block,
-            stale_blocks=Config.VALIDATOR_STALE_BLOCKS,
-        )
 
     def _proxy_base_url(self) -> str:
         """Return the externally-reachable base URL for the validator proxy.
@@ -447,9 +337,14 @@ class Validator:
         logger.info("Proxy server started on port %d", self.proxy_port)
 
     async def _wait_until_block(self, target_block: int):
-        """Wait until the chain reaches target_block."""
+        """Wait until the wall-clock-derived block counter reaches target_block.
+
+        Off-chain deploys use ``time.time() // 12`` as a stand-in for block
+        height so timing stays compatible with the per-phase block-window
+        constants in ``config.py``.
+        """
         while True:
-            current = self.subtensor.block
+            current = int(time.time() // 12)
             if current >= target_block:
                 return
             remaining = (target_block - current) * 12
@@ -464,15 +359,11 @@ class Validator:
         if the cache write fails."""
         if not metas:
             return
-        hotkeys = self.metagraph.hotkeys if hasattr(self.metagraph, "hotkeys") else []
         cached = 0
         for uid, meta in metas.items():
             if not isinstance(meta, dict):
                 continue
-            hk = (
-                meta.get("miner_hotkey")
-                or (hotkeys[uid] if uid < len(hotkeys) else "")
-            )
+            hk = meta.get("miner_hotkey", "")
             if not hk:
                 continue
             try:
@@ -541,25 +432,12 @@ class Validator:
     async def run_round(self):
         """Execute one full 3-phase round."""
         # ── SETUP ──────────────────────────────────────────────
-        if Config.NONCOMPETITIVE:
-            # No chain — round_start is a wall-clock-derived integer so
-            # the deterministic seed stays stable for ~12s like a block.
-            current_block = int(time.time() // 12)
-            round_start = round_start_block(current_block, Config.ROUND_INTERVAL_BLOCKS)
-            set_metagraph(None)
-            set_hotkey_map({})
-        else:
-            self.metagraph.sync()
-            set_metagraph(self.metagraph)
-            hotkeys = self.metagraph.hotkeys or []
-            hotkey_map = {
-                hotkeys[uid]: uid
-                for uid in range(self.metagraph.n)
-                if uid < len(hotkeys)
-            }
-            set_hotkey_map(hotkey_map)
-            current_block = self.subtensor.block
-            round_start = round_start_block(current_block, Config.ROUND_INTERVAL_BLOCKS)
+        # No chain — round_start is a wall-clock-derived integer so the
+        # deterministic seed stays stable for ~12s like a block.
+        current_block = int(time.time() // 12)
+        round_start = round_start_block(current_block, Config.ROUND_INTERVAL_BLOCKS)
+        set_metagraph(None)
+        set_hotkey_map({})
         block_hash = hashlib.sha256(str(round_start).encode()).hexdigest()
 
         # Select task for this round (deterministic from block hash)
@@ -625,20 +503,11 @@ class Validator:
         )
 
         # ── PHASE A: RUN AGENTS + COLLECT ────────────────────
-        commitments = read_miner_commitments(self.subtensor, self.netuid, self.metagraph)
-        try:
-            current_block = self.subtensor.get_current_block()
-        except Exception as e:
-            logger.warning("Failed to read current block for liveness filter: %s", e)
-            current_block = None
-        validator_uids = self._get_validator_uids(
-            miner_uids=set(commitments.keys()),
-            current_block=current_block,
-        )
-        logger.info(
-            "Live validators this round: %s (filtered miners + stale last_update)",
-            validator_uids,
-        )
+        # Off-chain deploy: miner identity comes from operator-CLI tokens,
+        # not on-chain ImageCommitments. Commitments stay empty; downstream
+        # code paths treat that as "every registered miner is eligible".
+        commitments: dict = {}
+        validator_uids: list[int] = []
 
         if not self.r2:
             logger.warning("No R2 configured — skipping Phase A/B/C")
@@ -656,16 +525,17 @@ class Validator:
             prepare_coro = _no_endpoints()
 
         collect_coro = run_and_collect_agents(
-            wallet=self.wallet,
-            metagraph=self.metagraph,
+            wallet=None,
+            metagraph=None,
             challenge_json=challenge.to_json(),
             round_id=challenge.round_id,
             seed=challenge.seed,
             r2=self.r2,
-            my_uid=self._my_uid(),
+            my_uid=-1,
             validator_uids=validator_uids,
             commitments=commitments,
             get_my_assignments_fn=get_my_assignments,
+            db_client=self.db_client,
         )
 
         dynamic_endpoints, (submissions, agent_meta) = await asyncio.gather(
@@ -703,30 +573,17 @@ class Validator:
             logger.warning("No coordinator configured — skipping Phase B/C")
             return
 
-        my_uid = self._my_uid()
-        dispatch_validators = list(validator_uids)
-        if my_uid >= 0 and my_uid not in dispatch_validators:
-            logger.info(
-                "My UID %d not in validator_uids %s — adding self as safety-net dispatcher",
-                my_uid, dispatch_validators,
-            )
-            dispatch_validators.append(my_uid)
+        # Single-validator deploy: we own every dispatch.
+        my_uid = -1
+        dispatch_validators = [my_uid]
 
         all_jobs = compute_assignments(
             block_hash, filtered,
-            miner_uids=list(commitments.keys()),
+            miner_uids=list(filtered.keys()),
             validator_uids=dispatch_validators,
             round_id=challenge.round_id,
         )
-        my_jobs = [j for j in all_jobs if j.dispatcher == my_uid]
-
-        if not my_jobs and all_jobs:
-            logger.warning(
-                "Round-robin assigned 0 of %d jobs to my_uid=%d — "
-                "dispatching all jobs (other dispatchers may be offline)",
-                len(all_jobs), my_uid,
-            )
-            my_jobs = list(all_jobs)
+        my_jobs = list(all_jobs)
 
         trainer_endpoints = dynamic_endpoints
         logger.info(
@@ -968,7 +825,7 @@ class Validator:
         await self._publish_submission_reveal(
             round_id=challenge.round_id,
             uid_to_sid=uid_to_sid,
-            hotkeys=self.metagraph.hotkeys or [],
+            hotkeys=[],
         )
         primary_obj = round_task.primary_objective
         primary_name = primary_obj.name if primary_obj else "metric"
@@ -1057,10 +914,10 @@ class Validator:
         # can attach the CID. Empty dict when disabled, no client, or
         # publish failed — never raises.
         substrate_cids = await run_substrate_publish_step(
-            hippius=self.hippius, wallet=self.wallet,
+            hippius=self.hippius, wallet=None,
             challenge=challenge, eval_results=eval_results,
             training_metas=training_metas, commitments=commitments,
-            metagraph=self.metagraph, my_uid=self._my_uid(),
+            metagraph=None, my_uid=-1,
             current_block=current_block, task_name=task_name,
             block_hash=block_hash, netuid=int(self.netuid),
         )
@@ -1078,8 +935,8 @@ class Validator:
                 gate_passed += 1
                 proposal = filtered.get(uid, Proposal())
 
-                miner_hk = self.metagraph.hotkeys[uid] if uid < len(self.metagraph.hotkeys) else ""
                 meta = agent_meta.get(uid, {})
+                miner_hk = meta.get("miner_hotkey", "") if isinstance(meta, dict) else ""
                 element = DataElement(
                     name=f"round_{challenge.round_id}_miner_{uid}",
                     code=proposal.code,
@@ -1108,7 +965,7 @@ class Validator:
                 new_idx = await self.db_client.add_experiment(
                     element.to_dict(),
                     substrate_cid=substrate_cids.get(uid, ""),
-                    validator_hotkey=self.wallet.hotkey.ss58_address,
+                    validator_hotkey="",
                 )
                 if new_idx is not None:
                     element.index = new_idx
@@ -1164,8 +1021,9 @@ class Validator:
         else:
             logger.warning("Round scores empty — no eval results passed size gate")
 
-        # EMA on raw scores, softmax applied once in _set_weights()
-        all_uids = list(range(self.metagraph.n))
+        # EMA on raw scores. No on-chain weight set — the EMA dict is the
+        # source of truth for the dashboard and operator-CLI reporting.
+        all_uids = sorted(set(self.ema_scores) | set(round_scores))
         self.ema_scores = ema_update(self.ema_scores, round_scores, all_uids, Config.EMA_ALPHA)
         nonzero_ema = {uid: s for uid, s in self.ema_scores.items() if s > 0}
         logger.info(
@@ -1173,7 +1031,6 @@ class Validator:
             Config.EMA_ALPHA, len(nonzero_ema),
             {uid: f"{s:.4f}" for uid, s in sorted(nonzero_ema.items())} if nonzero_ema else "all zero",
         )
-        self._set_weights()
 
         # Write frontier to centralized DB + R2
         await self.db_client.update_frontier(
@@ -1193,37 +1050,6 @@ class Validator:
             len(round_scores), nonzero_scored,
         )
 
-    def _set_weights(self):
-        """Set weights on chain — softmax on EMA scores."""
-        if Config.NONCOMPETITIVE:
-            logger.debug("NONCOMPETITIVE: skipping weight set")
-            return
-        if not self.ema_scores:
-            logger.warning("No EMA scores — skipping weight setting")
-            return
-        try:
-            uids, weights = scores_to_weights(self.ema_scores, Config.SOFTMAX_TEMPERATURE)
-            nonzero_weights = {
-                uid: f"{w:.4f}" for uid, w in zip(uids, weights) if w > 0
-            }
-            if nonzero_weights:
-                logger.info(
-                    "Setting weights for %d UIDs (%d nonzero): %s",
-                    len(uids), len(nonzero_weights), nonzero_weights,
-                )
-            else:
-                logger.warning(
-                    "Setting all-zero weights for %d UIDs (no miner scored this round)",
-                    len(uids),
-                )
-            self.subtensor.set_weights(
-                netuid=self.netuid, wallet=self.wallet,
-                uids=uids, weights=weights,
-            )
-            logger.info("Weights set successfully on chain")
-        except Exception as e:
-            logger.error("Failed to set weights: %s", e)
-
     async def run(self):
         """Main validator loop."""
         self.start_proxy_server()
@@ -1238,7 +1064,7 @@ class Validator:
             logger.warning("Startup orphan reap failed: %s", e)
         while True:
             try:
-                current_block = self.subtensor.block
+                current_block = int(time.time() // 12)
                 round_start = round_start_block(current_block, Config.ROUND_INTERVAL_BLOCKS)
                 phase = current_phase(
                     current_block, round_start,
@@ -1290,12 +1116,7 @@ def get_config():
     parser.add_argument("--task", type=str, default="ml_training")
     parser.add_argument("--db_dir", type=str, default="./experiments")
     parser.add_argument("--db_port", type=int, default=Config.PROXY_PORT)
-    if Config.NONCOMPETITIVE or bt is None:
-        # Plain argparse Namespace — no wallet / subtensor flags needed.
-        return parser.parse_args()
-    bt.Wallet.add_args(parser)
-    bt.Subtensor.add_args(parser)
-    return bt.Config(parser)
+    return parser.parse_args()
 
 
 def main():
