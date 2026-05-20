@@ -390,7 +390,15 @@ async def run_and_collect_agents(
 
     # Build DB client if not provided
     if db_client is None:
-        db_client = DatabaseClient(Config.DB_API_URL, wallet)
+        if Config.SERVICE_KEY:
+            db_client = DatabaseClient(
+                Config.DB_API_URL,
+                service_secret=Config.SERVICE_KEY.encode(),
+                key_id=Config.SERVICE_KEY_ID,
+                api_key=Config.DB_API_KEY,
+            )
+        else:
+            db_client = DatabaseClient(Config.DB_API_URL, wallet)
 
     # Pre-fetch all agent bundles for my assigned miners (concurrently).
     async def _prefetch(uid: int) -> tuple[int, Optional[dict]]:

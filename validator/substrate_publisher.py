@@ -261,6 +261,11 @@ async def run_substrate_publish_step(
     """
     if hippius is None or not eval_results:
         return {}
+    if wallet is None:
+        # Off-chain deploy — Phase C bundles are SR25519-signed by the
+        # validator hotkey. Without a wallet there's nothing to sign with,
+        # so we skip substrate publishing entirely.
+        return {}
     try:
         records = await build_phase_c_records(
             wallet=wallet, challenge=challenge,
