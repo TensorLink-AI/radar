@@ -124,6 +124,41 @@ def test_revoke_key_returns_0_on_hit(monkeypatch, capsys):
     assert code == 0
 
 
+def test_split_sql_statements_ignores_semicolons_in_comments():
+    """Regression: a naive split(';') broke on a ``;`` inside a ``--``
+    comment block in MINER_REGISTRY_SCHEMA, producing two bad chunks
+    (one all-comment, one starting with "only the issuing miner...")
+    that asyncpg reported as ``'NoneType' object has no attribute
+    'decode'`` and ``syntax error at or near "only"``. The comment-aware
+    splitter strips ``--`` line comments before splitting."""
+    sql = """
+    CREATE TABLE foo (id TEXT);
+    -- a comment with a ; semicolon ; inside
+    ALTER TABLE foo ADD COLUMN bar TEXT;
+    -- trailing comment-only line
+    """
+    stmts = operator_cli._split_sql_statements(sql)
+    assert len(stmts) == 2
+    assert stmts[0].startswith("CREATE TABLE foo")
+    assert stmts[1].startswith("ALTER TABLE foo")
+    # No "only" / orphan-tail garbage from mid-comment splitting.
+    assert not any("only" in s.lower() for s in stmts)
+
+
+def test_split_sql_statements_on_real_schema():
+    """Walk the actual MINER_REGISTRY_SCHEMA end-to-end — every chunk
+    the splitter produces must start with a legal SQL keyword, not
+    leftover comment text."""
+    from shared.pg_schema import MINER_REGISTRY_SCHEMA
+
+    stmts = operator_cli._split_sql_statements(MINER_REGISTRY_SCHEMA)
+    legal_starts = ("CREATE", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE")
+    for s in stmts:
+        assert s.upper().startswith(legal_starts), (
+            f"split produced a chunk that doesn't start with DDL/DML: {s!r}"
+        )
+
+
 def test_dotenv_is_loaded_at_import(tmp_path, monkeypatch):
     """Regression: operator_cli used to read os.environ directly without
     importing ``config``, which meant ``radar/.env`` was silently

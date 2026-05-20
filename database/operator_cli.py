@@ -49,6 +49,28 @@ async def _connect():
     return await asyncpg.connect(dsn)
 
 
+def _split_sql_statements(sql: str) -> list[str]:
+    """Split a DDL blob on statement-terminating semicolons.
+
+    Naive ``sql.split(";")`` breaks on semicolons that appear inside
+    ``--`` line comments — splitting mid-statement and leaving asyncpg
+    to choke on the orphan tail (``syntax error at or near "only"``)
+    plus an all-comment chunk that produces no command tag
+    (``'NoneType' object has no attribute 'decode'``).  Strip line
+    comments first, then split.  String-literal semicolons aren't a
+    concern for this schema, so we don't pay the price of a full SQL
+    tokenizer.
+    """
+    stripped_lines = []
+    for line in sql.splitlines():
+        comment_at = line.find("--")
+        if comment_at != -1:
+            line = line[:comment_at]
+        stripped_lines.append(line)
+    cleaned = "\n".join(stripped_lines)
+    return [s.strip() for s in cleaned.split(";") if s.strip()]
+
+
 async def _ensure_schema(conn) -> None:
     """Create the miners + miner_api_keys tables if they don't exist
     yet.  Mirrors PgExperimentStore.init_schema so the operator CLI
@@ -58,7 +80,7 @@ async def _ensure_schema(conn) -> None:
     # The DDL references experiments.prompt_id; if the table doesn't
     # exist yet we still want miners/miner_api_keys created.  Run each
     # statement separately and tolerate the ALTER failing.
-    for stmt in [s.strip() for s in MINER_REGISTRY_SCHEMA.split(";") if s.strip()]:
+    for stmt in _split_sql_statements(MINER_REGISTRY_SCHEMA):
         try:
             await conn.execute(stmt + ";")
         except Exception as e:
