@@ -47,11 +47,6 @@ def _build_env_vars() -> dict[str, str]:
     token = os.getenv("BASILICA_API_TOKEN", "")
     if token:
         env_vars["BASILICA_API_TOKEN"] = token
-    # Forward subtensor network config so pods connect to the right chain
-    for key in ("SUBTENSOR_NETWORK", "NETUID"):
-        val = os.getenv(key, "")
-        if val:
-            env_vars[key] = val
     # Note: R2 credentials are NOT forwarded to pods. Trainer pods
     # receive presigned URLs in the dispatch payload instead.
     # Forward user-specified vars
@@ -100,11 +95,6 @@ def pre_validate_agent_code(code: str) -> tuple[bool, str]:
 def _build_agent_env_vars(allowed_urls: str = "") -> dict[str, str]:
     """Build env vars for agent pods (more restricted than trainer)."""
     env_vars = {}
-    # Subtensor for read-only chain queries
-    for key in ("SUBTENSOR_NETWORK", "NETUID"):
-        val = os.getenv(key, "")
-        if val:
-            env_vars[key] = val
     # URL allowlist — the harness reads this to build the GatedClient
     # (app-layer gate); the entrypoint reads RADAR_ALLOWED_URLS to program
     # iptables (network-layer gate) before the harness starts.

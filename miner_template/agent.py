@@ -10,10 +10,10 @@ GatedClient that can only reach validator-approved URLs:
 
 You do NOT build a Docker image. Just write .py files and run the miner:
 
-  python miner/neuron.py --agent_dir miner_template/ --netuid <N> ...
+  python miner/neuron.py --agent_dir miner_template/ ...
 
-The miner neuron will POST your code to the DB server, commit the hash
-on-chain, and validators fetch + run it every round.
+The miner neuron will POST your code to the DB server, and validators
+fetch + run it every round.
 
 Your agent module MUST define:
     design_architecture(challenge: dict, client: GatedClient) -> dict

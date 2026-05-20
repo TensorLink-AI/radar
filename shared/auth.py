@@ -1,7 +1,8 @@
-"""Epistula authentication — sign and verify HTTP requests.
+"""Stub authentication module.
 
-Extracted from validator/gossip.py. Used by validators, trainers, and miners
-for authenticating HTTP requests with SR25519 hotkey signatures.
+The chain-based Epistula signature / hotkey verification has been removed.
+The functions below preserve their signatures so existing callers keep
+importing successfully, but they no longer perform any real verification.
 """
 
 from __future__ import annotations
@@ -12,84 +13,34 @@ import time
 import uuid
 from typing import Optional
 
-import bittensor as bt
-
 logger = logging.getLogger(__name__)
 
-# Epistula timestamp tolerance (seconds) — increase for cross-machine clock skew
+# Kept for backward compatibility with code that imports the constant.
 EPISTULA_TIMESTAMP_TOLERANCE = int(os.getenv("RADAR_EPISTULA_TOLERANCE", "30"))
 
 
-def sign_request(wallet: bt.Wallet, body: bytes) -> dict[str, str]:
-    """Sign an outgoing HTTP request with Epistula headers.
-
-    Headers: X-Epistula-Signed-By, X-Epistula-Timestamp,
-             X-Epistula-Nonce, X-Epistula-Signature
-    """
+def sign_request(wallet, body: bytes) -> dict[str, str]:
+    """No-op stub. Returns a minimal set of headers without a real signature."""
     timestamp = str(int(time.time()))
     nonce = uuid.uuid4().hex
-    message = body + timestamp.encode() + nonce.encode()
-    signature = wallet.hotkey.sign(message).hex()
     return {
-        "X-Epistula-Signed-By": wallet.hotkey.ss58_address,
+        "X-Epistula-Signed-By": "",
         "X-Epistula-Timestamp": timestamp,
         "X-Epistula-Nonce": nonce,
-        "X-Epistula-Signature": signature,
+        "X-Epistula-Signature": "",
     }
 
 
 def verify_request(
     headers: dict[str, str],
     body: bytes,
-    metagraph,
-    require_stake: bool = False,
+    *args,
+    **kwargs,
 ) -> tuple[bool, str, str]:
-    """Verify an incoming request's Epistula headers.
-
-    Returns (ok, error_message, sender_hotkey).
-    """
-    hotkey = headers.get("x-epistula-signed-by", "")
-    timestamp_str = headers.get("x-epistula-timestamp", "")
-    nonce = headers.get("x-epistula-nonce", "")
-    signature = headers.get("x-epistula-signature", "")
-
-    if not all([hotkey, timestamp_str, nonce, signature]):
-        return False, "Missing Epistula headers", ""
-
-    # Check timestamp freshness
-    try:
-        ts = int(timestamp_str)
-    except ValueError:
-        return False, "Invalid timestamp", ""
-    if abs(time.time() - ts) > EPISTULA_TIMESTAMP_TOLERANCE:
-        return False, "Timestamp too old or too far in future", ""
-
-    # Verify sender is registered
-    uid = get_uid_for_hotkey(metagraph, hotkey)
-    if uid is None:
-        return False, "Unknown hotkey", ""
-
-    if require_stake and float(metagraph.S[uid]) <= 0:
-        return False, "Not a validator (no stake)", ""
-
-    # Verify signature
-    message = body + timestamp_str.encode() + nonce.encode()
-    try:
-        keypair = bt.Keypair(ss58_address=hotkey)
-        if not keypair.verify(message, bytes.fromhex(signature)):
-            return False, "Invalid signature", ""
-    except Exception:
-        return False, "Signature verification failed", ""
-
-    return True, "", hotkey
+    """No-op stub — auth has been removed. Returns (True, "", "")."""
+    return True, "", ""
 
 
-def get_uid_for_hotkey(metagraph, hotkey: str) -> Optional[int]:
-    """Look up UID for a hotkey in the metagraph."""
-    hotkeys = metagraph.hotkeys
-    if hotkeys is None:
-        return None
-    for i in range(metagraph.n):
-        if i < len(hotkeys) and hotkeys[i] == hotkey:
-            return i
+def get_uid_for_hotkey(*args, **kwargs) -> Optional[int]:
+    """No-op stub — returns None."""
     return None

@@ -88,8 +88,7 @@ def test_shuffled_assignment_varies_by_round():
 async def test_dispatch_no_endpoint():
     """Jobs with no trainer endpoint get status='failed'."""
     coordinator = TrainingCoordinator(
-        wallet=MagicMock(), metagraph=MagicMock(hotkeys=["hk0", "hk1"]),
-        r2=MagicMock(), my_uid=10,
+        wallet=MagicMock(), r2=MagicMock(), my_uid=10,
     )
     jobs = [Job(arch_owner=0, trainer_uid=1, dispatcher=10, round_id=1)]
     challenge = MagicMock(seed=42, round_id=1, min_flops_equivalent=0,
@@ -109,8 +108,7 @@ async def test_dispatch_no_endpoint():
 async def test_dispatch_success():
     """Successful dispatch returns trainer response."""
     coordinator = TrainingCoordinator(
-        wallet=MagicMock(), metagraph=MagicMock(hotkeys=["hk0", "hk1"]),
-        r2=MagicMock(), my_uid=10,
+        wallet=MagicMock(), r2=MagicMock(), my_uid=10,
     )
     jobs = [Job(arch_owner=0, trainer_uid=1, dispatcher=10, round_id=1)]
     challenge = MagicMock(seed=42, round_id=1, min_flops_equivalent=0,
@@ -141,8 +139,7 @@ async def test_dispatch_success():
 async def test_dispatch_resigns_on_retry():
     """Headers are re-signed on retry so Epistula timestamps stay fresh."""
     coordinator = TrainingCoordinator(
-        wallet=MagicMock(), metagraph=MagicMock(hotkeys=["hk0", "hk1"]),
-        r2=MagicMock(), my_uid=10,
+        wallet=MagicMock(), r2=MagicMock(), my_uid=10,
     )
     jobs = [Job(arch_owner=0, trainer_uid=1, dispatcher=10, round_id=1)]
     challenge = MagicMock(seed=42, round_id=1, min_flops_equivalent=0,
@@ -195,8 +192,7 @@ async def test_dispatch_resigns_on_retry():
 async def test_dispatch_retries_on_403():
     """403 (stale timestamp) triggers retry with fresh signature."""
     coordinator = TrainingCoordinator(
-        wallet=MagicMock(), metagraph=MagicMock(hotkeys=["hk0", "hk1"]),
-        r2=MagicMock(), my_uid=10,
+        wallet=MagicMock(), r2=MagicMock(), my_uid=10,
     )
     jobs = [Job(arch_owner=0, trainer_uid=1, dispatcher=10, round_id=1)]
     challenge = MagicMock(seed=42, round_id=1, min_flops_equivalent=0,

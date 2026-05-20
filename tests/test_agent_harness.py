@@ -76,16 +76,6 @@ class TestBuildAgentEnvVars:
             assert "R2_ACCESS_KEY_ID" not in env
             assert "R2_SECRET_ACCESS_KEY" not in env
 
-    def test_forwards_subtensor(self):
-        with patch.dict(os.environ, {
-            "SUBTENSOR_NETWORK": "finney",
-            "NETUID": "42",
-        }):
-            env = _build_agent_env_vars()
-            assert env["SUBTENSOR_NETWORK"] == "finney"
-            assert env["NETUID"] == "42"
-
-
 # ── _write_agent_code ────────────────────────────────────────────
 
 class TestWriteAgentCode:

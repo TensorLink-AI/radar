@@ -16,8 +16,8 @@ import pytest
 def _reset_server_state():
     """Reset module-level state between tests."""
     import runner.server as srv
-    srv._metagraph_cache = None
-    srv._metagraph_last_refresh = 0.0
+    srv._auth_cache = None
+    srv._auth_last_refresh = 0.0
     srv._hotkey_last_request.clear()
     srv._train_semaphore = asyncio.Semaphore(1)
     srv._RUNNERS.clear()
@@ -157,21 +157,7 @@ class TestGeneralistHealth:
 
 
 class TestGeneralistAuth:
-    """Auth on generalist server mirrors per-task server."""
-
-    def test_rejects_when_metagraph_unavailable(self):
-        import runner.server as srv
-        from fastapi.testclient import TestClient
-
-        srv._metagraph_cache = None
-        srv._RUNNERS["ts_forecasting"] = MagicMock()
-
-        with patch.dict(os.environ, {"RADAR_LOCALNET": ""}), \
-             patch.object(srv, "_load_metagraph", return_value=None):
-            client = TestClient(srv.app)
-            resp = client.post("/train", content=_make_body())
-
-        assert resp.status_code == 503
+    """Concurrency / fail-closed behavior on the generalist server."""
 
     def test_concurrency_gate(self):
         import runner.server as srv

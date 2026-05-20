@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from validator.db_proxy import (
-    app, set_config, set_metagraph, rotate_agent_token, get_agent_token,
+    app, set_config, rotate_agent_token, get_agent_token,
     get_ready_trainers, clear_ready_trainers, _trainer_ready,
     _check_rate_limit, _rate_window, _rate_lock,
 )
@@ -14,12 +14,10 @@ from validator.db_proxy import (
 
 def _setup_proxy():
     """Configure proxy with a fake upstream, no Epistula auth, and a valid agent token."""
-    set_metagraph(None)
     rotate_agent_token()
     set_config(
         db_api_url="http://fake-db:8090",
         wallet=None,
-        metagraph=None,
         rate_limits={"db": (100, 60), "desearch": (100, 60), "llm": (100, 60), "agent_code": (100, 60)},
     )
 
@@ -49,12 +47,10 @@ def test_ready_trainers_tracking():
 
 def test_proxy_no_db_url():
     """Without a DB API URL configured, proxy returns 503."""
-    set_metagraph(None)
     rotate_agent_token()
     set_config(
         db_api_url="",
         wallet=None,
-        metagraph=None,
         rate_limits={"db": (100, 60), "desearch": (100, 60), "llm": (100, 60), "agent_code": (100, 60)},
     )
     client = TestClient(app, raise_server_exceptions=False)
@@ -66,12 +62,10 @@ def test_proxy_no_db_url():
 def test_per_category_rate_limits():
     """Each route category has an independent rate-limit bucket."""
     # Set tight limits: 2 for db, 2 for llm
-    set_metagraph(None)
     rotate_agent_token()
     set_config(
         db_api_url="http://fake-db:8090",
         wallet=None,
-        metagraph=None,
         rate_limits={"db": (2, 60), "llm": (2, 60), "desearch": (2, 60)},
     )
     identity = "test-miner-99"

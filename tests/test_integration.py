@@ -1,4 +1,4 @@
-"""Integration test — verify the 3-phase round data flow without Bittensor.
+"""Integration test — verify the 3-phase round data flow end-to-end.
 
 Tests the data structures and scoring pipeline end-to-end:
 1. Generate a deterministic challenge

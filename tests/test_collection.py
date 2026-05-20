@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from shared.commitment import ImageCommitment
 from shared.protocol import Proposal
+from validator.coordinator import ImageCommitment
 from validator.collection import run_and_collect_agents, _run_single_agent
 
 
@@ -36,7 +36,6 @@ async def test_collect_empty_commitments():
     mock_r2 = MagicMock()
     proposals, agent_logs = await run_and_collect_agents(
         wallet=MagicMock(),
-        metagraph=MagicMock(),
         challenge_json='{"round_id": 1}',
         round_id=1,
         seed=42,
@@ -68,7 +67,6 @@ async def test_dedup_removes_identical_code():
 
     proposals, agent_logs = await run_and_collect_agents(
         wallet=MagicMock(),
-        metagraph=MagicMock(),
         challenge_json='{"round_id": 1}',
         round_id=1,
         seed=42,
@@ -101,7 +99,6 @@ async def test_r2_proposal_read_on_other_validator_submissions():
 
     proposals, agent_logs = await run_and_collect_agents(
         wallet=MagicMock(),
-        metagraph=MagicMock(),
         challenge_json='{"round_id": 1}',
         round_id=1,
         seed=42,

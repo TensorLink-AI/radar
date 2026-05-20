@@ -72,7 +72,6 @@ def set_hotkey_map(mapping: dict[str, int]):
 # Injected at startup
 _db_api_url: str = ""
 _wallet = None
-_metagraph = None
 _api_key: str = ""
 _client: Optional[httpx.AsyncClient] = None
 
@@ -106,19 +105,18 @@ def _route_category(path: str) -> str:
 
 
 def set_config(
-    db_api_url: str, wallet, metagraph,
-    api_key: str = "",
+    db_api_url: str, wallet=None, api_key: str = "",
     rate_limits: dict[str, tuple[int, int]] | None = None,
+    **kwargs,
 ):
     """Configure the proxy at startup.
 
     ``rate_limits`` overrides per-category limits as
     ``{category: (max_requests, window_seconds)}``.
     """
-    global _db_api_url, _wallet, _metagraph, _api_key
+    global _db_api_url, _wallet, _api_key
     _db_api_url = db_api_url.rstrip("/")
     _wallet = wallet
-    _metagraph = metagraph
     _api_key = api_key
     if not _CATEGORY_LIMITS:
         _CATEGORY_LIMITS.update(_build_default_category_limits())
@@ -126,10 +124,6 @@ def set_config(
         _CATEGORY_LIMITS.update(rate_limits)
 
 
-def set_metagraph(metagraph):
-    """Update metagraph (called on sync)."""
-    global _metagraph
-    _metagraph = metagraph
 
 
 async def _get_client() -> httpx.AsyncClient:
@@ -206,25 +200,7 @@ async def auth_middleware(request: Request, call_next):
         )
         return response
 
-    # Fall back to Epistula for backward compat
-    if _metagraph:
-        body = await request.body()
-        from shared.auth import verify_request
-        ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
-        if ok:
-            request.state.miner_hotkey = hotkey
-            if not _check_rate_limit(hotkey, category):
-                return JSONResponse(status_code=429, content={
-                    "error": f"Rate limit exceeded for {category}",
-                })
-            response = await call_next(request)
-            logger.info(
-                "Epistula proxy: hotkey=%s %s %s -> %d",
-                hotkey[:16], request.method, path, response.status_code,
-            )
-            return response
-
-    return JSONResponse(status_code=403, content={"error": "Invalid agent token or signature"})
+    return JSONResponse(status_code=403, content={"error": "Invalid agent token"})
 
 
 def _build_proxy_headers(request: Request, body: bytes) -> dict:
@@ -398,32 +374,8 @@ def health():
 
 @app.post("/trainer/ready")
 async def trainer_ready(request: Request):
-    """Miner POSTs here after spinning up their Basilica pod."""
-    if not _metagraph:
-        raise HTTPException(status_code=503, detail="Metagraph not configured")
-
-    body = await request.body()
-    from shared.auth import verify_request
-    ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
-    if not ok:
-        return JSONResponse(status_code=403, content={"error": err})
-
-    from shared.protocol import TrainerReady
-    try:
-        ready_msg = TrainerReady.from_json(body.decode())
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"error": f"Invalid TrainerReady: {e}"})
-
-    uid = _hotkey_to_uid.get(hotkey)
-    if uid is None:
-        return JSONResponse(status_code=404, content={"error": "Unknown hotkey"})
-
-    round_id = ready_msg.round_id
-    if round_id not in _trainer_ready:
-        _trainer_ready[round_id] = {}
-    _trainer_ready[round_id][uid] = ready_msg
-
-    return {"status": "ok", "uid": uid, "round_id": round_id}
+    """Stub — chain-coupled trainer registration has been removed."""
+    raise HTTPException(status_code=410, detail="trainer/ready endpoint removed")
 
 
 # ── Proxied routes ───────────────────────────────────────

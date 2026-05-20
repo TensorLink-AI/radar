@@ -128,7 +128,6 @@ def test_val_shard_keys_stable_across_seeds():
 def _make_coordinator():
     return TrainingCoordinator(
         wallet=MagicMock(),
-        metagraph=MagicMock(hotkeys=["hk0", "hk1"]),
         r2=MagicMock(),
         my_uid=10,
     )

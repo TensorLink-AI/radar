@@ -20,8 +20,14 @@ from shared.auth import sign_request
 from shared.protocol import Proposal, TrainerRequest, TrainerReady, TrainerRelease
 
 if TYPE_CHECKING:
-    from shared.commitment import ImageCommitment
     from shared.r2_audit import R2AuditLog
+
+
+class ImageCommitment:  # minimal local placeholder; chain commitments removed
+    code_hash: str = ""
+    miner_uid: int = 0
+    hotkey: str = ""
+    listener_url: str = ""
 
 logger = logging.getLogger(__name__)
 
@@ -125,9 +131,8 @@ def compute_fallback(
 class TrainingCoordinator:
     """Orchestrates Phase B dispatch and R2 artifact monitoring."""
 
-    def __init__(self, wallet, metagraph, r2: "R2AuditLog", my_uid: int):
+    def __init__(self, wallet=None, r2: "R2AuditLog" = None, my_uid: int = 0, **kwargs):
         self.wallet = wallet
-        self.metagraph = metagraph
         self.r2 = r2
         self.my_uid = my_uid
         self._fallback_uids: dict[int, set[int]] = {}  # round_id → UIDs using proxy
@@ -204,11 +209,7 @@ class TrainingCoordinator:
                 ))
                 continue
 
-            miner_hotkey = (
-                self.metagraph.hotkeys[job.arch_owner]
-                if job.arch_owner < len(self.metagraph.hotkeys)
-                else f"uid_{job.arch_owner}"
-            )
+            miner_hotkey = f"uid_{job.arch_owner}"
 
             # Generate presigned PUT URLs so trainer can upload without R2 creds.
             from shared.artifacts import generate_upload_urls
@@ -275,7 +276,7 @@ class TrainingCoordinator:
                     # - 403: Timestamp stale (clock skew or slow dispatch)
                     # - 500: Internal Server Error (transient Basilica platform error)
                     # - 502: Bad Gateway (trainer pod proxy up, server still starting)
-                    # - 503: Service Unavailable (metagraph/auth not ready yet)
+                    # - 503: Service Unavailable (auth not ready yet)
                     # 429 is handled separately below — rate-limited 429s are
                     # retried, while already-running 429s go to R2 polling.
                     if resp.status_code in (403, 500, 502, 503) and attempt < max_retries:
@@ -439,12 +440,8 @@ class TrainingCoordinator:
         results: dict[int, dict] = {}
         deadline = asyncio.get_event_loop().time() + timeout
 
-        # Build uid→hotkey mapping
-        hotkeys = self.metagraph.hotkeys if hasattr(self.metagraph, "hotkeys") else []
-        uid_to_hotkey = {}
-        for uid in expected_miners:
-            hk = hotkeys[uid] if uid < len(hotkeys) else f"uid_{uid}"
-            uid_to_hotkey[uid] = hk
+        # Build uid→hotkey mapping (chain hotkeys removed; use uid placeholders)
+        uid_to_hotkey = {uid: f"uid_{uid}" for uid in expected_miners}
 
         # Log expected R2 keys for debugging
         for uid, hk in uid_to_hotkey.items():
@@ -557,7 +554,7 @@ class TrainingCoordinator:
 
     async def write_dispatch_record(self, round_id: int, results: list[TrainingResult]):
         """Write dispatch record to R2 for auditability."""
-        hotkey = self.wallet.hotkey.ss58_address
+        hotkey = getattr(getattr(self.wallet, "hotkey", None), "ss58_address", "") or "validator"
         key = f"round_{round_id}/dispatch/vali_{hotkey}.json"
         records = []
         for r in results:
@@ -737,11 +734,7 @@ class TrainingCoordinator:
                 try:
                     release = TrainerRelease(
                         round_id=round_id,
-                        miner_hotkey=(
-                            self.metagraph.hotkeys[uid]
-                            if uid < len(self.metagraph.hotkeys)
-                            else ""
-                        ),
+                        miner_hotkey=f"uid_{uid}",
                     )
                     body = release.to_json().encode()
                     headers = sign_request(self.wallet, body)

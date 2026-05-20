@@ -19,10 +19,10 @@ from typing import Optional
 from config import Config
 from shared.agent_code import compute_code_hash, validate_bundle
 from shared.artifacts import generate_scratchpad_urls
-from shared.commitment import ImageCommitment
 from shared.db_client import DatabaseClient
 from shared.protocol import Proposal
 from shared.url_gate import parse_allowed_urls
+from validator.coordinator import ImageCommitment  # minimal placeholder type
 from validator.pod_manager import (
     launch_agent_pod, pre_validate_agent_code, run_agent_on_pod,
 )
@@ -78,7 +78,7 @@ async def _fetch_agent_bundle(
 ) -> Optional[dict]:
     """Fetch a miner's agent code bundle from the DB server.
 
-    Verifies the code_hash against the on-chain commitment.
+    Verifies the code_hash against the stored commitment if present.
     Returns the validated bundle dict or None.
     """
     if not commitment.hotkey:
@@ -101,12 +101,12 @@ async def _fetch_agent_bundle(
         )
         return None
 
-    # Verify code hash matches on-chain commitment
+    # Verify code hash matches the stored commitment
     if commitment.code_hash:
         actual_hash = compute_code_hash(bundle["files"])
         if actual_hash != commitment.code_hash:
             logger.warning(
-                "UID %d code hash mismatch: on-chain=%s actual=%s",
+                "UID %d code hash mismatch: expected=%s actual=%s",
                 commitment.miner_uid,
                 commitment.code_hash[:24],
                 actual_hash[:24],
@@ -240,24 +240,24 @@ async def _run_agents_concurrently(
 
 
 async def run_and_collect_agents(
-    wallet,
-    metagraph,
-    challenge_json: str,
-    round_id: int,
-    seed: int,
-    r2,
-    my_uid: int,
-    validator_uids: list[int],
-    commitments: dict[int, ImageCommitment],
-    get_my_assignments_fn,
+    wallet=None,
+    challenge_json: str = "",
+    round_id: int = 0,
+    seed: int = 0,
+    r2=None,
+    my_uid: int = 0,
+    validator_uids: Optional[list[int]] = None,
+    commitments: Optional[dict[int, ImageCommitment]] = None,
+    get_my_assignments_fn=None,
     db_client: Optional[DatabaseClient] = None,
+    **kwargs,
 ) -> tuple[dict[int, Proposal], dict[int, str]]:
     """Phase A: run assigned miner agents, upload proposals to R2, read all.
 
     1. Work-split: get_my_assignments() for which agents this validator runs
     2. For each assigned miner:
        a. Fetch agent code bundle from DB server
-       b. Verify code_hash against on-chain commitment
+       b. Verify code_hash against the stored commitment
        c. launch_agent_pod() with official image + code injection
        d. run_agent_on_pod() with challenge JSON + URL allowlist
        e. Upload proposal + agent_log to R2: round_{id}/proposals/{uid}.json
@@ -266,10 +266,12 @@ async def run_and_collect_agents(
     5. Dedup by code hash
     6. Return ({uid: Proposal}, {uid: agent_log})
     """
+    commitments = commitments or {}
+    validator_uids = validator_uids or []
     all_uids = list(commitments.keys())
     my_agent_uids = get_my_assignments_fn(
         all_uids, validator_uids, my_uid, seed,
-    )
+    ) if get_my_assignments_fn else list(all_uids)
 
     # Build URL allowlist once for all agents this round
     allowed_urls = _build_allowed_urls(challenge_json)

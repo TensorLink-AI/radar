@@ -29,9 +29,6 @@ db = None  # PgExperimentStore
 _r2 = None  # R2AuditLog (for agent code storage)
 _pool = None  # asyncpg pool (for agent_submissions table)
 
-# Auth middleware reference
-_metagraph = None
-
 # Rate limiter: hotkey -> list of timestamps
 _rate_window: dict[str, list[float]] = defaultdict(list)
 _rate_lock = threading.Lock()
@@ -78,9 +75,9 @@ def set_pool(pool):
     _pool = pool
 
 
-def set_auth(metagraph):
-    global _metagraph
-    _metagraph = metagraph
+def set_auth(*args, **kwargs):
+    """Stub — chain-based auth has been removed."""
+    return None
 
 
 def set_rate_limit(limit: int):
@@ -143,17 +140,8 @@ def _check_rate_limit(hotkey: str) -> bool:
 
 
 def _is_validator(hotkey: str) -> bool:
-    """Check if a hotkey belongs to a validator (has permit)."""
-    if not _metagraph:
-        return False
-    permits = _metagraph.validator_permit
-    hotkeys = _metagraph.hotkeys
-    if permits is None or hotkeys is None:
-        return False
-    for uid in range(_metagraph.n):
-        if uid < len(hotkeys) and hotkeys[uid] == hotkey:
-            return uid < len(permits) and bool(permits[uid])
-    return False
+    """Stub — chain-based validator check removed. Always returns True."""
+    return True
 
 
 def _check_ip_rate_limit(ip: str) -> bool:
@@ -260,25 +248,10 @@ async def auth_middleware(request: Request, call_next):
                 response = await call_next(request)
                 return response
 
-        # ── Epistula auth: miners and validators without API key ──
-        if _metagraph:
-            from shared.auth import verify_request
-            ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
-            if not ok:
-                return JSONResponse(status_code=403, content={"error": err})
-
-            nonce = request.headers.get("x-epistula-nonce", "")
-            if nonce and not _check_nonce(nonce):
-                return JSONResponse(status_code=403, content={"error": "Replayed request"})
-
-            request.state.caller_hotkey = hotkey
-            if not _check_rate_limit(hotkey):
-                return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
-
-            # ── Role enforcement ──
-            is_vali_route = any(path.startswith(p) for p in _VALIDATOR_ONLY_PREFIXES)
-            if is_vali_route and not _is_validator(hotkey):
-                return JSONResponse(status_code=403, content={"error": "Validators only"})
+        # Chain-based Epistula auth has been removed. Requests without an
+        # API key fall through to the response — IP rate limiting still
+        # protects against floods.
+        request.state.caller_hotkey = ""
 
     response = await call_next(request)
 

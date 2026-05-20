@@ -92,8 +92,6 @@ application layer — but the defence-in-depth layer is absent.
 | `RADAR_ALLOWED_URLS`  | validator | entrypoint.sh (iptables)          |
 | `AGENT_ALLOWED_URLS`  | validator | harness.py → `GatedClient`        |
 | `AGENT_MODULE`        | validator | harness.py (entry-point path)     |
-| `SUBTENSOR_NETWORK`   | operator  | agent code (read-only chain RPC)  |
-| `NETUID`              | operator  | agent code                        |
 
 R2 credentials, Basilica tokens, and arbitrary pass-through vars are
 **not** forwarded into agent pods.

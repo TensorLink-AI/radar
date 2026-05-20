@@ -1,8 +1,8 @@
-# Radar Subnet — CLAUDE.md
+# Radar — CLAUDE.md
 
 ## What This Is
 
-A Bittensor subnet for autonomous ML research using phase-split validation. Miners host agents that design architectures. Validators coordinate training and independently evaluate checkpoints for consensus.
+A platform for autonomous ML research using phase-split validation. Miners host agents that design architectures. Validators coordinate training and independently evaluate checkpoints for consensus.
 
 ## Architecture — Phase-Split Validation
 
@@ -69,7 +69,6 @@ scripts/         Localnet test script + Postgres startup
 | `shared/pareto.py` | ParetoFront — non-dominated sorting, UCT sampling |
 | `shared/dedup.py` | Code similarity (provenance queries) |
 | `shared/scoring.py` | Size-gated Pareto frontier scoring (Phase C) |
-| `shared/commitment.py` | On-chain Docker image + endpoint commitment |
 | `shared/r2_audit.py` | R2 storage for checkpoints, snapshots, dispatch records |
 | `database/server.py` | Centralized DB API (FastAPI, all experiment routes) |
 | `database/neuron.py` | Subnet owner process (Postgres + API server) |
@@ -103,14 +102,13 @@ scripts/start_pg.sh
 python -m pytest tests/ -v
 
 # Start database server (subnet owner)
-python database/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <name>
+python database/neuron.py
 
-# Start validator (requires subtensor or mainnet)
-python validator/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <name>
+# Start validator
+python validator/neuron.py
 
 # Start miner
-python miner/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <name> \
-    --agent_image myagent:latest --agent_url <url> --trainer_url <url>
+python miner/neuron.py --agent_image myagent:latest --agent_url <url> --trainer_url <url>
 
 # Build trainer image
 docker build -t ts-runner:latest runner/timeseries_forecast/
@@ -162,7 +160,7 @@ Each round targets one bucket deterministically from the block hash. FLOPs measu
 
 Three layers of timing, intentionally separated:
 
-1. **Block windows** (on-chain, validator-global): define WHEN phases start/end. Consensus-driven via block height (~12s/block). Rigid boundaries. Env: `RADAR_SUBMISSION_WINDOW`, `RADAR_TRAINING_WINDOW`, `RADAR_EVAL_WINDOW`, `RADAR_FALLBACK_WINDOW`.
+1. **Block windows** (validator-global): define WHEN phases start/end (~12s/block). Rigid boundaries. Env: `RADAR_SUBMISSION_WINDOW`, `RADAR_TRAINING_WINDOW`, `RADAR_EVAL_WINDOW`, `RADAR_FALLBACK_WINDOW`.
 2. **Validator operational timeouts** (seconds, validator-global): HTTP / R2 polling guardrails. E.g. `TRAINER_PREPARE_TIMEOUT`.
 3. **Per-task second budgets** (seconds, set in `tasks/<task>/<task>.yaml`): different tasks can demand different amounts of work per phase.
    - `agent_seconds` → Phase A wall-clock for the **agent pod** (0/unset = inherit `Config.AGENT_TIMEOUT`)
@@ -217,10 +215,6 @@ frontier/latest.json                                        # Current Pareto fro
 - [ ] **Mainnet registration** — register subnet, set hyperparameters, deploy
 - [ ] **Docker network isolation** — whitelist network for trainer containers
 - [ ] **Cross-tempo EMA** — weight smoothing across rounds
-
-## Bittensor SDK
-
-Using `bittensor>=10.1.0`. Key classes: `bt.Wallet`, `bt.Subtensor`, `bt.Keypair`.
 
 ## Code Style
 
