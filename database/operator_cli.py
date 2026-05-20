@@ -24,6 +24,12 @@ import secrets
 import sys
 from typing import Optional
 
+# Importing ``config`` triggers ``load_dotenv`` so RADAR_PG_DSN and
+# friends resolve from ``radar/.env`` the same way they do for every
+# other CLI in the repo.  Without this, operator_cli read os.environ
+# directly and silently ignored .env.
+import config  # noqa: F401
+
 from shared import miner_auth
 
 

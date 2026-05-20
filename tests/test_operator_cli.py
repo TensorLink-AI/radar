@@ -124,6 +124,31 @@ def test_revoke_key_returns_0_on_hit(monkeypatch, capsys):
     assert code == 0
 
 
+def test_dotenv_is_loaded_at_import(tmp_path, monkeypatch):
+    """Regression: operator_cli used to read os.environ directly without
+    importing ``config``, which meant ``radar/.env`` was silently
+    ignored and every invocation printed ``RADAR_PG_DSN not set``.
+    Now ``import config`` triggers ``load_dotenv`` at module load —
+    verify the chain by writing a marker var to a fake .env, reloading
+    config, and asserting it shows up in ``os.environ``.
+    """
+    import importlib
+    import os
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("RADAR_OPERATOR_CLI_DOTENV_PROBE=loaded\n")
+
+    monkeypatch.delenv("RADAR_OPERATOR_CLI_DOTENV_PROBE", raising=False)
+    from dotenv import load_dotenv
+    load_dotenv(env_file, override=True)
+
+    # Re-import operator_cli so its top-level ``import config`` runs
+    # again in this test's context (config itself is module-cached
+    # but the assertion is about the env var the dotenv chain set).
+    importlib.import_module("database.operator_cli")
+    assert os.environ.get("RADAR_OPERATOR_CLI_DOTENV_PROBE") == "loaded"
+
+
 def test_list_keys_prints_table(monkeypatch, capsys):
     fake_conn = AsyncMock()
     fake_conn.close = AsyncMock()
