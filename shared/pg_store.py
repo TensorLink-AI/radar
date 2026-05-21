@@ -16,7 +16,6 @@ import asyncpg
 from shared.database import DataElement
 from shared.pg_schema import (
     SCHEMA_TABLE_DDL, SCHEMA_INDEX_DDL, FTS_FUNCTION_DDL, FTS_TRIGGER_DDL,
-    MINER_REGISTRY_SCHEMA,
     INSERT_SQL, row_to_element, element_to_params, compute_diff, _finite_or,
 )
 
@@ -154,7 +153,6 @@ class PgExperimentStore:
             await conn.execute(SCHEMA_INDEX_DDL)
             await conn.execute(FTS_FUNCTION_DDL)
             await conn.execute(FTS_TRIGGER_DDL)
-            await conn.execute(MINER_REGISTRY_SCHEMA)
         from shared.pg_provenance import PgProvenanceQuery
         self.provenance = PgProvenanceQuery(self.pool)
         await self.provenance.init_schema()

@@ -259,33 +259,6 @@ add `HIPPIUS_*` once your Hippius keys are issued — the client will pick up
 the new backend automatically. To cut over fully, also set
 `HIPPIUS_BUCKET` (or unset `R2_BUCKET`) so dispatched URLs point at Hippius.
 
-## Non-competitive Mode
-
-Set `RADAR_NONCOMPETITIVE=true` for a non-subnet deployment:
-
-- Validator skips wallet, subtensor, metagraph, weight-setting, on-chain
-  commitments. Existing competitive deployments leave it false.
-- Auth uses HMAC service key (`RADAR_SERVICE_KEY`) for validator ↔ trainer
-  ↔ DB. Headers: `X-Radar-{Signature,Timestamp,Key-Id}`.
-- Miner identity is bearer tokens issued via the operator CLI:
-  ```
-  python -m database.operator_cli register --name alice [--hotkey ss58]
-  python -m database.operator_cli issue-key --miner-id <id> --label prod
-  python -m database.operator_cli rotate-service-key
-  python -m database.operator_cli list-miners | list-keys --miner-id <id>
-  python -m database.operator_cli revoke-key --key-id <id>
-  ```
-- Miners pull scored history + evolve prompts locally via the miner CLI:
-  ```
-  RADAR_DB_URL=http://db:8090 RADAR_MINER_API_KEY=rdrk_... \
-    python miner/neuron.py optimize --optimizer gepa --seed --watch
-  python miner/neuron.py results --json
-  python miner/neuron.py prompts list | history | rollback <gen>
-  ```
-- `prompts/active.json` (atomic-write) drives which prompt variant the
-  agent picks each round; `prompt_id` round-trips back via
-  `experiments.prompt_id` so Phase C scores attribute to the variant.
-
 ## Neuron Mode Environment Variables
 
 | Var | Default | Purpose |

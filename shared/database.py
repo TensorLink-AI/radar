@@ -56,11 +56,6 @@ class DataElement:
     # entries written by validators after Phase C. One per validator that
     # published a Hippius bundle covering this experiment.
     substrate_cids: list = field(default_factory=list)
-    # Miner-local prompt-variant id (from Proposal.prompt_id).  Opaque to
-    # the operator; round-tripped so the miner's GEPA/random_mutate loop
-    # can correlate Phase C scores with the variant that produced this
-    # architecture.  Empty string when the miner submitted without one.
-    prompt_id: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

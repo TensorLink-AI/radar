@@ -410,23 +410,6 @@ class Config:
     #   all        — Everything on one process (legacy / dev default).
     NEURON_MODE: str = os.getenv("RADAR_NEURON_MODE", "all").lower()
 
-    # ── Non-competitive mode ────────────────────────────────────
-    # When true, validators + miners SKIP all chain interactions:
-    #   * no metagraph sync, no Subtensor connection, no wallet
-    #   * no weight setting, no on-chain commitments
-    #   * outbound auth uses HMAC service key (RADAR_SERVICE_KEY)
-    #   * miner identity comes from bearer API keys, not hotkeys
-    # Existing competitive deployments leave this false and run unchanged.
-    NONCOMPETITIVE: bool = os.getenv(
-        "RADAR_NONCOMPETITIVE", "false",
-    ).lower() in ("1", "true", "yes")
-
-    # Shared HMAC secret for service-to-service auth in non-competitive
-    # mode (validator -> trainer, validator -> DB).  Required when
-    # NONCOMPETITIVE is true.
-    SERVICE_KEY: str = os.getenv("RADAR_SERVICE_KEY", "")
-    SERVICE_KEY_ID: str = os.getenv("RADAR_SERVICE_KEY_ID", "operator")
-
     # CORS origins for the public JSON API. Comma-separated, empty = no CORS
     # (safe default for validator mode, which doesn't speak to browsers).
     # In production dashboard mode set this to "https://radarnet.io".

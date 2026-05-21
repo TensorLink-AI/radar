@@ -19,6 +19,8 @@ import logging
 import os
 import threading
 import time
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -36,24 +38,32 @@ from runner.uploads import upload_artifacts, upload_failure_meta
 logger = logging.getLogger(__name__)
 
 
-app = FastAPI(title="Radar Trainer")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Preload metagraph at startup so /train doesn't block on first request."""
+    localnet = os.getenv("RADAR_LOCALNET", "").lower() in ("1", "true")
+    if not localnet:
+        logger.info("Preloading metagraph at startup...")
+        mg = await asyncio.to_thread(_load_metagraph)
+        if mg is not None:
+            logger.info("Metagraph preloaded (%d neurons)", mg.n)
+        else:
+            logger.warning("Metagraph preload failed — will retry on first request")
+    yield
 
-# ── Auth (shared HMAC service key) ───────────────────────────────────
-# In non-competitive mode there's exactly one issuer (the operator), so
-# the trainer just verifies HMAC against ``RADAR_SERVICE_KEY``.  No
-# metagraph fetch, no bittensor import.
 
-def _service_secret() -> bytes | None:
-    raw = os.getenv("RADAR_SERVICE_KEY", "").strip()
-    return raw.encode() if raw else None
+app = FastAPI(title="Radar Trainer", lifespan=_lifespan)
 
+# ── Metagraph cache ──────────────────────────────────────────────────
+_metagraph_cache = None
+_metagraph_lock = threading.Lock()
+_metagraph_last_refresh: float = 0.0
+METAGRAPH_REFRESH_INTERVAL = float(os.getenv("METAGRAPH_REFRESH_INTERVAL", "300"))
 
-_EXPECTED_KEY_ID = os.getenv("RADAR_SERVICE_KEY_ID", "operator")
-
-# ── Rate limiting (per key_id) ───────────────────────────────────────
+# ── Rate limiting ────────────────────────────────────────────────────
 _train_semaphore = asyncio.Semaphore(1)  # max 1 concurrent /train
-_key_last_request: dict[str, float] = {}
-_key_lock = threading.Lock()
+_hotkey_last_request: dict[str, float] = {}
+_hotkey_lock = threading.Lock()
 HOTKEY_COOLDOWN_SECONDS = float(os.getenv("TRAINER_HOTKEY_COOLDOWN", "60"))
 
 # ── Task registry ───────────────────────────────────────────────────
@@ -79,38 +89,32 @@ async def train(request: Request):
 
     body = await request.body()
 
-    # 1. Auth — FAIL CLOSED (HMAC service key)
+    # 1. Auth — FAIL CLOSED
     localnet = os.getenv("RADAR_LOCALNET", "").lower() in ("1", "true")
     if localnet:
         logger.info("Localnet mode: skipping auth")
         sender = "localnet"
     else:
-        secret = _service_secret()
-        if not secret:
-            logger.error("RADAR_SERVICE_KEY not set — rejecting (fail closed)")
-            return JSONResponse(
-                status_code=503,
-                content={"error": "Auth not configured on trainer"},
-            )
+        metagraph = _load_metagraph()
+        if metagraph is None:
+            logger.error("Metagraph unavailable — rejecting request (fail closed)")
+            return JSONResponse(status_code=503, content={"error": "Auth unavailable, try again later"})
         try:
-            from shared.auth import hmac_verify_request, static_key_lookup
-            ok, err, sender = hmac_verify_request(
-                dict(request.headers), body,
-                static_key_lookup(_EXPECTED_KEY_ID, secret),
-            )
+            from shared.auth import verify_request
+            ok, err, sender = verify_request(dict(request.headers), body, metagraph, require_stake=True)
             if not ok:
-                kid = request.headers.get("x-radar-key-id", "?")
-                logger.warning("Auth rejected (key_id=%s): %s", kid, err)
+                signed_by = request.headers.get("x-epistula-signed-by", "?")
+                logger.warning(
+                    "Auth rejected from %s: %s", signed_by, err,
+                )
                 return JSONResponse(status_code=403, content={"error": err})
         except Exception as e:
             logger.error("Auth verification failed: %s", e)
-            return JSONResponse(
-                status_code=403, content={"error": "Auth verification error"},
-            )
+            return JSONResponse(status_code=403, content={"error": "Auth verification error"})
 
-    # 2. Per-key rate limit (check only — timestamp recorded after semaphore)
-    with _key_lock:
-        last = _key_last_request.get(sender, 0.0)
+    # 2. Per-hotkey rate limit (check only — timestamp recorded after semaphore)
+    with _hotkey_lock:
+        last = _hotkey_last_request.get(sender, 0.0)
         if time.time() - last < HOTKEY_COOLDOWN_SECONDS:
             remaining = HOTKEY_COOLDOWN_SECONDS - (time.time() - last)
             return JSONResponse(status_code=429, content={
@@ -151,8 +155,8 @@ async def train(request: Request):
 
     # Record rate-limit timestamp AFTER semaphore acquired — if the
     # request fails before this point, retries won't be rate-limited.
-    with _key_lock:
-        _key_last_request[sender] = time.time()
+    with _hotkey_lock:
+        _hotkey_last_request[sender] = time.time()
 
     training_config = {
         "seed": data.get("seed", 42),
@@ -309,6 +313,33 @@ async def boot_proof():
     if status != 200:
         return JSONResponse(status_code=status, content=body)
     return body
+
+
+def _load_metagraph():
+    """Load metagraph with caching. Returns None if never reachable."""
+    global _metagraph_cache, _metagraph_last_refresh
+    now = time.time()
+    if _metagraph_cache is not None and (now - _metagraph_last_refresh) < METAGRAPH_REFRESH_INTERVAL:
+        return _metagraph_cache
+    with _metagraph_lock:
+        if _metagraph_cache is not None and (now - _metagraph_last_refresh) < METAGRAPH_REFRESH_INTERVAL:
+            return _metagraph_cache
+        try:
+            import bittensor as bt
+            netuid = int(os.getenv("NETUID", "1"))
+            network = os.getenv("SUBTENSOR_NETWORK", "finney")
+            subtensor = bt.Subtensor(network=network)
+            mg = subtensor.metagraph(netuid)
+            _metagraph_cache = mg
+            _metagraph_last_refresh = time.time()
+            logger.info("Metagraph refreshed (%d neurons)", mg.n)
+            return mg
+        except Exception as e:
+            logger.warning("Metagraph refresh failed: %s", e)
+            if _metagraph_cache is not None:
+                logger.info("Using stale metagraph cache")
+                return _metagraph_cache
+            return None
 
 
 if __name__ == "__main__":
