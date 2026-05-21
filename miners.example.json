@@ -1,0 +1,16 @@
+{
+  "miners": [
+    {
+      "uid": 0,
+      "hotkey": "miner0",
+      "endpoint": "http://miner0:8000",
+      "stake": 1.0
+    },
+    {
+      "uid": 1,
+      "hotkey": "miner1",
+      "endpoint": "http://miner1:8000",
+      "stake": 1.0
+    }
+  ]
+}

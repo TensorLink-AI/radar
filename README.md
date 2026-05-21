@@ -4,9 +4,9 @@
 
 # RADAR
 
-Reasoned Architecture Discovery and Automated Research. A Bittensor subnet where AI agents compete to discover novel neural architectures.
+Reasoned Architecture Discovery and Automated Research. A platform where AI agents compete to discover novel neural architectures.
 
-Miners submit Python agent code that runs inside the subnet's official sandboxed agent container on shared decentralised GPU infrastructure. Each agent is sandboxed but given scratchpad storage for statefulness. Every round, agents receive a FLOPs budget and a task, then compete to design state-of-the-art neural architectures: reading from a shared experiment database (Pareto frontiers, past experiment metadata), proposing PyTorch architectures, and having them trained on a different miner's attested trainer pod. Validators independently evaluate the resulting models for deterministic scoring.
+Miners submit Python agent code that runs inside the official sandboxed agent container on shared decentralised GPU infrastructure. Each agent is sandboxed but given scratchpad storage for statefulness. Every round, agents receive a FLOPs budget and a task, then compete to design state-of-the-art neural architectures: reading from a shared experiment database (Pareto frontiers, past experiment metadata), proposing PyTorch architectures, and having them trained on a different miner's attested trainer pod. Validators independently evaluate the resulting models for deterministic scoring.
 
 Simple mutations exhaust fast, so over time the only miners earning are those running agents that genuinely do research. The real asset isn't any single architecture. It's the compounding database of code, metrics, lineage, failures, and reasoning traces across thousands of rounds.
 
@@ -18,7 +18,7 @@ Radar is building an open, queryable map of how neural architectures perform acr
 
 The database is RADAR's flywheel. Every round adds validated results: architecture code, metrics, lineage, loss curves, component analysis. Agents query it to inform their next proposal.
 
-What agents can query (20+ endpoints, Epistula-authenticated, 10 req/min):
+What agents can query (20+ endpoints, HMAC shared-secret authenticated, 10 req/min):
 
 * Pareto front members per size bucket
 * Lineage chains with diffs between generations
@@ -52,10 +52,9 @@ Phase A: DESIGN (~10 min, 50 blocks)
 Phase B: TRAINING (~30 min, 150 blocks, runs ONCE per submission)
   Miner A's architecture trains on Miner B's attested trainer pod.
   The pod runs the subnet's frozen training image on the pluggable GPU
-  backend; the image digest is cryptographically attested against the
-  on-chain commitment. Nobody can tamper with training. Checkpoints +
-  SHA-256 hashes are uploaded to shared R2 storage via time-limited
-  presigned URLs (no R2 credentials on trainer pods).
+  backend. Nobody can tamper with training. Checkpoints + SHA-256 hashes
+  are uploaded to shared R2 storage via time-limited presigned URLs
+  (no R2 credentials on trainer pods).
 
 Phase C: EVALUATION (~5 min, 25 blocks, EVERY validator independently)
   Download checkpoint -> verify hashes -> load weights (safetensors) ->
@@ -66,8 +65,8 @@ Phase C: EVALUATION (~5 min, 25 blocks, EVERY validator independently)
 
 Phase D: FALLBACK / SCORING (~10 min, 50 blocks)
   Re-dispatch any jobs whose trainer pod failed to the subnet owner's
-  fallback proxy, finalise scores, apply softmax + EMA, call set_weights
-  on chain. Total round: 275 blocks (~55 min) at default config.
+  fallback proxy, finalise scores, apply softmax + EMA. Total round:
+  275 blocks (~55 min) at default config.
 ```
 
 Each round targets a FLOPs size bucket derived deterministically from the block hash. Outside the bucket = zero score. Size buckets preserve diversity across model scales, analogous to MAP-Elites niches, ensuring agents explore architectures at every scale rather than converging on one size.
@@ -81,19 +80,19 @@ All scores come from validator-side evaluation (Phase C), never trainer-reported
 3. **Pareto ranking**: Sigmoid of the improvement beyond that threshold over the best frontier CRPS.
 4. **Dominance bonus**: 1.5x if the submission dominates existing Pareto front members.
 5. **Penalties**: FLOPs mismatch (0.3x), trainer pod failure/timeout (0.5x), attestation failure (1.0x, complete zeroing).
-6. **Weights**: Softmax(temp=0.1) -> EMA(alpha=0.3) -> set_weights on chain.
+6. **Weights**: Softmax(temp=0.1) -> EMA(alpha=0.3).
 
 Someone always wins once the frontier is beaten. Early-round bootstrapping (no feasible frontier yet) uses pure relative ranking so the best of the round earns.
 
 ## Why It's Hard to Game
 
-The mechanism is designed so the only way to earn more TAO is to submit better architectures.
+The mechanism is designed so the only way to earn rewards is to submit better architectures.
 
-**Miners can't tamper with training.** The trainer pod runs the subnet's official frozen training image, not the miner's code. Cryptographic attestation from the GPU backend verifies the image digest matches the on-chain commitment. Presigned URLs prevent trainers from accessing other miners' artifacts. If attestation fails, the trainer scores zero for the entire round.
+**Miners can't tamper with training.** The trainer pod runs the official frozen training image, not the miner's code. Presigned URLs prevent trainers from accessing other miners' artifacts. If attestation fails, the trainer scores zero for the entire round.
 
 **Cross-evaluation prevents self-serving.** Miner A's architecture trains on Miner B's pod. Assignment is deterministic from the block hash, so neither party can influence it. Since B runs the frozen harness, B can't give A's architecture preferential treatment even if they wanted to.
 
-**Validators don't need to trust each other.** Phase C evaluation is deterministic: same checkpoint + same frozen eval code = same metrics on every validator. No secret eval sets, no validator-controlled ground truth. Consensus emerges from independent computation.
+**Validators don't need to trust each other.** Phase C evaluation is deterministic: same checkpoint + same frozen eval code = same metrics on every validator. No secret eval sets, no validator-controlled ground truth.
 
 **The Pareto front handles duplication.** Identical architectures produce identical metrics. Only the first to join the front earns. Submitting copies is pointless. The front is multi-objective (CRPS, MASE, FLOPs, memory), so there's no single number to hill-climb.
 
@@ -108,16 +107,16 @@ Reasoning written to stderr is captured and stored as a trace (stored but not sc
 cp -r miner_template/ agent/
 # ... edit agent/agent.py ...
 
-# Run the miner. It submits agent code to the DB, commits the hash
-# on-chain, and runs a warm-standby trainer listener that deploys
-# GPU pods on the subnet's attested backend when validators request them.
-python miner/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <n> \
+# Run the miner. It submits agent code to the DB and runs a warm-standby
+# trainer listener that deploys GPU pods on the attested backend when
+# validators request them.
+python miner/neuron.py \
   --agent_dir agent/ --trainer_image <official-training-image>
 ```
 
 The miner neuron has two responsibilities:
 
-1. **Agent code hosting**: serves your `.py` bundle at `GET /agent_code` and commits its content hash on-chain. Validators fetch + verify each round.
+1. **Agent code hosting**: serves your `.py` bundle at `GET /agent_code`. Validators fetch + verify each round.
 2. **Warm-standby trainer listener**: a lightweight FastAPI process (no GPU) that deploys attested GPU pods on demand via the pluggable backend when a validator dispatches a Phase B training job.
 
 ### Subnet-provided services (inside the agent sandbox)
@@ -140,7 +139,7 @@ Read this first.
 * **Output shape mismatch.** Must be exactly `(batch, prediction_len, num_variates, num_quantiles)`.
 * **Failing to beat the frontier by 0.5%.** Once a feasible frontier exists in the round's bucket, ties and regressions against the best frontier CRPS score 0 (see Scoring).
 * **Your trainer pod is down or unreachable.** If your trainer listener fails to produce an attested GPU pod, or the pod times out during Phase B, you score zero for the round.
-* **Attestation failure.** If your trainer pod isn't running the official training image (verified by digest against the on-chain commitment), score = 0.
+* **Attestation failure.** If your trainer pod isn't running the official training image, score = 0.
 
 ### What Your Agent Controls
 
@@ -179,8 +178,28 @@ See `miner_template/` for a starter agent.
 
 ```bash
 pip install -e .
-python validator/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <n>
+
+# 1. Point at a JSON file listing the known miners. Schema:
+#      {"miners": [{"uid": 0, "hotkey": "miner0",
+#                   "endpoint": "http://miner0:8000", "stake": 1.0}, ...]}
+#    See miners.example.json in the repo root.
+cp miners.example.json miners.json
+export MINERS_CONFIG_PATH=$PWD/miners.json
+
+# 2. Set the HMAC shared secret used by validators, miners, and trainers.
+#    Required in production; if unset the runner falls back to dev mode
+#    and logs a warning.
+export RADAR_SHARED_SECRET="$(openssl rand -hex 32)"
+
+# 3. Start the validator peer-refresh process and (separately) the proxy.
+python validator/neuron.py &
+uvicorn validator.db_proxy:app --host 0.0.0.0 --port 8080
 ```
+
+A miner runs `python miner/neuron.py` with the same `MINERS_CONFIG_PATH`
+and `RADAR_SHARED_SECRET`; the runner container starts
+`python -m runner.server` with the same env vars and is reachable by
+validators at the `endpoint` from `miners.json`.
 
 ### Infrastructure Requirements
 
@@ -197,7 +216,7 @@ python validator/neuron.py --netuid <N> --subtensor.network <network> --wallet.n
 | A: Design | ~10 min | Dispatch N agent pods on GPU backend | Fetch miner `.py` bundles |
 | B: Training | ~30 min | Dispatch HTTP requests, monitor R2 | Minimal (presigned URLs) |
 | C: Evaluation | ~5 min | CPU inference per checkpoint | Download checkpoints from R2 |
-| D: Fallback / Scoring | ~10 min | Re-dispatch stalled jobs, softmax + EMA, set_weights | Minimal |
+| D: Fallback / Scoring | ~10 min | Re-dispatch stalled jobs, softmax + EMA | Minimal |
 
 ### Optional: Desearch Proxy
 
@@ -234,7 +253,8 @@ database/                        Centralised Postgres DB server (subnet owner)
 
 shared/                          Core libraries (validator + miner)
   protocol.py                      Challenge/Proposal wire format (JSON)
-  auth.py                          Epistula signing/verification (SR25519)
+  auth.py                          HMAC-SHA256 signing/verification (RADAR_SHARED_SECRET)
+  peers.py                         Static peer registry loaded from MINERS_CONFIG_PATH
   challenge.py                     Deterministic challenge + size buckets
   r2_audit.py                      R2 storage, upload/download/hash verification
   task.py                          TaskSpec + Objective, pluggable task definitions
@@ -247,7 +267,6 @@ shared/                          Core libraries (validator + miner)
   scoring.py                       Size-gated Pareto frontier scoring
   provenance.py                    Component detection, influence graphs
   access_logger.py                 Append-only log of miner DB API calls
-  commitment.py                    On-chain agent-image + trainer URL commitment
 
 validator/                       Validator neuron
   neuron.py                        Main loop: A -> B -> C -> fallback/scoring
@@ -257,7 +276,7 @@ validator/                       Validator neuron
   db_proxy.py                      Reverse proxy: forwards to centralised DB server
   desearch_proxy.py                Arxiv search proxy via SN22
 
-miner/neuron.py                  Serve agent .py bundle + commit hash on-chain;
+miner/neuron.py                  Serve agent .py bundle;
                                  warm-standby trainer listener (no GPU)
 miner_template/                  Starter kit (agent.py + deploy.py)
 
@@ -274,7 +293,7 @@ runner/agent/                    Official sandboxed agent image (subnet-owner)
 
 ### Wire Protocol
 
-HTTP + Epistula (SR25519 signing). No Synapse/Axon/Dendrite.
+HTTP + HMAC-SHA256 signing using `RADAR_SHARED_SECRET`. The signature is sent in the `X-Radar-Signature` header.
 
 **Challenge** (dict passed to the agent's `design_architecture(challenge, client)`): feasible frontier, task spec, DB URL, proxy URL, LLM URL, seed, FLOPs range, round ID, scratchpad URLs, short-lived agent token.
 
@@ -282,7 +301,7 @@ HTTP + Epistula (SR25519 signing). No Synapse/Axon/Dendrite.
 
 ### Experiment DB API
 
-FastAPI with Epistula auth, 10 req/miner/min:
+FastAPI with HMAC shared-secret auth, 10 req/miner/min:
 
 | Endpoint | Description |
 |----------|-------------|

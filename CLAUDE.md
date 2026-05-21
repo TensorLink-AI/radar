@@ -1,8 +1,8 @@
-# Radar Subnet — CLAUDE.md
+# Radar — CLAUDE.md
 
 ## What This Is
 
-A Bittensor subnet for autonomous ML research using phase-split validation. Miners host agents that design architectures. Validators coordinate training and independently evaluate checkpoints for consensus.
+A platform for autonomous ML research using phase-split validation. Miners host agents that design architectures. Validators coordinate training and independently evaluate checkpoints for consensus.
 
 ## Architecture — Phase-Split Validation
 
@@ -55,7 +55,8 @@ scripts/         Localnet test script + Postgres startup
 | File | Purpose |
 |------|---------|
 | `shared/protocol.py` | Challenge/Proposal wire format (JSON serializable) |
-| `shared/auth.py` | Epistula signing/verification |
+| `shared/auth.py` | HMAC-SHA256 signing/verification keyed by `RADAR_SHARED_SECRET` |
+| `shared/peers.py` | Static peer registry loaded from `MINERS_CONFIG_PATH` (`miners.json`) |
 | `shared/challenge.py` | Deterministic challenge generation, phase timing, size buckets |
 | `shared/task.py` | TaskSpec, Objective, YAML loader |
 | `shared/database.py` | DataElement dataclass + deprecated ExperimentDB (JSON) |
@@ -69,7 +70,6 @@ scripts/         Localnet test script + Postgres startup
 | `shared/pareto.py` | ParetoFront — non-dominated sorting, UCT sampling |
 | `shared/dedup.py` | Code similarity (provenance queries) |
 | `shared/scoring.py` | Size-gated Pareto frontier scoring (Phase C) |
-| `shared/commitment.py` | On-chain Docker image + endpoint commitment |
 | `shared/r2_audit.py` | R2 storage for checkpoints, snapshots, dispatch records |
 | `database/server.py` | Centralized DB API (FastAPI, all experiment routes) |
 | `database/neuron.py` | Subnet owner process (Postgres + API server) |
@@ -103,14 +103,21 @@ scripts/start_pg.sh
 python -m pytest tests/ -v
 
 # Start database server (subnet owner)
-python database/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <name>
+python database/neuron.py
 
-# Start validator (requires subtensor or mainnet)
-python validator/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <name>
+# Point everything at a JSON peer registry and a shared HMAC secret
+export MINERS_CONFIG_PATH=$PWD/miners.json   # see miners.example.json
+export RADAR_SHARED_SECRET="$(openssl rand -hex 32)"
 
-# Start miner
-python miner/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <name> \
-    --agent_image myagent:latest --agent_url <url> --trainer_url <url>
+# Start validator (peer-refresh loop) + proxy
+python validator/neuron.py &
+uvicorn validator.db_proxy:app --host 0.0.0.0 --port 8080
+
+# Start miner (peer-refresh loop)
+python miner/neuron.py
+
+# Start the runner that hosts /train (used by trainer pods)
+python -m runner.server
 
 # Build trainer image
 docker build -t ts-runner:latest runner/timeseries_forecast/
@@ -162,7 +169,7 @@ Each round targets one bucket deterministically from the block hash. FLOPs measu
 
 Three layers of timing, intentionally separated:
 
-1. **Block windows** (on-chain, validator-global): define WHEN phases start/end. Consensus-driven via block height (~12s/block). Rigid boundaries. Env: `RADAR_SUBMISSION_WINDOW`, `RADAR_TRAINING_WINDOW`, `RADAR_EVAL_WINDOW`, `RADAR_FALLBACK_WINDOW`.
+1. **Block windows** (validator-global): define WHEN phases start/end (~12s/block). Rigid boundaries. Env: `RADAR_SUBMISSION_WINDOW`, `RADAR_TRAINING_WINDOW`, `RADAR_EVAL_WINDOW`, `RADAR_FALLBACK_WINDOW`.
 2. **Validator operational timeouts** (seconds, validator-global): HTTP / R2 polling guardrails. E.g. `TRAINER_PREPARE_TIMEOUT`.
 3. **Per-task second budgets** (seconds, set in `tasks/<task>/<task>.yaml`): different tasks can demand different amounts of work per phase.
    - `agent_seconds` → Phase A wall-clock for the **agent pod** (0/unset = inherit `Config.AGENT_TIMEOUT`)
@@ -193,7 +200,8 @@ frontier/latest.json                                        # Current Pareto fro
 ## What's Done
 
 - [x] Phase-split validation pipeline (A -> B -> C)
-- [x] Epistula authentication (`shared/auth.py`)
+- [x] HMAC shared-secret authentication (`shared/auth.py`, `RADAR_SHARED_SECRET`)
+- [x] Static peer registry (`shared/peers.py`, `MINERS_CONFIG_PATH`)
 - [x] Deterministic challenge generation with size buckets (`shared/challenge.py`)
 - [x] Size-gated Pareto frontier scoring (`shared/scoring.py`)
 - [x] FLOPs-equivalent wallclock calibration (`runner/timeseries_forecast/flops.py`)
@@ -217,10 +225,6 @@ frontier/latest.json                                        # Current Pareto fro
 - [ ] **Mainnet registration** — register subnet, set hyperparameters, deploy
 - [ ] **Docker network isolation** — whitelist network for trainer containers
 - [ ] **Cross-tempo EMA** — weight smoothing across rounds
-
-## Bittensor SDK
-
-Using `bittensor>=10.1.0`. Key classes: `bt.Wallet`, `bt.Subtensor`, `bt.Keypair`.
 
 ## Code Style
 

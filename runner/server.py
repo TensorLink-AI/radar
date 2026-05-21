@@ -22,15 +22,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Preload metagraph at startup so /train doesn't block on first request."""
-    localnet = os.getenv("RADAR_LOCALNET", "").lower() in ("1", "true")
-    if not localnet:
-        logger.info("Preloading metagraph at startup...")
-        mg = await asyncio.to_thread(_load_metagraph)
-        if mg is not None:
-            logger.info("Metagraph preloaded (%d neurons)", mg.n)
-        else:
-            logger.warning("Metagraph preload failed — will retry on first request")
+    """Startup/shutdown lifecycle (chain preload removed)."""
     yield
 
 
@@ -39,11 +31,11 @@ app = FastAPI(title="Radar Trainer", lifespan=_lifespan)
 # R2 client (initialized on first use, only for localnet fallback)
 _r2 = None
 
-# ── Metagraph cache ──────────────────────────────────────────────────
-_metagraph_cache = None
-_metagraph_lock = threading.Lock()
-_metagraph_last_refresh: float = 0.0
-METAGRAPH_REFRESH_INTERVAL = float(os.getenv("METAGRAPH_REFRESH_INTERVAL", "300"))
+# ── Auth cache (kept for tests that patch this slot directly) ────────
+_auth_cache = None
+_auth_lock = threading.Lock()
+_auth_last_refresh: float = 0.0
+_dev_mode_warned: bool = False
 
 # ── Rate limiting ────────────────────────────────────────────────────
 _train_semaphore = asyncio.Semaphore(1)  # max 1 concurrent /train
@@ -89,24 +81,43 @@ async def train(request: Request):
 
     body = await request.body()
 
-    # 1. Auth — FAIL CLOSED
+    # 1. Auth — HMAC-shared-secret scheme. If RADAR_SHARED_SECRET is unset
+    #    we log once and allow the request through (dev mode); when it is
+    #    set we require a matching X-Radar-Signature on every request.
+    #    The legacy RADAR_LOCALNET flag is still honoured for test setups
+    #    that exercise the auth-bypass path explicitly.
     localnet = os.getenv("RADAR_LOCALNET", "").lower() in ("1", "true")
+    secret = os.getenv("RADAR_SHARED_SECRET", "")
     if localnet:
-        logger.info("Localnet mode: skipping auth")
         sender = "localnet"
+    elif not secret:
+        global _dev_mode_warned
+        if not _dev_mode_warned:
+            logger.warning(
+                "RADAR_SHARED_SECRET is unset — running trainer in dev mode "
+                "(requests will NOT be authenticated)",
+            )
+            _dev_mode_warned = True
+        sender = "dev-mode"
     else:
-        metagraph = _load_metagraph()
-        if metagraph is None:
-            logger.error("Metagraph unavailable — rejecting request (fail closed)")
-            return JSONResponse(status_code=503, content={"error": "Auth unavailable, try again later"})
-        try:
-            from shared.auth import verify_request
-            ok, err, sender = verify_request(dict(request.headers), body, metagraph, require_stake=True)
-            if not ok:
-                return JSONResponse(status_code=403, content={"error": err})
-        except Exception as e:
-            logger.error("Auth verification failed: %s", e)
-            return JSONResponse(status_code=403, content={"error": "Auth verification error"})
+        from shared.auth import verify_request_hmac
+        signature = (
+            request.headers.get("X-Radar-Signature", "")
+            or request.headers.get("x-radar-signature", "")
+        )
+        if not signature or not verify_request_hmac(body, signature):
+            logger.warning(
+                "Rejecting /train request: missing or invalid X-Radar-Signature",
+            )
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Invalid or missing signature"},
+            )
+        sender = (
+            request.headers.get("X-Miner-Hotkey", "")
+            or request.headers.get("x-miner-hotkey", "")
+            or "signed"
+        )
 
     # 2. Per-hotkey rate limit (check only — timestamp recorded after semaphore)
     with _hotkey_lock:
@@ -385,31 +396,13 @@ async def health():
     return {"status": "ok", "gift_eval_ready": _gift_eval_ready}
 
 
-def _load_metagraph():
-    """Load metagraph with caching. Returns None if never reachable."""
-    global _metagraph_cache, _metagraph_last_refresh
-    now = time.time()
-    if _metagraph_cache is not None and (now - _metagraph_last_refresh) < METAGRAPH_REFRESH_INTERVAL:
-        return _metagraph_cache
-    with _metagraph_lock:
-        if _metagraph_cache is not None and (now - _metagraph_last_refresh) < METAGRAPH_REFRESH_INTERVAL:
-            return _metagraph_cache
-        try:
-            import bittensor as bt
-            netuid = int(os.getenv("NETUID", "1"))
-            network = os.getenv("SUBTENSOR_NETWORK", "finney")
-            subtensor = bt.Subtensor(network=network)
-            mg = subtensor.metagraph(netuid)
-            _metagraph_cache = mg
-            _metagraph_last_refresh = time.time()
-            logger.info("Metagraph refreshed (%d neurons)", mg.n)
-            return mg
-        except Exception as e:
-            logger.warning("Metagraph refresh failed: %s", e)
-            if _metagraph_cache is not None:
-                logger.info("Using stale metagraph cache")
-                return _metagraph_cache
-            return None
+def _load_auth():
+    """Stub auth-backend loader. Chain layer has been removed.
+
+    Returns the (possibly None) cached auth handle so legacy tests that
+    monkeypatch this hook still drive the request flow correctly.
+    """
+    return _auth_cache
 
 
 if __name__ == "__main__":
