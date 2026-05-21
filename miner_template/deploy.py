@@ -1,24 +1,20 @@
 """Deploy guide for Radar miners.
 
 Miners have two components:
-  1. Agent code: .py files in a directory. The miner neuron POSTs them to
-     the DB server and commits the code hash on-chain. Validators fetch
-     the code and run it inside the official sandboxed agent image.
+  1. Agent code: .py files in a directory. The miner neuron POSTs them
+     to the DB server (bearer-auth via RADAR_MINER_API_KEY). Validators
+     fetch the code and run it inside the official sandboxed agent image.
   2. Trainer listener: a lightweight HTTP server on the miner's neuron
-     process. GPU pods deploy on-demand via Basilica when validators send
-     TrainerRequests.
+     process. GPU pods deploy on-demand via Basilica/Targon/RunPod when
+     validators send TrainerRequests.
 
 No Docker image needed for agents — just write .py files.
 No upfront GPU cost — pods deploy on-demand.
 
 Usage:
-  # Start miner (agent code auto-submitted from --agent_dir)
-  python miner/neuron.py \\
-      --agent_dir miner_template/ \\
-      --listener_port 8090 \\
-      --netuid <N> \\
-      --subtensor.network <network> \\
-      --wallet.name <name>
+  RADAR_SERVICE_KEY=... RADAR_MINER_API_KEY=rdrk_... \\
+  RADAR_DB_API_URL=http://<db-host>:8090 \\
+    python miner/neuron.py --agent_dir miner_template/ --listener_port 8090
 """
 
 import argparse
@@ -58,15 +54,15 @@ def main():
     print("How it works:")
     print("  1. Miner neuron reads .py files from --agent_dir")
     print("  2. POSTs them to the DB server (stored in R2 + Postgres)")
-    print("  3. Commits code_hash on-chain for validator verification")
-    print("  4. Validators fetch code, inject into official agent image, run it")
+    print("  3. Validators fetch code, inject into official agent image, run it")
     print()
     print("Start miner:")
-    print(f"  python miner/neuron.py \\")
-    print(f"    --agent_dir {args.agent_dir} \\")
-    print(f"    --listener_port {args.listener_port} \\")
-    print(f"    --trainer_image {args.trainer_image} \\")
-    print(f"    --netuid <N> --subtensor.network <network> --wallet.name <name>")
+    print(f"  RADAR_SERVICE_KEY=... RADAR_MINER_API_KEY=rdrk_... \\")
+    print(f"  RADAR_DB_API_URL=http://<db-host>:8090 \\")
+    print(f"    python miner/neuron.py \\")
+    print(f"      --agent_dir {args.agent_dir} \\")
+    print(f"      --listener_port {args.listener_port} \\")
+    print(f"      --trainer_image {args.trainer_image}")
     print()
     print("Notes:")
     print("  - Agent code must define: design_architecture(challenge, client)")

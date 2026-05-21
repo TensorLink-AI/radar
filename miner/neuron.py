@@ -1,12 +1,10 @@
-"""Radar Miner — commits agent code hash to chain, hosts warm-standby trainer.
+"""Radar Miner — hosts warm-standby trainer + serves agent code.
 
-The miner has three components:
-  1. Agent code: .py files served from the listener. Validators fetch and
-     run them inside the official sandboxed agent image.
+The miner has two components:
+  1. Agent code: .py files submitted to the central DB. Validators
+     fetch and run them inside the official sandboxed agent image.
   2. Trainer listener: a lightweight FastAPI server (no GPU). Deploys
-     Basilica GPU pods on-demand when validators send TrainerRequests.
-  3. Agent code endpoint: GET /agent_code returns a JSON bundle of the
-     miner's agent .py files plus a content hash for verification.
+     trainer pods on demand when validators send TrainerRequests.
 """
 
 import argparse
@@ -16,10 +14,6 @@ import logging
 import os
 import time
 
-try:
-    import bittensor as bt
-except ImportError:  # pragma: no cover — only fires in noncompetitive deploys
-    bt = None  # type: ignore[assignment]
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
@@ -42,9 +36,8 @@ from miner.targon_lifecycle import (
     HealthMonitorRegistry, install_shutdown_handlers,
     make_targon_client, validate_and_reap_orphans,
 )
-from shared.agent_code import bundle_from_directory, compute_code_hash
-from shared.auth import sign_request, verify_request
-from shared.commitment import ImageCommitment
+from shared.agent_code import bundle_from_directory
+from shared.auth import hmac_sign_request, hmac_verify_request, static_key_lookup
 from shared.protocol import TrainerRequest, TrainerReady, TrainerRelease
 
 logger = logging.getLogger(__name__)
@@ -57,7 +50,19 @@ class Miner:
 
     def __init__(self, config):
         self.config = config
-        self.netuid = getattr(config, "netuid", 1)
+
+        # Miner identity is a free-form label (no chain hotkey).  Used
+        # only to namespace agent code in the DB and to tag outbound
+        # log lines.
+        self.miner_id = (
+            getattr(config, "miner_id", "")
+            or os.getenv("RADAR_MINER_ID", "")
+            or "miner"
+        )
+
+        # Per-miner bearer token used to authenticate to the DB (issued
+        # via the operator CLI).  Required to submit agent code.
+        self.api_key = os.getenv("RADAR_MINER_API_KEY", "").strip()
 
         # Fail-fast on Targon misconfig — operator gets a clear error at
         # startup instead of a cryptic deploy failure on the first round.
@@ -88,21 +93,17 @@ class Miner:
                 "image and set RADAR_RUNPOD_ENDPOINT_ID to its id."
             )
 
-        # Bittensor chain — skipped entirely in non-competitive mode
-        if Config.NONCOMPETITIVE:
-            self.wallet = None
-            self.subtensor = None
-            self.metagraph = None
-        else:
-            if bt is None:
-                raise RuntimeError(
-                    "competitive mode requires the bittensor package; "
-                    "install with `pip install bittensor` or run with "
-                    "RADAR_NONCOMPETITIVE=true."
-                )
-            self.wallet = bt.Wallet(config=config)
-            self.subtensor = bt.Subtensor(config=config)
-            self.metagraph = self.subtensor.metagraph(self.netuid)
+        # Shared HMAC service key — used to verify inbound validator
+        # /prepare requests and to sign outbound TrainerReady POSTs.
+        if not Config.SERVICE_KEY:
+            raise RuntimeError(
+                "RADAR_SERVICE_KEY must be set — the miner verifies "
+                "validator /prepare requests and signs TrainerReady "
+                "posts with the shared HMAC service key."
+            )
+        self._service_secret = Config.SERVICE_KEY.encode()
+        self._service_key_id = Config.SERVICE_KEY_ID
+
         self._targon_client = None
         self._runpod_client = None
         # Per-round RunPod job ids the miner has submitted on behalf of
@@ -142,7 +143,7 @@ class Miner:
         )
 
     async def submit_agent_code(self):
-        """Submit agent code directly to the DB server and commit hash on-chain."""
+        """Submit agent code to the DB server."""
         if not os.path.isdir(self.agent_dir):
             logger.error("Agent directory not found: %s", self.agent_dir)
             return
@@ -158,8 +159,14 @@ class Miner:
         if not db_url:
             logger.error("RADAR_DB_API_URL not set — cannot submit agent code")
             return
+        if not self.api_key:
+            logger.error(
+                "RADAR_MINER_API_KEY is not set — cannot submit agent code. "
+                "Issue one via `python -m database.operator_cli issue-key`.",
+            )
+            return
         from shared.db_client import DatabaseClient
-        db = DatabaseClient(db_url=db_url, wallet=self.wallet)
+        db = DatabaseClient(db_url=db_url, api_key=self.api_key)
         try:
             result = await db.submit_agent_code(
                 files=bundle["files"],
@@ -178,43 +185,21 @@ class Miner:
             await db.close()
 
         self._code_hash = code_hash
-        self._commit_to_chain(code_hash)
-
-    def _commit_to_chain(self, code_hash: str):
-        """Commit code_hash + listener URL to chain."""
-        commitment = ImageCommitment(
-            code_hash=code_hash,
-            subnet_version="0.3.0",
-            listener_url=f"http://{self.external_ip}:{self.listener_port}",
-            trainer_image=self.trainer_image,
-        )
-
-        chain_json = commitment.to_chain_json()
-        logger.info("Committing to chain (%d bytes): %s", len(chain_json), chain_json)
-        response = self.subtensor.set_commitment(
-            wallet=self.wallet,
-            netuid=self.netuid,
-            data=chain_json,
-        )
-        if hasattr(response, "success") and not response.success:
-            raise RuntimeError(f"Chain commit failed: {getattr(response, 'message', response)}")
-        logger.info("Committed to chain: code_hash=%s", code_hash[:24])
 
     async def _post_trainer_ready(
         self, round_id: int, deployment: Deployment, validator_db_url: str,
     ):
-        """POST signed TrainerReady to a validator's DB server.
+        """POST a signed TrainerReady to a validator's proxy.
 
         Carries backend-specific metadata when present; empty strings
         for backends that don't use a given field keep the wire format
         backwards-compatible.
         """
-        hotkey = self.wallet.hotkey.ss58_address
         ready = TrainerReady(
             round_id=round_id,
             trainer_url=deployment.url,
             instance_name=deployment.name,
-            miner_hotkey=hotkey,
+            miner_hotkey=self.miner_id,
             targon_workload_uid=deployment.targon_workload_uid,
             cvm_ip=deployment.cvm_ip,
             gpu_class=deployment.gpu_class,
@@ -223,8 +208,11 @@ class Miner:
             runpod_template_id=deployment.runpod_template_id,
         )
         body = ready.to_json().encode()
-        headers = sign_request(self.wallet, body)
+        headers = hmac_sign_request(
+            self._service_secret, body, key_id=self._service_key_id,
+        )
         headers["Content-Type"] = "application/json"
+        headers["X-Miner-UID"] = str(getattr(self, "miner_uid", -1))
         url = f"{validator_db_url}/trainer/ready"
         logger.info("Posting TrainerReady to %s", url)
         try:
@@ -274,9 +262,8 @@ class Miner:
         # TTL covers Phase A wait + training + upload buffer.
         submission_wait = int(getattr(request, "submission_window_seconds", 0) or 600)
         ttl = submission_wait + int(request.time_budget) + 600
-        hotkey = self.wallet.hotkey.ss58_address
-
-        network = os.environ.get("SUBTENSOR_NETWORK", "") or getattr(self.subtensor, "network", "") or ""
+        hotkey = self.miner_id
+        network = os.environ.get("RADAR_NETWORK", "") or ""
 
         deploy_start = time.time()
         try:
@@ -405,7 +392,7 @@ class Miner:
                 image=self.trainer_image,
                 deployed_image_digest=Config.OFFICIAL_TRAINING_IMAGE_DIGEST,
                 hotkey=hotkey,
-                netuid=self.netuid,
+                netuid=0,
                 subtensor_network=network,
                 gpu_class=gpu_class,
                 registry=get_targon_registry_creds(),
@@ -429,7 +416,7 @@ class Miner:
             request=request,
             image=self.trainer_image,
             hotkey=hotkey,
-            netuid=self.netuid,
+            netuid=0,
             subtensor_network=network,
             ttl=ttl,
         )
@@ -567,24 +554,19 @@ class Miner:
         """Register listener endpoints on the FastAPI app."""
         miner = self
 
+        verify_lookup = static_key_lookup(
+            miner._service_key_id, miner._service_secret,
+        )
+
         @listener_app.post("/prepare")
         async def prepare(request: Request):
             body = await request.body()
-            # Verify Epistula signature from validator (use cached metagraph)
-            try:
-                ok, err, hotkey = verify_request(
-                    dict(request.headers), body,
-                    miner.metagraph,
-                )
-                if not ok:
-                    logger.warning(
-                        "Auth failed on /prepare: %s (signed-by: %s)",
-                        err,
-                        request.headers.get("x-epistula-signed-by", "?")[:16],
-                    )
-                    return JSONResponse(status_code=403, content={"error": err})
-            except Exception as exc:
-                logger.debug("Auth verification exception (allowing): %s", exc)
+            ok, err, _kid = hmac_verify_request(
+                dict(request.headers), body, verify_lookup,
+            )
+            if not ok:
+                logger.warning("Auth failed on /prepare: %s", err)
+                return JSONResponse(status_code=403, content={"error": err})
 
             try:
                 req = TrainerRequest.from_json(body.decode())
@@ -637,16 +619,12 @@ class Miner:
                     content={"error": "miner listener does not relay /train for this backend"},
                 )
             body = await request.body()
-            try:
-                ok, err, signed_by = verify_request(
-                    dict(request.headers), body, miner.metagraph,
-                )
-                if not ok:
-                    logger.warning("Auth failed on /train: %s", err)
-                    return JSONResponse(status_code=403, content={"error": err})
-            except Exception as exc:
-                logger.debug("Auth verification exception (allowing): %s", exc)
-                signed_by = ""
+            ok, err, signed_by = hmac_verify_request(
+                dict(request.headers), body, verify_lookup,
+            )
+            if not ok:
+                logger.warning("Auth failed on /train: %s", err)
+                return JSONResponse(status_code=403, content={"error": err})
 
             try:
                 payload = json.loads(body)
@@ -751,39 +729,31 @@ class Miner:
                 pass  # normal heartbeat tick
 
             try:
-                self.metagraph = self.subtensor.metagraph(self.netuid)
                 await self._reap_stale_deployments()
                 logger.info(
-                    "Heartbeat: metagraph synced (%d neurons). "
-                    "Active deployments: %d. Listening on port %d.",
-                    self.metagraph.n,
-                    len(self.active_deployments),
-                    self.listener_port,
+                    "Heartbeat: active deployments=%d, listening on port %d",
+                    len(self.active_deployments), self.listener_port,
                 )
-                # Retry if DB server was unreachable at startup
                 if not self._code_hash:
                     await self.submit_agent_code()
             except Exception as e:
-                logger.warning("Metagraph sync failed: %s", e)
+                logger.warning("Heartbeat tick failed: %s", e)
 
 
 def get_config():
     parser = argparse.ArgumentParser(description="Radar Miner")
-    parser.add_argument("--netuid", type=int, default=1)
+    parser.add_argument("--miner_id", type=str, default="",
+                        help="Free-form miner label (defaults to RADAR_MINER_ID env)")
     parser.add_argument("--agent_dir", type=str, default="agent/",
                         help="Directory containing agent .py files")
     parser.add_argument("--listener_port", type=int, default=Config.MINER_LISTENER_PORT,
                         help="Port for warm-standby trainer listener")
     parser.add_argument("--trainer_image", type=str,
                         default=Config.OFFICIAL_TRAINING_IMAGE,
-                        help="Trainer Docker image deployed on Basilica on-demand")
+                        help="Trainer Docker image deployed on demand")
     parser.add_argument("--external_ip", type=str, default="",
-                        help="External IP for listener URL committed to chain")
-    if Config.NONCOMPETITIVE or bt is None:
-        return parser.parse_args()
-    bt.Wallet.add_args(parser)
-    bt.Subtensor.add_args(parser)
-    return bt.Config(parser)
+                        help="External IP for the listener URL")
+    return parser.parse_args()
 
 
 def main():
@@ -799,8 +769,6 @@ def main():
     from miner import cli
     if cli.is_subcommand(sys.argv):
         sys.exit(cli.dispatch(sys.argv))
-    # Optional explicit ``run`` token for clarity; strip it before the
-    # bittensor argparse kicks in.
     if len(sys.argv) >= 2 and sys.argv[1] == "run":
         del sys.argv[1]
 

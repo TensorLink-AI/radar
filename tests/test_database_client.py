@@ -8,17 +8,13 @@ import pytest
 from shared.db_client import DatabaseClient
 
 
-class MockWallet:
-    class hotkey:
-        ss58_address = "5FakeHotkey"
-        @staticmethod
-        def sign(msg):
-            return b"\x00" * 64
-
-
 @pytest.fixture
 def client():
-    return DatabaseClient(db_url="http://fake-db:8090", wallet=MockWallet())
+    return DatabaseClient(
+        db_url="http://fake-db:8090",
+        service_secret=b"test-secret",
+        key_id="operator",
+    )
 
 
 @pytest.mark.asyncio

@@ -160,7 +160,8 @@ async def _fetch_agent_bundle(
 ) -> Optional[dict]:
     """Fetch a miner's agent code bundle from the DB server.
 
-    Verifies the code_hash against the on-chain commitment.
+    Verifies the bundle's code_hash against the in-memory commitment
+    record so a tampered bundle in the DB still gets caught here.
     Returns the validated bundle dict or None.
     """
     if not commitment.hotkey:
@@ -183,12 +184,12 @@ async def _fetch_agent_bundle(
         )
         return None
 
-    # Verify code hash matches on-chain commitment
+    # Verify code hash matches the registered commitment
     if commitment.code_hash:
         actual_hash = compute_code_hash(bundle["files"])
         if actual_hash != commitment.code_hash:
             logger.warning(
-                "UID %d code hash mismatch: on-chain=%s actual=%s",
+                "UID %d code hash mismatch: expected=%s actual=%s",
                 commitment.miner_uid,
                 commitment.code_hash[:24],
                 actual_hash[:24],
@@ -352,8 +353,6 @@ async def _run_agents_concurrently(
 
 
 async def run_and_collect_agents(
-    wallet,
-    metagraph,
     challenge_json: str,
     round_id: int,
     seed: int,
@@ -369,7 +368,7 @@ async def run_and_collect_agents(
     1. Work-split: get_my_assignments() for which agents this validator runs
     2. For each assigned miner:
        a. Fetch agent code bundle from DB server
-       b. Verify code_hash against on-chain commitment
+       b. Verify code_hash against the in-memory commitment record
        c. launch_agent_pod() with official image + code injection
        d. run_agent_on_pod() with challenge JSON + URL allowlist
        e. Upload proposal + per-agent metadata to R2:
@@ -390,15 +389,17 @@ async def run_and_collect_agents(
 
     # Build DB client if not provided
     if db_client is None:
-        if Config.SERVICE_KEY:
-            db_client = DatabaseClient(
-                Config.DB_API_URL,
-                service_secret=Config.SERVICE_KEY.encode(),
-                key_id=Config.SERVICE_KEY_ID,
-                api_key=Config.DB_API_KEY,
+        if not Config.SERVICE_KEY:
+            raise RuntimeError(
+                "RADAR_SERVICE_KEY must be set so the collector can sign "
+                "requests to the centralized DB server."
             )
-        else:
-            db_client = DatabaseClient(Config.DB_API_URL, wallet)
+        db_client = DatabaseClient(
+            Config.DB_API_URL,
+            service_secret=Config.SERVICE_KEY.encode(),
+            key_id=Config.SERVICE_KEY_ID,
+            api_key=Config.DB_API_KEY,
+        )
 
     # Pre-fetch all agent bundles for my assigned miners (concurrently).
     async def _prefetch(uid: int) -> tuple[int, Optional[dict]]:

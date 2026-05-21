@@ -12,7 +12,7 @@
 #   export RADAR_PG_DSN='postgresql://radar:PW@p.abc.db.postgresbridge.com:5432/radar?sslmode=require'
 #   export RADAR_PG_SSL=verify
 #   export RADAR_NETWORK=testnet        # or mainnet
-#   ./scripts/deploy_db_crunchy.sh --netuid 279 --subtensor.network test
+#   ./scripts/deploy_db_crunchy.sh 
 #
 # Required env:
 #   RADAR_PG_DSN          Full connection string (include ?sslmode=require)

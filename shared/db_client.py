@@ -7,14 +7,9 @@ Two auth modes selected at construction time:
     validator dispatcher and any other operator-side process holding
     the shared service key.
   * Bearer token — passes ``api_key`` (str).  Outbound requests carry
-    ``Authorization: Bearer <token>``.  Used by miner-side tooling
-    (``MinerResultsClient`` lives in ``miner_template`` for the same
-    surface).
+    ``Authorization: Bearer <token>``.  Used by miner-side tooling.
 
-Legacy Epistula path (``wallet`` keyword) is retained as a back-compat
-shim during the cutover.  When ``wallet`` is supplied and no HMAC/key
-is set, requests are signed with the on-chain hotkey via
-``shared.auth.sign_request``.  Pass exactly ONE of the three.
+Pass exactly ONE of the two.
 """
 
 from __future__ import annotations
@@ -34,21 +29,19 @@ class DatabaseClient:
     def __init__(
         self,
         db_url: str,
-        wallet=None,
         *,
         service_secret: Optional[bytes] = None,
         key_id: str = "operator",
         api_key: str = "",
     ):
         self.db_url = db_url.rstrip("/")
-        self.wallet = wallet
         self.service_secret = service_secret
         self.key_id = key_id
         self.api_key = api_key or ""
-        if not any([self.service_secret, self.api_key, self.wallet]):
+        if not (self.service_secret or self.api_key):
             raise ValueError(
-                "DatabaseClient needs one of service_secret (HMAC), "
-                "api_key (bearer), or wallet (legacy Epistula).",
+                "DatabaseClient needs one of service_secret (HMAC) or "
+                "api_key (bearer).",
             )
         self._client: Optional[httpx.AsyncClient] = None
 
@@ -63,11 +56,7 @@ class DatabaseClient:
             return hmac_sign_request(
                 self.service_secret, body, key_id=self.key_id,
             )
-        if self.api_key:
-            return {"Authorization": f"Bearer {self.api_key}"}
-        # Legacy: wallet (Epistula).
-        from shared.auth import sign_request
-        return sign_request(self.wallet, body)
+        return {"Authorization": f"Bearer {self.api_key}"}
 
     async def _post(self, path: str, json_data: dict) -> Optional[dict]:
         try:
@@ -124,18 +113,10 @@ class DatabaseClient:
     async def add_experiment(
         self,
         element_data: dict,
-        substrate_cid: str = "",
-        validator_hotkey: str = "",
         artifact_cids: Optional[list[dict]] = None,
     ) -> Optional[int]:
-        """POST a DataElement dict.  ``validator_hotkey`` is the legacy
-        name for the writer's identifier — operator dispatchers in
-        non-competitive mode pass an opaque operator_id here.
-        """
+        """POST a DataElement dict."""
         payload: dict = {"data": element_data}
-        if substrate_cid:
-            payload["substrate_cid"] = substrate_cid
-            payload["validator_hotkey"] = validator_hotkey
         if artifact_cids:
             payload["artifact_cids"] = artifact_cids
         result = await self._post("/experiments/add", payload)

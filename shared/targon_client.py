@@ -281,7 +281,6 @@ class TargonClient:
         miner_hotkey: str,
         validator_hotkey: str,
         nonce: str = "",
-        wallet=None,
     ) -> AttestationResult:
         # Raises TargonUnavailable on outage; returns verified=False on
         # any other failure so the caller can keep exclusion-vs-soft-fail
@@ -297,7 +296,7 @@ class TargonClient:
 
         async def _evidence():
             return await fetch_cvm_evidence(
-                cvm_ip, nonce, timeout=self.timeout, wallet=wallet,
+                cvm_ip, nonce, timeout=self.timeout,
             )
 
         try:
