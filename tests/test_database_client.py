@@ -92,3 +92,20 @@ async def test_post_failure_returns_none(client):
         mock_get.return_value = mock_client
         result = await client.add_experiment({"name": "test"})
         assert result is None
+
+
+def test_signs_with_hotkey_header(monkeypatch):
+    """When ``hotkey`` is set, _sign attaches X-Miner-Hotkey for the server."""
+    monkeypatch.setenv("RADAR_SHARED_SECRET", "test-secret")
+    c = DatabaseClient(db_url="http://db", wallet=None, hotkey="hk1")
+    headers = c._sign(b'{"foo": 1}')
+    assert headers.get("X-Miner-Hotkey") == "hk1"
+    assert headers.get("X-Radar-Signature")  # non-empty signature
+
+
+def test_warns_when_no_shared_secret(monkeypatch, caplog):
+    """No RADAR_SHARED_SECRET → loud, actionable error at construction time."""
+    monkeypatch.delenv("RADAR_SHARED_SECRET", raising=False)
+    with caplog.at_level("ERROR"):
+        DatabaseClient(db_url="http://db", wallet=None)
+    assert any("RADAR_SHARED_SECRET" in rec.message for rec in caplog.records)

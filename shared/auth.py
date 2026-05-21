@@ -33,6 +33,11 @@ EPISTULA_TIMESTAMP_TOLERANCE = int(os.getenv("RADAR_EPISTULA_TOLERANCE", "30"))
 
 _ENV_SECRET = "RADAR_SHARED_SECRET"
 
+# One-time guard for the "no shared secret configured" warning emitted
+# from :func:`sign_request_hmac`. We deliberately log this once per
+# process so callers see the misconfiguration without flooding logs.
+_missing_secret_warned: bool = False
+
 
 def _get_secret(explicit: Optional[str] = None) -> str:
     """Return the configured shared secret (explicit override > env)."""
@@ -48,10 +53,20 @@ def sign_request_hmac(body: bytes, secret: Optional[str] = None) -> str:
     """Return the hex HMAC-SHA256 of ``body`` keyed by ``secret``.
 
     If ``secret`` is None we read ``RADAR_SHARED_SECRET`` from the env.
-    Returns an empty string if no secret is configured (dev mode).
+    Returns an empty string if no secret is configured (dev mode); a
+    one-time warning is logged in that case so misconfigured miners can
+    spot the silent-empty-signature problem without grepping the source.
     """
     s = _get_secret(secret)
     if not s:
+        global _missing_secret_warned
+        if not _missing_secret_warned:
+            _missing_secret_warned = True
+            logger.warning(
+                "sign_request_hmac called without RADAR_SHARED_SECRET — "
+                "signed requests will carry an empty signature and any "
+                "HMAC-checking peer will reject them.",
+            )
         return ""
     mac = hmac.new(s.encode("utf-8"), body or b"", hashlib.sha256)
     return mac.hexdigest()
