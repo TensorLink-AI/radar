@@ -6,5 +6,3 @@ __pycache__/
 experiments/
 *.backup
 data/
-logs/
-prompts/

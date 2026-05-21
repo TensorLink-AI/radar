@@ -304,12 +304,6 @@ async def auth_middleware(request: Request, call_next):
 
     path = request.url.path
 
-    # Bearer-auth surface for the non-competitive feedback API.  Handled
-    # before the Epistula path because tokens use Authorization: Bearer
-    # headers, not the X-Epistula-* set.
-    if path.startswith("/miners/me/"):
-        return await _bearer_auth_then_call(request, call_next)
-
     needs_auth = (
         path.startswith("/experiments")
         or path.startswith("/challenge")
@@ -334,42 +328,18 @@ async def auth_middleware(request: Request, call_next):
                 status_code=413, content={"error": "Request body too large"},
             )
 
-        # ── Validator API key: trusted proxy, fast path ──
+        # ── Validator API key: trusted proxy, skip Epistula ──
         proxy_authed = False
         if Config.DB_API_KEY:
             import secrets as _secrets
             provided = request.headers.get("X-Radar-API-Key", "")
             if provided and _secrets.compare_digest(provided, Config.DB_API_KEY):
+                # Trusted validator proxy — rate-limit by IP instead of hotkey
                 if not _check_rate_limit(client_ip):
                     return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
                 proxy_authed = True
 
-        # ── HMAC service-key auth (non-competitive default) ──
-        if not proxy_authed:
-            import os as _os
-            service_key = _os.getenv("RADAR_SERVICE_KEY", "").strip()
-            if service_key:
-                from shared.auth import (
-                    hmac_verify_request, static_key_lookup,
-                )
-                expected_kid = _os.getenv("RADAR_SERVICE_KEY_ID", "operator")
-                ok, err, kid = hmac_verify_request(
-                    dict(request.headers), body,
-                    static_key_lookup(expected_kid, service_key.encode()),
-                )
-                if ok:
-                    request.state.caller_hotkey = kid
-                    if not _check_rate_limit(kid):
-                        return JSONResponse(
-                            status_code=429,
-                            content={"error": "Rate limit exceeded"},
-                        )
-                    proxy_authed = True
-                elif _metagraph is None:
-                    # No Epistula fallback configured — reject.
-                    return JSONResponse(status_code=403, content={"error": err})
-
-        # ── Legacy Epistula path (dual-stack period) ──
+        # ── Epistula auth: miners and validators without API key ──
         if not proxy_authed and _metagraph:
             from shared.auth import verify_request
             ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
@@ -1089,57 +1059,9 @@ def include_validator_routes(target_app: FastAPI) -> None:
     target_app.include_router(validator_router)
 
 
-async def _bearer_auth_then_call(request: Request, call_next):
-    """Resolve a bearer token against ``miner_api_keys`` and attach the
-    identity to ``request.state`` for the route handler.
-
-    401 if the token is missing / unknown / revoked, 503 if the asyncpg
-    pool isn't wired up yet (dashboard-only mode that accidentally
-    received bearer traffic, or pre-startup race).
-    """
-    from shared.auth import extract_bearer
-    from shared.miner_auth import lookup_bearer
-
-    token = extract_bearer(dict(request.headers))
-    if not token:
-        return JSONResponse(
-            status_code=401, content={"error": "Bearer token required"},
-        )
-    if _pool is None:
-        return JSONResponse(
-            status_code=503, content={"error": "DB pool not ready"},
-        )
-    try:
-        ident = await lookup_bearer(_pool, token)
-    except Exception as e:
-        logger.warning("bearer lookup failed: %s", e)
-        return JSONResponse(
-            status_code=503, content={"error": "auth lookup failed"},
-        )
-    if ident is None:
-        return JSONResponse(
-            status_code=403, content={"error": "Unknown or revoked token"},
-        )
-    request.state.miner_identity = ident
-    return await call_next(request)
-
-
-def include_miner_feedback_routes(target_app: FastAPI) -> None:
-    """Mount the bearer-auth ``/miners/me/*`` + public per-task frontier
-    routes onto ``target_app``.  Idempotent."""
-    from database.miner_feedback import (
-        include_miner_feedback_routes as _mount,
-    )
-    _mount(target_app)
-
-
 # Legacy auto-mount: keep the validator surface on ``app`` at import time
 # unless this process is running in ``dashboard`` mode. Preserves backward
 # compatibility for tests that import ``app`` directly and expect every
 # route to be reachable.
 if Config.NEURON_MODE != "dashboard":
     include_validator_routes(app)
-# Miner feedback routes are mounted unconditionally — they need bearer
-# auth (no chain dependency) and are useful in both validator and
-# dashboard deployments.
-include_miner_feedback_routes(app)

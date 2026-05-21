@@ -22,19 +22,11 @@ import hashlib
 import json
 import logging
 from dataclasses import asdict, dataclass, fields
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:  # only the type stubs at static-check time
-    import bittensor as bt  # noqa: F401
+import bittensor as bt
 
 logger = logging.getLogger(__name__)
-
-
-def _bt():
-    """Lazy bittensor import — keeps this module loadable in
-    non-competitive deployments that never sign/verify records."""
-    import bittensor as bt
-    return bt
 
 
 SCHEMA_VERSION = "radar.substrate.v1"
@@ -157,7 +149,6 @@ def verify_record(
     if not record.validator_hotkey:
         return False, "validator_hotkey is empty"
     try:
-        bt = _bt()
         keypair = bt.Keypair(ss58_address=record.validator_hotkey)
         if not keypair.verify(canonical_bytes(record), sig_bytes):
             return False, "sr25519 signature does not match canonical bytes"
