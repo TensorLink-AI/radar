@@ -1,8 +1,7 @@
 """Centralized DB API server — FastAPI app for the experiment database.
 
-Migrated from validator/db_server.py. All routes preserved with identical
-paths and response shapes. New write endpoints for validators.
-Auth: Epistula verify, caller must be a validator.
+All experiment routes are HMAC-authed via ``RADAR_SERVICE_KEY``. The
+public JSON surface at ``/dashboard/api/*`` is open by design.
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ from shared.pg_access_logger import PgAccessLogger
 
 app = FastAPI(title="RADAR Experiment DB (Centralized)")
 
-# Validator-surface routes (Epistula-authed): /experiments/*, /challenge,
+# Validator-surface routes (HMAC-authed): /experiments/*, /challenge,
 # /frontier, /provenance/*, /agent_code/*. Included in modes {validator, all}
 # via include_validator_routes(); dashboard-only processes never mount these.
 validator_router = APIRouter()
@@ -35,12 +34,9 @@ logger = logging.getLogger(__name__)
 db = None  # PgExperimentStore
 _r2 = None  # R2AuditLog (for agent code storage)
 _pool = None  # asyncpg pool (for agent_submissions table)
-_hippius = None  # HippiusClient — used by GET /experiments/{id}/verify
+_hippius = None  # HippiusClient — currently unused after substrate removal
 
-# Auth middleware reference
-_metagraph = None
-
-# Rate limiter: hotkey -> list of timestamps
+# Rate limiter: caller-key -> list of timestamps
 _rate_window: dict[str, list[float]] = defaultdict(list)
 _rate_lock = threading.Lock()
 _rate_limit: int = 60  # requests per minute per validator
@@ -70,18 +66,12 @@ _PROVENANCE_CAPTURE_PREFIXES = (
 _MAX_AGENT_FILES: int = 25          # max .py files per submission
 _MAX_AGENT_FILE_BYTES: int = 100_000  # 100 KB per file
 
-# Nonce replay protection: track recently seen nonces
-_nonce_cache: set[str] = set()
-_nonce_timestamps: list[tuple[float, str]] = []  # (time, nonce)
-_nonce_lock = threading.Lock()
-
 # Current challenge and frontier (set by database neuron)
 _current_challenge = None
 _current_frontier = None
 
 # Access logging
 _access_logger: Optional[PgAccessLogger] = None
-_hotkey_to_uid: dict[str, int] = {}
 
 
 def set_db(experiment_db):
@@ -103,11 +93,6 @@ def set_hippius(hippius):
 def set_pool(pool):
     global _pool
     _pool = pool
-
-
-def set_auth(metagraph):
-    global _metagraph
-    _metagraph = metagraph
 
 
 def set_rate_limit(limit: int):
@@ -145,11 +130,6 @@ def set_access_logger(al: PgAccessLogger):
     _access_logger = al
 
 
-def set_hotkey_map(mapping: dict[str, int]):
-    global _hotkey_to_uid
-    _hotkey_to_uid = mapping
-
-
 def _require_db():
     if db is None:
         raise HTTPException(status_code=503, detail="DB not initialized")
@@ -163,29 +143,15 @@ def _require_provenance():
     return d.provenance
 
 
-def _check_rate_limit(hotkey: str) -> bool:
+def _check_rate_limit(caller: str) -> bool:
     with _rate_lock:
         now = time.time()
-        window = _rate_window[hotkey]
-        _rate_window[hotkey] = [t for t in window if now - t < 60]
-        if len(_rate_window[hotkey]) >= _rate_limit:
+        window = _rate_window[caller]
+        _rate_window[caller] = [t for t in window if now - t < 60]
+        if len(_rate_window[caller]) >= _rate_limit:
             return False
-        _rate_window[hotkey].append(now)
+        _rate_window[caller].append(now)
         return True
-
-
-def _is_validator(hotkey: str) -> bool:
-    """Check if a hotkey belongs to a validator (has permit)."""
-    if not _metagraph:
-        return False
-    permits = _metagraph.validator_permit
-    hotkeys = _metagraph.hotkeys
-    if permits is None or hotkeys is None:
-        return False
-    for uid in range(_metagraph.n):
-        if uid < len(hotkeys) and hotkeys[uid] == hotkey:
-            return uid < len(permits) and bool(permits[uid])
-    return False
 
 
 def _check_ip_rate_limit(ip: str) -> bool:
@@ -207,18 +173,12 @@ class SearchRequest(BaseModel):
 class AddExperimentRequest(BaseModel):
     """Validator POSTs experiment data after Phase C.
 
-    ``substrate_cid`` and ``validator_hotkey`` are optional; when set, the
-    server appends a ``{kind: "phase_c_record", validator_hotkey, cid,
-    round_id}`` entry to the row's ``substrate_cids`` audit list.
-
     ``artifact_cids`` (TEN-240 Phase 7) carries Hippius CIDs for the
     dual-written non-DB artifacts (checkpoint, architecture,
-    training_meta). Each element is appended to the audit list verbatim;
-    callers are responsible for the ``kind`` field.
+    training_meta). Each element is appended to the row's audit list
+    verbatim; callers are responsible for the ``kind`` field.
     """
     data: dict
-    substrate_cid: str = ""
-    validator_hotkey: str = ""
     artifact_cids: list[dict] = []
 
 
@@ -258,42 +218,15 @@ class SubmissionRevealRequest(BaseModel):
     entries: list[SubmissionRevealEntry]
 
 
-# Routes that only validators (hotkeys with permit) may call
-_VALIDATOR_ONLY_PREFIXES = (
-    "/experiments/add", "/frontier/update", "/provenance/record",
-    "/training_metas", "/round_submissions/reveal",
-)
-
-
-def _check_nonce(nonce: str) -> bool:
-    """Reject replayed nonces within the timestamp tolerance window."""
-    from shared.auth import EPISTULA_TIMESTAMP_TOLERANCE
-    with _nonce_lock:
-        now = time.time()
-        # Evict expired nonces
-        cutoff = now - EPISTULA_TIMESTAMP_TOLERANCE
-        while _nonce_timestamps and _nonce_timestamps[0][0] < cutoff:
-            _, old = _nonce_timestamps.pop(0)
-            _nonce_cache.discard(old)
-        # Check for replay
-        if nonce in _nonce_cache:
-            return False
-        _nonce_cache.add(nonce)
-        _nonce_timestamps.append((now, nonce))
-        return True
-
-
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Epistula auth on protected routes with IP-level flood protection.
+    """HMAC service-key auth on protected routes with IP-level flood protection.
 
     In ``dashboard`` mode the validator routes are not mounted at all, so
-    auth/rate-limit/nonce checks are skipped entirely — the dashboard
-    process only serves the public JSON API and never sees Epistula
-    traffic.
+    auth and rate-limit checks are skipped — the dashboard process only
+    serves the public JSON API.
     """
-    # Dashboard mode: no Epistula, no nonce cache, no IP rate limit.
-    # The public JSON API is open by design.
+    # Dashboard mode: open public JSON API, no rate limit / no auth.
     if Config.NEURON_MODE == "dashboard":
         return await call_next(request)
 
@@ -304,9 +237,8 @@ async def auth_middleware(request: Request, call_next):
 
     path = request.url.path
 
-    # Bearer-auth surface for the non-competitive feedback API.  Handled
-    # before the Epistula path because tokens use Authorization: Bearer
-    # headers, not the X-Epistula-* set.
+    # Bearer-auth surface for the miner feedback API. Handled before the
+    # HMAC path because tokens use Authorization: Bearer, not X-Radar-*.
     if path.startswith("/miners/me/"):
         return await _bearer_auth_then_call(request, call_next)
 
@@ -321,7 +253,6 @@ async def auth_middleware(request: Request, call_next):
         or path.startswith("/round_submissions")
     )
     if needs_auth:
-        # ── Reject oversized bodies before reading fully ──
         content_length = request.headers.get("content-length")
         if content_length and int(content_length) > _MAX_BODY_BYTES:
             return JSONResponse(
@@ -344,50 +275,28 @@ async def auth_middleware(request: Request, call_next):
                     return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
                 proxy_authed = True
 
-        # ── HMAC service-key auth (non-competitive default) ──
+        # ── HMAC service-key auth ──
         if not proxy_authed:
             import os as _os
             service_key = _os.getenv("RADAR_SERVICE_KEY", "").strip()
-            if service_key:
-                from shared.auth import (
-                    hmac_verify_request, static_key_lookup,
+            if not service_key:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "RADAR_SERVICE_KEY unset on server"},
                 )
-                expected_kid = _os.getenv("RADAR_SERVICE_KEY_ID", "operator")
-                ok, err, kid = hmac_verify_request(
-                    dict(request.headers), body,
-                    static_key_lookup(expected_kid, service_key.encode()),
-                )
-                if ok:
-                    request.state.caller_hotkey = kid
-                    if not _check_rate_limit(kid):
-                        return JSONResponse(
-                            status_code=429,
-                            content={"error": "Rate limit exceeded"},
-                        )
-                    proxy_authed = True
-                elif _metagraph is None:
-                    # No Epistula fallback configured — reject.
-                    return JSONResponse(status_code=403, content={"error": err})
-
-        # ── Legacy Epistula path (dual-stack period) ──
-        if not proxy_authed and _metagraph:
-            from shared.auth import verify_request
-            ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
+            from shared.auth import hmac_verify_request, static_key_lookup
+            expected_kid = _os.getenv("RADAR_SERVICE_KEY_ID", "operator")
+            ok, err, kid = hmac_verify_request(
+                dict(request.headers), body,
+                static_key_lookup(expected_kid, service_key.encode()),
+            )
             if not ok:
                 return JSONResponse(status_code=403, content={"error": err})
-
-            nonce = request.headers.get("x-epistula-nonce", "")
-            if nonce and not _check_nonce(nonce):
-                return JSONResponse(status_code=403, content={"error": "Replayed request"})
-
-            request.state.caller_hotkey = hotkey
-            if not _check_rate_limit(hotkey):
-                return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
-
-            # ── Role enforcement ──
-            is_vali_route = any(path.startswith(p) for p in _VALIDATOR_ONLY_PREFIXES)
-            if is_vali_route and not _is_validator(hotkey):
-                return JSONResponse(status_code=403, content={"error": "Validators only"})
+            request.state.caller_hotkey = kid
+            if not _check_rate_limit(kid):
+                return JSONResponse(
+                    status_code=429, content={"error": "Rate limit exceeded"},
+                )
 
     response = await call_next(request)
 
@@ -585,61 +494,18 @@ async def get_experiment(index: int):
     return elem.to_api_dict()
 
 
-@validator_router.get("/experiments/{index}/verify")
-async def verify_experiment_route(index: int):
-    """Independently verify the substrate audit trail for one experiment.
-
-    For each CID in ``substrate_cids``: download the bundle from Hippius,
-    locate the (round_id, miner_uid) record, sr25519-verify the signature,
-    and compare the record's metric dict with what's in the DB. Returns
-    per-CID flags + discrepancy strings, never raises on per-CID errors.
-
-    503 when the server has no Hippius client wired up.
-    """
-    d = _require_db()
-    elem = await d.get(index)
-    if elem is None:
-        raise HTTPException(status_code=404, detail=f"Experiment {index} not found")
-    if _hippius is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Hippius not configured — substrate verification unavailable",
-        )
-    from database.verify import verify_experiment
-    verifications = await verify_experiment(hippius=_hippius, element=elem)
-    return {
-        "experiment_id": index,
-        "substrate_cids": list(elem.substrate_cids or []),
-        "verifications": verifications,
-    }
-
-
 # ── Write endpoints (new — validators only) ──────────────
 
 @validator_router.post("/experiments/add")
 async def add_experiment(req: AddExperimentRequest):
-    """Validator writes a DataElement after Phase C.
-
-    When ``req.substrate_cid`` is set, append a ``phase_c_record`` entry to
-    the element's ``substrate_cids`` audit list before insert. The entry
-    captures who published the bundle (validator_hotkey), where it lives
-    (cid), and which round it covers (taken from element.round_id).
-    """
+    """Validator writes a DataElement after Phase C."""
     d = _require_db()
     from shared.database import DataElement
     try:
         element = DataElement.from_dict(req.data)
-        # Defensive: from_dict may have produced something unexpected.
         if not isinstance(element.substrate_cids, list):
             element.substrate_cids = []
         cids = list(element.substrate_cids)
-        if req.substrate_cid:
-            cids.append({
-                "kind": "phase_c_record",
-                "validator_hotkey": req.validator_hotkey,
-                "cid": req.substrate_cid,
-                "round_id": int(element.round_id),
-            })
         # Append artifact CIDs verbatim (TEN-240 Phase 7). Filter to dicts
         # so a malformed caller can't poison the list with non-objects.
         for entry in req.artifact_cids or []:
@@ -861,7 +727,12 @@ async def submit_agent_code(request: Request, req: SubmitAgentCodeRequest):
     if not hotkey:
         raise HTTPException(status_code=403, detail="Auth required")
 
-    miner_uid = _hotkey_to_uid.get(hotkey, -1)
+    # Miner UID is forwarded by the validator proxy when known; otherwise
+    # -1 is fine — the row is still uniquely keyed by hotkey.
+    try:
+        miner_uid = int(request.headers.get("X-Miner-UID", "-1"))
+    except (TypeError, ValueError):
+        miner_uid = -1
 
     # ── Size limits ──
     if len(req.files) > _MAX_AGENT_FILES:
@@ -1074,7 +945,7 @@ async def get_agent_code_by_hash(code_hash: str):
 
 
 def include_validator_routes(target_app: FastAPI) -> None:
-    """Mount the Epistula-authed validator/miner surface onto ``target_app``.
+    """Mount the HMAC-authed validator/miner surface onto ``target_app``.
 
     Idempotent — safe to call multiple times. Called from ``database.neuron``
     in modes ``validator`` and ``all``. Dashboard-only processes never call

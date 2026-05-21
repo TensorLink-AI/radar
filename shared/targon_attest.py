@@ -3,9 +3,7 @@
 Split out of ``shared/targon_client.py`` so each file stays under the
 project's 300-line cap. The flow:
 
-  1. POST a fresh nonce to the CVM at ``http://{cvm_ip}:8080/api/v1/evidence``,
-     optionally Epistula-signed by the validator's hotkey so the CVM
-     can prove the evidence was bound to a specific validator.
+  1. POST a fresh nonce to the CVM at ``http://{cvm_ip}:8080/api/v1/evidence``.
   2. CVM returns ``{quote, user_data: {nvcc_response, ...}}``.
   3. Forward the bundle to ``tower.targon.com/api/v1/verify-attestation``.
   4. Tower verifies the Intel TDX signature on the quote and the
@@ -46,24 +44,11 @@ async def fetch_cvm_evidence(
     nonce: str,
     *,
     timeout: float,
-    wallet=None,
 ) -> dict:
-    """Ask the CVM for a fresh attestation evidence bundle.
-
-    ``wallet`` is the validator's bittensor wallet — used to
-    Epistula-sign the nonce request so the CVM can bind the evidence
-    to a specific validator. Optional; if omitted the request goes
-    out unsigned.
-    """
+    """Ask the CVM for a fresh attestation evidence bundle."""
     url = f"http://{cvm_ip}:8080/api/v1/evidence"
     body = json.dumps({"nonce": nonce}).encode()
     headers = {"Content-Type": "application/json"}
-    if wallet is not None:
-        try:
-            from shared.auth import sign_request
-            headers.update(sign_request(wallet, body))
-        except Exception as e:
-            logger.warning("Could not Epistula-sign attestation nonce: %s", e)
 
     async with httpx.AsyncClient(timeout=timeout) as http:
         resp = await http.post(url, content=body, headers=headers)

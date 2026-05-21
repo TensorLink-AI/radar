@@ -40,12 +40,10 @@ from validator.coordinator import (
     TrainingCoordinator, compute_assignments, compute_fallback,
 )
 from validator.db_proxy import (
-    app as proxy_app, set_config as set_proxy_config, set_metagraph,
-    set_hotkey_map, rotate_agent_token,
+    app as proxy_app, set_config as set_proxy_config, rotate_agent_token,
 )
 from validator.evaluator import evaluate_all_checkpoints
 from validator.pod_manager import pre_validate_code, reap_orphan_agent_pods
-from validator.substrate_publisher import run_substrate_publish_step
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +66,6 @@ class Validator:
 
     def __init__(self, config):
         self.config = config
-        self.netuid = getattr(config, "netuid", 0)
 
         # Fail-fast on Targon misconfig — operator gets a clear error at
         # startup instead of a stack trace mid-round when verify fires.
@@ -168,13 +165,8 @@ class Validator:
             except Exception as e:
                 logger.warning("Cognition-wiki R2 unavailable: %s", e)
 
-        # Substrate publishing (best-effort, opt-in via Config.HIPPIUS_ENABLED).
-        # The Hippius client wrapper from TEN-242 isn't shipped yet, so the
-        # import is lazy and tolerant: with HIPPIUS_ENABLED=false (the default)
-        # nothing is imported and `self.hippius` stays None. Operators who
-        # opt in before the wrapper lands get a warning and the validator
-        # continues to run normally — substrate publishing is never a
-        # precondition for weight setting.
+        # Hippius client (best-effort, opt-in via Config.HIPPIUS_ENABLED).
+        # Used only for the optional artifact dual-write path.
         self.hippius = self._init_hippius()
 
         # Dual-write artifact store (TEN-240 Phase 7). Constructed only
@@ -199,24 +191,20 @@ class Validator:
         # Training coordinator
         if self.r2:
             self.coordinator = TrainingCoordinator(
-                wallet=None, metagraph=None,
                 r2=self.r2, my_uid=-1,
                 artifact_store=self.artifact_store,
             )
         else:
             self.coordinator = None
 
-        # Desearch and LLM proxies run on the DB server (subnet owner).
-        # Validators just forward /desearch/* and /llm/* via db_proxy.py.
-        # These flags control whether URLs are injected into the challenge.
+        # Desearch and LLM proxies run on the DB server. Validators just
+        # forward /desearch/* and /llm/* via db_proxy.py.
         self.desearch_enabled = Config.DESEARCH_ENABLED
         self.llm_enabled = Config.LLM_ENABLED
 
         # Configure proxy
         set_proxy_config(
             db_api_url=Config.DB_API_URL,
-            wallet=None,
-            metagraph=None,
             api_key=Config.DB_API_KEY,
         )
 
@@ -235,14 +223,13 @@ class Validator:
         except ImportError:
             logger.warning(
                 "HIPPIUS_ENABLED=true but shared.hippius_client is not "
-                "available yet (TEN-242). Substrate publishing disabled."
+                "available — artifact dual-write disabled."
             )
             return None
         try:
             return HippiusClient(
                 ipfs_api_url=Config.HIPPIUS_IPFS_API_URL,
                 hippius_key=Config.HIPPIUS_KEY,
-                substrate_rpc=Config.HIPPIUS_SUBSTRATE_RPC,
             )
         except Exception as e:  # noqa: BLE001 — best-effort
             logger.warning("Hippius client init failed: %s", e)
@@ -436,8 +423,6 @@ class Validator:
         # deterministic seed stays stable for ~12s like a block.
         current_block = int(time.time() // 12)
         round_start = round_start_block(current_block, Config.ROUND_INTERVAL_BLOCKS)
-        set_metagraph(None)
-        set_hotkey_map({})
         block_hash = hashlib.sha256(str(round_start).encode()).hexdigest()
 
         # Select task for this round (deterministic from block hash)
@@ -525,8 +510,6 @@ class Validator:
             prepare_coro = _no_endpoints()
 
         collect_coro = run_and_collect_agents(
-            wallet=None,
-            metagraph=None,
             challenge_json=challenge.to_json(),
             round_id=challenge.round_id,
             seed=challenge.seed,
@@ -909,25 +892,6 @@ class Validator:
             except Exception:
                 pass
 
-        # Best-effort: publish signed Phase C records to Hippius/substrate.
-        # Returns {miner_uid: bundle_cid} so the per-miner DB writes below
-        # can attach the CID. Empty dict when disabled, no client, or
-        # publish failed — never raises.
-        substrate_cids = await run_substrate_publish_step(
-            hippius=self.hippius, wallet=None,
-            challenge=challenge, eval_results=eval_results,
-            training_metas=training_metas, commitments=commitments,
-            metagraph=None, my_uid=-1,
-            current_block=current_block, task_name=task_name,
-            block_hash=block_hash, netuid=int(self.netuid),
-        )
-        if substrate_cids:
-            logger.info(
-                "Substrate published: round_id=%d cid=%s miners=%d",
-                challenge.round_id, next(iter(substrate_cids.values())),
-                len(substrate_cids),
-            )
-
         gate_passed = 0
         gate_failed = 0
         for uid, metrics in eval_results.items():
@@ -959,13 +923,8 @@ class Validator:
                     ),
                 )
 
-                # Write to centralized DB. When this validator published
-                # a Phase C bundle this round, attach the CID so the row
-                # carries an audit-trail entry pointing at the bundle.
                 new_idx = await self.db_client.add_experiment(
                     element.to_dict(),
-                    substrate_cid=substrate_cids.get(uid, ""),
-                    validator_hotkey="",
                 )
                 if new_idx is not None:
                     element.index = new_idx

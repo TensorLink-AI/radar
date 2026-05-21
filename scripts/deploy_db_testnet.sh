@@ -7,7 +7,7 @@
 #   3. Starts the database/neuron.py FastAPI server
 #
 # Usage:
-#   ./scripts/deploy_db_testnet.sh --netuid 279 --subtensor.network test
+#   ./scripts/deploy_db_testnet.sh 
 #
 # Environment (optional overrides):
 #   RADAR_PG_DSN          Postgres connection string (default: local Docker)

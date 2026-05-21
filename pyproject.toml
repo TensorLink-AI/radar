@@ -5,11 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "radar-subnet"
 version = "0.1.0"
-description = "Bittensor subnet for autonomous ML research via evolutionary code optimization"
+description = "Autonomous ML research service with phase-split validation"
 requires-python = ">=3.10"
 dependencies = [
     "affinetes @ git+https://github.com/AffineFoundation/affinetes.git",
-    "bittensor>=8.0",
     "fastapi>=0.104",
     "uvicorn>=0.24",
     "pydantic>=2.0",

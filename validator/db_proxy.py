@@ -22,7 +22,8 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from shared.auth import sign_request
+from config import Config
+from shared.auth import hmac_sign_request
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,6 @@ app = FastAPI(title="RADAR Validator Proxy")
 
 # Warm-standby trainer readiness: round_id → {uid: TrainerReady}
 _trainer_ready: dict[int, dict[int, object]] = {}
-_hotkey_to_uid: dict[str, int] = {}
 
 # ── Per-round agent token ──────────────────────────────────────────
 # A short-lived random token generated each round by the validator.
@@ -134,14 +134,8 @@ def clear_ready_trainers(round_id: int):
     _trainer_ready.pop(round_id, None)
 
 
-def set_hotkey_map(mapping: dict[str, int]):
-    global _hotkey_to_uid
-    _hotkey_to_uid = mapping
-
 # Injected at startup
 _db_api_url: str = ""
-_wallet = None
-_metagraph = None
 _api_key: str = ""
 _client: Optional[httpx.AsyncClient] = None
 
@@ -175,7 +169,7 @@ def _route_category(path: str) -> str:
 
 
 def set_config(
-    db_api_url: str, wallet, metagraph,
+    db_api_url: str,
     api_key: str = "",
     rate_limits: dict[str, tuple[int, int]] | None = None,
 ):
@@ -184,21 +178,13 @@ def set_config(
     ``rate_limits`` overrides per-category limits as
     ``{category: (max_requests, window_seconds)}``.
     """
-    global _db_api_url, _wallet, _metagraph, _api_key
+    global _db_api_url, _api_key
     _db_api_url = db_api_url.rstrip("/")
-    _wallet = wallet
-    _metagraph = metagraph
     _api_key = api_key
     if not _CATEGORY_LIMITS:
         _CATEGORY_LIMITS.update(_build_default_category_limits())
     if rate_limits:
         _CATEGORY_LIMITS.update(rate_limits)
-
-
-def set_metagraph(metagraph):
-    """Update metagraph (called on sync)."""
-    global _metagraph
-    _metagraph = metagraph
 
 
 async def _get_client() -> httpx.AsyncClient:
@@ -256,55 +242,35 @@ async def auth_middleware(request: Request, call_next):
 
     needs_auth = any(path.startswith(p) for p in _AGENT_TOKEN_PREFIXES)
     if not needs_auth:
-        response = await call_next(request)
-        return response
+        return await call_next(request)
 
     category = _route_category(path)
 
-    # Agent token is the primary auth for pod requests
-    if _verify_agent_token(request):
-        rate_key = request.headers.get("X-Miner-UID", "agent-shared")
-        if not _check_rate_limit(f"agent:{rate_key}", category):
-            # Rate-limit rejection still counts as a request the agent made
-            # for behaviour tracking — bump before returning.
-            _bump_agent_behavior(rate_key, category, 429)
-            return JSONResponse(status_code=429, content={
-                "error": f"Rate limit exceeded for {category}",
-            })
-        response = await call_next(request)
-        _bump_agent_behavior(rate_key, category, response.status_code)
-        logger.info(
-            "Agent proxy: miner=%s %s %s -> %d",
-            rate_key, request.method, path, response.status_code,
-        )
-        return response
+    if not _verify_agent_token(request):
+        return JSONResponse(status_code=403, content={"error": "Invalid agent token"})
 
-    # Fall back to Epistula for backward compat
-    if _metagraph:
-        body = await request.body()
-        from shared.auth import verify_request
-        ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
-        if ok:
-            request.state.miner_hotkey = hotkey
-            if not _check_rate_limit(hotkey, category):
-                return JSONResponse(status_code=429, content={
-                    "error": f"Rate limit exceeded for {category}",
-                })
-            response = await call_next(request)
-            logger.info(
-                "Epistula proxy: hotkey=%s %s %s -> %d",
-                hotkey[:16], request.method, path, response.status_code,
-            )
-            return response
-
-    return JSONResponse(status_code=403, content={"error": "Invalid agent token or signature"})
+    rate_key = request.headers.get("X-Miner-UID", "agent-shared")
+    if not _check_rate_limit(f"agent:{rate_key}", category):
+        _bump_agent_behavior(rate_key, category, 429)
+        return JSONResponse(status_code=429, content={
+            "error": f"Rate limit exceeded for {category}",
+        })
+    response = await call_next(request)
+    _bump_agent_behavior(rate_key, category, response.status_code)
+    logger.info(
+        "Agent proxy: miner=%s %s %s -> %d",
+        rate_key, request.method, path, response.status_code,
+    )
+    return response
 
 
 def _build_proxy_headers(request: Request, body: bytes) -> dict:
     """Build signed headers with forwarded miner identity."""
-    headers = {}
-    if _wallet:
-        headers = sign_request(_wallet, body)
+    headers: dict[str, str] = {}
+    if Config.SERVICE_KEY:
+        headers = hmac_sign_request(
+            Config.SERVICE_KEY.encode(), body, key_id=Config.SERVICE_KEY_ID,
+        )
     if _api_key:
         headers["X-Radar-API-Key"] = _api_key
     if body:
@@ -369,7 +335,7 @@ async def _proxy_request(request: Request, path: str) -> Response:
                 content={"error": "Retry budget exhausted"},
             )
 
-        # Re-sign on retries so the Epistula timestamp stays fresh
+        # Re-sign on retries so the HMAC timestamp stays fresh
         if attempt > 0:
             headers = _build_proxy_headers(request, body)
         try:
@@ -471,13 +437,21 @@ def health():
 
 @app.post("/trainer/ready")
 async def trainer_ready(request: Request):
-    """Miner POSTs here after spinning up their Basilica pod."""
-    if not _metagraph:
-        raise HTTPException(status_code=503, detail="Metagraph not configured")
+    """Miner POSTs here after spinning up their trainer pod.
+
+    Authenticated with the shared HMAC service key. The miner labels
+    itself with X-Miner-UID and an optional X-Miner-Hotkey header (the
+    latter is just a free-form identifier under non-chain deploys).
+    """
+    if not Config.SERVICE_KEY:
+        raise HTTPException(status_code=503, detail="SERVICE_KEY not configured")
 
     body = await request.body()
-    from shared.auth import verify_request
-    ok, err, hotkey = verify_request(dict(request.headers), body, _metagraph)
+    from shared.auth import hmac_verify_request, static_key_lookup
+    ok, err, _kid = hmac_verify_request(
+        dict(request.headers), body,
+        static_key_lookup(Config.SERVICE_KEY_ID, Config.SERVICE_KEY.encode()),
+    )
     if not ok:
         return JSONResponse(status_code=403, content={"error": err})
 
@@ -487,9 +461,12 @@ async def trainer_ready(request: Request):
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": f"Invalid TrainerReady: {e}"})
 
-    uid = _hotkey_to_uid.get(hotkey)
-    if uid is None:
-        return JSONResponse(status_code=404, content={"error": "Unknown hotkey"})
+    try:
+        uid = int(request.headers.get("X-Miner-UID", "-1"))
+    except (TypeError, ValueError):
+        uid = -1
+    if uid < 0:
+        return JSONResponse(status_code=400, content={"error": "Missing X-Miner-UID"})
 
     round_id = ready_msg.round_id
     if round_id not in _trainer_ready:

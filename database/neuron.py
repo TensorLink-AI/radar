@@ -1,19 +1,18 @@
-"""Subnet owner / dashboard process — centralized Postgres experiment DB.
+"""Database / dashboard process — centralized Postgres experiment DB.
 
 Two deployable modes, selected by ``RADAR_NEURON_MODE``:
 
-  * ``validator``  — Epistula-authed write/read API for validators + miners,
-                     plus desearch/LLM proxies. Runs metagraph sync + round
-                     loop. Requires a Bittensor wallet. Optionally also mounts
+  * ``validator``  — HMAC-authed write/read API for validators + miners,
+                     plus desearch/LLM proxies. Optionally also mounts
                      the internal Jinja dashboard when
                      ``RADAR_DASHBOARD_ENABLED=true``.
-  * ``dashboard``  — Open public JSON API at ``/dashboard/api/*``. No wallet,
-                     no proxies, no metagraph sync, no Jinja, no Epistula.
-                     This is what gets deployed to Railway behind radarnet.io.
+  * ``dashboard``  — Open public JSON API at ``/dashboard/api/*``. No
+                     proxies, no Jinja.  This is what gets deployed to
+                     Railway behind radarnet.io.
   * ``all``        — Everything on one process (legacy / dev default).
 
-Both modes share the same Postgres cluster with independent connection
-pools, independent auth, and independent route sets.
+All modes share the same Postgres cluster with independent connection
+pools and independent route sets.
 """
 
 from __future__ import annotations
@@ -28,8 +27,8 @@ import uvicorn
 from config import Config, validate_neuron_mode
 from database.server import (
     app, include_validator_routes,
-    set_db, set_auth, set_challenge, set_frontier,
-    set_access_logger, set_hotkey_map, set_rate_limit, set_ip_rate_limit,
+    set_db, set_challenge, set_frontier,
+    set_access_logger, set_rate_limit, set_ip_rate_limit,
     set_r2, set_hippius, set_pool,
     get_current_challenge, get_current_frontier,
 )
@@ -105,7 +104,7 @@ async def _with_startup_retry(
 
 
 def _mode_runs_validator_surface(mode: str) -> bool:
-    """True for modes that mount the Epistula-authed validator/miner routes."""
+    """True for modes that mount the HMAC-authed validator/miner routes."""
     return mode in ("validator", "all")
 
 
@@ -114,33 +113,15 @@ def _mode_runs_dashboard_api(mode: str) -> bool:
     return mode in ("dashboard", "all")
 
 
-def _mode_runs_chain(mode: str) -> bool:
-    """True for modes that read the chain (wallet / subtensor / metagraph)."""
-    return mode in ("validator", "all")
-
-
 class DatabaseNeuron:
-    """Subnet owner database server — surface depends on ``Config.NEURON_MODE``."""
+    """Database server — surface depends on ``Config.NEURON_MODE``."""
 
     def __init__(self, config):
         self.config = config
         self.mode = Config.NEURON_MODE
         validate_neuron_mode()
 
-        self.netuid = getattr(config, "netuid", 1)
         self.port = int(getattr(config, "port", Config.DB_API_PORT))
-
-        # Bittensor components — only constructed when this process needs to
-        # talk to the chain. Dashboard mode never imports bittensor so it can
-        # start without a wallet file on disk.
-        self.wallet = None
-        self.subtensor = None
-        self.metagraph = None
-        if _mode_runs_chain(self.mode):
-            import bittensor as bt  # lazy import
-            self.wallet = bt.Wallet(config=config)
-            self.subtensor = bt.Subtensor(config=config)
-            self.metagraph = self.subtensor.metagraph(self.netuid)
 
         # Tasks
         self.tasks = load_enabled_tasks(Config.ENABLED_TASKS)
@@ -377,10 +358,9 @@ class DatabaseNeuron:
             set_hippius(self.hippius)
         set_access_logger(self.access_logger)
 
-        # ── Validator-surface wiring (Epistula auth + rate limit) ──
+        # ── Validator-surface wiring (HMAC auth + rate limit) ──
         if _mode_runs_validator_surface(self.mode):
             include_validator_routes(app)
-            set_auth(self.metagraph)
             set_rate_limit(Config.DB_VALI_RATE_LIMIT)
             set_ip_rate_limit(Config.DB_IP_RATE_LIMIT)
 
@@ -533,30 +513,11 @@ class DatabaseNeuron:
             len(self.pareto_fronts), len(all_candidates),
         )
 
-    def _sync_metagraph(self):
-        """Sync metagraph and update hotkey map. No-op outside chain modes."""
-        if not _mode_runs_chain(self.mode) or self.metagraph is None:
-            return
-        self.metagraph.sync()
-        hotkeys = self.metagraph.hotkeys or []
-        hotkey_map = {
-            hotkeys[uid]: uid
-            for uid in range(self.metagraph.n)
-            if uid < len(hotkeys)
-        }
-        set_hotkey_map(hotkey_map)
-        set_auth(self.metagraph)
-
     def _refresh_round_id(self) -> int:
-        """Recompute round_id from chain height. Returns -1 outside chain modes."""
-        if not _mode_runs_chain(self.mode) or self.subtensor is None:
-            return -1
+        """Recompute round_id from the wall-clock derived block counter."""
+        import time as _time
         from shared.challenge import round_id_from_block
-        try:
-            current_block = self.subtensor.block
-        except Exception as e:
-            logger.warning("Round refresh: subtensor read failed: %s", e)
-            return -1
+        current_block = int(_time.time() // 12)
         round_id = round_id_from_block(
             current_block, Config.ROUND_INTERVAL_BLOCKS,
         )
@@ -565,14 +526,11 @@ class DatabaseNeuron:
         return round_id
 
     async def run(self):
-        """Main loop: init DB, start server, periodic loops (chain modes only)."""
+        """Main loop: init DB, start server, periodic round-id refresh."""
         await self._init_db()
 
-        # Chain-driven state only runs in modes with a subtensor connection.
-        # Dashboard mode skips Pareto rebuild + metagraph sync + round loop.
-        if _mode_runs_chain(self.mode):
+        if _mode_runs_validator_surface(self.mode):
             await self._rebuild_pareto()
-            self._sync_metagraph()
             self._refresh_round_id()
 
         db_size = await self.store.get_size()
@@ -583,21 +541,17 @@ class DatabaseNeuron:
             db_size, list(self.tasks.keys()),
         )
 
-        # Start uvicorn in background
         server_config = uvicorn.Config(
             app, host="0.0.0.0", port=self.port, log_level="warning",
-            limit_concurrency=200,  # DDoS: cap concurrent connections
-            limit_max_requests=50000,  # Recycle worker after N requests
+            limit_concurrency=200,
+            limit_max_requests=50000,
         )
         server = uvicorn.Server(server_config)
         server_task = asyncio.create_task(server.serve())
 
         round_task: Optional[asyncio.Task] = None
 
-        if _mode_runs_chain(self.mode):
-            # Round tracker — rounds are ~55 min (275 blocks × 12s), so a
-            # 30s poll keeps miner_access_log.round_id within one block of
-            # the actual round boundary.
+        if _mode_runs_validator_surface(self.mode):
             async def _round_loop():
                 while True:
                     await asyncio.sleep(30)
@@ -608,47 +562,20 @@ class DatabaseNeuron:
 
             round_task = asyncio.create_task(_round_loop())
 
-            # Periodic metagraph sync
-            try:
-                while True:
-                    await asyncio.sleep(300)  # 5 minutes
-                    try:
-                        self._sync_metagraph()
-                        logger.info("Metagraph synced: %d neurons", self.metagraph.n)
-                    except Exception as e:
-                        logger.warning("Metagraph sync failed: %s", e)
-            except asyncio.CancelledError:
-                if round_task is not None:
-                    round_task.cancel()
-                server.should_exit = True
-                await server_task
-        else:
-            # Dashboard mode: no chain loops, just serve HTTP until killed.
-            try:
-                await server_task
-            except asyncio.CancelledError:
-                server.should_exit = True
-                await server_task
+        try:
+            await server_task
+        except asyncio.CancelledError:
+            if round_task is not None:
+                round_task.cancel()
+            server.should_exit = True
+            await server_task
 
 
 def get_config():
     parser = argparse.ArgumentParser(description="Radar Database Server")
-    parser.add_argument("--netuid", type=int, default=1)
     parser.add_argument("--port", type=int, default=Config.DB_API_PORT)
     parser.add_argument("--pg_dsn", type=str, default="")
     parser.add_argument("--task", type=str, default="")
-
-    # Only stitch the wallet / subtensor argparse extensions in when the
-    # process actually needs them. Dashboard mode must parse without
-    # importing bittensor at all.
-    if _mode_runs_chain(Config.NEURON_MODE):
-        import bittensor as bt
-        bt.Wallet.add_args(parser)
-        bt.Subtensor.add_args(parser)
-        return bt.Config(parser)
-
-    # Dashboard mode: return a plain namespace that behaves like bt.Config
-    # for the attribute access patterns we use.
     return parser.parse_args()
 
 

@@ -1,4 +1,4 @@
-// pm2 ecosystem for running a non-competitive miner alongside the GEPA
+// pm2 ecosystem for running a miner alongside the GEPA
 // prompt-optimizer loop on the same host.
 //
 // Usage:
@@ -20,8 +20,8 @@
 const path = require("path");
 
 const sharedEnv = {
-  RADAR_NONCOMPETITIVE: "true",
   RADAR_DB_URL: process.env.RADAR_DB_URL || "http://localhost:8090",
+  RADAR_SERVICE_KEY: process.env.RADAR_SERVICE_KEY || "",
   RADAR_MINER_API_KEY: process.env.RADAR_MINER_API_KEY || "",
   MINER_PROMPTS_DIR: path.join(__dirname, "prompts"),
 

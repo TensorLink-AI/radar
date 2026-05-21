@@ -1,8 +1,10 @@
-# Radar Subnet — CLAUDE.md
+# Radar — CLAUDE.md
 
 ## What This Is
 
-A Bittensor subnet for autonomous ML research using phase-split validation. Miners host agents that design architectures. Validators coordinate training and independently evaluate checkpoints for consensus.
+A standalone autonomous-ML-research service using phase-split validation. Miners host agents that design architectures. Validators coordinate training and independently evaluate checkpoints for consensus.
+
+There is no bittensor / metagraph / wallet anywhere in the stack — auth is HMAC service key (validator ↔ trainer ↔ DB) and operator-CLI-issued bearer tokens (miner ↔ DB).
 
 ## Architecture — Phase-Split Validation
 
@@ -15,11 +17,11 @@ Phase C (Evaluation): Every validator evals every checkpoint (seconds, TRUST ANC
 ### Database Architecture
 
 ```
-Subnet Owner (database/ module) — one binary, three deploy modes
-                                  (RADAR_NEURON_MODE={validator,dashboard,all})
+Operator (database/ module) — one binary, three deploy modes
+                              (RADAR_NEURON_MODE={validator,dashboard,all})
   ├── Runs Postgres (single source of truth, shared across modes)
   ├── FastAPI on RADAR_DB_API_PORT (default 8090)
-  │   ├── validator mode  — Epistula-authed validator/miner surface
+  │   ├── validator mode  — HMAC-authed validator/miner surface
   │   │   ├── /experiments/*, /challenge, /frontier
   │   │   ├── /provenance/*, /agent_code/*
   │   │   ├── /desearch/*, /llm/*  (optional proxies)
@@ -28,9 +30,10 @@ Subnet Owner (database/ module) — one binary, three deploy modes
   │   ├── dashboard mode  — Public JSON API for radarnet.io SPA
   │   │   └── /dashboard/api/* (no auth, CORS via RADAR_DASHBOARD_CORS_ORIGINS)
   │   └── all mode (default, dev/legacy)  — every surface on one process
-  ├── Epistula auth: validator surface only. JSON API is public by design.
-  └── Chain sync (metagraph + round loop) runs in {validator, all} modes
-      only. Dashboard mode never imports bittensor or touches a wallet.
+  └── Auth on the validator surface is HMAC (RADAR_SERVICE_KEY) for
+      service-to-service calls, plus bearer tokens (issued by
+      database/operator_cli.py) for per-miner calls. JSON API is
+      public by design.
 
 Public dashboard JSON API (/dashboard/api/*) is PUBLIC by design — anyone
 on the internet can read agent source code, stdout, experiments, and
@@ -67,7 +70,7 @@ scripts/         Localnet test script + Postgres startup
 | File | Purpose |
 |------|---------|
 | `shared/protocol.py` | Challenge/Proposal wire format (JSON serializable) |
-| `shared/auth.py` | Epistula signing/verification |
+| `shared/auth.py` | HMAC service-key signing + bearer-token helpers |
 | `shared/challenge.py` | Deterministic challenge generation, phase timing, size buckets |
 | `shared/task.py` | TaskSpec, Objective, YAML loader |
 | `shared/database.py` | DataElement dataclass + deprecated ExperimentDB (JSON) |
@@ -115,29 +118,29 @@ scripts/start_pg.sh
 python -m pytest tests/ -v
 
 # Start database server — default (all) mode: validator surface + public JSON
-python database/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <name>
+RADAR_SERVICE_KEY=... python database/neuron.py
 
 # Validator-only mode (no public JSON API; internal Jinja UI optional)
-RADAR_NEURON_MODE=validator \
-  python database/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <name>
+RADAR_NEURON_MODE=validator RADAR_SERVICE_KEY=... \
+  python database/neuron.py
 
-# Public dashboard-only mode (no wallet, no chain sync, no Epistula)
+# Public dashboard-only mode (no auth, no Jinja)
 RADAR_NEURON_MODE=dashboard \
   RADAR_DASHBOARD_CORS_ORIGINS=https://radarnet.io \
   python database/neuron.py --port 8091
 
 # Running both locally on the same Postgres (dev)
-# Terminal 1: validator surface on 8090
-RADAR_NEURON_MODE=validator python database/neuron.py --netuid 1 --port 8090
-# Terminal 2: public JSON API on 8091 pointing at the same Postgres
+RADAR_NEURON_MODE=validator RADAR_SERVICE_KEY=dev python database/neuron.py --port 8090
 RADAR_NEURON_MODE=dashboard python database/neuron.py --port 8091
 
-# Start validator (requires subtensor or mainnet)
-python validator/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <name>
+# Start validator
+RADAR_SERVICE_KEY=... RADAR_DB_API_URL=http://<db-host>:8090 \
+  python validator/neuron.py
 
 # Start miner
-python miner/neuron.py --netuid <N> --subtensor.network <network> --wallet.name <name> \
-    --agent_image myagent:latest --agent_url <url> --trainer_url <url>
+RADAR_SERVICE_KEY=... RADAR_MINER_API_KEY=rdrk_... \
+RADAR_DB_API_URL=http://<db-host>:8090 \
+  python miner/neuron.py --agent_dir agent/
 
 # Build trainer image
 docker build -t ts-runner:latest runner/timeseries_forecast/
@@ -189,7 +192,7 @@ Each round targets one bucket deterministically from the block hash. FLOPs measu
 
 Three layers of timing, intentionally separated:
 
-1. **Block windows** (on-chain, validator-global): define WHEN phases start/end. Consensus-driven via block height (~12s/block). Rigid boundaries. Env: `RADAR_SUBMISSION_WINDOW`, `RADAR_TRAINING_WINDOW`, `RADAR_EVAL_WINDOW`, `RADAR_FALLBACK_WINDOW`.
+1. **Block windows** (wall-clock-derived, validator-global): define WHEN phases start/end. The validator derives a synthetic block counter as `time.time() // 12` so the per-phase block-window math stays compatible with the existing config. Env: `RADAR_SUBMISSION_WINDOW`, `RADAR_TRAINING_WINDOW`, `RADAR_EVAL_WINDOW`, `RADAR_FALLBACK_WINDOW`.
 2. **Validator operational timeouts** (seconds, validator-global): HTTP / R2 polling guardrails. E.g. `TRAINER_PREPARE_TIMEOUT`.
 3. **Per-task second budgets** (seconds, set in `tasks/<task>/<task>.yaml`): different tasks can demand different amounts of work per phase.
    - `agent_seconds` → Phase A wall-clock for the **agent pod** (0/unset = inherit `Config.AGENT_TIMEOUT`)
@@ -220,7 +223,7 @@ frontier/latest.json                                        # Current Pareto fro
 ## What's Done
 
 - [x] Phase-split validation pipeline (A -> B -> C)
-- [x] Epistula authentication (`shared/auth.py`)
+- [x] HMAC service-key + bearer-token auth (`shared/auth.py`)
 - [x] Deterministic challenge generation with size buckets (`shared/challenge.py`)
 - [x] Size-gated Pareto frontier scoring (`shared/scoring.py`)
 - [x] FLOPs-equivalent wallclock calibration (`runner/timeseries_forecast/flops.py`)
@@ -259,15 +262,15 @@ add `HIPPIUS_*` once your Hippius keys are issued — the client will pick up
 the new backend automatically. To cut over fully, also set
 `HIPPIUS_BUCKET` (or unset `R2_BUCKET`) so dispatched URLs point at Hippius.
 
-## Non-competitive Mode
+## Auth model
 
-Set `RADAR_NONCOMPETITIVE=true` for a non-subnet deployment:
+The deployment has no chain dependency. Auth is split across two surfaces:
 
-- Validator skips wallet, subtensor, metagraph, weight-setting, on-chain
-  commitments. Existing competitive deployments leave it false.
-- Auth uses HMAC service key (`RADAR_SERVICE_KEY`) for validator ↔ trainer
-  ↔ DB. Headers: `X-Radar-{Signature,Timestamp,Key-Id}`.
-- Miner identity is bearer tokens issued via the operator CLI:
+- **Service auth (HMAC)**: validator ↔ trainer ↔ DB. Headers are
+  `X-Radar-{Signature,Timestamp,Key-Id}`. Every service that signs or
+  verifies outbound calls reads `RADAR_SERVICE_KEY` at startup; missing
+  key = fail-closed.
+- **Miner identity (bearer tokens)** issued via the operator CLI:
   ```
   python -m database.operator_cli register --name alice [--hotkey ss58]
   python -m database.operator_cli issue-key --miner-id <id> --label prod
@@ -290,7 +293,7 @@ Set `RADAR_NONCOMPETITIVE=true` for a non-subnet deployment:
 
 | Var | Default | Purpose |
 |-----|---------|---------|
-| `RADAR_NEURON_MODE` | `all` | `validator` (Epistula API + chain), `dashboard` (open public JSON), or `all` (both on one process). |
+| `RADAR_NEURON_MODE` | `all` | `validator` (HMAC API), `dashboard` (open public JSON), or `all` (both on one process). |
 | `RADAR_PG_POOL_MIN` | `2` | asyncpg pool min size. Dashboard deploys typically leave as-is; validator deploys can bump. |
 | `RADAR_PG_POOL_MAX` | `10` | asyncpg pool max size. |
 | `RADAR_PG_STATEMENT_TIMEOUT_MS` | `0` | `SET statement_timeout` for every pool connection. `0` disables. Set to `5000` on dashboard deploys so a slow public query can't pressure the shared cluster. |
@@ -483,13 +486,8 @@ the env var if the trade-off needs adjusting.
 - [ ] **Spot checking Phase A** — 10-20% of rounds re-audit agent submissions
 - [ ] **Subnet LLM** — provide shared LLM endpoint to miners
 - [ ] **Real GIFT-Eval data** — swap placeholder prepare.py with real data pipeline
-- [ ] **Mainnet registration** — register subnet, set hyperparameters, deploy
 - [ ] **Docker network isolation** — whitelist network for trainer containers
-- [ ] **Cross-tempo EMA** — weight smoothing across rounds
-
-## Bittensor SDK
-
-Using `bittensor>=10.1.0`. Key classes: `bt.Wallet`, `bt.Subtensor`, `bt.Keypair`.
+- [ ] **Cross-tempo EMA** — score smoothing across rounds
 
 ## Code Style
 

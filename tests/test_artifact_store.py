@@ -279,9 +279,7 @@ async def test_coordinator_routes_through_artifact_store_when_present():
 
     # Build a coordinator without invoking __init__'s broader concerns.
     coord = TrainingCoordinator.__new__(TrainingCoordinator)
-    coord.wallet = MagicMock()
-    coord.wallet.hotkey.ss58_address = "5Vali"
-    coord.metagraph = MagicMock()
+    coord._service_key_id = "5Vali"
     coord.r2 = r2
     coord.my_uid = 0
     coord.artifact_store = store
@@ -312,9 +310,7 @@ async def test_coordinator_falls_back_to_r2_only_when_no_store():
 
     r2 = _FakeR2()
     coord = TrainingCoordinator.__new__(TrainingCoordinator)
-    coord.wallet = MagicMock()
-    coord.wallet.hotkey.ss58_address = "5Vali"
-    coord.metagraph = MagicMock()
+    coord._service_key_id = "5Vali"
     coord.r2 = r2
     coord.my_uid = 0
     coord.artifact_store = None

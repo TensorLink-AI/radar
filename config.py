@@ -81,20 +81,12 @@ class Config:
     R2_BUCKET: str = os.getenv("R2_BUCKET", "") or os.getenv("HIPPIUS_BUCKET", "")
     R2_PRESIGNED_TTL: int = int(os.getenv("RADAR_PRESIGNED_TTL", "5400"))
 
-    # ── Hippius / Substrate Phase C publishing ──────────────────────
-    # Phase 1 of the Hippius migration ships the signing/serialisation
-    # contract (`shared/substrate.py`) but leaves the publishing pipeline
-    # off by default — existing validators are not affected by merging
-    # this code. Operators opt in by setting HIPPIUS_ENABLED=true once the
-    # downstream phases (IPFS upload, on-chain extrinsic) are wired up.
+    # ── Hippius artifact storage ─────────────────────────────────────
+    # When opted in, the validator may dual-write artifacts to Hippius
+    # alongside R2 via the shared ArtifactStore.
     HIPPIUS_ENABLED: bool = os.getenv("HIPPIUS_ENABLED", "false").lower() == "true"
     HIPPIUS_IPFS_API_URL: str = os.getenv("HIPPIUS_IPFS_API_URL", "")
     HIPPIUS_KEY: str = os.getenv("HIPPIUS_KEY", "")
-    HIPPIUS_SUBSTRATE_RPC: str = os.getenv("HIPPIUS_SUBSTRATE_RPC", "")
-    SUBSTRATE_APP_TAG: str = os.getenv("SUBSTRATE_APP_TAG", "radar")
-    SUBSTRATE_SCHEMA_VERSION: str = os.getenv(
-        "SUBSTRATE_SCHEMA_VERSION", "radar.substrate.v1",
-    )
 
     # ── Hippius artifact dual-write (TEN-240 Phase 7) ───────────────
     # When enabled, validator-side artifact writes (dispatch records,
@@ -382,7 +374,7 @@ class Config:
     )
 
     # ── Network / Schema Isolation ────────────────────────────
-    # Which Bittensor network this DB process serves: "testnet" or "mainnet".
+    # Which logical network this DB process serves: "testnet" or "mainnet".
     # A single Postgres database holds BOTH networks; isolation is enforced by
     # Postgres *schemas* (NOT a `network` tag column, NOT separate DBs).
     #
@@ -400,30 +392,18 @@ class Config:
 
     # ── Neuron Mode ───────────────────────────────────────────
     # RADAR_NEURON_MODE controls which surface this process serves.
-    #   validator  — Epistula-authed write/read API for validators + miners,
-    #                plus desearch/LLM proxies. Runs metagraph sync + round
-    #                loop. Requires a Bittensor wallet. Optionally also mounts
+    #   validator  — HMAC-authed write/read API for validators + miners,
+    #                plus desearch/LLM proxies. Optionally also mounts
     #                the internal Jinja dashboard when RADAR_DASHBOARD_ENABLED=true.
-    #   dashboard  — Open public JSON API at /dashboard/api/*. No wallet, no
-    #                proxies, no metagraph sync, no Jinja, no Epistula.
-    #                This is what gets deployed to Railway behind radarnet.io.
+    #   dashboard  — Open public JSON API at /dashboard/api/*. No proxies,
+    #                no Jinja. This is what gets deployed to Railway
+    #                behind radarnet.io.
     #   all        — Everything on one process (legacy / dev default).
     NEURON_MODE: str = os.getenv("RADAR_NEURON_MODE", "all").lower()
 
-    # ── Non-competitive mode ────────────────────────────────────
-    # When true, validators + miners SKIP all chain interactions:
-    #   * no metagraph sync, no Subtensor connection, no wallet
-    #   * no weight setting, no on-chain commitments
-    #   * outbound auth uses HMAC service key (RADAR_SERVICE_KEY)
-    #   * miner identity comes from bearer API keys, not hotkeys
-    # Existing competitive deployments leave this false and run unchanged.
-    NONCOMPETITIVE: bool = os.getenv(
-        "RADAR_NONCOMPETITIVE", "false",
-    ).lower() in ("1", "true", "yes")
-
-    # Shared HMAC secret for service-to-service auth in non-competitive
-    # mode (validator -> trainer, validator -> DB).  Required when
-    # NONCOMPETITIVE is true.
+    # Shared HMAC secret for service-to-service auth (validator -> trainer,
+    # validator -> DB). Required for every service that signs or verifies
+    # outbound calls.
     SERVICE_KEY: str = os.getenv("RADAR_SERVICE_KEY", "")
     SERVICE_KEY_ID: str = os.getenv("RADAR_SERVICE_KEY_ID", "operator")
 
@@ -449,9 +429,9 @@ class Config:
     # ── Database Auth ─────────────────────────────────────────
     DB_VALI_RATE_LIMIT: int = int(os.getenv("RADAR_DB_VALI_RATE_LIMIT", "60"))
     DB_IP_RATE_LIMIT: int = int(os.getenv("RADAR_DB_IP_RATE_LIMIT", "120"))
-    # Shared subnet API key — lightweight gate before Epistula verification.
-    # Subnet owner generates once, distributes to validators for reverse proxy auth.
-    # Empty string = disabled (open access, Epistula-only).
+    # Shared subnet API key — lightweight gate in front of the validator
+    # surface. Operator generates once, distributes to validators for
+    # reverse-proxy auth. Empty string = disabled (HMAC-only).
     DB_API_KEY: str = os.getenv("RADAR_DB_API_KEY", "")
 
     # ── Dashboard (read-only web UI for inspecting experiments) ───────

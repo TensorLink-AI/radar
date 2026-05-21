@@ -55,7 +55,6 @@ EXPECTED_FILES = [
     "/workspace/runner/handler.py",
     "/workspace/runner/sandbox.py",
     "/workspace/runner/uploads.py",
-    "/workspace/runner/boot_proof.py",
     # Timeseries task package
     "/workspace/runner/timeseries_forecast/__init__.py",
     "/workspace/runner/timeseries_forecast/train.py",
