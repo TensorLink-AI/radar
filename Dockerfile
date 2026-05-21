@@ -9,11 +9,10 @@ WORKDIR /app
 
 # System deps:
 #   build-essential, libpq-dev — wheels that may need to compile (asyncpg
-#     usually has manylinux wheels, but bittensor's chain stack pulls in
-#     packages that occasionally fall back to source).
+#     usually has manylinux wheels).
 #   git — affinetes is declared in pyproject as a git+https dependency
 #     and pip needs git on PATH to clone it.
-#   ca-certificates — TLS to Postgres / Bittensor RPC.
+#   ca-certificates — TLS to Postgres / outbound HTTPS.
 # CUDA / GPU deps deliberately omitted; the DB neuron is CPU-only.
 # Training images live in runner/Dockerfile.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -25,8 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install runtime deps from pyproject.toml. requirements.txt in this repo
 # is a partial list (core libs only) and does not include fastapi,
-# uvicorn, bittensor, pydantic, jinja2, etc. that database/neuron.py
-# imports — installing only requirements.txt yields an unbootable image.
+# uvicorn, pydantic, jinja2, etc. that database/neuron.py imports —
+# installing only requirements.txt yields an unbootable image.
 COPY pyproject.toml requirements.txt ./
 COPY shared/ shared/
 COPY validator/ validator/
@@ -51,5 +50,4 @@ USER radar
 
 # Mode-specific behaviour (validator / dashboard / all) is selected via
 # RADAR_NEURON_MODE at runtime — the image itself is mode-agnostic.
-# NETUID defaults to 64 (mainnet) and can be overridden per-deployment.
-CMD ["sh", "-c", "python database/neuron.py --port ${PORT} --netuid ${NETUID:-64}"]
+CMD ["sh", "-c", "python database/neuron.py --port ${PORT}"]

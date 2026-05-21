@@ -248,10 +248,8 @@ CREATE INDEX IF NOT EXISTS idx_access_hotkey_round
 """
 
 # Miner registry + bearer API keys for the non-competitive cutover.
-# A ``miner_id`` is an opaque operator-issued identifier (UUID by default)
-# that decouples the feedback API from the on-chain hotkey identity.
-# During the dual-stack period a miner row carries both: ``hotkey`` is
-# the bittensor SS58 (nullable, only set for chain-registered miners) and
+# A ``miner_id`` is an opaque operator-issued identifier (UUID by default).
+# ``hotkey`` is the static peer identifier from miners.json and
 # ``miner_id`` is the bearer-auth identifier scoped to /miners/me/*.
 MINER_REGISTRY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS miners (

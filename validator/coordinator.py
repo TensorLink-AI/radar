@@ -11,37 +11,41 @@ import json
 import logging
 import os
 import random
-import secrets
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
 import httpx
 
-from config import Config
-from shared.auth import sign_request, hmac_sign_request
+from shared.auth import sign_request
+from shared.peers import get_hotkey_for_uid
 from shared.protocol import Proposal, TrainerRequest, TrainerReady, TrainerRelease
 
 if TYPE_CHECKING:
-    from shared.commitment import ImageCommitment
     from shared.r2_audit import R2AuditLog
+
+
+@dataclass
+class ImageCommitment:
+    """Minimal placeholder for the old on-chain image commitment.
+
+    Carries the bits the rest of the validator still cares about
+    (code hash, miner identity, optional listener URL).
+    """
+    code_hash: str = ""
+    miner_uid: int = 0
+    hotkey: str = ""
+    listener_url: str = ""
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class Job:
-    """A training job assignment.
-
-    ``submission_id`` is an opaque per-job ID minted by the dispatching
-    validator at dispatch time (left empty for jobs we don't dispatch).
-    It hides the architecture owner's hotkey from the trainer-host (which
-    is itself another miner's pod under cross-eval).
-    """
+    """A training job assignment."""
     arch_owner: int      # miner whose architecture is being trained
     trainer_uid: int     # miner whose trainer runs the job (self-training allowed)
     dispatcher: int      # validator UID responsible for dispatching
     round_id: int = 0
-    submission_id: str = ""
 
 
 @dataclass
@@ -58,7 +62,6 @@ class TrainingResult:
     training_time_seconds: float = 0.0
     checkpoint_key: str = ""
     architecture_key: str = ""
-    submission_id: str = ""
 
 
 def compute_assignments(
@@ -135,49 +138,11 @@ def compute_fallback(
 class TrainingCoordinator:
     """Orchestrates Phase B dispatch and R2 artifact monitoring."""
 
-    def __init__(
-        self, wallet, metagraph, r2: "R2AuditLog", my_uid: int,
-        artifact_store=None,
-    ):
+    def __init__(self, wallet=None, r2: "R2AuditLog" = None, my_uid: int = 0, **kwargs):
         self.wallet = wallet
-        self.metagraph = metagraph
         self.r2 = r2
         self.my_uid = my_uid
-        # Off-chain deploy: when no wallet, sign outbound trainer / proxy
-        # requests with the shared HMAC service key. The trainer image
-        # (runner/server.py) verifies the same way.
-        self._service_secret = (
-            Config.SERVICE_KEY.encode() if (wallet is None and Config.SERVICE_KEY) else None
-        )
-        self._service_key_id = Config.SERVICE_KEY_ID
-        # Optional dual-write store (TEN-240 Phase 7). When present, JSON
-        # artifacts (dispatch records, frontier snapshots) fan out to both
-        # R2 and Hippius. Falls back to R2-only when None — historical
-        # behaviour and the default.
-        self.artifact_store = artifact_store
         self._fallback_uids: dict[int, set[int]] = {}  # round_id → UIDs using proxy
-        # round_id → {uid → True} for miners verified during a Targon outage.
-        # Scoring multiplies their contribution by TARGON_UNAVAILABLE_SCORE_MULTIPLIER.
-        self._targon_unavailable: dict[int, dict[int, bool]] = {}
-        # round_id → {uid → True} for miners flagged as compromised during
-        # mid-round re-verification. Excluded from scoring.
-        self._compromised: dict[int, dict[int, bool]] = {}
-        # round_id → {uid → TrainerReady} so mid-run reverify knows where
-        # each accepted miner's CVM lives. Populated in prepare_trainers.
-        self._ready_msgs: dict[int, dict[int, "TrainerReady"]] = {}
-        # round_id → list[asyncio.Task] of in-flight mid-round reverify
-        # tasks. Cancelled by release_trainers / cancel_mid_round_reverify.
-        self._reverify_tasks: dict[int, list[asyncio.Task]] = {}
-        self._targon_client = None
-
-    def _sign(self, body: bytes) -> dict[str, str]:
-        """Sign an outbound HTTP body. HMAC in off-chain deploys, Epistula
-        otherwise."""
-        if self._service_secret is not None:
-            return hmac_sign_request(
-                self._service_secret, body, key_id=self._service_key_id,
-            )
-        return sign_request(self.wallet, body)
 
     def compute_my_jobs(
         self,
@@ -200,20 +165,20 @@ class TrainingCoordinator:
         submissions: dict[int, Proposal],
         trainer_endpoints: dict[int, str],
         commitments: dict[int, "ImageCommitment"] | None = None,
-        extras: dict | None = None,
+        gift_eval_urls: dict[str, str] | None = None,
+        pretrain_shard_urls: list[str] | None = None,
+        pretrain_val_shard_urls: list[str] | None = None,
     ) -> list[TrainingResult]:
         """POST to trainer endpoints with Epistula-signed payload.
 
         Dispatches concurrently. Attestation is already verified in
         prepare_trainers() when TrainerReady arrives; fallback proxy
         is trusted subnet-owner infrastructure.
-
-        `extras` is a task-provided dict merged into every dispatch
-        payload (e.g. ts_forecasting supplies `gift_eval_urls` and
-        `pretrain_shard_urls`).
         """
         commitments = commitments or {}
-        extras = extras or {}
+        gift_eval_urls = gift_eval_urls or {}
+        pretrain_shard_urls = pretrain_shard_urls or []
+        pretrain_val_shard_urls = pretrain_val_shard_urls or []
         # Each job is sent to exactly one trainer (1:1 arch→trainer).
         # `trainer_endpoints` is the available pool, not the fan-out.
         logger.info(
@@ -248,35 +213,27 @@ class TrainingCoordinator:
                     dispatcher=self.my_uid,
                     status="failed",
                     error="No trainer endpoint",
-                    submission_id=job.submission_id,
                 ))
                 continue
 
-            # Mint an opaque submission_id per job at dispatch time.
-            # The trainer-host receives only this ID — the miner's hotkey
-            # is never on the wire to the trainer or in the bucket path.
-            # `secrets.token_hex(16)` → 32-char unguessable hex.
-            if not job.submission_id:
-                job.submission_id = secrets.token_hex(16)
-            submission_id = job.submission_id
+            miner_hotkey = get_hotkey_for_uid(job.arch_owner)
 
             # Generate presigned PUT URLs so trainer can upload without R2 creds.
             from shared.artifacts import generate_upload_urls
             presigned_ttl = int(os.getenv("RADAR_PRESIGNED_TTL", "5400"))
             upload_urls = generate_upload_urls(
-                self.r2, challenge.round_id, submission_id, ttl=presigned_ttl,
+                self.r2, challenge.round_id, miner_hotkey, ttl=presigned_ttl,
             )
 
             if not upload_urls.get("architecture"):
                 logger.error(
-                    "Missing architecture presigned URL for arch_owner=%d submission=%s",
-                    job.arch_owner, submission_id[:12],
+                    "Missing architecture presigned URL for arch_owner=%d miner=%s",
+                    job.arch_owner, miner_hotkey[:16],
                 )
             else:
                 logger.info(
-                    "Generated %d presigned URLs for arch_owner=%d submission=%s: %s",
-                    len(upload_urls), job.arch_owner, submission_id[:12],
-                    list(upload_urls.keys()),
+                    "Generated %d presigned URLs for arch_owner=%d: %s",
+                    len(upload_urls), job.arch_owner, list(upload_urls.keys()),
                 )
 
             task_name = challenge.task.get("name", "")
@@ -287,13 +244,18 @@ class TrainingCoordinator:
                 "round_id": challenge.round_id,
                 "min_flops_equivalent": challenge.min_flops_equivalent,
                 "max_flops_equivalent": challenge.max_flops_equivalent,
-                "submission_id": submission_id,
+                "miner_hotkey": miner_hotkey,
                 "time_budget": time_budget,
                 "upload_urls": upload_urls,
                 "task_name": task_name,
                 "runner_dir": runner_dir,
             }
-            dispatch_payload.update(extras)
+            if gift_eval_urls:
+                dispatch_payload["gift_eval_urls"] = gift_eval_urls
+            if pretrain_shard_urls:
+                dispatch_payload["pretrain_shard_urls"] = pretrain_shard_urls
+            if pretrain_val_shard_urls:
+                dispatch_payload["pretrain_val_shard_urls"] = pretrain_val_shard_urls
             payload = json.dumps(dispatch_payload).encode()
 
             dispatch_tasks.append((job, trainer_url, payload))
@@ -308,9 +270,8 @@ class TrainingCoordinator:
             for attempt in range(max_retries + 1):
                 try:
                     # Sign fresh every attempt so the Epistula timestamp
-                    # stays inside the EPISTULA_TIMESTAMP_TOLERANCE window
-                    # (default 120s; tunable via RADAR_EPISTULA_TOLERANCE).
-                    headers = self._sign(payload)
+                    # is always within the 30s tolerance window.
+                    headers = sign_request(self.wallet, payload)
                     headers["Content-Type"] = "application/json"
                     resp = await client.post(
                         f"{url.rstrip('/')}/train",
@@ -322,7 +283,7 @@ class TrainingCoordinator:
                     # - 403: Timestamp stale (clock skew or slow dispatch)
                     # - 500: Internal Server Error (transient Basilica platform error)
                     # - 502: Bad Gateway (trainer pod proxy up, server still starting)
-                    # - 503: Service Unavailable (metagraph/auth not ready yet)
+                    # - 503: Service Unavailable (auth not ready yet)
                     # 429 is handled separately below — rate-limited 429s are
                     # retried, while already-running 429s go to R2 polling.
                     if resp.status_code in (403, 500, 502, 503) and attempt < max_retries:
@@ -367,7 +328,6 @@ class TrainingCoordinator:
                             dispatcher=self.my_uid,
                             seed=challenge.seed,
                             status="already_running",
-                            submission_id=job.submission_id,
                         )
 
                     try:
@@ -385,7 +345,6 @@ class TrainingCoordinator:
                             dispatcher=self.my_uid,
                             status="failed",
                             error=f"Non-JSON response (HTTP {resp.status_code}): {body_preview}",
-                            submission_id=job.submission_id,
                         )
 
                     # 202 Accepted = trainer acknowledged, training in background
@@ -402,7 +361,6 @@ class TrainingCoordinator:
                             dispatcher=self.my_uid,
                             seed=challenge.seed,
                             status="accepted",
-                            submission_id=job.submission_id,
                         )
 
                     # Log HTTP errors with the response body for diagnostics
@@ -424,7 +382,6 @@ class TrainingCoordinator:
                         training_time_seconds=float(data.get("training_time_seconds", 0)),
                         checkpoint_key=data.get("checkpoint_key", ""),
                         architecture_key=data.get("architecture_key", ""),
-                        submission_id=job.submission_id,
                     )
                 except httpx.TimeoutException:
                     logger.error("Dispatch to trainer UID %d timed out", job.trainer_uid)
@@ -435,7 +392,6 @@ class TrainingCoordinator:
                         dispatcher=self.my_uid,
                         status="timeout",
                         error="Request timed out",
-                        submission_id=job.submission_id,
                     )
                 except Exception as e:
                     if attempt < max_retries:
@@ -454,14 +410,12 @@ class TrainingCoordinator:
                         dispatcher=self.my_uid,
                         status="failed",
                         error=str(e),
-                        submission_id=job.submission_id,
                     )
             # Should not reach here, but handle defensively
             return TrainingResult(
                 round_id=job.round_id, arch_owner=job.arch_owner,
                 trainer_uid=job.trainer_uid, dispatcher=self.my_uid,
                 status="failed", error="Retries exhausted",
-                submission_id=job.submission_id,
             )
 
         async with httpx.AsyncClient(timeout=job_timeout) as client:
@@ -477,43 +431,30 @@ class TrainingCoordinator:
         self,
         round_id: int,
         expected_miners: list[int],
-        uid_to_submission_id: dict[int, str],
         timeout: int = 300,
     ) -> dict[int, dict]:
-        """Poll R2/Hippius for training_meta.json by submission_id.
+        """Poll R2 for training_meta.json from each miner.
 
-        Artifacts live at ``round_{id}/submission_{sid}/...``. Resolution
-        from miner UID → submission_id comes from the dispatching
-        validator's in-memory job state plus other validators' published
-        dispatch records — assembled by the caller and passed in via
-        ``uid_to_submission_id``.
+        Uses direct key lookups (strongly consistent) instead of
+        list_objects (eventually consistent) to avoid missing recently
+        uploaded artifacts.
 
-        UIDs missing from the mapping are skipped (no submission_id known
-        yet — typically jobs dispatched by another validator that hasn't
-        written its dispatch record). Successful collections include the
-        miner's hotkey/uid in the returned meta so the rest of the
-        validator pipeline keeps working unchanged.
+        Performs post-upload verification: checks that the meta's round_id
+        and miner_hotkey match expectations, rejecting tampered artifacts.
         """
         from shared.artifacts import meta_key as mk_fn, checkpoint_key as ck_fn
 
         results: dict[int, dict] = {}
         deadline = asyncio.get_event_loop().time() + timeout
 
-        # Build uid→hotkey mapping for stamping the result so downstream
-        # scoring/eval still has the resolved hotkey.
-        hotkeys = self.metagraph.hotkeys if hasattr(self.metagraph, "hotkeys") else []
+        # Build uid → hotkey mapping from the static peer registry.
+        uid_to_hotkey = {uid: get_hotkey_for_uid(uid) for uid in expected_miners}
 
-        # Log expected keys for debugging
-        for uid in expected_miners:
-            sid = uid_to_submission_id.get(uid, "")
-            if not sid:
-                logger.info(
-                    "UID %d: no submission_id known yet — skipping until reveal",
-                    uid,
-                )
-                continue
+        # Log expected R2 keys for debugging
+        for uid, hk in uid_to_hotkey.items():
             logger.info(
-                "Expecting meta key for UID %d: %s", uid, mk_fn(round_id, sid),
+                "Expecting R2 meta key for UID %d: %s",
+                uid, mk_fn(round_id, hk),
             )
 
         poll_count = 0
@@ -524,14 +465,11 @@ class TrainingCoordinator:
                 "Checkpoint poll #%d: %d/%d collected, %.0fs remaining (round %d)",
                 poll_count, len(results), len(expected_miners), remaining, round_id,
             )
-            for uid in expected_miners:
+            # Check each pending miner directly (strongly consistent)
+            for uid, hk in uid_to_hotkey.items():
                 if uid in results:
                     continue
-                sid = uid_to_submission_id.get(uid, "")
-                if not sid:
-                    continue
-                hk = hotkeys[uid] if uid < len(hotkeys) else f"uid_{uid}"
-                mk = mk_fn(round_id, sid)
+                mk = mk_fn(round_id, hk)
                 try:
                     meta = self.r2.download_json(mk)
                     if not meta:
@@ -547,19 +485,24 @@ class TrainingCoordinator:
                         uid, mk, meta.get("status", "?"),
                     )
 
+                    # Verify meta fields match expectations
                     if meta.get("round_id") != round_id:
                         logger.warning(
                             "Meta round_id mismatch for UID %d: expected %d, got %s",
                             uid, round_id, meta.get("round_id"),
                         )
                         continue
-                    if meta.get("submission_id") != sid:
+                    if meta.get("miner_hotkey") != hk:
                         logger.warning(
-                            "Meta submission_id mismatch for UID %d: expected %s, got %s",
-                            uid, sid[:12], str(meta.get("submission_id"))[:12],
+                            "Meta miner_hotkey mismatch for UID %d: expected %s, got %s",
+                            uid, hk[:16], str(meta.get("miner_hotkey"))[:16],
                         )
                         continue
 
+                    # Failure statuses: collect the meta without requiring a checkpoint.
+                    # The trainer only uploads training_meta.json for failures
+                    # (no checkpoint is produced). Downstream scoring handles these
+                    # via penalties / size gate rejection.
                     _FAILURE_STATUSES = ("build_failed", "size_violation", "failed", "timeout")
                     meta_status = meta.get("status", "")
                     if meta_status in _FAILURE_STATUSES:
@@ -572,7 +515,8 @@ class TrainingCoordinator:
                         )
                         continue
 
-                    ck = ck_fn(round_id, sid)
+                    # Verify checkpoint file exists (only for success status)
+                    ck = ck_fn(round_id, hk)
                     if not self.r2.key_exists(ck):
                         logger.info(
                             "Meta exists but checkpoint missing for UID %d at %s (round %d)",
@@ -596,116 +540,50 @@ class TrainingCoordinator:
                 break
             await asyncio.sleep(30)
         else:
+            # On timeout, check what actually exists in R2 for this round
             round_prefix = f"round_{round_id}/"
             try:
                 existing_keys = self.r2.list_keys(round_prefix)
                 logger.warning(
                     "Checkpoint collection timed out: %d/%d collected after %ds (round %d). "
-                    "Keys under %s: %s",
+                    "R2 keys under %s: %s",
                     len(results), len(expected_miners), timeout, round_id,
                     round_prefix, existing_keys[:20] if existing_keys else "(none)",
                 )
             except Exception:
                 logger.warning(
                     "Checkpoint collection timed out: %d/%d collected after %ds (round %d). "
-                    "list_keys also failed — check connectivity",
+                    "R2 list_keys also failed — check R2 connectivity",
                     len(results), len(expected_miners), timeout, round_id,
                 )
 
         return results
 
     async def write_dispatch_record(self, round_id: int, results: list[TrainingResult]):
-        """Write dispatch record (and the submission_id reveal map for our jobs).
-
-        Each record carries (arch_owner, submission_id, miner_hotkey) so any
-        validator can resolve every checkpoint they need for Phase C eval
-        — the dispatching validator is the only entity that knows the
-        opaque submission_id minted at dispatch.
-        """
-        hotkey = (
-            self.wallet.hotkey.ss58_address
-            if self.wallet is not None else self._service_key_id
-        )
+        """Write dispatch record to R2 for auditability."""
+        hotkey = getattr(getattr(self.wallet, "hotkey", None), "ss58_address", "") or "validator"
         key = f"round_{round_id}/dispatch/vali_{hotkey}.json"
-        hotkeys = self.metagraph.hotkeys if hasattr(self.metagraph, "hotkeys") else []
         records = []
         for r in results:
-            arch_hk = (
-                hotkeys[r.arch_owner]
-                if 0 <= r.arch_owner < len(hotkeys) else ""
-            )
             records.append({
                 "arch_owner": r.arch_owner,
-                "arch_owner_hotkey": arch_hk,
                 "trainer_uid": r.trainer_uid,
-                "submission_id": r.submission_id,
                 "status": r.status,
                 "flops_equivalent_size": r.flops_equivalent_size,
                 "training_time_seconds": r.training_time_seconds,
                 "checkpoint_key": r.checkpoint_key,
             })
-        body = {"dispatcher": hotkey, "round_id": round_id, "jobs": records}
-        if self.artifact_store is not None:
-            await self.artifact_store.put_json(key, body, {
-                "app": "radar", "kind": "dispatch",
-                "round_id": str(round_id), "validator_hotkey": hotkey,
-            })
-        else:
-            self.r2.upload_json(key, body)
-
-    async def collect_submission_map(
-        self, round_id: int,
-    ) -> dict[int, str]:
-        """Read every validator's dispatch record for ``round_id`` and
-        assemble the union ``arch_owner_uid → submission_id`` map.
-
-        Used for Phase C cross-eval: every validator must independently
-        download every checkpoint, so each needs the submission_ids minted
-        by the *other* validators. Best-effort — missing records mean a
-        UID falls out of the map and its checkpoint is skipped this round.
-        """
-        prefix = f"round_{round_id}/dispatch/"
-        try:
-            keys = self.r2.list_keys(prefix)
-        except Exception as e:
-            logger.warning("Failed to list dispatch records for round %d: %s", round_id, e)
-            return {}
-        mapping: dict[int, str] = {}
-        for key in keys:
-            if not key.endswith(".json"):
-                continue
-            try:
-                body = self.r2.download_json(key)
-            except Exception as e:
-                logger.warning("Failed to read dispatch record %s: %s", key, e)
-                continue
-            if not isinstance(body, dict):
-                continue
-            for job in body.get("jobs", []) or []:
-                if not isinstance(job, dict):
-                    continue
-                sid = job.get("submission_id", "")
-                uid = job.get("arch_owner")
-                if isinstance(uid, int) and sid and uid not in mapping:
-                    mapping[uid] = sid
-        return mapping
+        self.r2.upload_json(key, {"dispatcher": hotkey, "round_id": round_id, "jobs": records})
 
     async def write_frontier(
         self, frontier_data: list[dict], task_name: str = "",
     ):
-        """Write current frontier to R2 (and Hippius if dual-write enabled)."""
+        """Write current frontier to R2, scoped by task."""
         if task_name:
             key = f"frontier/{task_name}/latest.json"
         else:
             key = "frontier/latest.json"
-        body = {"frontier": frontier_data}
-        if self.artifact_store is not None:
-            await self.artifact_store.put_json(key, body, {
-                "app": "radar", "kind": "frontier",
-                "task": task_name or "default",
-            })
-        else:
-            self.r2.upload_json(key, body)
+        self.r2.upload_json(key, {"frontier": frontier_data})
 
     async def prepare_trainers(
         self,
@@ -721,6 +599,7 @@ class TrainingCoordinator:
 
         Returns {uid: trainer_url} for all miners that responded or fell back.
         """
+        from config import Config
         from validator.db_proxy import get_ready_trainers
         from validator.pod_manager import verify_miner_pod
 
@@ -744,7 +623,7 @@ class TrainingCoordinator:
 
         # Fire TrainerRequest to all miners with listener_urls.
         # Re-sign per miner so the Epistula timestamp stays fresh —
-        # stale timestamps cause miners to reject with 403.
+        # stale timestamps (>30s) cause miners to reject with 403.
         with_listener = {uid: c for uid, c in commitments.items() if c.listener_url}
         without_listener = {uid: c for uid, c in commitments.items() if not c.listener_url}
         if without_listener:
@@ -761,7 +640,7 @@ class TrainingCoordinator:
             for uid, commitment in with_listener.items():
                 try:
                     url = f"{commitment.listener_url.rstrip('/')}/prepare"
-                    fresh_headers = self._sign(body)
+                    fresh_headers = sign_request(self.wallet, body)
                     fresh_headers["Content-Type"] = "application/json"
                     resp = await client.post(url, content=body, headers=fresh_headers)
                     if resp.status_code < 400:
@@ -783,33 +662,20 @@ class TrainingCoordinator:
         deadline = asyncio.get_event_loop().time() + Config.TRAINER_PREPARE_TIMEOUT
         result: dict[int, str] = {}
 
-        # Track the per-round flags so dispatch / scoring can read them.
-        targon_unavailable: dict[int, bool] = self._targon_unavailable.setdefault(round_id, {})
-        # Cache ready messages so mid-round reverify can re-hit each CVM.
-        ready_cache: dict[int, "TrainerReady"] = self._ready_msgs.setdefault(round_id, {})
-
         while asyncio.get_event_loop().time() < deadline:
             ready = get_ready_trainers(round_id)
             for uid, ready_msg in ready.items():
                 if uid in result:
                     continue
-                ok, reason, soft_fail = await self._verify_ready(ready_msg, uid)
-                if not ok:
-                    if soft_fail:
-                        # Targon API down — let the round proceed with a flag.
-                        targon_unavailable[uid] = True
-                        result[uid] = ready_msg.trainer_url
-                        logger.warning(
-                            "UID %d trainer accepted with targon_unavailable=True: %s",
-                            uid, reason,
-                        )
-                    else:
+                # Verify the pod via Basilica public metadata
+                if ready_msg.instance_name:
+                    ok, reason = await verify_miner_pod(ready_msg.instance_name)
+                    if not ok:
                         logger.warning(
                             "UID %d TrainerReady failed verification: %s", uid, reason,
                         )
-                    continue
+                        continue
                 result[uid] = ready_msg.trainer_url
-                ready_cache[uid] = ready_msg
                 logger.info("UID %d trainer ready at %s", uid, ready_msg.trainer_url)
 
             if len(result) >= len(sent_uids):
@@ -873,17 +739,12 @@ class TrainingCoordinator:
                 if not commitment or not commitment.listener_url:
                     continue
                 try:
-                    mg_hotkeys = getattr(self.metagraph, "hotkeys", None) or []
                     release = TrainerRelease(
                         round_id=round_id,
-                        miner_hotkey=(
-                            mg_hotkeys[uid]
-                            if uid < len(mg_hotkeys)
-                            else ""
-                        ),
+                        miner_hotkey=get_hotkey_for_uid(uid),
                     )
                     body = release.to_json().encode()
-                    headers = self._sign(body)
+                    headers = sign_request(self.wallet, body)
                     headers["Content-Type"] = "application/json"
                     url = f"{commitment.listener_url.rstrip('/')}/release"
                     await client.post(url, content=body, headers=headers)
@@ -894,178 +755,3 @@ class TrainingCoordinator:
         logger.info("Released %d trainers (round %d)", released, round_id)
         clear_ready_trainers(round_id)
         self._fallback_uids.pop(round_id, None)
-        await self.cancel_mid_round_reverify(round_id)
-        self._ready_msgs.pop(round_id, None)
-
-    # ── Trainer verification (backend-aware) ──────────────────────
-
-    def _get_targon_client(self):
-        if self._targon_client is None:
-            from shared.targon_breaker import CircuitBreaker
-            from shared.targon_client import TargonClient
-            self._targon_client = TargonClient(
-                base_url=Config.TARGON_API_BASE_URL,
-                tower_url=Config.TARGON_TOWER_URL,
-                timeout=Config.TARGON_VERIFICATION_TIMEOUT,
-                breaker=CircuitBreaker(
-                    threshold=Config.TARGON_CIRCUIT_BREAKER_THRESHOLD,
-                    reset_after=Config.TARGON_CIRCUIT_BREAKER_RESET,
-                ),
-            )
-        return self._targon_client
-
-    async def _verify_ready(self, ready_msg, uid: int) -> tuple[bool, str, bool]:
-        """Verify a TrainerReady envelope. Returns (ok, reason, soft_fail).
-
-        ``soft_fail=True`` means the round should proceed with a
-        ``targon_unavailable`` flag instead of excluding the miner —
-        the only soft-fail signal is the Targon circuit breaker.
-        """
-        if Config.HOSTING_BACKEND == "targon":
-            from validator.trainer_verify import verify_trainer
-            mg_hotkeys = getattr(self.metagraph, "hotkeys", None) or []
-            hotkey = (
-                mg_hotkeys[uid]
-                if uid < len(mg_hotkeys) else ready_msg.miner_hotkey
-            )
-            result = await verify_trainer(
-                ready=ready_msg,
-                miner_hotkey=hotkey,
-                expected_image_digest=Config.OFFICIAL_TRAINING_IMAGE_DIGEST,
-                trainer_url=ready_msg.trainer_url,
-                targon_client=self._get_targon_client(),
-                wallet=self.wallet,
-                require_boot_proof=Config.REQUIRE_BOOT_PROOF,
-            )
-            return result.ok, result.reason, result.targon_unavailable
-
-        # Basilica path — preserve original behavior.
-        from validator.pod_manager import verify_miner_pod
-        if not ready_msg.instance_name:
-            return True, "", False
-        ok, reason = await verify_miner_pod(ready_msg.instance_name)
-        return ok, reason, False
-
-    async def reverify_running(
-        self, round_id: int, miner_uid: int, ready_msg, block_hash: str,
-    ) -> bool:
-        """Run a single mid-round re-verification. Returns False on compromise.
-
-        Caller schedules this at deterministic offsets within the
-        training window via ``trainer_verify.reverify_offsets``. We
-        keep that helper out of the hot path because the offsets are
-        block-derived (see compute_assignments for the same pattern).
-        """
-        if Config.HOSTING_BACKEND != "targon":
-            return True  # No mid-run check on Basilica.
-        from validator.trainer_verify import reverify_workload
-        mg_hotkeys = getattr(self.metagraph, "hotkeys", None) or []
-        miner_hotkey = (
-            mg_hotkeys[miner_uid]
-            if miner_uid < len(mg_hotkeys) else ready_msg.miner_hotkey
-        )
-        result = await reverify_workload(
-            ready=ready_msg,
-            expected_image_digest=Config.OFFICIAL_TRAINING_IMAGE_DIGEST,
-            trainer_url=ready_msg.trainer_url,
-            targon_client=self._get_targon_client(),
-            require_boot_proof=Config.REQUIRE_BOOT_PROOF,
-            expected_signer_hotkey=miner_hotkey,
-        )
-        if result.targon_unavailable:
-            self._targon_unavailable.setdefault(round_id, {})[miner_uid] = True
-            return True  # treat as soft-pass
-        if not result.ok:
-            self._compromised.setdefault(round_id, {})[miner_uid] = True
-            logger.warning(
-                "Mid-run reverify failed for UID %d (round %d): %s",
-                miner_uid, round_id, result.reason,
-            )
-            return False
-        return True
-
-    def schedule_mid_round_reverify(
-        self,
-        round_id: int,
-        block_hash: str,
-        training_window_seconds: float,
-        n_checkpoints: int | None = None,
-    ) -> int:
-        """Fire background reverify tasks at deterministic offsets.
-
-        Returns the number of tasks spawned. Caller invokes this once at
-        the start of Phase B; the tasks self-clean and ``release_trainers``
-        cancels any stragglers. No-op for the Basilica backend.
-        """
-        if Config.HOSTING_BACKEND != "targon":
-            return 0
-        from validator.trainer_verify import reverify_offsets
-        ready_msgs = self._ready_msgs.get(round_id) or {}
-        n = n_checkpoints if n_checkpoints is not None else Config.TARGON_REVERIFY_CHECKPOINTS
-        spawned: list[asyncio.Task] = []
-        for uid, ready_msg in ready_msgs.items():
-            if not ready_msg.targon_workload_uid:
-                continue  # Basilica miner in a Targon-mode validator — skip.
-            offsets = reverify_offsets(
-                block_hash, round_id, uid,
-                n=n, window_seconds=training_window_seconds,
-            )
-            spawned.append(asyncio.create_task(
-                self._run_reverify_schedule(round_id, uid, ready_msg, offsets, block_hash)
-            ))
-        self._reverify_tasks.setdefault(round_id, []).extend(spawned)
-        if spawned:
-            logger.info(
-                "Scheduled mid-round reverify: round=%d miners=%d checkpoints_each=%d",
-                round_id, len(spawned), n,
-            )
-        return len(spawned)
-
-    async def _run_reverify_schedule(
-        self, round_id: int, miner_uid: int, ready_msg, offsets: list[float],
-        block_hash: str = "",
-    ) -> None:
-        """Sleep to each offset, then run reverify_running once. Stops early on first failure."""
-        last = 0.0
-        for offset in offsets:
-            delta = max(0.0, offset - last)
-            try:
-                await asyncio.sleep(delta)
-            except asyncio.CancelledError:
-                return
-            last = offset
-            try:
-                ok = await self.reverify_running(round_id, miner_uid, ready_msg, block_hash)
-            except Exception as e:
-                logger.warning(
-                    "Reverify task crashed for round=%d uid=%d: %s",
-                    round_id, miner_uid, e,
-                )
-                return
-            if not ok:
-                # reverify_running already logged + recorded compromise.
-                return
-
-    async def cancel_mid_round_reverify(self, round_id: int) -> None:
-        tasks = self._reverify_tasks.pop(round_id, [])
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        for t in tasks:
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
-
-    def round_metadata(self, round_id: int) -> dict:
-        """Snapshot Targon flags for the round — written into experiment rows.
-
-        Returns a dict with ``targon_unavailable`` (list of UIDs that
-        verified soft) and ``compromised`` (list of UIDs that failed
-        re-verify). Scoring reads these to apply the multiplier and
-        exclusion respectively.
-        """
-        return {
-            "targon_unavailable": sorted((self._targon_unavailable.get(round_id) or {}).keys()),
-            "compromised": sorted((self._compromised.get(round_id) or {}).keys()),
-        }

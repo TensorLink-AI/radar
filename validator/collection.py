@@ -5,16 +5,7 @@ the OFFICIAL agent image, send challenges, collect proposals.
 Work-split across validators — each runs a subset.
 Proposals uploaded to R2 so all validators see all submissions.
 
-Each agent run produces three trust tiers of metadata, all collected here:
-
-* Self-reported (stderr ``trace``, ``reasoning``, ``tool_calls``):
-  written by the miner's agent code; trivially fakeable.
-* Observed (``agent_behavior``): pod wall-clock + per-category proxy
-  call counts measured by the validator outside the pod.
-* Verified: produced later in Phase C (results, score).
-
-The combined ``agent_meta`` per UID is uploaded to R2 alongside the
-Proposal so other validators see the same picture.
+Agent stderr (reasoning trace) is captured and stored alongside proposals.
 """
 
 from __future__ import annotations
@@ -23,19 +14,17 @@ import asyncio
 import hashlib
 import json
 import logging
-import time
 from typing import Optional
 
 from config import Config
 from shared.agent_code import compute_code_hash, validate_bundle
 from shared.artifacts import generate_scratchpad_urls
-from shared.commitment import ImageCommitment
 from shared.db_client import DatabaseClient
 from shared.protocol import Proposal
 from shared.url_gate import parse_allowed_urls
+from validator.coordinator import ImageCommitment  # minimal placeholder type
 from validator.pod_manager import (
-    cleanup_agent_env, launch_agent_pod, pre_validate_agent_code,
-    run_agent_on_pod,
+    launch_agent_pod, pre_validate_agent_code, run_agent_on_pod,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,71 +32,6 @@ logger = logging.getLogger(__name__)
 # Polling parameters for R2 proposal sync
 _PROPOSAL_SYNC_MAX_WAIT = 120  # max seconds to wait for other validators
 _PROPOSAL_SYNC_POLL_INTERVAL = 15  # seconds between polls
-
-# Storage hygiene: agents that emit megabytes of stderr or reasoning would
-# bloat the experiments table without producing extra signal. These caps
-# are intentionally generous (a typical reasoning trace is < 64 KB).
-_TRACE_MAX_BYTES = 256 * 1024
-_REASONING_MAX_BYTES = 256 * 1024
-_TOOL_CALLS_MAX = 256
-
-
-def _truncate_text(value: str, limit: int) -> str:
-    """Cap a string at ``limit`` UTF-8 bytes, preserving valid UTF-8."""
-    if not value:
-        return ""
-    raw = value.encode("utf-8", errors="replace")
-    if len(raw) <= limit:
-        return value
-    truncated = raw[:limit].decode("utf-8", errors="ignore")
-    suffix = f"\n... [truncated {len(raw) - limit} bytes]"
-    return truncated + suffix
-
-
-def _normalise_tool_calls(value) -> list:
-    """Coerce a self-reported tool_calls payload to a bounded list of dicts."""
-    if not isinstance(value, list):
-        return []
-    out: list = []
-    for entry in value[:_TOOL_CALLS_MAX]:
-        if isinstance(entry, dict):
-            out.append(entry)
-        else:
-            # Stringify scalars so consumers always see a uniform shape.
-            out.append({"value": str(entry)})
-    return out
-
-
-def _empty_meta() -> dict:
-    """Per-UID metadata bag used when no real run produced anything."""
-    return {
-        "agent_log": "",
-        "reasoning": "",
-        "tool_calls": [],
-        "agent_behavior": {},
-    }
-
-
-def _snapshot_agent_behavior(
-    uid: int, started_at: float, exit_status: str,
-) -> dict:
-    """Build the validator-observed ``agent_behavior`` dict.
-
-    Pulls per-agent proxy counters from ``validator.db_proxy`` (None if
-    the proxy module isn't initialised, e.g. in unit tests). Adds the
-    pod wall-clock and exit status the validator measured itself.
-    """
-    proxy_metrics: dict = {}
-    try:
-        from validator import db_proxy as _db_proxy
-        proxy_metrics = _db_proxy.get_agent_behavior(uid)
-    except Exception:
-        proxy_metrics = {}
-    return {
-        "wall_clock_s": round(max(0.0, time.monotonic() - started_at), 3),
-        "exit_status": exit_status,
-        "proxy": proxy_metrics,
-    }
 
 
 def _attach_scratchpad_urls(challenge_json: str, r2, hotkey: str) -> str:
@@ -132,10 +56,7 @@ def _build_allowed_urls(challenge_json: str) -> str:
     """Build the allowed URL prefix string for agent pods.
 
     Combines the static config allowlist with dynamic URLs derived
-    from the challenge (validator proxy, desearch proxy, cognition wiki).
-    The wiki URL is a per-object presigned URL, so the full URL is added
-    rather than a base prefix; harness.py uses the same trick for
-    scratchpad URLs.
+    from the challenge (validator proxy, desearch proxy).
     """
     prefixes: list[str] = parse_allowed_urls(Config.AGENT_ALLOWED_URLS)
     try:
@@ -146,9 +67,6 @@ def _build_allowed_urls(challenge_json: str) -> str:
                 base = url.rstrip("/") + "/"
                 if base not in prefixes:
                     prefixes.append(base)
-        wiki_url = data.get("cognition_wiki_url", "")
-        if wiki_url and not any(wiki_url.startswith(p) for p in prefixes):
-            prefixes.append(wiki_url)
     except (json.JSONDecodeError, TypeError):
         pass
     return ",".join(prefixes)
@@ -160,7 +78,7 @@ async def _fetch_agent_bundle(
 ) -> Optional[dict]:
     """Fetch a miner's agent code bundle from the DB server.
 
-    Verifies the code_hash against the on-chain commitment.
+    Verifies the code_hash against the stored commitment if present.
     Returns the validated bundle dict or None.
     """
     if not commitment.hotkey:
@@ -183,12 +101,12 @@ async def _fetch_agent_bundle(
         )
         return None
 
-    # Verify code hash matches on-chain commitment
+    # Verify code hash matches the stored commitment
     if commitment.code_hash:
         actual_hash = compute_code_hash(bundle["files"])
         if actual_hash != commitment.code_hash:
             logger.warning(
-                "UID %d code hash mismatch: on-chain=%s actual=%s",
+                "UID %d code hash mismatch: expected=%s actual=%s",
                 commitment.miner_uid,
                 commitment.code_hash[:24],
                 actual_hash[:24],
@@ -206,14 +124,8 @@ async def _run_single_agent(
     round_id: int,
     allowed_urls: str,
     bundle: dict,
-) -> tuple[Optional[Proposal], dict]:
-    """Run a single miner agent.
-
-    Returns ``(proposal, meta)``. ``meta`` is a dict with keys
-    ``agent_log``, ``reasoning``, ``tool_calls``, ``agent_behavior``;
-    populated even when the proposal is None so the caller can record
-    why the run failed.
-    """
+) -> tuple[Optional[Proposal], str]:
+    """Run a single miner agent and return (proposal, agent_log) or (None, "")."""
     miner_challenge_json = _attach_scratchpad_urls(
         challenge_json, r2, commitment.hotkey,
     )
@@ -235,63 +147,36 @@ async def _run_single_agent(
     except (json.JSONDecodeError, TypeError, ValueError):
         agent_timeout = Config.AGENT_TIMEOUT
 
-    # Wrap launch + run in a single try/finally so a failure inside
-    # launch_agent_pod (or anywhere before cleanup) still triggers
-    # teardown. Each Basilica retry inside run_agent_on_pod can spawn a
-    # NEW deployment; cleanup_agent_env force-deletes every name we
-    # recorded, not just the latest, which prevents orphan accumulation
-    # on HTTP-error paths.
-    agent_env = None
-    started_at = time.monotonic()
+    agent_env = await launch_agent_pod(
+        image_url=Config.OFFICIAL_AGENT_IMAGE,
+        mem_limit="8192Mi",
+        agent_code=bundle,
+        allowed_urls=allowed_urls,
+    )
+
     try:
-        agent_env = await launch_agent_pod(
-            image_url=Config.OFFICIAL_AGENT_IMAGE,
-            mem_limit="8192Mi",
-            agent_code=bundle,
-            allowed_urls=allowed_urls,
-        )
         result = await run_agent_on_pod(
             agent_env, miner_challenge_json,
             timeout=agent_timeout,
             allowed_urls=allowed_urls,
-            task_id=uid,
         )
         if result and isinstance(result, dict) and "code" in result:
             proposal = Proposal(
                 code=result.get("code", ""),
                 name=result.get("name", ""),
                 motivation=result.get("motivation", ""),
-                reasoning=_truncate_text(
-                    result.get("reasoning", "") or "", _REASONING_MAX_BYTES,
-                ),
-                tool_calls=_normalise_tool_calls(result.get("tool_calls", [])),
-                prompt_id=str(result.get("prompt_id", "") or "")[:64],
             )
-            agent_log = _truncate_text(
-                result.get("agent_log", "") or "", _TRACE_MAX_BYTES,
-            )
-            agent_behavior = _snapshot_agent_behavior(uid, started_at, "ok")
-            meta = {
-                "agent_log": agent_log,
-                "reasoning": proposal.reasoning,
-                "tool_calls": proposal.tool_calls,
-                "agent_behavior": agent_behavior,
-                "prompt_id": proposal.prompt_id,
-            }
+            agent_log = result.get("agent_log", "")
             r2.upload_json(
                 f"round_{round_id}/proposals/{uid}.json",
                 {
                     "code": proposal.code,
                     "name": proposal.name,
                     "motivation": proposal.motivation,
-                    "reasoning": proposal.reasoning,
-                    "tool_calls": proposal.tool_calls,
-                    "prompt_id": proposal.prompt_id,
                     "agent_log": agent_log,
-                    "agent_behavior": agent_behavior,
                 },
             )
-            return proposal, meta
+            return proposal, agent_log
         else:
             error_msg = ""
             result_keys = ""
@@ -308,8 +193,11 @@ async def _run_single_agent(
                 type(result).__name__, result_keys,
             )
     finally:
-        await cleanup_agent_env(agent_env)
-    return None, _empty_meta()
+        try:
+            await agent_env.cleanup()
+        except Exception:
+            pass
+    return None, ""
 
 
 async def _run_agents_concurrently(
@@ -322,83 +210,75 @@ async def _run_agents_concurrently(
     round_id: int,
     allowed_urls: str,
     concurrency: int,
-) -> dict[int, tuple[Optional[Proposal], dict]]:
+) -> dict[int, tuple[Optional[Proposal], str]]:
     """Run multiple agents concurrently with a bounded semaphore.
 
-    Returns {uid: (proposal_or_None, meta)}. Per-agent exceptions are
-    logged and produce ``(None, _empty_meta())`` so one bad agent never
-    aborts the batch.
+    Returns {uid: (proposal_or_None, agent_log)}. Per-agent exceptions
+    are logged and produce (None, "") so one bad agent never aborts the
+    batch.
     """
     sem = asyncio.Semaphore(max(1, int(concurrency)))
 
-    async def _bounded(uid: int) -> tuple[int, Optional[Proposal], dict]:
+    async def _bounded(uid: int) -> tuple[int, Optional[Proposal], str]:
         async with sem:
             try:
-                proposal, meta = await _run_single_agent(
+                proposal, agent_log = await _run_single_agent(
                     uid, commitments[uid], challenge_json, r2, round_id,
                     allowed_urls, bundles[uid],
                 )
-                return uid, proposal, meta
+                return uid, proposal, agent_log
             except Exception as e:
                 logger.error("UID %d agent failed: %s", uid, e)
-                return uid, None, _empty_meta()
+                return uid, None, ""
 
     logger.info(
         "Running %d agents concurrently (cap=%d)",
         len(uids), max(1, int(concurrency)),
     )
     raw = await asyncio.gather(*[_bounded(uid) for uid in uids])
-    return {uid: (proposal, meta) for uid, proposal, meta in raw}
+    return {uid: (proposal, log) for uid, proposal, log in raw}
 
 
 async def run_and_collect_agents(
-    wallet,
-    metagraph,
-    challenge_json: str,
-    round_id: int,
-    seed: int,
-    r2,
-    my_uid: int,
-    validator_uids: list[int],
-    commitments: dict[int, ImageCommitment],
-    get_my_assignments_fn,
+    wallet=None,
+    challenge_json: str = "",
+    round_id: int = 0,
+    seed: int = 0,
+    r2=None,
+    my_uid: int = 0,
+    validator_uids: Optional[list[int]] = None,
+    commitments: Optional[dict[int, ImageCommitment]] = None,
+    get_my_assignments_fn=None,
     db_client: Optional[DatabaseClient] = None,
-) -> tuple[dict[int, Proposal], dict[int, dict]]:
+    **kwargs,
+) -> tuple[dict[int, Proposal], dict[int, str]]:
     """Phase A: run assigned miner agents, upload proposals to R2, read all.
 
     1. Work-split: get_my_assignments() for which agents this validator runs
     2. For each assigned miner:
        a. Fetch agent code bundle from DB server
-       b. Verify code_hash against on-chain commitment
+       b. Verify code_hash against the stored commitment
        c. launch_agent_pod() with official image + code injection
        d. run_agent_on_pod() with challenge JSON + URL allowlist
-       e. Upload proposal + per-agent metadata to R2:
-          round_{id}/proposals/{uid}.json
+       e. Upload proposal + agent_log to R2: round_{id}/proposals/{uid}.json
     3. Wait for other validators to upload
     4. Read all proposals from R2
     5. Dedup by code hash
-    6. Return ``({uid: Proposal}, {uid: meta})`` where ``meta`` is
-       ``{"agent_log", "reasoning", "tool_calls", "agent_behavior"}``.
+    6. Return ({uid: Proposal}, {uid: agent_log})
     """
+    commitments = commitments or {}
+    validator_uids = validator_uids or []
     all_uids = list(commitments.keys())
     my_agent_uids = get_my_assignments_fn(
         all_uids, validator_uids, my_uid, seed,
-    )
+    ) if get_my_assignments_fn else list(all_uids)
 
     # Build URL allowlist once for all agents this round
     allowed_urls = _build_allowed_urls(challenge_json)
 
     # Build DB client if not provided
     if db_client is None:
-        if Config.SERVICE_KEY:
-            db_client = DatabaseClient(
-                Config.DB_API_URL,
-                service_secret=Config.SERVICE_KEY.encode(),
-                key_id=Config.SERVICE_KEY_ID,
-                api_key=Config.DB_API_KEY,
-            )
-        else:
-            db_client = DatabaseClient(Config.DB_API_URL, wallet)
+        db_client = DatabaseClient(Config.DB_API_URL, wallet)
 
     # Pre-fetch all agent bundles for my assigned miners (concurrently).
     async def _prefetch(uid: int) -> tuple[int, Optional[dict]]:
@@ -418,7 +298,7 @@ async def run_and_collect_agents(
     # so no local resource contention; the cap throttles orchestration /
     # R2 fan-out and prevents one slow agent from serialising the round.
     proposals: dict[int, Proposal] = {}
-    agent_meta: dict[int, dict] = {}
+    agent_logs: dict[int, str] = {}
 
     runnable_uids = [uid for uid in my_agent_uids if uid in bundles]
     if runnable_uids:
@@ -432,10 +312,10 @@ async def run_and_collect_agents(
             allowed_urls=allowed_urls,
             concurrency=Config.AGENT_CONCURRENCY,
         )
-        for uid, (proposal, meta) in results.items():
+        for uid, (proposal, agent_log) in results.items():
             if proposal:
                 proposals[uid] = proposal
-                agent_meta[uid] = meta
+                agent_logs[uid] = agent_log
 
     logger.info(
         "Ran %d agents, got %d proposals", len(my_agent_uids), len(proposals),
@@ -463,29 +343,8 @@ async def run_and_collect_agents(
                             code=data["code"],
                             name=data.get("name", ""),
                             motivation=data.get("motivation", ""),
-                            reasoning=_truncate_text(
-                                data.get("reasoning", "") or "",
-                                _REASONING_MAX_BYTES,
-                            ),
-                            tool_calls=_normalise_tool_calls(
-                                data.get("tool_calls", []),
-                            ),
-                            prompt_id=str(
-                                data.get("prompt_id", "") or ""
-                            )[:64],
                         )
-                        agent_meta[uid] = {
-                            "agent_log": _truncate_text(
-                                data.get("agent_log", "") or "",
-                                _TRACE_MAX_BYTES,
-                            ),
-                            "reasoning": proposals[uid].reasoning,
-                            "tool_calls": proposals[uid].tool_calls,
-                            "prompt_id": proposals[uid].prompt_id,
-                            "agent_behavior": data.get("agent_behavior", {})
-                                if isinstance(data.get("agent_behavior"), dict)
-                                else {},
-                        }
+                        agent_logs[uid] = data.get("agent_log", "")
                     else:
                         still_missing.add(uid)
                 except Exception:
@@ -511,25 +370,8 @@ async def run_and_collect_agents(
                         code=data["code"],
                         name=data.get("name", ""),
                         motivation=data.get("motivation", ""),
-                        reasoning=_truncate_text(
-                            data.get("reasoning", "") or "",
-                            _REASONING_MAX_BYTES,
-                        ),
-                        tool_calls=_normalise_tool_calls(
-                            data.get("tool_calls", []),
-                        ),
                     )
-                    agent_meta[uid] = {
-                        "agent_log": _truncate_text(
-                            data.get("agent_log", "") or "",
-                            _TRACE_MAX_BYTES,
-                        ),
-                        "reasoning": proposals[uid].reasoning,
-                        "tool_calls": proposals[uid].tool_calls,
-                        "agent_behavior": data.get("agent_behavior", {})
-                            if isinstance(data.get("agent_behavior"), dict)
-                            else {},
-                    }
+                    agent_logs[uid] = data.get("agent_log", "")
             except Exception:
                 pass
 
@@ -567,21 +409,21 @@ async def run_and_collect_agents(
                 allowed_urls=allowed_urls,
                 concurrency=Config.AGENT_CONCURRENCY,
             )
-            for uid, (proposal, meta) in results.items():
+            for uid, (proposal, agent_log) in results.items():
                 if proposal:
                     proposals[uid] = proposal
-                    agent_meta[uid] = meta
+                    agent_logs[uid] = agent_log
 
     # Dedup by code hash
     seen_hashes: dict[str, int] = {}  # hash -> first uid that claimed it
     deduped: dict[int, Proposal] = {}
-    deduped_meta: dict[int, dict] = {}
+    deduped_logs: dict[int, str] = {}
     for uid, p in sorted(proposals.items()):
         h = hashlib.sha256(p.code.strip().encode()).hexdigest()
         if h not in seen_hashes:
             seen_hashes[h] = uid
             deduped[uid] = p
-            deduped_meta[uid] = agent_meta.get(uid, _empty_meta())
+            deduped_logs[uid] = agent_logs.get(uid, "")
         else:
             logger.warning(
                 "UID %d proposal rejected (duplicate): code hash %s "
@@ -594,4 +436,4 @@ async def run_and_collect_agents(
         "Phase A complete: %d total proposals, %d after dedup (%d duplicates removed)",
         len(proposals), len(deduped), dup_count,
     )
-    return deduped, deduped_meta
+    return deduped, deduped_logs

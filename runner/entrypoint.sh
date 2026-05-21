@@ -42,11 +42,11 @@ export PYTHONNOUSERSITE
 
 # Allow-list of env vars passed through to Python. Anything not matched
 # by either the exact-name set or the prefix set is unset before exec.
-allow_exact='^(PATH|HOME|LANG|LC_ALL|TZ|CUDA_VISIBLE_DEVICES|NVIDIA_VISIBLE_DEVICES|NVIDIA_DRIVER_CAPABILITIES|TRAINER_PORT|NETUID|SUBTENSOR_NETWORK|RADAR_LOCALNET|TRAINER_HOTKEY_COOLDOWN|METAGRAPH_REFRESH_INTERVAL|PYTHONNOUSERSITE)$'
-# Prefix allow-list — covers wallet vars (WALLET_*, BT_*), trainer-side
-# config (RADAR_*), artifact storage (R2_*, S3_*, AWS_*, HIPPIUS_*),
-# and localnet test overrides (MOCK_*).
-allow_prefix='^(WALLET_|BT_|RADAR_|R2_|S3_|AWS_|HIPPIUS_|MOCK_)'
+allow_exact='^(PATH|HOME|LANG|LC_ALL|TZ|CUDA_VISIBLE_DEVICES|NVIDIA_VISIBLE_DEVICES|NVIDIA_DRIVER_CAPABILITIES|TRAINER_PORT|RADAR_LOCALNET|TRAINER_HOTKEY_COOLDOWN|MINERS_CONFIG_PATH|PYTHONNOUSERSITE)$'
+# Prefix allow-list — covers trainer-side config (RADAR_*), artifact
+# storage (R2_*, S3_*, AWS_*, HIPPIUS_*), and localnet test overrides
+# (MOCK_*).
+allow_prefix='^(RADAR_|R2_|S3_|AWS_|HIPPIUS_|MOCK_)'
 
 names=$(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p')
 for name in $names; do

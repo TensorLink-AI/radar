@@ -400,23 +400,21 @@ class Config:
 
     # ── Neuron Mode ───────────────────────────────────────────
     # RADAR_NEURON_MODE controls which surface this process serves.
-    #   validator  — Epistula-authed write/read API for validators + miners,
-    #                plus desearch/LLM proxies. Runs metagraph sync + round
-    #                loop. Requires a Bittensor wallet. Optionally also mounts
-    #                the internal Jinja dashboard when RADAR_DASHBOARD_ENABLED=true.
-    #   dashboard  — Open public JSON API at /dashboard/api/*. No wallet, no
-    #                proxies, no metagraph sync, no Jinja, no Epistula.
+    #   validator  — HMAC-authed write/read API for validators + miners,
+    #                plus desearch/LLM proxies. Runs the peer-refresh /
+    #                round loop. Optionally also mounts the internal
+    #                Jinja dashboard when RADAR_DASHBOARD_ENABLED=true.
+    #   dashboard  — Open public JSON API at /dashboard/api/*. No HMAC
+    #                proxies, no Jinja dashboard.
     #                This is what gets deployed to Railway behind radarnet.io.
     #   all        — Everything on one process (legacy / dev default).
     NEURON_MODE: str = os.getenv("RADAR_NEURON_MODE", "all").lower()
 
     # ── Non-competitive mode ────────────────────────────────────
-    # When true, validators + miners SKIP all chain interactions:
-    #   * no metagraph sync, no Subtensor connection, no wallet
-    #   * no weight setting, no on-chain commitments
+    # When true, validators + miners run in HMAC-only mode:
+    #   * no peer-discovery beyond miners.json, no weight setting
     #   * outbound auth uses HMAC service key (RADAR_SERVICE_KEY)
-    #   * miner identity comes from bearer API keys, not hotkeys
-    # Existing competitive deployments leave this false and run unchanged.
+    #   * miner identity comes from bearer API keys, not the static peer set
     NONCOMPETITIVE: bool = os.getenv(
         "RADAR_NONCOMPETITIVE", "false",
     ).lower() in ("1", "true", "yes")

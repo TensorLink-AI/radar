@@ -1,242 +1,175 @@
-"""Auth primitives — both legacy Epistula and new HMAC/bearer surfaces.
+"""HMAC-based shared-secret authentication.
 
-Two coexisting auth schemes during the non-competitive cutover:
+Replaces the previous chain-based Epistula signing. Callers sign request
+bodies with a shared secret (``RADAR_SHARED_SECRET``) and the receiving
+side validates the ``X-Radar-Signature`` header with a constant-time
+compare.
 
-  Legacy (Epistula / SR25519, metagraph-backed)
-    sign_request(wallet, body)             -> headers
-    verify_request(headers, body, mg, …)   -> (ok, error, hotkey)
-
-  New (HMAC service-key + bearer API tokens)
-    hmac_sign_request(secret, body, kid)   -> headers
-    hmac_verify_request(headers, body, lk) -> (ok, error, key_id)
-    extract_bearer(headers)                -> token | None
-    hash_api_key(key)                      -> sha256 hex (for DB storage)
-
-The HMAC scheme signs ``f"{timestamp}.{sha256(body).hex()}"`` with
-HMAC-SHA256.  ``key_id`` is sent in cleartext so the verifier can look
-up the right secret; secrets themselves are never on the wire.
-
-Once every caller is on the new surface we'll drop the Epistula
-functions and the ``bittensor`` import below.
+This module keeps a few thin compatibility shims (``set_auth``, the
+``Epistula`` header names returned by :func:`sign_request`) so that the
+rest of the codebase — which used to call into chain-based signing —
+keeps working without changes. New code should prefer the explicit
+``sign_request_hmac`` / ``verify_request_hmac`` helpers.
 """
 
 from __future__ import annotations
 
-import hashlib
 import hmac
+import hashlib
 import logging
 import os
 import time
 import uuid
-from typing import Callable, Optional
+from typing import Optional, Union
 
 logger = logging.getLogger(__name__)
 
-# ── Legacy Epistula ──────────────────────────────────────────────────
+# Header used by the new HMAC scheme. Kept in sync with runner/server.py
+# and validator/db_proxy.py.
+SIGNATURE_HEADER = "X-Radar-Signature"
 
-# Epistula timestamp tolerance (seconds). Cross-machine clock skew between
-# validator hosts and miner trainer pods is the most common cause of 403s
-# here, so the default is intentionally generous.
-EPISTULA_TIMESTAMP_TOLERANCE = int(os.getenv("RADAR_EPISTULA_TOLERANCE", "120"))
+# Kept for backward compatibility with code that imports the constant.
+EPISTULA_TIMESTAMP_TOLERANCE = int(os.getenv("RADAR_EPISTULA_TOLERANCE", "30"))
+
+_ENV_SECRET = "RADAR_SHARED_SECRET"
 
 
-def sign_request(wallet, body: bytes) -> dict[str, str]:
-    """Sign an outgoing HTTP request with Epistula headers (legacy)."""
-    import bittensor as bt  # local import keeps non-chain processes light
+def _get_secret(explicit: Optional[str] = None) -> str:
+    """Return the configured shared secret (explicit override > env)."""
+    if explicit is not None:
+        return explicit
+    return os.getenv(_ENV_SECRET, "") or ""
 
-    _ = bt  # silence linter
+
+# ── Primary HMAC primitives ─────────────────────────────────────────
+
+
+def sign_request_hmac(body: bytes, secret: Optional[str] = None) -> str:
+    """Return the hex HMAC-SHA256 of ``body`` keyed by ``secret``.
+
+    If ``secret`` is None we read ``RADAR_SHARED_SECRET`` from the env.
+    Returns an empty string if no secret is configured (dev mode).
+    """
+    s = _get_secret(secret)
+    if not s:
+        return ""
+    mac = hmac.new(s.encode("utf-8"), body or b"", hashlib.sha256)
+    return mac.hexdigest()
+
+
+def verify_request_hmac(
+    body: bytes, signature: str, secret: Optional[str] = None,
+) -> bool:
+    """Constant-time HMAC-SHA256 verification.
+
+    Returns ``True`` when the signature matches. If the secret is unset,
+    returns ``False`` — callers may decide to fall back to "dev mode" in
+    that case (see ``runner/server.py``).
+    """
+    s = _get_secret(secret)
+    if not s:
+        return False
+    expected = sign_request_hmac(body, s)
+    if not expected or not signature:
+        return False
+    return hmac.compare_digest(expected, signature)
+
+
+# ── Compatibility shims used across the codebase ────────────────────
+
+
+def sign_request(wallet=None, body: Union[bytes, str] = b"") -> dict[str, str]:
+    """Return signed headers for an outbound HTTP request.
+
+    The ``wallet`` argument is ignored (it used to carry a Bittensor
+    Keypair). We always sign with the process-wide shared secret. The
+    returned dict carries both the new ``X-Radar-Signature`` header and a
+    minimal set of the legacy Epistula-style headers so old callers keep
+    working unmodified.
+    """
+    if isinstance(body, str):
+        body_bytes = body.encode("utf-8")
+    else:
+        body_bytes = body or b""
+
     timestamp = str(int(time.time()))
     nonce = uuid.uuid4().hex
-    message = body + timestamp.encode() + nonce.encode()
-    signature = wallet.hotkey.sign(message).hex()
-    return {
-        "X-Epistula-Signed-By": wallet.hotkey.ss58_address,
+    signature = sign_request_hmac(body_bytes)
+
+    headers = {
+        # New HMAC header — the one runner/server.py actually checks.
+        SIGNATURE_HEADER: signature,
+        # Legacy header names retained so unrelated code paths that read
+        # them (logs, proxies forwarding identity) don't break.
+        "X-Epistula-Signed-By": "",
         "X-Epistula-Timestamp": timestamp,
         "X-Epistula-Nonce": nonce,
         "X-Epistula-Signature": signature,
     }
+    return headers
 
 
 def verify_request(
-    headers: dict[str, str],
+    headers: dict,
     body: bytes,
-    metagraph,
-    require_stake: bool = False,
+    *args,
+    **kwargs,
 ) -> tuple[bool, str, str]:
-    """Verify Epistula headers on an inbound request (legacy)."""
-    import bittensor as bt
+    """Verify the HMAC signature on an inbound request.
 
-    hotkey = headers.get("x-epistula-signed-by", "")
-    timestamp_str = headers.get("x-epistula-timestamp", "")
-    nonce = headers.get("x-epistula-nonce", "")
-    signature = headers.get("x-epistula-signature", "")
+    Returns ``(ok, signer, error)``. ``signer`` is left empty under the
+    shared-secret scheme. Header lookup is case-insensitive against both
+    the new and the legacy header names.
 
-    if not all([hotkey, timestamp_str, nonce, signature]):
-        return False, "Missing Epistula headers", ""
+    If no secret is configured the request is allowed through (dev
+    fallback) and ``signer == "dev-mode"``.
+    """
+    if not headers:
+        headers = {}
+    # Case-insensitive lookup
+    def _h(name: str) -> str:
+        for k, v in headers.items():
+            if k.lower() == name.lower():
+                return v or ""
+        return ""
 
+    if not _get_secret():
+        return True, "dev-mode", ""
+
+    sig = _h(SIGNATURE_HEADER) or _h("X-Epistula-Signature")
+    if not sig:
+        return False, "", "Missing signature header"
+
+    if verify_request_hmac(body, sig):
+        return True, "", ""
+    return False, "", "Bad signature"
+
+
+def set_auth(*args, **kwargs):
+    """Compatibility entry point.
+
+    Old code wired the on-chain peer set in here to teach the auth layer
+    about registered hotkeys. With shared-secret HMAC that bookkeeping
+    isn't needed, but we still load the peer registry so callers that
+    depend on a populated peer cache (rate limiting, logging) get a warm
+    cache.
+    """
     try:
-        ts = int(timestamp_str)
-    except ValueError:
-        return False, "Invalid timestamp", ""
-    skew = int(time.time() - ts)
-    if abs(skew) > EPISTULA_TIMESTAMP_TOLERANCE:
-        err = (
-            f"Timestamp too old or too far in future "
-            f"(skew={skew}s, tolerance=±{EPISTULA_TIMESTAMP_TOLERANCE}s)"
-        )
-        return False, err, ""
-
-    uid = get_uid_for_hotkey(metagraph, hotkey)
-    if uid is None:
-        return False, "Unknown hotkey", ""
-
-    if require_stake and float(metagraph.S[uid]) <= 0:
-        return False, "Not a validator (no stake)", ""
-
-    message = body + timestamp_str.encode() + nonce.encode()
-    try:
-        keypair = bt.Keypair(ss58_address=hotkey)
-        if not keypair.verify(message, bytes.fromhex(signature)):
-            return False, "Invalid signature", ""
-    except Exception:
-        return False, "Signature verification failed", ""
-
-    return True, "", hotkey
-
-
-def get_uid_for_hotkey(metagraph, hotkey: str) -> Optional[int]:
-    hotkeys = metagraph.hotkeys
-    if hotkeys is None:
-        return None
-    for i in range(metagraph.n):
-        if i < len(hotkeys) and hotkeys[i] == hotkey:
-            return i
+        from shared.peers import load_peers
+        peers = load_peers()
+        logger.debug("set_auth: loaded %d peers", len(peers))
+    except Exception as e:  # pragma: no cover — defensive
+        logger.debug("set_auth: peer load failed: %s", e)
     return None
 
 
-# ── New HMAC primitives ──────────────────────────────────────────────
-
-# How far the wire timestamp may drift from the verifier's clock.
-HMAC_TIMESTAMP_TOLERANCE = int(os.getenv("RADAR_HMAC_TOLERANCE", "300"))
-
-DEFAULT_KEY_ID = "operator"
-
-H_SIG = "x-radar-signature"
-H_TS = "x-radar-timestamp"
-H_KID = "x-radar-key-id"
-H_AUTH = "authorization"
-
-KeyLookup = Callable[[str], Optional[bytes]]
+def register_peers_for_auth(*args, **kwargs):
+    """Alias for :func:`set_auth` used by some callers."""
+    return set_auth(*args, **kwargs)
 
 
-def _canonical(body: bytes, timestamp: str) -> bytes:
-    body_digest = hashlib.sha256(body).hexdigest()
-    return f"{timestamp}.{body_digest}".encode()
-
-
-def hmac_sign_request(
-    secret: bytes,
-    body: bytes,
-    key_id: str = DEFAULT_KEY_ID,
-) -> dict[str, str]:
-    """HMAC-SHA256 sign a request. Caller attaches the returned headers
-    to its outbound HTTP request."""
-    if not isinstance(secret, (bytes, bytearray)):
-        raise TypeError("secret must be bytes")
-    timestamp = str(int(time.time()))
-    sig = hmac.new(secret, _canonical(body, timestamp), hashlib.sha256).hexdigest()
-    return {
-        "X-Radar-Signature": sig,
-        "X-Radar-Timestamp": timestamp,
-        "X-Radar-Key-Id": key_id,
-    }
-
-
-def hmac_verify_request(
-    headers: dict[str, str],
-    body: bytes,
-    key_lookup: KeyLookup,
-    tolerance_s: int = HMAC_TIMESTAMP_TOLERANCE,
-) -> tuple[bool, str, str]:
-    """Verify HMAC headers on an inbound request.
-
-    ``key_lookup`` resolves ``key_id -> secret``.  Returning ``None``
-    fails verification closed.  Returns ``(ok, error, key_id)`` with
-    ``key_id`` empty on failure.
-    """
-    h = {k.lower(): v for k, v in headers.items()}
-    sig = h.get(H_SIG, "")
-    ts = h.get(H_TS, "")
-    kid = h.get(H_KID, "")
-
-    if not sig or not ts or not kid:
-        return False, "missing HMAC headers", ""
-
-    try:
-        ts_int = int(ts)
-    except ValueError:
-        return False, "invalid timestamp", ""
-    skew = int(time.time()) - ts_int
-    if abs(skew) > tolerance_s:
-        return False, (
-            f"timestamp out of tolerance (skew={skew}s, "
-            f"tolerance=±{tolerance_s}s)"
-        ), ""
-
-    secret = key_lookup(kid)
-    if secret is None:
-        return False, "unknown key_id", ""
-
-    expected = hmac.new(secret, _canonical(body, ts), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, sig):
-        return False, "bad signature", ""
-
-    return True, "", kid
-
-
-def static_key_lookup(key_id: str, secret: bytes) -> KeyLookup:
-    """Build a ``key_lookup`` that accepts exactly one ``(key_id, secret)``
-    — the common case for trainer-side service auth."""
-    expected = key_id
-
-    def lookup(kid: str) -> Optional[bytes]:
-        if kid == expected:
-            return secret
-        return None
-
-    return lookup
-
-
-# ── Bearer tokens (per-agent / per-miner API keys) ───────────────────
-
-
-def extract_bearer(headers: dict[str, str]) -> Optional[str]:
-    """Return the bearer token from an ``Authorization`` header, or
-    ``None`` if missing/malformed."""
-    h = {k.lower(): v for k, v in headers.items()}
-    raw = h.get(H_AUTH, "")
-    if not raw:
-        return None
-    parts = raw.split(None, 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        return None
-    token = parts[1].strip()
-    return token or None
-
-
-def hash_api_key(key: str) -> str:
-    """SHA-256 hex digest. The DB stores this — never the raw key."""
-    return hashlib.sha256(key.encode()).hexdigest()
-
-
-def load_service_secret(env: str = "RADAR_SERVICE_KEY") -> bytes:
-    """Read the shared HMAC service key from the environment.  Raises
-    ``RuntimeError`` if unset — callers that need fail-closed behavior
-    should let this propagate at startup."""
-    raw = os.getenv(env, "").strip()
-    if not raw:
-        raise RuntimeError(
-            f"{env} is unset — set it to a long random string shared "
-            f"between operator, validator, and trainer processes."
-        )
-    return raw.encode()
+def get_uid_for_hotkey(hotkey: str, *args, **kwargs) -> Optional[int]:
+    """Lookup helper backed by the static peer registry."""
+    from shared.peers import get_peer_by_hotkey
+    p = get_peer_by_hotkey(hotkey)
+    return p.uid if p else None

@@ -1,68 +1,6 @@
 """Tests for validator work-splitting (get_my_assignments)."""
 
-from types import SimpleNamespace
-
-from validator.neuron import compute_live_validator_uids, get_my_assignments
-
-
-def _mg(permits, last_update=None, n=None):
-    """Build a stub metagraph with permits and optional last_update."""
-    n = n if n is not None else len(permits)
-    return SimpleNamespace(
-        n=n,
-        validator_permit=list(permits),
-        last_update=list(last_update) if last_update is not None else None,
-    )
-
-
-class TestComputeLiveValidatorUids:
-    def test_permit_only(self):
-        """Without miner/block info, returns all permit holders."""
-        mg = _mg([True, False, True, True])
-        assert compute_live_validator_uids(mg) == [0, 2, 3]
-
-    def test_excludes_miners(self):
-        """UIDs with commitments are miners, not validators, even with permit."""
-        mg = _mg([True, True, True, True])
-        result = compute_live_validator_uids(mg, miner_uids={2, 3})
-        assert result == [0, 1]
-
-    def test_excludes_stale_last_update(self):
-        """Validators whose last_update is older than stale_blocks are skipped."""
-        # current_block=1000, stale_blocks=100. UID 2's last_update=500 -> stale.
-        mg = _mg([True, True, True], last_update=[950, 999, 500])
-        result = compute_live_validator_uids(
-            mg, current_block=1000, stale_blocks=100,
-        )
-        assert result == [0, 1]
-
-    def test_last_update_zero_is_bootstrap(self):
-        """last_update=0 (never updated) is not treated as stale."""
-        mg = _mg([True, True], last_update=[0, 0])
-        result = compute_live_validator_uids(
-            mg, current_block=1000, stale_blocks=100,
-        )
-        assert result == [0, 1]
-
-    def test_combined_filters(self):
-        """All three filters compose: permit + not-miner + fresh."""
-        mg = _mg(
-            [True, True, True, False, True],
-            last_update=[990, 990, 100, 990, 990],
-        )
-        result = compute_live_validator_uids(
-            mg,
-            miner_uids={1},          # UID 1 is a miner
-            current_block=1000,
-            stale_blocks=100,        # UID 2 stale
-        )
-        # UID 0 kept, 1 excluded (miner), 2 excluded (stale),
-        # 3 excluded (no permit), 4 kept
-        assert result == [0, 4]
-
-    def test_no_permits_returns_empty(self):
-        mg = SimpleNamespace(n=3, validator_permit=None, last_update=None)
-        assert compute_live_validator_uids(mg) == []
+from validator.neuron import get_my_assignments
 
 
 class TestGetMyAssignments:

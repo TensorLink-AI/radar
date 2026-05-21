@@ -2,7 +2,7 @@
 
 The bootstrap (``runner/_bootstrap.py``) writes ``/tmp/boot_proof.json``
 on a successful integrity check. This module reads that file, signs its
-canonical-JSON encoding with the trainer's hotkey, and returns the
+canonical-JSON encoding with the shared HMAC secret, and returns the
 payload ``runner/server.py`` exposes at GET /boot_proof.
 
 Kept out of ``runner/server.py`` so that file stays under the project's
@@ -27,24 +27,6 @@ def _canonical_json(obj) -> bytes:
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
 
 
-def _load_trainer_wallet():
-    """Load the trainer's hotkey wallet for signing /boot_proof responses.
-
-    Reads WALLET_NAME / WALLET_HOTKEY / WALLET_PATH (the entrypoint
-    allow-list passes WALLET_* and BT_* through). Returns None if the
-    wallet isn't available (e.g. localnet, missing files).
-    """
-    try:
-        import bittensor as bt
-        name = os.getenv("WALLET_NAME") or os.getenv("BT_WALLET_NAME") or "default"
-        hotkey = os.getenv("WALLET_HOTKEY") or os.getenv("BT_WALLET_HOTKEY") or "default"
-        path = os.getenv("WALLET_PATH") or os.getenv("BT_WALLET_PATH") or "~/.bittensor/wallets"
-        return bt.Wallet(name=name, hotkey=hotkey, path=path)
-    except Exception as e:
-        logger.warning("Trainer wallet load failed: %s", e)
-        return None
-
-
 def build_boot_proof_response(
     proof_path: Optional[str] = None,
     wallet=None,
@@ -53,10 +35,10 @@ def build_boot_proof_response(
 
     ``proof_path`` defaults to the module-level BOOT_PROOF_PATH and is
     resolved at call time so monkeypatched test paths take effect.
-    ``wallet`` is dependency-injected for tests; when None we try to
-    resolve the trainer's wallet from env. The signature is empty when
-    no wallet is available — validators that require attestation
-    treat that as a hard fail.
+    ``wallet`` is accepted for backward compatibility and ignored — the
+    proof is signed with the process-wide ``RADAR_SHARED_SECRET`` HMAC.
+    The signature is empty when no secret is configured; validators that
+    require attestation treat that as a hard fail.
     """
     if proof_path is None:
         proof_path = BOOT_PROOF_PATH
@@ -74,14 +56,13 @@ def build_boot_proof_response(
 
     payload = _canonical_json(proof)
     signature = ""
-    signer = ""
-    wallet = wallet if wallet is not None else _load_trainer_wallet()
-    if wallet is not None:
-        try:
-            signature = wallet.hotkey.sign(payload).hex()
-            signer = wallet.hotkey.ss58_address
-        except Exception as e:
-            logger.warning("Boot proof signing failed: %s", e)
+    try:
+        from shared.auth import sign_request_hmac
+        signature = sign_request_hmac(payload)
+    except Exception as e:  # pragma: no cover — defensive
+        logger.warning("Boot proof HMAC signing failed: %s", e)
+
+    signer = os.getenv("RADAR_TRAINER_ID", "")
 
     return 200, {
         "proof": proof,

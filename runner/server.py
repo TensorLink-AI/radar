@@ -7,7 +7,7 @@ Untrusted miner training code never runs in this process.  Each /train
 request prefetches data with the parent's network credentials, then
 spawns ``runner/sandbox_runner.py`` in a separate, network-isolated
 subprocess via ``runner/sandbox.py::run_sandbox``.  The sandbox child
-inherits no R2 / wallet / Basilica secrets and cannot import any
+inherits no R2 / artifact-store / Basilica secrets and cannot import any
 high-level HTTP client.
 """
 
@@ -39,9 +39,9 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Radar Trainer")
 
 # ── Auth (shared HMAC service key) ───────────────────────────────────
-# In non-competitive mode there's exactly one issuer (the operator), so
-# the trainer just verifies HMAC against ``RADAR_SERVICE_KEY``.  No
-# metagraph fetch, no bittensor import.
+# There's exactly one issuer (the operator), so the trainer just
+# verifies HMAC against ``RADAR_SERVICE_KEY``.  No peer-set fetch,
+# no external chain dependency.
 
 def _service_secret() -> bytes | None:
     raw = os.getenv("RADAR_SERVICE_KEY", "").strip()
@@ -202,8 +202,8 @@ async def _train_and_upload(
 
     Network-touching steps (prefetch + R2 upload) run in *this* process,
     which has the deployment's secrets.  The miner's training code runs
-    in a separate ``sandbox_runner.py`` subprocess with no R2 / wallet
-    credentials and no network-capable Python imports.
+    in a separate ``sandbox_runner.py`` subprocess with no R2 /
+    artifact-store credentials and no network-capable Python imports.
     """
     round_id = training_config["round_id"]
     submission_id = training_config["submission_id"]
