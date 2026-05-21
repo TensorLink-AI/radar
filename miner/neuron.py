@@ -16,7 +16,10 @@ import logging
 import os
 import time
 
-import bittensor as bt
+try:
+    import bittensor as bt
+except ImportError:  # pragma: no cover — only fires in noncompetitive deploys
+    bt = None  # type: ignore[assignment]
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
@@ -52,9 +55,9 @@ listener_app = FastAPI(title="RADAR Miner Listener")
 class Miner:
     """Radar subnet miner — Docker agent + warm-standby trainer listener."""
 
-    def __init__(self, config: bt.Config):
+    def __init__(self, config):
         self.config = config
-        self.netuid = config.netuid
+        self.netuid = getattr(config, "netuid", 1)
 
         # Fail-fast on Targon misconfig — operator gets a clear error at
         # startup instead of a cryptic deploy failure on the first round.
@@ -85,17 +88,27 @@ class Miner:
                 "image and set RADAR_RUNPOD_ENDPOINT_ID to its id."
             )
 
-        self.wallet = bt.Wallet(config=config)
-        self.subtensor = bt.Subtensor(config=config)
+        # Bittensor chain — skipped entirely in non-competitive mode
+        if Config.NONCOMPETITIVE:
+            self.wallet = None
+            self.subtensor = None
+            self.metagraph = None
+        else:
+            if bt is None:
+                raise RuntimeError(
+                    "competitive mode requires the bittensor package; "
+                    "install with `pip install bittensor` or run with "
+                    "RADAR_NONCOMPETITIVE=true."
+                )
+            self.wallet = bt.Wallet(config=config)
+            self.subtensor = bt.Subtensor(config=config)
+            self.metagraph = self.subtensor.metagraph(self.netuid)
         self._targon_client = None
         self._runpod_client = None
         # Per-round RunPod job ids the miner has submitted on behalf of
         # validators. Cancelled at end-of-round / shutdown.
         # round_id → list[job_id]
         self._runpod_jobs: dict[int, list[str]] = {}
-
-        # Cache metagraph — synced periodically in keep-alive loop
-        self.metagraph = self.subtensor.metagraph(self.netuid)
 
         # Agent code directory — validators fetch the code and run it
         # in the official sandboxed image
@@ -754,7 +767,7 @@ class Miner:
                 logger.warning("Metagraph sync failed: %s", e)
 
 
-def get_config() -> bt.Config:
+def get_config():
     parser = argparse.ArgumentParser(description="Radar Miner")
     parser.add_argument("--netuid", type=int, default=1)
     parser.add_argument("--agent_dir", type=str, default="agent/",
@@ -766,15 +779,31 @@ def get_config() -> bt.Config:
                         help="Trainer Docker image deployed on Basilica on-demand")
     parser.add_argument("--external_ip", type=str, default="",
                         help="External IP for listener URL committed to chain")
+    if Config.NONCOMPETITIVE or bt is None:
+        return parser.parse_args()
     bt.Wallet.add_args(parser)
     bt.Subtensor.add_args(parser)
     return bt.Config(parser)
 
 
 def main():
+    import sys
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    # Subcommand router: ``results`` / ``optimize`` / ``prompts`` go to
+    # ``miner/cli.py``.  Anything else (or no args) falls through to the
+    # legacy ``run`` behavior so existing deployments keep working.
+    from miner import cli
+    if cli.is_subcommand(sys.argv):
+        sys.exit(cli.dispatch(sys.argv))
+    # Optional explicit ``run`` token for clarity; strip it before the
+    # bittensor argparse kicks in.
+    if len(sys.argv) >= 2 and sys.argv[1] == "run":
+        del sys.argv[1]
+
     config = get_config()
     miner = Miner(config)
     asyncio.run(miner.run())

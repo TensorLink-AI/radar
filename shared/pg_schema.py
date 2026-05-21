@@ -247,6 +247,52 @@ CREATE INDEX IF NOT EXISTS idx_access_hotkey_round
     ON miner_access_log(hotkey, round_id);
 """
 
+# Miner registry + bearer API keys for the non-competitive cutover.
+# A ``miner_id`` is an opaque operator-issued identifier (UUID by default)
+# that decouples the feedback API from the on-chain hotkey identity.
+# During the dual-stack period a miner row carries both: ``hotkey`` is
+# the bittensor SS58 (nullable, only set for chain-registered miners) and
+# ``miner_id`` is the bearer-auth identifier scoped to /miners/me/*.
+MINER_REGISTRY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS miners (
+    miner_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    hotkey TEXT NOT NULL DEFAULT '',
+    contact TEXT NOT NULL DEFAULT '',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT extract(epoch from now()),
+    revoked_at DOUBLE PRECISION
+);
+CREATE INDEX IF NOT EXISTS idx_miners_hotkey ON miners(hotkey)
+    WHERE hotkey <> '';
+
+CREATE TABLE IF NOT EXISTS miner_api_keys (
+    key_id TEXT PRIMARY KEY,
+    key_hash TEXT NOT NULL,
+    miner_id TEXT NOT NULL REFERENCES miners(miner_id) ON DELETE CASCADE,
+    scope TEXT NOT NULL DEFAULT 'miner',
+    label TEXT NOT NULL DEFAULT '',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT extract(epoch from now()),
+    last_used_at DOUBLE PRECISION,
+    revoked_at DOUBLE PRECISION
+);
+CREATE INDEX IF NOT EXISTS idx_miner_api_keys_hash
+    ON miner_api_keys(key_hash) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_miner_api_keys_miner
+    ON miner_api_keys(miner_id);
+
+-- ``prompt_id`` on experiments lets miners correlate Phase C scores
+-- with the prompt variant that produced the architecture (drives the
+-- GEPA / random_mutate feedback loop on the miner CLI).  Opaque to
+-- the operator; only the issuing miner interprets it.
+ALTER TABLE experiments
+    ADD COLUMN IF NOT EXISTS prompt_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_experiments_prompt_id
+    ON experiments(prompt_id) WHERE prompt_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_experiments_miner_prompt
+    ON experiments(miner_hotkey, prompt_id)
+    WHERE prompt_id IS NOT NULL;
+"""
+
 
 def _decode_jsonb(value, default):
     """Coerce a JSONB column value to a Python dict/list.
@@ -314,6 +360,9 @@ def row_to_element(row) -> DataElement:
         _decode_jsonb(row["substrate_cids"], [])
         if "substrate_cids" in row_keys else []
     )
+    prompt_id = (
+        (row["prompt_id"] or "") if "prompt_id" in row_keys else ""
+    )
 
     return DataElement(
         index=row["id"],
@@ -340,6 +389,7 @@ def row_to_element(row) -> DataElement:
         task=row["task"],
         round_id=row["round_id"] if row["round_id"] is not None else -1,
         substrate_cids=substrate_cids,
+        prompt_id=prompt_id,
     )
 
 
@@ -366,7 +416,7 @@ def _jsonb(value) -> str:
 
 
 def element_to_params(element: DataElement, next_id: int) -> tuple:
-    """Convert a DataElement to a positional tuple for INSERT ($1..$24).
+    """Convert a DataElement to a positional tuple for INSERT ($1..$25).
 
     JSONB columns (loss_curve, generated_samples, objectives, tool_calls,
     agent_behavior, substrate_cids) are explicitly serialised with
@@ -375,6 +425,7 @@ def element_to_params(element: DataElement, next_id: int) -> tuple:
     are replaced with ``null`` to keep PostgreSQL happy.
     """
     round_id = element.round_id if element.round_id >= 0 else None
+    prompt_id = getattr(element, "prompt_id", "") or None
     return (
         next_id,
         element.name,
@@ -400,6 +451,7 @@ def element_to_params(element: DataElement, next_id: int) -> tuple:
         _jsonb(element.tool_calls),
         _jsonb(element.agent_behavior),
         _jsonb(element.substrate_cids),
+        prompt_id,
     )
 
 
@@ -409,13 +461,15 @@ INSERT INTO experiments (
     parent_index, generation, score, miner_uid, miner_hotkey,
     loss_curve, manifest_sha256, generated_samples, objectives,
     timestamp, round_id, task,
-    reasoning, tool_calls, agent_behavior, substrate_cids
+    reasoning, tool_calls, agent_behavior, substrate_cids,
+    prompt_id
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8,
     $9, $10, $11, $12, $13,
     $14, $15, $16, $17,
     $18, $19, $20,
-    $21, $22, $23, $24
+    $21, $22, $23, $24,
+    $25
 )
 """
 

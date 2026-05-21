@@ -18,7 +18,7 @@ from typing import Optional, TYPE_CHECKING
 import httpx
 
 from config import Config
-from shared.auth import sign_request
+from shared.auth import sign_request, hmac_sign_request
 from shared.protocol import Proposal, TrainerRequest, TrainerReady, TrainerRelease
 
 if TYPE_CHECKING:
@@ -143,6 +143,13 @@ class TrainingCoordinator:
         self.metagraph = metagraph
         self.r2 = r2
         self.my_uid = my_uid
+        # Off-chain deploy: when no wallet, sign outbound trainer / proxy
+        # requests with the shared HMAC service key. The trainer image
+        # (runner/server.py) verifies the same way.
+        self._service_secret = (
+            Config.SERVICE_KEY.encode() if (wallet is None and Config.SERVICE_KEY) else None
+        )
+        self._service_key_id = Config.SERVICE_KEY_ID
         # Optional dual-write store (TEN-240 Phase 7). When present, JSON
         # artifacts (dispatch records, frontier snapshots) fan out to both
         # R2 and Hippius. Falls back to R2-only when None — historical
@@ -162,6 +169,15 @@ class TrainingCoordinator:
         # tasks. Cancelled by release_trainers / cancel_mid_round_reverify.
         self._reverify_tasks: dict[int, list[asyncio.Task]] = {}
         self._targon_client = None
+
+    def _sign(self, body: bytes) -> dict[str, str]:
+        """Sign an outbound HTTP body. HMAC in off-chain deploys, Epistula
+        otherwise."""
+        if self._service_secret is not None:
+            return hmac_sign_request(
+                self._service_secret, body, key_id=self._service_key_id,
+            )
+        return sign_request(self.wallet, body)
 
     def compute_my_jobs(
         self,
@@ -294,7 +310,7 @@ class TrainingCoordinator:
                     # Sign fresh every attempt so the Epistula timestamp
                     # stays inside the EPISTULA_TIMESTAMP_TOLERANCE window
                     # (default 120s; tunable via RADAR_EPISTULA_TOLERANCE).
-                    headers = sign_request(self.wallet, payload)
+                    headers = self._sign(payload)
                     headers["Content-Type"] = "application/json"
                     resp = await client.post(
                         f"{url.rstrip('/')}/train",
@@ -606,7 +622,10 @@ class TrainingCoordinator:
         — the dispatching validator is the only entity that knows the
         opaque submission_id minted at dispatch.
         """
-        hotkey = self.wallet.hotkey.ss58_address
+        hotkey = (
+            self.wallet.hotkey.ss58_address
+            if self.wallet is not None else self._service_key_id
+        )
         key = f"round_{round_id}/dispatch/vali_{hotkey}.json"
         hotkeys = self.metagraph.hotkeys if hasattr(self.metagraph, "hotkeys") else []
         records = []
@@ -742,7 +761,7 @@ class TrainingCoordinator:
             for uid, commitment in with_listener.items():
                 try:
                     url = f"{commitment.listener_url.rstrip('/')}/prepare"
-                    fresh_headers = sign_request(self.wallet, body)
+                    fresh_headers = self._sign(body)
                     fresh_headers["Content-Type"] = "application/json"
                     resp = await client.post(url, content=body, headers=fresh_headers)
                     if resp.status_code < 400:
@@ -854,16 +873,17 @@ class TrainingCoordinator:
                 if not commitment or not commitment.listener_url:
                     continue
                 try:
+                    mg_hotkeys = getattr(self.metagraph, "hotkeys", None) or []
                     release = TrainerRelease(
                         round_id=round_id,
                         miner_hotkey=(
-                            self.metagraph.hotkeys[uid]
-                            if uid < len(self.metagraph.hotkeys)
+                            mg_hotkeys[uid]
+                            if uid < len(mg_hotkeys)
                             else ""
                         ),
                     )
                     body = release.to_json().encode()
-                    headers = sign_request(self.wallet, body)
+                    headers = self._sign(body)
                     headers["Content-Type"] = "application/json"
                     url = f"{commitment.listener_url.rstrip('/')}/release"
                     await client.post(url, content=body, headers=headers)
@@ -903,9 +923,10 @@ class TrainingCoordinator:
         """
         if Config.HOSTING_BACKEND == "targon":
             from validator.trainer_verify import verify_trainer
+            mg_hotkeys = getattr(self.metagraph, "hotkeys", None) or []
             hotkey = (
-                self.metagraph.hotkeys[uid]
-                if uid < len(self.metagraph.hotkeys) else ready_msg.miner_hotkey
+                mg_hotkeys[uid]
+                if uid < len(mg_hotkeys) else ready_msg.miner_hotkey
             )
             result = await verify_trainer(
                 ready=ready_msg,
@@ -938,9 +959,10 @@ class TrainingCoordinator:
         if Config.HOSTING_BACKEND != "targon":
             return True  # No mid-run check on Basilica.
         from validator.trainer_verify import reverify_workload
+        mg_hotkeys = getattr(self.metagraph, "hotkeys", None) or []
         miner_hotkey = (
-            self.metagraph.hotkeys[miner_uid]
-            if miner_uid < len(self.metagraph.hotkeys) else ready_msg.miner_hotkey
+            mg_hotkeys[miner_uid]
+            if miner_uid < len(mg_hotkeys) else ready_msg.miner_hotkey
         )
         result = await reverify_workload(
             ready=ready_msg,
