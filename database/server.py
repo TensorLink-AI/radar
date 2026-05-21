@@ -242,6 +242,13 @@ async def auth_middleware(request: Request, call_next):
     if path.startswith("/miners/me/"):
         return await _bearer_auth_then_call(request, call_next)
 
+    # Miners submit agent code with operator-issued bearer tokens — the
+    # validator proxy intentionally does not forward /agent_code, so this
+    # endpoint is the only one a miner posts to the DB directly. Bearer
+    # auth on POST; HMAC on the GET reads used by validators.
+    if path == "/agent_code" and request.method == "POST":
+        return await _bearer_auth_then_call_for_agent_code(request, call_next)
+
     needs_auth = (
         path.startswith("/experiments")
         or path.startswith("/challenge")
@@ -992,6 +999,62 @@ async def _bearer_auth_then_call(request: Request, call_next):
             status_code=403, content={"error": "Unknown or revoked token"},
         )
     request.state.miner_identity = ident
+    return await call_next(request)
+
+
+async def _bearer_auth_then_call_for_agent_code(request: Request, call_next):
+    """Bearer auth for miner-driven POST /agent_code.
+
+    Mirrors ``_bearer_auth_then_call`` but also enforces the body-size
+    limit, the per-caller rate limit, and surfaces the resolved hotkey
+    as ``request.state.caller_hotkey`` so the existing handler logic
+    (which was written for the HMAC path) keeps working unchanged.
+    """
+    from shared.auth import extract_bearer
+    from shared.miner_auth import lookup_bearer
+
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > _MAX_BODY_BYTES:
+        return JSONResponse(
+            status_code=413, content={"error": "Request body too large"},
+        )
+
+    token = extract_bearer(dict(request.headers))
+    if not token:
+        return JSONResponse(
+            status_code=401, content={"error": "Bearer token required"},
+        )
+    if _pool is None:
+        return JSONResponse(
+            status_code=503, content={"error": "DB pool not ready"},
+        )
+    try:
+        ident = await lookup_bearer(_pool, token)
+    except Exception as e:
+        logger.warning("bearer lookup failed: %s", e)
+        return JSONResponse(
+            status_code=503, content={"error": "auth lookup failed"},
+        )
+    if ident is None:
+        return JSONResponse(
+            status_code=403, content={"error": "Unknown or revoked token"},
+        )
+    if not ident.hotkey:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "Miner has no hotkey on file — register with "
+                         "`operator_cli register --hotkey <ss58>` before "
+                         "submitting agent code.",
+            },
+        )
+    if not _check_rate_limit(ident.key_id):
+        return JSONResponse(
+            status_code=429, content={"error": "Rate limit exceeded"},
+        )
+
+    request.state.miner_identity = ident
+    request.state.caller_hotkey = ident.hotkey
     return await call_next(request)
 
 
