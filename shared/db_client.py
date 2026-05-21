@@ -1,12 +1,15 @@
-"""HTTP client for validators to talk to the centralized database server.
+"""HTTP client for validators and miners to talk to the centralized DB server.
 
-Used for writes (POST experiments, provenance) and frontier fetches.
-All methods sign requests with Epistula via the validator's wallet.
+Used for writes (POST experiments, provenance, agent code) and frontier
+fetches. Requests are signed with the HMAC shared secret
+(``RADAR_SHARED_SECRET``); miners must additionally pass their hotkey so
+the server can identify the caller for endpoints like ``/agent_code``.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import httpx
@@ -19,11 +22,28 @@ logger = logging.getLogger(__name__)
 class DatabaseClient:
     """Async HTTP client for the centralized database API."""
 
-    def __init__(self, db_url: str, wallet, api_key: str = ""):
+    def __init__(
+        self,
+        db_url: str,
+        wallet=None,
+        api_key: str = "",
+        hotkey: str = "",
+    ):
         self.db_url = db_url.rstrip("/")
         self.wallet = wallet
         self.api_key = api_key or ""
+        self.hotkey = hotkey or ""
         self._client: Optional[httpx.AsyncClient] = None
+        self._auth_hint_logged: bool = False
+        if not self.api_key and not os.getenv("RADAR_SHARED_SECRET", ""):
+            logger.error(
+                "DatabaseClient(%s): neither RADAR_SHARED_SECRET nor an API "
+                "key is configured — signed requests will carry empty "
+                "signatures and the DB server will reject them with "
+                "'missing HMAC headers'. Set RADAR_SHARED_SECRET in the "
+                "environment to match the validator/DB server.",
+                self.db_url,
+            )
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -34,6 +54,8 @@ class DatabaseClient:
         headers = sign_request(self.wallet, body)
         if self.api_key:
             headers["X-Radar-API-Key"] = self.api_key
+        if self.hotkey:
+            headers["X-Miner-Hotkey"] = self.hotkey
         return headers
 
     async def _post(self, path: str, json_data: dict) -> Optional[dict]:
@@ -55,13 +77,14 @@ class DatabaseClient:
                 "DatabaseClient POST %s failed (HTTP %d): %s",
                 path, e.response.status_code, detail,
             )
+            self._maybe_warn_auth(e.response.status_code, detail)
             return None
         except Exception as e:
             logger.warning("DatabaseClient POST %s failed: %s", path, e)
             return None
 
     async def _get(self, path: str, params: Optional[dict] = None) -> Optional[dict]:
-        """GET with Epistula signing. Returns JSON response or None."""
+        """GET with HMAC signing. Returns JSON response or None."""
         try:
             client = await self._get_client()
             headers = self._sign(b"")
@@ -76,10 +99,41 @@ class DatabaseClient:
                 "DatabaseClient GET %s failed (HTTP %d): %s",
                 path, e.response.status_code, detail,
             )
+            self._maybe_warn_auth(e.response.status_code, detail)
             return None
         except Exception as e:
             logger.warning("DatabaseClient GET %s failed: %s", path, e)
             return None
+
+    def _maybe_warn_auth(self, status: int, detail: str) -> None:
+        """Emit a one-shot actionable hint when an auth-shaped 4xx comes back."""
+        if status not in (401, 403):
+            return
+        if self._auth_hint_logged:
+            return
+        body = (detail or "").lower()
+        looks_auth = (
+            "hmac" in body or "epistula" in body or "signature" in body
+            or "auth" in body or "unauthor" in body
+        )
+        if not looks_auth:
+            return
+        self._auth_hint_logged = True
+        if not os.getenv("RADAR_SHARED_SECRET", "") and not self.api_key:
+            logger.error(
+                "DatabaseClient auth rejected by %s: RADAR_SHARED_SECRET is "
+                "unset in this process, so all requests are being signed "
+                "with an empty HMAC. Export RADAR_SHARED_SECRET (matching "
+                "the value the DB server is configured with) and restart.",
+                self.db_url,
+            )
+        else:
+            logger.error(
+                "DatabaseClient auth rejected by %s — the configured "
+                "RADAR_SHARED_SECRET / API key does not match the server. "
+                "Verify the secret on both sides.",
+                self.db_url,
+            )
 
     # ── Public API ───────────────────────────────────────
 

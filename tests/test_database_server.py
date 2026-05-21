@@ -290,3 +290,42 @@ def test_agent_code_file_limits():
     """Agent code rejects too many files or oversized files."""
     assert _MAX_AGENT_FILES == 25
     assert _MAX_AGENT_FILE_BYTES == 100_000
+
+
+def test_hmac_middleware_rejects_missing_signature(monkeypatch):
+    """With RADAR_SHARED_SECRET set, protected POSTs require an HMAC header."""
+    _setup()
+    monkeypatch.setenv("RADAR_SHARED_SECRET", "test-secret")
+    # Make sure no API key path silently lets us through
+    from config import Config
+    monkeypatch.setattr(Config, "DB_API_KEY", "", raising=False)
+
+    client = TestClient(app)
+    r = client.post("/experiments/search", json={"query": "x"})
+    assert r.status_code == 403
+    assert "hmac" in r.json()["error"].lower()
+
+
+def test_hmac_middleware_accepts_signed_request(monkeypatch):
+    """A valid X-Radar-Signature lets the request through."""
+    _setup()
+    monkeypatch.setenv("RADAR_SHARED_SECRET", "test-secret")
+    from config import Config
+    monkeypatch.setattr(Config, "DB_API_KEY", "", raising=False)
+
+    from shared.auth import sign_request_hmac
+    import json as _json
+    body = _json.dumps({"query": "attention"}).encode()
+    sig = sign_request_hmac(body, "test-secret")
+
+    client = TestClient(app)
+    r = client.post(
+        "/experiments/search",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Radar-Signature": sig,
+            "X-Miner-Hotkey": "test-hotkey",
+        },
+    )
+    assert r.status_code == 200

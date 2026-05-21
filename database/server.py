@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -205,7 +206,7 @@ def _check_nonce(nonce: str) -> bool:
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Epistula auth on protected routes with IP-level flood protection."""
+    """HMAC shared-secret auth on protected routes + IP flood protection."""
     # ── IP-level rate limit (pre-auth, blocks unauthenticated floods) ──
     client_ip = request.client.host if request.client else "unknown"
     if not _check_ip_rate_limit(client_ip):
@@ -236,7 +237,7 @@ async def auth_middleware(request: Request, call_next):
                 status_code=413, content={"error": "Request body too large"},
             )
 
-        # ── Validator API key: trusted proxy, skip Epistula ──
+        # ── Validator API key: trusted proxy, skip HMAC ──
         from config import Config
         if Config.DB_API_KEY:
             import secrets as _secrets
@@ -245,13 +246,37 @@ async def auth_middleware(request: Request, call_next):
                 # Trusted validator proxy — rate-limit by IP instead of hotkey
                 if not _check_rate_limit(client_ip):
                     return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+                # Trust X-Miner-Hotkey forwarded by the proxy
+                request.state.caller_hotkey = request.headers.get("X-Miner-Hotkey", "")
                 response = await call_next(request)
                 return response
 
-        # Chain-based Epistula auth has been removed. Requests without an
-        # API key fall through to the response — IP rate limiting still
-        # protects against floods.
-        request.state.caller_hotkey = ""
+        # ── HMAC shared-secret path (direct miner → DB server) ──
+        from shared.auth import verify_request_hmac
+        secret = os.getenv("RADAR_SHARED_SECRET", "")
+        if secret:
+            signature = (
+                request.headers.get("X-Radar-Signature", "")
+                or request.headers.get("x-radar-signature", "")
+                or request.headers.get("X-Epistula-Signature", "")
+                or request.headers.get("x-epistula-signature", "")
+            )
+            if not signature:
+                return JSONResponse(
+                    status_code=403, content={"error": "missing HMAC headers"},
+                )
+            if not verify_request_hmac(body, signature):
+                return JSONResponse(
+                    status_code=403, content={"error": "invalid HMAC signature"},
+                )
+            caller_hotkey = request.headers.get("X-Miner-Hotkey", "")
+            if not _check_rate_limit(caller_hotkey or client_ip):
+                return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+            request.state.caller_hotkey = caller_hotkey
+        else:
+            # Dev fallback: no secret configured. Trust the forwarded hotkey
+            # so endpoints like /agent_code still work in local testing.
+            request.state.caller_hotkey = request.headers.get("X-Miner-Hotkey", "")
 
     response = await call_next(request)
 
