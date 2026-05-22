@@ -157,11 +157,20 @@ CREATE TABLE IF NOT EXISTS agent_submissions (
     r2_key TEXT NOT NULL,
     round_submitted BIGINT NOT NULL DEFAULT -1,
     timestamp DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    listener_url TEXT NOT NULL DEFAULT '',
+    listener_seen_at DOUBLE PRECISION NOT NULL DEFAULT 0.0,
     UNIQUE(hotkey)
 );
 ALTER TABLE agent_submissions ALTER COLUMN round_submitted TYPE BIGINT;
+ALTER TABLE agent_submissions
+    ADD COLUMN IF NOT EXISTS listener_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_submissions
+    ADD COLUMN IF NOT EXISTS listener_seen_at DOUBLE PRECISION NOT NULL DEFAULT 0.0;
 CREATE INDEX IF NOT EXISTS idx_agent_hotkey ON agent_submissions(hotkey);
 CREATE INDEX IF NOT EXISTS idx_agent_hash ON agent_submissions(code_hash);
+CREATE INDEX IF NOT EXISTS idx_agent_listener_seen
+    ON agent_submissions(listener_seen_at)
+    WHERE listener_url <> '';
 
 -- Append-only history of every agent submission. Unlike agent_submissions
 -- (one row per hotkey, overwritten on each upload), this preserves the full

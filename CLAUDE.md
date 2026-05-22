@@ -239,6 +239,7 @@ frontier/latest.json                                        # Current Pareto fro
 - [x] DatabaseClient for validator -> DB server communication (`shared/db_client.py`)
 - [x] Validator / dashboard deploy split (`RADAR_NEURON_MODE`)
 - [x] Hippius (Substrate) artifact backend with R2 legacy fallback (`shared/r2_audit.py`)
+- [x] Off-chain miner listener registry (miners self-register via `POST /miners/me/listener`; validators discover via `GET /miners/active`)
 
 ## Artifact Storage (Hippius / R2)
 

@@ -187,11 +187,42 @@ class DatabaseClient:
         return await self._get(f"/agent_code/by_hash/{code_hash}")
 
     async def submit_agent_code(
-        self, files: dict[str, str], entry_point: str = "agent.py",
+        self,
+        files: dict[str, str],
+        entry_point: str = "agent.py",
+        listener_url: str = "",
     ) -> Optional[dict]:
-        return await self._post("/agent_code", {
-            "files": files, "entry_point": entry_point,
-        })
+        body: dict = {"files": files, "entry_point": entry_point}
+        if listener_url:
+            body["listener_url"] = listener_url
+        return await self._post("/agent_code", body)
+
+    async def register_listener(self, listener_url: str) -> Optional[dict]:
+        """Refresh this miner's listener URL on the DB registry.
+
+        Bearer-authed — the miner must already have an agent_submissions
+        row (i.e. submit_agent_code has been called at least once).
+        """
+        return await self._post(
+            "/miners/me/listener", {"listener_url": listener_url},
+        )
+
+    async def get_active_miners(
+        self, window_seconds: float = 6 * 60 * 60,
+    ) -> list[dict]:
+        """Recent miners with live listener registrations.
+
+        HMAC-authed. Returns the list raw from the DB; callers project
+        the fields they need (typically hotkey + listener_url + code_hash).
+        """
+        result = await self._get(
+            "/miners/active", params={"window_seconds": window_seconds},
+        )
+        if isinstance(result, dict):
+            miners = result.get("miners")
+            if isinstance(miners, list):
+                return miners
+        return []
 
     async def submit_training_meta(
         self, round_id: int, hotkey: str, meta: dict,
