@@ -92,6 +92,36 @@ def test_issue_key_dispatch_prints_plaintext_once(monkeypatch, capsys):
     assert "shown ONCE" in out
 
 
+def test_issue_key_refuses_when_miner_missing(monkeypatch, capsys):
+    """Regression: ``issue-key`` used to mint an orphan key against a
+    miner_id that didn't exist in the active schema, producing a row
+    that lookup_bearer's JOIN would silently drop → 403. The new
+    pre-flight returns exit code 2 with a clear stderr message instead."""
+    fake_conn = AsyncMock()
+    fake_conn.close = AsyncMock()
+    fake_conn.fetchval = AsyncMock(return_value=None)
+
+    async def _connect_stub():
+        return fake_conn
+
+    async def _ensure_stub(conn):
+        pass
+
+    monkeypatch.setattr(operator_cli, "_connect", _connect_stub)
+    monkeypatch.setattr(operator_cli, "_ensure_schema", _ensure_stub)
+    issue = AsyncMock(return_value=("rdrk_should_not_be_called", "kid"))
+    with patch("shared.miner_auth.issue_api_key", new=issue):
+        code = operator_cli.main([
+            "issue-key", "--miner-id", "ghost", "--label", "x",
+        ])
+    assert code == 2
+    issue.assert_not_awaited()
+    err = capsys.readouterr().err
+    assert "ghost" in err
+    assert "not found" in err
+    assert "RADAR_NETWORK" in err
+
+
 def test_revoke_key_returns_1_on_miss(monkeypatch, capsys):
     fake_conn = AsyncMock()
     fake_conn.close = AsyncMock()

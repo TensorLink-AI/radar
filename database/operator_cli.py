@@ -38,6 +38,7 @@ from shared import miner_auth
 
 async def _connect():
     import asyncpg
+    from config import Config
     dsn = os.getenv("RADAR_PG_DSN", "").strip()
     if not dsn:
         print(
@@ -46,7 +47,24 @@ async def _connect():
             file=sys.stderr,
         )
         sys.exit(2)
-    return await asyncpg.connect(dsn)
+    conn = await asyncpg.connect(dsn)
+    # Pin the same schema the DB neuron's pool uses (see shared/pg_store.py
+    # _setup). Without this, register / issue-key silently write to
+    # "public" while the API reads testnet — keys exist in psql but
+    # lookup_bearer returns None → 403 "Unknown or revoked token".
+    network = Config.NETWORK
+    if not network.replace("_", "").isalnum():
+        raise RuntimeError(
+            f"RADAR_NETWORK={network!r} contains characters that aren't "
+            "alnum or '_'; refusing to interpolate into search_path."
+        )
+    await conn.execute(f'SET search_path TO "{network}", public')
+    print(
+        f"operator: connected schema={network!r} "
+        f"(override with RADAR_NETWORK=...)",
+        file=sys.stderr,
+    )
+    return conn
 
 
 async def _ensure_schema(conn) -> None:
@@ -94,6 +112,18 @@ async def cmd_issue_key(args) -> int:
     conn = await _connect()
     try:
         await _ensure_schema(conn)
+        exists = await conn.fetchval(
+            "SELECT 1 FROM miners WHERE miner_id = $1", args.miner_id,
+        )
+        if not exists:
+            print(
+                f"operator: miner_id {args.miner_id!r} not found in the "
+                f"active schema. Register it first "
+                f"(`operator_cli register --name ...`) or set "
+                f"RADAR_NETWORK to the schema where it lives.",
+                file=sys.stderr,
+            )
+            return 2
         plaintext, key_id = await miner_auth.issue_api_key(
             conn, args.miner_id, scope=args.scope, label=args.label,
         )
