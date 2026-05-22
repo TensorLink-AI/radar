@@ -31,7 +31,8 @@ deployments keep working without flag churn.
   miner/neuron.py prompts rollback <gen>
     restore an archived generation (with safety-archive of current)
 
-DB URL + API key are read from env (``RADAR_DB_URL``,
+DB URL + API key are read from env (``RADAR_DB_API_URL`` —
+``RADAR_DB_URL`` is accepted as a legacy alias — and
 ``RADAR_MINER_API_KEY``) or flags.
 """
 
@@ -147,8 +148,10 @@ def _root_parser() -> argparse.ArgumentParser:
 
 def _add_db_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--db-url",
-                   default=os.getenv("RADAR_DB_URL", ""),
-                   help="DB server URL (env: RADAR_DB_URL).")
+                   default=os.getenv("RADAR_DB_API_URL", "") or
+                           os.getenv("RADAR_DB_URL", ""),
+                   help="DB server URL (env: RADAR_DB_API_URL; "
+                        "RADAR_DB_URL accepted as legacy alias).")
     p.add_argument("--api-key",
                    default=os.getenv("RADAR_MINER_API_KEY", ""),
                    help="Miner bearer API key (env: RADAR_MINER_API_KEY).")
@@ -172,7 +175,7 @@ def cmd_results(args) -> int:
     if not args.db_url or not args.api_key:
         print(
             "results: missing --db-url or --api-key "
-            "(or RADAR_DB_URL / RADAR_MINER_API_KEY).",
+            "(or RADAR_DB_API_URL / RADAR_MINER_API_KEY).",
             file=sys.stderr,
         )
         return 2
@@ -215,7 +218,7 @@ def cmd_optimize(args) -> int:
     if not args.db_url or not args.api_key:
         print(
             "optimize: missing --db-url or --api-key "
-            "(or RADAR_DB_URL / RADAR_MINER_API_KEY).",
+            "(or RADAR_DB_API_URL / RADAR_MINER_API_KEY).",
             file=sys.stderr,
         )
         return 2
