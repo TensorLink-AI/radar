@@ -64,13 +64,27 @@ const sharedEnv = {
 const agentDir = env.RADAR_AGENT_DIR ||
   "../radar-miner-examples/agents/autonomous/";
 
+// Listener — validators POST /prepare here to dispatch training. The
+// URL the DB advertises is http://<externalIp>:<listenerPort>, so
+// externalIp must be reachable from the validator (public IP or DNS
+// name). Defaulting to 0.0.0.0 keeps the miner running but invisible
+// to validators — set RADAR_MINER_EXTERNAL_IP in .env on real deploys.
+const externalIp = env.RADAR_MINER_EXTERNAL_IP || "0.0.0.0";
+const listenerPort = env.RADAR_MINER_LISTENER_PORT || "8090";
+
+const minerArgs = [
+  "--agent_dir", agentDir,
+  "--external_ip", externalIp,
+  "--listener_port", listenerPort,
+].join(" ");
+
 module.exports = {
   apps: [
     {
       name: "radar-miner",
       script: "miner/neuron.py",
       interpreter: "python3",
-      args: `--agent_dir ${agentDir}`,
+      args: minerArgs,
       cwd: __dirname,
       env: sharedEnv,
       autorestart: true,
