@@ -7,6 +7,7 @@ Run against the DB Postgres directly:
   python -m database.operator_cli revoke-key --key-id <id>
   python -m database.operator_cli list-keys --miner-id <id>
   python -m database.operator_cli list-miners
+  python -m database.operator_cli verify-key [--key rdrk_...]
   python -m database.operator_cli rotate-service-key
 
 DSN is read from ``RADAR_PG_DSN`` (same as the rest of the stack).
@@ -172,6 +173,71 @@ async def cmd_list_miners(args) -> int:
         await conn.close()
 
 
+async def cmd_verify_key(args) -> int:
+    """Resolve a bearer token against the configured DSN and print the
+    miner identity it maps to.  The diagnostic for 403 ``Unknown or
+    revoked token`` from the DB API — run this against the **same**
+    ``RADAR_PG_DSN`` the API server reads to confirm the key is present
+    and not revoked there.
+    """
+    token = (args.key or os.getenv("RADAR_MINER_API_KEY", "")).strip()
+    if not token:
+        print(
+            "verify-key: pass --key or set RADAR_MINER_API_KEY.",
+            file=sys.stderr,
+        )
+        return 2
+    conn = await _connect()
+    try:
+        from shared.auth import hash_api_key
+        digest = hash_api_key(token)
+        row = await conn.fetchrow(
+            "SELECT k.key_id, k.miner_id, k.scope, k.label, "
+            "       k.created_at, k.revoked_at AS k_revoked, "
+            "       k.last_used_at, m.name, m.hotkey, "
+            "       m.revoked_at AS m_revoked "
+            "FROM miner_api_keys k "
+            "LEFT JOIN miners m ON m.miner_id = k.miner_id "
+            "WHERE k.key_hash = $1",
+            digest,
+        )
+        if row is None:
+            print(
+                f"verify-key: token hash {digest[:16]}... NOT FOUND in "
+                "miner_api_keys.  Check that you issued the key against "
+                "this DSN (RADAR_PG_DSN) and that the miner is using "
+                "the matching RADAR_MINER_API_KEY.",
+                file=sys.stderr,
+            )
+            return 1
+        if row["k_revoked"]:
+            print(
+                f"verify-key: key {row['key_id']} is REVOKED at "
+                f"{_fmt_ts(row['k_revoked'])}.",
+                file=sys.stderr,
+            )
+            return 1
+        if row["m_revoked"]:
+            print(
+                f"verify-key: miner {row['miner_id']} is REVOKED at "
+                f"{_fmt_ts(row['m_revoked'])}.",
+                file=sys.stderr,
+            )
+            return 1
+        print("verify-key: OK")
+        print(f"  key_id     {row['key_id']}")
+        print(f"  miner_id   {row['miner_id']}")
+        print(f"  name       {row['name'] or '-'}")
+        print(f"  hotkey     {row['hotkey'] or '-'}")
+        print(f"  scope      {row['scope']}")
+        print(f"  label      {row['label'] or '-'}")
+        print(f"  created    {_fmt_ts(row['created_at'])}")
+        print(f"  last_used  {_fmt_ts(row['last_used_at'])}")
+        return 0
+    finally:
+        await conn.close()
+
+
 def cmd_rotate_service_key(args) -> int:
     """Print a fresh service key — operator pastes into env."""
     key = secrets.token_hex(32)
@@ -219,6 +285,15 @@ def _build_parser() -> argparse.ArgumentParser:
     lm = sub.add_parser("list-miners", help="List registered miners.")
     lm.add_argument("--limit", type=int, default=100)
 
+    vk = sub.add_parser(
+        "verify-key",
+        help="Resolve a bearer token against the DSN to diagnose 403s.",
+    )
+    vk.add_argument(
+        "--key", default="",
+        help="Bearer token to verify (default: $RADAR_MINER_API_KEY).",
+    )
+
     sub.add_parser("rotate-service-key",
                    help="Print a fresh RADAR_SERVICE_KEY.")
     return p
@@ -246,6 +321,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "revoke-key": cmd_revoke_key,
         "list-keys": cmd_list_keys,
         "list-miners": cmd_list_miners,
+        "verify-key": cmd_verify_key,
     }[args.command]
     return asyncio.run(handler(args))
 

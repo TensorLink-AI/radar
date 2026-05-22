@@ -149,6 +149,94 @@ def test_dotenv_is_loaded_at_import(tmp_path, monkeypatch):
     assert os.environ.get("RADAR_OPERATOR_CLI_DOTENV_PROBE") == "loaded"
 
 
+def test_parser_verify_key_optional_arg():
+    args = operator_cli._build_parser().parse_args(["verify-key"])
+    assert args.command == "verify-key"
+    assert args.key == ""
+
+
+def test_verify_key_no_token_returns_2(monkeypatch, capsys):
+    monkeypatch.delenv("RADAR_MINER_API_KEY", raising=False)
+    code = operator_cli.main(["verify-key"])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "RADAR_MINER_API_KEY" in err
+
+
+def test_verify_key_unknown_token(monkeypatch, capsys):
+    fake_conn = AsyncMock()
+    fake_conn.close = AsyncMock()
+    fake_conn.fetchrow = AsyncMock(return_value=None)
+
+    async def _connect_stub():
+        return fake_conn
+
+    monkeypatch.setattr(operator_cli, "_connect", _connect_stub)
+    code = operator_cli.main(["verify-key", "--key", "rdrk_bogus"])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "NOT FOUND" in err
+
+
+def test_verify_key_revoked_key(monkeypatch, capsys):
+    fake_conn = AsyncMock()
+    fake_conn.close = AsyncMock()
+    fake_conn.fetchrow = AsyncMock(return_value={
+        "key_id": "k1", "miner_id": "m1", "scope": "miner", "label": "",
+        "created_at": 1700000000, "k_revoked": 1700000500,
+        "last_used_at": None, "name": "alice", "hotkey": "",
+        "m_revoked": None,
+    })
+
+    async def _connect_stub():
+        return fake_conn
+
+    monkeypatch.setattr(operator_cli, "_connect", _connect_stub)
+    code = operator_cli.main(["verify-key", "--key", "rdrk_revoked"])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "REVOKED" in err
+    assert "k1" in err
+
+
+def test_verify_key_ok(monkeypatch, capsys):
+    fake_conn = AsyncMock()
+    fake_conn.close = AsyncMock()
+    fake_conn.fetchrow = AsyncMock(return_value={
+        "key_id": "k1", "miner_id": "m1", "scope": "miner", "label": "prod",
+        "created_at": 1700000000, "k_revoked": None,
+        "last_used_at": 1700001000, "name": "alice", "hotkey": "",
+        "m_revoked": None,
+    })
+
+    async def _connect_stub():
+        return fake_conn
+
+    monkeypatch.setattr(operator_cli, "_connect", _connect_stub)
+    code = operator_cli.main(["verify-key", "--key", "rdrk_good"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "OK" in out
+    assert "k1" in out
+    assert "m1" in out
+    assert "alice" in out
+
+
+def test_verify_key_reads_env(monkeypatch, capsys):
+    fake_conn = AsyncMock()
+    fake_conn.close = AsyncMock()
+    fake_conn.fetchrow = AsyncMock(return_value=None)
+
+    async def _connect_stub():
+        return fake_conn
+
+    monkeypatch.setattr(operator_cli, "_connect", _connect_stub)
+    monkeypatch.setenv("RADAR_MINER_API_KEY", "rdrk_from_env")
+    code = operator_cli.main(["verify-key"])
+    # Unknown but env-supplied — exit 1, not 2.
+    assert code == 1
+
+
 def test_list_keys_prints_table(monkeypatch, capsys):
     fake_conn = AsyncMock()
     fake_conn.close = AsyncMock()
