@@ -145,15 +145,19 @@ def test_post_agent_code_unknown_token_returns_403(monkeypatch):
     assert "Unknown" in err or "revoked" in err
 
 
-def test_post_agent_code_rejects_identity_without_hotkey(monkeypatch):
-    """A miner registered without a hotkey can't write — agent_submissions
-    is keyed by hotkey, so a blank one would silently overwrite another
-    row in the worst case."""
-    with _wire_app(monkeypatch, with_hotkey="") as (app, _, _):
+def test_post_agent_code_identity_without_hotkey_falls_back_to_miner_id(monkeypatch):
+    """Post-bittensor a miner row may have an empty hotkey. The auth path
+    falls back to miner_id as the storage identifier so submissions still
+    succeed — agent_submissions.hotkey is just an opaque unique miner id
+    at this point, not an ss58."""
+    with _wire_app(monkeypatch, with_hotkey="") as (app, _, r2):
         client = TestClient(app)
         r = client.post(
             "/agent_code", json=_bundle(),
             headers={"Authorization": "Bearer good"},
         )
-    assert r.status_code == 400
-    assert "hotkey" in r.json()["error"]
+    assert r.status_code == 200, r.text
+    # Stored under miner_id (the fake identity uses miner_id="m1").
+    keys = [k for k, _ in r2.uploads]
+    assert any(k.startswith("agents/m1/") for k in keys)
+    assert "agents/m1/latest.json" in keys

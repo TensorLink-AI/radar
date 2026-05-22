@@ -1039,22 +1039,16 @@ async def _bearer_auth_then_call_for_agent_code(request: Request, call_next):
         return JSONResponse(
             status_code=403, content={"error": "Unknown or revoked token"},
         )
-    if not ident.hotkey:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": "Miner has no hotkey on file — register with "
-                         "`operator_cli register --hotkey <ss58>` before "
-                         "submitting agent code.",
-            },
-        )
     if not _check_rate_limit(ident.key_id):
         return JSONResponse(
             status_code=429, content={"error": "Rate limit exceeded"},
         )
 
     request.state.miner_identity = ident
-    request.state.caller_hotkey = ident.hotkey
+    # Post-bittensor the miner row may have an empty hotkey — fall back to
+    # miner_id as the storage identifier. agent_submissions.hotkey is just
+    # an opaque "unique miner id" column at this point.
+    request.state.caller_hotkey = ident.hotkey or ident.miner_id
     return await call_next(request)
 
 
