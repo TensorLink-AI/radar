@@ -364,11 +364,33 @@ class Validator:
             logger.warning("get_active_miners failed: %s", e)
             return {}
 
+        db_url = getattr(self.db_client, "db_url", "?")
+        if not rows:
+            logger.warning(
+                "get_active_miners returned 0 rows from db=%s — "
+                "either no miner heartbeated within the 6h window, the GET "
+                "failed silently (check DatabaseClient GET warnings), or "
+                "the validator is pointed at a different DB than the miners.",
+                db_url,
+            )
+        else:
+            logger.info(
+                "get_active_miners returned %d rows from db=%s (hotkeys=%s)",
+                len(rows), db_url,
+                [(r.get("hotkey") or "")[:16] for r in rows[:8]],
+            )
+
         out: dict[int, ImageCommitment] = {}
+        skipped_no_hotkey = 0
+        skipped_no_listener = 0
         for row in rows:
             hotkey = row.get("hotkey") or ""
             listener_url = row.get("listener_url") or ""
-            if not hotkey or not listener_url:
+            if not hotkey:
+                skipped_no_hotkey += 1
+                continue
+            if not listener_url:
+                skipped_no_listener += 1
                 continue
             preferred = int(row.get("miner_uid", -1))
             uid = preferred if preferred >= 0 and preferred not in out else -1
@@ -394,6 +416,12 @@ class Validator:
                 listener_url=listener_url,
                 miner_uid=uid,
                 hotkey=hotkey,
+            )
+        if rows and not out:
+            logger.warning(
+                "get_active_miners returned %d rows but 0 survived filter "
+                "(skipped_no_hotkey=%d, skipped_no_listener=%d)",
+                len(rows), skipped_no_hotkey, skipped_no_listener,
             )
         return out
 

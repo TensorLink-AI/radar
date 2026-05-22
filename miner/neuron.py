@@ -202,9 +202,28 @@ class Miner:
         from shared.db_client import DatabaseClient
         db = DatabaseClient(db_url=db_url, api_key=self.api_key)
         try:
-            await db.register_listener(listener_url)
+            # register_listener returns the parsed body on success and
+            # None on any HTTP/transport failure (db_client logs the
+            # underlying warning). Log both outcomes explicitly so a
+            # silently-failing heartbeat doesn't hide behind the bare
+            # "Heartbeat:" tick log.
+            result = await db.register_listener(listener_url)
+            if result is None:
+                logger.warning(
+                    "Listener heartbeat FAILED url=%s db=%s "
+                    "(see DatabaseClient warning above)",
+                    listener_url, db_url,
+                )
+            else:
+                logger.info(
+                    "Listener heartbeat OK url=%s db=%s",
+                    listener_url, db_url,
+                )
         except Exception as e:
-            logger.warning("Listener heartbeat failed: %s", e)
+            logger.warning(
+                "Listener heartbeat raised url=%s db=%s err=%s",
+                listener_url, db_url, e,
+            )
         finally:
             await db.close()
 
