@@ -167,16 +167,18 @@ class Miner:
             return
         from shared.db_client import DatabaseClient
         db = DatabaseClient(db_url=db_url, api_key=self.api_key)
+        listener_url = self._listener_external_url()
         try:
             result = await db.submit_agent_code(
                 files=bundle["files"],
                 entry_point=bundle["entry_point"],
+                listener_url=listener_url,
             )
             if result:
                 logger.info(
-                    "Agent code submitted to %s: hash=%s files=%s",
+                    "Agent code submitted to %s: hash=%s listener=%s files=%s",
                     db_url, result.get("code_hash", "?")[:24],
-                    sorted(bundle["files"].keys()),
+                    listener_url, sorted(bundle["files"].keys()),
                 )
             else:
                 logger.error("Agent code submission failed")
@@ -185,6 +187,26 @@ class Miner:
             await db.close()
 
         self._code_hash = code_hash
+
+    async def heartbeat_listener(self):
+        """Refresh listener_url on the DB so validators keep seeing us.
+
+        The /miners/active endpoint filters on listener_seen_at, so
+        without periodic re-registration the miner drops out of the
+        active set after the TTL window even if it's still online.
+        """
+        db_url = Config.DB_API_URL
+        if not db_url or not self.api_key:
+            return
+        listener_url = self._listener_external_url()
+        from shared.db_client import DatabaseClient
+        db = DatabaseClient(db_url=db_url, api_key=self.api_key)
+        try:
+            await db.register_listener(listener_url)
+        except Exception as e:
+            logger.warning("Listener heartbeat failed: %s", e)
+        finally:
+            await db.close()
 
     async def _post_trainer_ready(
         self, round_id: int, deployment: Deployment, validator_db_url: str,
@@ -736,6 +758,8 @@ class Miner:
                 )
                 if not self._code_hash:
                     await self.submit_agent_code()
+                else:
+                    await self.heartbeat_listener()
             except Exception as e:
                 logger.warning("Heartbeat tick failed: %s", e)
 

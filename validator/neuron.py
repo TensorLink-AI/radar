@@ -27,6 +27,7 @@ from config import Config
 from shared.challenge import (
     generate_challenge, round_start_block, current_phase, select_task,
 )
+from shared.commitment import ImageCommitment
 from shared.database import DataElement
 from shared.db_client import DatabaseClient
 from shared.protocol import Proposal
@@ -337,6 +338,65 @@ class Validator:
             remaining = (target_block - current) * 12
             await asyncio.sleep(min(remaining, 30))
 
+    async def _fetch_active_commitments(self) -> dict[int, ImageCommitment]:
+        """Build {uid: ImageCommitment} from the DB's active miner list.
+
+        The off-chain deploy has no on-chain ImageCommitment; miners
+        self-register their listener URL via POST /miners/me/listener
+        after submit_agent_code. We synthesise an ImageCommitment per
+        active miner so the rest of Phase A/B/C (which is still typed
+        around commitments) keeps working.
+
+        UIDs:
+          * Prefer agent_submissions.miner_uid when the miner posted
+            one via X-Miner-UID (lets operators keep stable, small ids).
+          * Otherwise derive a stable synthetic int from the hotkey.
+            Collisions are vanishingly unlikely in practice but we
+            re-roll on conflict so two miners never share a uid.
+        """
+        if self.db_client is None:
+            logger.warning("No db_client configured — cannot fetch active miners")
+            return {}
+
+        try:
+            rows = await self.db_client.get_active_miners()
+        except Exception as e:
+            logger.warning("get_active_miners failed: %s", e)
+            return {}
+
+        out: dict[int, ImageCommitment] = {}
+        for row in rows:
+            hotkey = row.get("hotkey") or ""
+            listener_url = row.get("listener_url") or ""
+            if not hotkey or not listener_url:
+                continue
+            preferred = int(row.get("miner_uid", -1))
+            uid = preferred if preferred >= 0 and preferred not in out else -1
+            if uid < 0:
+                base = int.from_bytes(
+                    hashlib.sha256(hotkey.encode()).digest()[:4],
+                    "big",
+                ) % (2**31 - 1)
+                uid = base
+                # Re-roll on collision — extremely rare but cheap.
+                bump = 0
+                while uid in out and bump < 16:
+                    bump += 1
+                    uid = (base + bump) % (2**31 - 1)
+                if uid in out:
+                    logger.warning(
+                        "Skipping miner %s — could not assign unique synthetic uid",
+                        hotkey[:16],
+                    )
+                    continue
+            out[uid] = ImageCommitment(
+                code_hash=row.get("code_hash", "") or "",
+                listener_url=listener_url,
+                miner_uid=uid,
+                hotkey=hotkey,
+            )
+        return out
+
     async def _cache_training_metas(
         self, round_id: int, metas: dict[int, dict],
     ) -> None:
@@ -489,10 +549,17 @@ class Validator:
 
         # ── PHASE A: RUN AGENTS + COLLECT ────────────────────
         # Off-chain deploy: miner identity comes from operator-CLI tokens,
-        # not on-chain ImageCommitments. Commitments stay empty; downstream
-        # code paths treat that as "every registered miner is eligible".
-        commitments: dict = {}
+        # not on-chain ImageCommitments. We rebuild the equivalent record
+        # by asking the DB for miners that have recently registered a
+        # listener URL (POST /miners/me/listener). Without this lookup
+        # `commitments` would be empty and the round would dead-end at
+        # "0 miners with listener_urls".
+        commitments = await self._fetch_active_commitments()
         validator_uids: list[int] = []
+        logger.info(
+            "Active miner registry: %d miners with live listener URLs",
+            len(commitments),
+        )
 
         if not self.r2:
             logger.warning("No R2 configured — skipping Phase A/B/C")

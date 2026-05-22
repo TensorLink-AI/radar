@@ -720,6 +720,10 @@ class SubmitAgentCodeRequest(BaseModel):
     """Miner POSTs their agent code bundle."""
     files: dict[str, str]          # filename -> source code
     entry_point: str = "agent.py"  # which file has design_architecture()
+    # Where the miner's warm-standby listener is reachable. Optional in
+    # the body so existing clients still work; validators that need to
+    # send TrainerRequests look this up via GET /miners/active.
+    listener_url: str = ""
 
 
 @validator_router.post("/agent_code")
@@ -794,6 +798,7 @@ async def submit_agent_code(request: Request, req: SubmitAgentCodeRequest):
     import json as _json
 
     bundle_json = _json.dumps(bundle)
+    listener_url = (req.listener_url or "").strip()
     try:
         async with _pool.acquire() as conn:
             async with conn.transaction():
@@ -801,18 +806,28 @@ async def submit_agent_code(request: Request, req: SubmitAgentCodeRequest):
                     """
                     INSERT INTO agent_submissions
                         (hotkey, miner_uid, code_hash, entry_point, r2_key,
-                         round_submitted, timestamp)
-                    VALUES ($1, $2, $3, $4, $5, $6, extract(epoch from now()))
+                         round_submitted, timestamp,
+                         listener_url, listener_seen_at)
+                    VALUES ($1, $2, $3, $4, $5, $6,
+                            extract(epoch from now()),
+                            $7,
+                            CASE WHEN $7 = '' THEN 0.0
+                                 ELSE extract(epoch from now()) END)
                     ON CONFLICT (hotkey) DO UPDATE SET
                         miner_uid = $2,
                         code_hash = $3,
                         entry_point = $4,
                         r2_key = $5,
                         round_submitted = $6,
-                        timestamp = extract(epoch from now())
+                        timestamp = extract(epoch from now()),
+                        listener_url = CASE WHEN $7 = ''
+                            THEN agent_submissions.listener_url ELSE $7 END,
+                        listener_seen_at = CASE WHEN $7 = ''
+                            THEN agent_submissions.listener_seen_at
+                            ELSE extract(epoch from now()) END
                     """,
                     hotkey, miner_uid, code_hash, req.entry_point,
-                    immutable_key, round_submitted,
+                    immutable_key, round_submitted, listener_url,
                 )
                 await conn.execute(
                     """
@@ -949,6 +964,119 @@ async def get_agent_code_by_hash(code_hash: str):
     if not bundle:
         raise HTTPException(status_code=404, detail="Bundle missing in R2")
     return bundle
+
+
+# ── Miner listener registry ────────────────────────────────────────
+#
+# The post-bittensor deploy has no on-chain ImageCommitment to carry a
+# miner's listener_url. Miners self-register by POSTing it here (with
+# the bearer token they already use for /agent_code), refreshing
+# `listener_seen_at` on each call. Validators then call /miners/active
+# at the start of every round to discover where to send TrainerRequests.
+
+# Active = listener_seen_at within this many seconds. 6h tolerates
+# brief miner restarts without re-registration while still pruning
+# truly-gone miners before the next round.
+_ACTIVE_MINER_WINDOW_SECONDS: float = 6 * 60 * 60
+
+
+class RegisterListenerRequest(BaseModel):
+    """Miner POSTs the URL of its warm-standby listener.
+
+    The miner must have already submitted agent code (so a row in
+    agent_submissions exists for this hotkey); otherwise the endpoint
+    returns 404 and the miner should call submit_agent_code first.
+    """
+    listener_url: str
+
+
+@validator_router.post("/miners/me/listener")
+async def register_listener(request: Request, req: RegisterListenerRequest):
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="DB pool not configured")
+
+    # _bearer_auth_then_call (the /miners/me/* path) sets miner_identity;
+    # the agent_code helper sets caller_hotkey. Accept either so this
+    # endpoint works under both auth wrappers (and is testable on its own).
+    hotkey = getattr(request.state, "caller_hotkey", "") or ""
+    if not hotkey:
+        ident = getattr(request.state, "miner_identity", None)
+        if ident is not None:
+            hotkey = ident.hotkey or ident.miner_id
+    if not hotkey:
+        raise HTTPException(status_code=403, detail="Auth required")
+
+    listener_url = (req.listener_url or "").strip()
+    if not listener_url:
+        raise HTTPException(status_code=400, detail="listener_url required")
+
+    result = await _pool.execute(
+        """
+        UPDATE agent_submissions
+           SET listener_url = $2,
+               listener_seen_at = extract(epoch from now())
+         WHERE hotkey = $1
+        """,
+        hotkey, listener_url,
+    )
+    try:
+        updated = int(result.split()[-1]) > 0
+    except (ValueError, IndexError):
+        updated = False
+    if not updated:
+        raise HTTPException(
+            status_code=404,
+            detail="No agent_submissions row — submit agent code first",
+        )
+    logger.info(
+        "Listener registered: hotkey=%s url=%s",
+        hotkey[:16], listener_url,
+    )
+    return {"status": "ok", "listener_url": listener_url}
+
+
+@validator_router.get("/miners/active")
+async def list_active_miners(
+    window_seconds: float = _ACTIVE_MINER_WINDOW_SECONDS,
+):
+    """Recent miners with live listener registrations.
+
+    Validators call this at the start of every round to build the set
+    of miners eligible to receive TrainerRequests. Rows are filtered
+    by `listener_seen_at` so a stale miner whose listener is no
+    longer reachable drops out automatically after the TTL.
+    """
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="DB pool not configured")
+
+    cutoff = max(60.0, float(window_seconds))
+    rows = await _pool.fetch(
+        """
+        SELECT hotkey, miner_uid, code_hash, entry_point,
+               listener_url, listener_seen_at,
+               round_submitted, timestamp
+          FROM agent_submissions
+         WHERE listener_url <> ''
+           AND listener_seen_at > extract(epoch from now()) - $1
+         ORDER BY listener_seen_at DESC
+        """,
+        cutoff,
+    )
+    return {
+        "miners": [
+            {
+                "hotkey": r["hotkey"],
+                "miner_uid": r["miner_uid"],
+                "code_hash": r["code_hash"],
+                "entry_point": r["entry_point"],
+                "listener_url": r["listener_url"],
+                "listener_seen_at": float(r["listener_seen_at"]),
+                "round_submitted": int(r["round_submitted"]),
+                "timestamp": float(r["timestamp"]),
+            }
+            for r in rows
+        ],
+    }
 
 
 def include_validator_routes(target_app: FastAPI) -> None:
