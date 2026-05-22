@@ -31,9 +31,15 @@ function loadDotenv(file) {
     const eq = s.indexOf("=");
     if (eq < 0) continue;
     let v = s.slice(eq + 1).trim();
-    if ((v.startsWith('"') && v.endsWith('"')) ||
-        (v.startsWith("'") && v.endsWith("'"))) {
+    const quoted = (v.startsWith('"') && v.endsWith('"')) ||
+                   (v.startsWith("'") && v.endsWith("'"));
+    if (quoted) {
       v = v.slice(1, -1);
+    } else {
+      // Strip inline `# comment` on unquoted values — `KEY=val # note`
+      // would otherwise pass the literal "val # note" into argv.
+      const hash = v.indexOf(" #");
+      if (hash >= 0) v = v.slice(0, hash).trim();
     }
     out[s.slice(0, eq).trim()] = v;
   }
