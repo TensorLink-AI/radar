@@ -13,24 +13,47 @@
 // scores land, `radar-miner` reads it on the next round — no restart
 // needed.
 //
-// Secrets: do NOT commit RADAR_MINER_API_KEY. Either keep this file out
-// of git on the deploy host or load secrets from a sibling .env and
-// reference process.env.RADAR_MINER_API_KEY here.
+// Secrets: do NOT commit RADAR_MINER_API_KEY. Put it (and any other
+// secret env vars) in a sibling `.env` file — this config loads it at
+// startup so `pm2 restart` always picks up the current value without
+// fighting a stale `pm2 save` dump. `.env` wins over the shell so a
+// leftover pm2 dump can't silently override the file.
 
 const path = require("path");
+const fs = require("fs");
+
+function loadDotenv(file) {
+  if (!fs.existsSync(file)) return {};
+  const out = {};
+  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+    const s = line.trim();
+    if (!s || s.startsWith("#")) continue;
+    const eq = s.indexOf("=");
+    if (eq < 0) continue;
+    let v = s.slice(eq + 1).trim();
+    if ((v.startsWith('"') && v.endsWith('"')) ||
+        (v.startsWith("'") && v.endsWith("'"))) {
+      v = v.slice(1, -1);
+    }
+    out[s.slice(0, eq).trim()] = v;
+  }
+  return out;
+}
+
+const env = { ...process.env, ...loadDotenv(path.join(__dirname, ".env")) };
 
 const sharedEnv = {
-  RADAR_DB_URL: process.env.RADAR_DB_URL || "http://localhost:8090",
-  RADAR_SERVICE_KEY: process.env.RADAR_SERVICE_KEY || "",
-  RADAR_MINER_API_KEY: process.env.RADAR_MINER_API_KEY || "",
+  RADAR_DB_API_URL: env.RADAR_DB_API_URL || env.RADAR_DB_URL || "http://localhost:8090",
+  RADAR_SERVICE_KEY: env.RADAR_SERVICE_KEY || "",
+  RADAR_MINER_API_KEY: env.RADAR_MINER_API_KEY || "",
   MINER_PROMPTS_DIR: path.join(__dirname, "prompts"),
 
   // GEPA reflector LM — operator's shared LLM proxy. Swap to
   // MINER_REFLECTOR_API_{BASE,KEY,MODEL} for an explicit OpenAI /
   // Anthropic-style endpoint instead.
-  MINER_LLM_URL: process.env.MINER_LLM_URL || "",
-  MINER_LLM_API_KEY: process.env.MINER_LLM_API_KEY || "",
-  MINER_LLM_MODEL: process.env.MINER_LLM_MODEL ||
+  MINER_LLM_URL: env.MINER_LLM_URL || "",
+  MINER_LLM_API_KEY: env.MINER_LLM_API_KEY || "",
+  MINER_LLM_MODEL: env.MINER_LLM_MODEL ||
     "deepseek-ai/DeepSeek-V3-0324",
 };
 
@@ -38,7 +61,7 @@ const sharedEnv = {
 // radar-miner-examples checkout. Override with RADAR_AGENT_DIR to use a
 // different example (openai_sdk_v2, claude_style_v2, patch_decoder) or
 // your own agent directory.
-const agentDir = process.env.RADAR_AGENT_DIR ||
+const agentDir = env.RADAR_AGENT_DIR ||
   "../radar-miner-examples/agents/autonomous/";
 
 module.exports = {
