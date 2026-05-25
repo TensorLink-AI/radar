@@ -3,7 +3,7 @@
 Kept in a separate module so ``local/services.py`` stays focused on
 HTTP plumbing. Provider rules:
 
-* ``ANTHROPIC_API_KEY`` set → proxy to Anthropic Messages.
+* ``CHUTES_API_KEY`` set → proxy to Chutes AI (OpenAI-compatible).
 * ``OPENAI_API_KEY`` set → proxy to OpenAI Chat Completions.
 * Otherwise → deterministic stub so agents can still test the call path.
 
@@ -28,31 +28,18 @@ ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom"}
 
 # ── LLM ────────────────────────────────────────────────────────
 
-def _llm_anthropic(payload: dict) -> dict:
-    api_key = os.environ["ANTHROPIC_API_KEY"]
-    model = payload.get("model") or "claude-haiku-4-5-20251001"
-    body = json.dumps({
-        "model": model,
-        "max_tokens": int(payload.get("max_tokens", 1024)),
-        "messages": payload.get("messages") or [],
-    }).encode()
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=body, method="POST",
-    )
-    req.add_header("x-api-key", api_key)
-    req.add_header("anthropic-version", "2023-06-01")
-    req.add_header("content-type", "application/json")
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read())
-    parts = data.get("content", [])
-    text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
-    return {"content": text, "model": model}
+# Matches the real validator's llm_proxy default — Chutes serves the
+# OpenAI-compatible API at /v1/chat/completions.
+CHUTES_BASE_URL = "https://llm.chutes.ai/v1"
+CHUTES_DEFAULT_MODEL = "deepseek-ai/DeepSeek-V3-0324"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 
-def _llm_openai(payload: dict) -> dict:
-    api_key = os.environ["OPENAI_API_KEY"]
-    model = payload.get("model") or "gpt-4o-mini"
+def _openai_compat_chat(base_url: str, api_key: str, payload: dict,
+                        default_model: str) -> dict:
+    """Hit any OpenAI-compatible /chat/completions endpoint with Bearer
+    auth. Used for both Chutes and OpenAI."""
+    model = payload.get("model") or default_model
     body = json.dumps({
         "model": model,
         "messages": payload.get("messages") or [],
@@ -60,15 +47,29 @@ def _llm_openai(payload: dict) -> dict:
         "max_tokens": int(payload.get("max_tokens", 1024)),
     }).encode()
     req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
+        f"{base_url.rstrip('/')}/chat/completions",
         data=body, method="POST",
     )
     req.add_header("authorization", f"Bearer {api_key}")
     req.add_header("content-type", "application/json")
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=90) as resp:
         data = json.loads(resp.read())
     text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
     return {"content": text, "model": model}
+
+
+def _llm_chutes(payload: dict) -> dict:
+    return _openai_compat_chat(
+        CHUTES_BASE_URL, os.environ["CHUTES_API_KEY"],
+        payload, CHUTES_DEFAULT_MODEL,
+    )
+
+
+def _llm_openai(payload: dict) -> dict:
+    return _openai_compat_chat(
+        OPENAI_BASE_URL, os.environ["OPENAI_API_KEY"],
+        payload, "gpt-4o-mini",
+    )
 
 
 def _llm_stub(payload: dict) -> dict:
@@ -78,23 +79,27 @@ def _llm_stub(payload: dict) -> dict:
         "content": (
             "[local stub LLM — no API key set] "
             f"received {len(msgs)} message(s); last_len={len(last)}. "
-            "Set ANTHROPIC_API_KEY or OPENAI_API_KEY for real responses."
+            "Set CHUTES_API_KEY (or OPENAI_API_KEY) for real responses."
         ),
         "model": "stub",
     }
 
 
 def llm_dispatch(payload: dict) -> dict:
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return _llm_anthropic(payload)
+    if os.environ.get("CHUTES_API_KEY"):
+        return _llm_chutes(payload)
     if os.environ.get("OPENAI_API_KEY"):
         return _llm_openai(payload)
     return _llm_stub(payload)
 
 
 def llm_available_models() -> list[str]:
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return ["claude-haiku-4-5-20251001", "claude-sonnet-4-6"]
+    if os.environ.get("CHUTES_API_KEY"):
+        return [
+            CHUTES_DEFAULT_MODEL,
+            "deepseek-ai/DeepSeek-R1",
+            "moonshotai/Kimi-K2-Instruct",
+        ]
     if os.environ.get("OPENAI_API_KEY"):
         return ["gpt-4o-mini", "gpt-4o"]
     return ["stub"]

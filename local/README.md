@@ -115,14 +115,19 @@ LLM provider rules (no key required for the stack to *run*):
 
 | Env var | What happens |
 |---|---|
-| `ANTHROPIC_API_KEY` | Real proxy to Anthropic Messages |
+| `CHUTES_API_KEY` | Real proxy to Chutes AI (`https://llm.chutes.ai/v1`) — same provider real radar uses; default model `deepseek-ai/DeepSeek-V3-0324` |
 | `OPENAI_API_KEY` | Real proxy to OpenAI Chat Completions |
 | neither | Deterministic stub — agent can still test the call path |
+
+Both providers expose the same OpenAI-compatible `POST /llm/chat` shape
+(`{model?, messages, temperature?, max_tokens?}`), so the agent code
+that ships in the other repo's example miner doesn't need to know
+which one is configured.
 
 Wiki: pass `--wiki_dir <path>` to expose any markdown directory.
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-... python local/run.py \
+CHUTES_API_KEY=cpk_... python local/run.py \
     --agent_dir /path/to/my_agent \
     --wiki_dir  /path/to/notes
 ```
