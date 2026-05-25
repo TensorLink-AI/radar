@@ -60,12 +60,22 @@ def build_model(input_dim, output_dim):
 """
 
 
-def design_architecture(challenge: dict) -> dict:
+def design_architecture(challenge: dict, client=None) -> dict:
     """Return a proposal dict for the given challenge.
 
-    No external clients in the local stack — the miner reads
-    ``feasible_frontier`` and FLOPs range directly from the challenge.
+    The signature mirrors the distributed harness — ``client`` is a
+    ``shared.url_gate.GatedClient`` when called via ``local/miner.py``
+    against a running validator, ``None`` for direct unit calls. We use
+    it (when available) only to read the validator-side frontier so the
+    code path is exercised; the agent's design logic doesn't depend on
+    LLM/arxiv here.
     """
+    db_url = challenge.get("db_url", "")
+    if client is not None and db_url:
+        try:
+            client.get_json(f"{db_url}/frontier", timeout=5)
+        except Exception:  # noqa: BLE001
+            pass  # local services unreachable — fall through
     min_flops = int(challenge.get("min_flops_equivalent", 0))
     max_flops = int(challenge.get("max_flops_equivalent", 0))
     frontier = challenge.get("feasible_frontier", []) or []

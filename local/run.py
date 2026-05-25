@@ -49,6 +49,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="How many miner processes to launch")
     parser.add_argument("--phase_a_seconds", type=float, default=10.0)
     parser.add_argument("--gap_seconds", type=float, default=2.0)
+    parser.add_argument("--agent_dir", default="",
+                        help="Directory containing agent.py; passed to "
+                             "every miner process.")
+    parser.add_argument("--agent_module", default="",
+                        help="Single-file alternative to --agent_dir.")
+    parser.add_argument("--wiki_dir", default="",
+                        help="Local markdown directory exposed to the "
+                             "agent at GET /wiki.")
     parser.add_argument("--log_level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -62,6 +70,8 @@ def main(argv: list[str] | None = None) -> int:
         "--gap_seconds", str(args.gap_seconds),
         "--log_level", args.log_level,
     ]
+    if args.wiki_dir:
+        validator_cmd += ["--wiki_dir", args.wiki_dir]
 
     procs: list[subprocess.Popen] = []
     print(f"[run] launching validator: {' '.join(validator_cmd)}", flush=True)
@@ -80,6 +90,10 @@ def main(argv: list[str] | None = None) -> int:
             "--rounds", str(args.rounds),
             "--log_level", args.log_level,
         ]
+        if args.agent_dir:
+            miner_cmd += ["--agent_dir", args.agent_dir]
+        elif args.agent_module:
+            miner_cmd += ["--agent_module", args.agent_module]
         print(f"[run] launching miner {miner_id}", flush=True)
         procs.append(_spawn(miner_cmd))
 

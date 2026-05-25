@@ -16,7 +16,8 @@ Postgres and a fleet of trainer pods.
 | HMAC + bearer tokens | None — trust the machine |
 | Size buckets (FLOPs-equivalent) | `local/task.py::SIZE_BUCKETS` |
 | Scoring: size gate + frontier + Pareto bonus | `local/scoring.py` |
-| Validator ↔ DB HTTP API | Direct SQLite reads/writes |
+| Validator ↔ DB HTTP API | `local/services.py` on 127.0.0.1 |
+| Agent's `GatedClient` for db/llm/desearch/wiki | Real `shared.url_gate.GatedClient` pointed at the local services URL |
 | Validator ↔ miner via challenge proxy | Validator writes `challenges` row; miner polls |
 | Miner ↔ trainer pod via Targon/Basilica | Validator runs trainer in-process |
 
@@ -63,19 +64,68 @@ Both processes write into `local/radar_local.db`. Inspect it with
 
 ## Plugging in your own agent
 
-Drop a file with a top-level `design_architecture(challenge: dict) -> dict`
-and point the miner at it:
+Same interface as `miner/neuron.py --agent_dir` in real radar. Point
+either run.py or the miner directly at a directory containing
+`agent.py`:
 
 ```bash
-python -m local.miner --agent_module my_agent.py
+python local/run.py --agent_dir path/to/your/agent_dir/
+# or
+python -m local.miner --agent_dir path/to/your/agent_dir/
 ```
 
-The contract matches `miner_template/agent.py`: return
-`{code, name, motivation, reasoning, tool_calls, prompt_id}`. The
-`code` field is a Python source string that must define
+Sibling files in that dir are importable from `agent.py`.
+`--agent_module path/to/single.py` works for one-file agents.
+
+The agent's signature can be either form — the miner auto-detects:
+
+```python
+def design_architecture(challenge, client):   # like the distributed harness
+    ...
+
+def design_architecture(challenge):           # if you don't need the client
+    ...
+```
+
+Returns `{code, name, motivation, reasoning, tool_calls, prompt_id}`.
+The `code` field is a Python source string that must define
 `build_model(input_dim, output_dim)` returning an object with
 `hidden_sizes`, `activation`, `learning_rate`, `epochs` attributes —
 see `local/agent.py` for the reference emitter.
+
+## Agent-facing services
+
+When the validator starts it stands up a localhost HTTP server with
+the same endpoint shape miner agents see in real radar. The challenge
+carries the URLs and `allowed_urls`, and the miner builds a real
+`shared.url_gate.GatedClient` pointed at them:
+
+| Endpoint | Use |
+|---|---|
+| `GET  {db_url}/experiments/recent?limit=N` | Past experiment rows (SQLite) |
+| `GET  {db_url}/experiments/{id}` | One experiment by id |
+| `GET  {db_url}/frontier` | Current Pareto front |
+| `POST {llm_url}/chat`  `{model?, messages, max_tokens?, temperature?}` | LLM |
+| `GET  {llm_url}/models` | Available models |
+| `POST {desearch_url}/search`  `{query, max_results?}` | Arxiv via `export.arxiv.org` |
+| `GET  {cognition_wiki_url}` | List markdown files |
+| `GET  {cognition_wiki_url}/<path>` | Raw markdown content |
+
+LLM provider rules (no key required for the stack to *run*):
+
+| Env var | What happens |
+|---|---|
+| `ANTHROPIC_API_KEY` | Real proxy to Anthropic Messages |
+| `OPENAI_API_KEY` | Real proxy to OpenAI Chat Completions |
+| neither | Deterministic stub — agent can still test the call path |
+
+Wiki: pass `--wiki_dir <path>` to expose any markdown directory.
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... python local/run.py \
+    --agent_dir /path/to/my_agent \
+    --wiki_dir  /path/to/notes
+```
 
 ## Where to look next
 

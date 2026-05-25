@@ -26,6 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from local.scoring import compute_pareto, passes_size_gate, score_round
+from local.services import ServicesServer
 from local.store import LocalStore
 from local.task import SIZE_BUCKETS, TaskSpec
 from local.trainer import run_training
@@ -41,7 +42,8 @@ def _pick_bucket(round_id: int) -> tuple[str, int, int]:
     return name, lo, hi
 
 
-def _build_challenge(round_id: int, store: LocalStore, task: TaskSpec) -> dict:
+def _build_challenge(round_id: int, store: LocalStore, task: TaskSpec,
+                     services_url: str) -> dict:
     name, lo, hi = _pick_bucket(round_id)
     all_exps = store.recent_experiments(n=10_000)
     pareto = compute_pareto(all_exps)
@@ -55,6 +57,9 @@ def _build_challenge(round_id: int, store: LocalStore, task: TaskSpec) -> dict:
         for e in pareto
         if passes_size_gate(e["objectives"], lo, hi)
     ]
+    # ``allowed_urls`` is what the miner-side GatedClient enforces. Every
+    # endpoint the agent can reach lives under ``services_url`` so a
+    # single prefix is enough.
     return {
         "challenge_id": f"r{round_id:06d}-{uuid.uuid4().hex[:8]}",
         "round_id": round_id,
@@ -68,7 +73,13 @@ def _build_challenge(round_id: int, store: LocalStore, task: TaskSpec) -> dict:
             "output_dim": task.output_dim,
         },
         "feasible_frontier": feasible,
-        "agent_seconds": 30,  # local agent runs in milliseconds
+        "agent_seconds": 30,
+        # URL surface the agent uses via GatedClient.
+        "db_url": services_url,
+        "llm_url": f"{services_url}/llm",
+        "desearch_url": f"{services_url}/desearch",
+        "cognition_wiki_url": f"{services_url}/wiki",
+        "allowed_urls": services_url,
     }
 
 
@@ -82,8 +93,8 @@ def _next_round_id(store: LocalStore) -> int:
 
 
 def run_round(store: LocalStore, task: TaskSpec, round_id: int,
-              phase_a_seconds: float) -> None:
-    challenge = _build_challenge(round_id, store, task)
+              phase_a_seconds: float, services_url: str) -> None:
+    challenge = _build_challenge(round_id, store, task, services_url)
     challenge_id = challenge["challenge_id"]
     bucket = challenge["bucket"]
     logger.info(
@@ -195,6 +206,16 @@ def main(argv: list[str] | None = None) -> int:
                         help="Max wait for miner proposals each round")
     parser.add_argument("--gap_seconds", type=float, default=2.0,
                         help="Sleep between rounds")
+    parser.add_argument("--services_port", type=int, default=0,
+                        help="HTTP port for the agent-facing services "
+                             "server (db/llm/desearch/wiki). 0 = pick free.")
+    parser.add_argument("--services_url_file", default="",
+                        help="If set, write the chosen services URL here "
+                             "after binding (used by run.py to forward it "
+                             "to the miner process).")
+    parser.add_argument("--wiki_dir", default="",
+                        help="Local directory of markdown files exposed to "
+                             "the agent at GET /wiki. Empty = no wiki.")
     parser.add_argument("--log_level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -208,12 +229,26 @@ def main(argv: list[str] | None = None) -> int:
     task = TaskSpec()
     logger.info("starting; db=%s task=%s", args.db, task.name)
 
+    services = ServicesServer(
+        store=store,
+        wiki_dir=args.wiki_dir or None,
+        port=args.services_port,
+    )
+    services_url = services.start()
+    logger.info(
+        "services: db=%s llm=%s/llm desearch=%s/desearch wiki=%s/wiki",
+        services_url, services_url, services_url, services_url,
+    )
+    if args.services_url_file:
+        Path(args.services_url_file).write_text(services_url)
+
     round_id = _next_round_id(store)
     completed = 0
     try:
         while args.rounds == 0 or completed < args.rounds:
             run_round(store, task, round_id,
-                      phase_a_seconds=args.phase_a_seconds)
+                      phase_a_seconds=args.phase_a_seconds,
+                      services_url=services_url)
             round_id += 1
             completed += 1
             if args.rounds == 0 or completed < args.rounds:
@@ -221,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         logger.info("interrupted; bye")
     finally:
+        services.stop()
         store.close()
     return 0
 
