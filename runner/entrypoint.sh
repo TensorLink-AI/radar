@@ -28,7 +28,11 @@ fi
 
 # Refuse to run if any preload / import-path-altering env var is set.
 # PYTHONNOUSERSITE is handled separately below (we always set it).
-for var in LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT PYTHONUSERBASE; do
+# LD_LIBRARY_PATH is intentionally NOT banned: the nvidia/cuda base image
+# sets it as a default (/usr/local/nvidia/lib[64]). Operator overrides of
+# CUDA lib paths remain possible; _bootstrap.py's sha256 check still
+# detects code tampering.
+for var in LD_PRELOAD LD_AUDIT PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT PYTHONUSERBASE; do
     eval "val=\${$var:-}"
     if [ -n "$val" ]; then
         echo "radar-entrypoint: refusing to run — banned env var $var is set" >&2
