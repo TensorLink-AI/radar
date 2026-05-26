@@ -1,12 +1,13 @@
-"""Miner template — starter agent + prompt-evolution scaffolding.
+"""Minimal subset of miner_template kept for the local stack.
 
-The miner CLI (``miner/neuron.py``) drives this package's two surfaces:
+Surfaces:
 
-  * ``agent.py`` — ``design_architecture(challenge, client)`` entrypoint
-    called by the validator each round.
-  * ``prompts`` + ``optimizers`` + ``results_client`` — feedback loop
-    that lets miners pull their own scored history and evolve their
-    agent's prompts (e.g. via GEPA).
+* ``miner_template.prompts`` — atomic-write population store the local
+  agent reads (``active.json``) and ``local/optimize.py`` writes.
+* ``miner_template.optimizers`` — pluggable registry plus the built-in
+  ``random_mutate`` and ``gepa`` adapters.
 
-See ``docs/optimizer.md`` for the loop in full.
+The original distributed-deployment surfaces (``agent.py``,
+``deploy.py``, ``results_client.py``) were removed when the repo was
+pruned to the local stack.
 """

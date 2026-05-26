@@ -3,40 +3,17 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "radar-subnet"
+name = "radar-local"
 version = "0.1.0"
-description = "Autonomous ML research service with phase-split validation"
+description = "Single-laptop validator + miner stack with SQLite broker"
 requires-python = ">=3.10"
 dependencies = [
-    "affinetes @ git+https://github.com/AffineFoundation/affinetes.git",
-    "fastapi>=0.104",
-    "uvicorn>=0.24",
-    "pydantic>=2.0",
-    "httpx>=0.25",
-    "docker>=7.0",
-    "pyyaml>=6.0",
-    "cryptography>=41.0",
-    "boto3>=1.28",
-    "python-dotenv>=1.0",
-    "safetensors>=0.4.0",
-    "asyncpg>=0.29.0",
-    "jinja2>=3.1",
-    "itsdangerous>=2.1",
-    "python-multipart>=0.0.7",
-    "targon-sdk>=1.0.0",
+    "numpy>=1.24",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=7.0",
-    "pytest-asyncio>=0.21",
-]
-lightning = [
-    "btlightning>=0.2.4",
-]
+# GEPA prompt optimizer (uses DSPy + an LLM provider).
+gepa = ["dspy>=2.4"]
 
 [tool.setuptools.packages.find]
-include = ["shared*", "validator*", "miner*", "learners*", "database*"]
-
-[tool.setuptools]
-py-modules = ["config"]
+include = ["local*", "shared*", "miner_template*"]
