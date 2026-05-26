@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-IMAGE="${IMAGE:-ghcr.io/tensorlink-ai/ts-runner:latest}"
+IMAGE="${IMAGE:-ghcr.io/tensorlink-ai/radar/radar-runner:latest}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE="$(mktemp -d)"
