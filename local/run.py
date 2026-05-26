@@ -28,6 +28,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
+sys.path.insert(0, str(ROOT))
 
 
 def _spawn(args: list[str]) -> subprocess.Popen:
@@ -61,6 +62,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     py = sys.executable
+
+    # Pre-init the SQLite file so validator + miner don't race on the
+    # initial PRAGMA journal_mode=WAL (which needs an exclusive lock).
+    from local.store import LocalStore
+    LocalStore(args.db).close()
 
     validator_cmd = [
         py, "-m", "local.validator",

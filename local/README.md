@@ -132,6 +132,46 @@ CHUTES_API_KEY=cpk_... python local/run.py \
     --wiki_dir  /path/to/notes
 ```
 
+## Prompt-population optimizer (GEPA / random_mutate)
+
+The local stack reuses the existing `miner_template.optimizers`
+plugins against the local SQLite store. `prompt_id` round-trips
+end-to-end (`agent → proposal → experiments.prompt_id`) so the
+optimizer can attribute Phase C scores back to the variant that
+produced each architecture.
+
+```bash
+# one-shot (no LLM needed — CI-safe)
+python -m local.optimize --agent_dir /path/to/agent \
+    --optimizer random_mutate --population 6
+
+# daemon — re-runs whenever a new experiment lands
+CHUTES_API_KEY=cpk_... python -m local.optimize \
+    --agent_dir /path/to/agent --optimizer gepa --watch
+```
+
+Layout written under `<agent_dir>/prompts/` (override with
+`--prompts_dir`):
+
+```
+prompts/
+  active.json          # current population the agent rotates through
+  history/
+    gen_001.json
+    gen_002.json
+```
+
+The default `local/agent.py` reads `active.json` via
+`miner_template.prompts.load_active` and picks one variant per round
+with `pick_for_round(pop, round_id)` — same logic as
+`miner_template/agent.py` in real radar.
+
+For GEPA the reflector LM is auto-configured from `CHUTES_API_KEY`
+(preferred — points DSPy at `https://llm.chutes.ai/v1`) or
+`OPENAI_API_KEY`. Without either, GEPA refuses to run; use
+`--optimizer random_mutate` for a no-key loop. Install DSPy with
+`pip install dspy` before using `--optimizer gepa`.
+
 ## Where to look next
 
 - `local/validator.py` — the round loop. Mirrors the structure of

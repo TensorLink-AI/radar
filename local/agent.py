@@ -12,10 +12,37 @@ top-level ``design_architecture(challenge: dict) -> dict``.
 
 from __future__ import annotations
 
+import os
 import random
+from pathlib import Path
 from typing import Optional
 
 from local.task import INPUT_DIM, MAX_HIDDEN_WIDTH, estimate_flops_equivalent
+
+
+def _load_active_prompt(round_id: int) -> dict:
+    """Return ``{id, template}`` for the prompt variant this round
+    should use. Reads via ``miner_template.prompts`` so the same
+    on-disk layout (``prompts/active.json`` + ``history/gen_NNN.json``)
+    works for both the local stack and the real miner CLI.
+
+    Returns ``{"id": "", "template": ""}`` if no population exists
+    (fresh stack, optimizer hasn't been run yet) so the agent falls
+    back to its hardcoded heuristic.
+    """
+    try:
+        from miner_template import prompts as prompts_mod
+    except ImportError:
+        return {"id": "", "template": ""}
+    prompts_dir = os.environ.get("MINER_PROMPTS_DIR")
+    pop = prompts_mod.load_active(Path(prompts_dir) if prompts_dir else None)
+    if not pop:
+        return {"id": "", "template": ""}
+    try:
+        pick = prompts_mod.pick_for_round(pop, round_id)
+    except ValueError:
+        return {"id": "", "template": ""}
+    return {"id": pick.id, "template": pick.template}
 
 
 def _pick_shape(min_flops: int, max_flops: int) -> tuple[list[int], str, float, int]:
@@ -76,6 +103,12 @@ def design_architecture(challenge: dict, client=None) -> dict:
             client.get_json(f"{db_url}/frontier", timeout=5)
         except Exception:  # noqa: BLE001
             pass  # local services unreachable — fall through
+
+    # Read the active prompt variant for this round. The id round-trips
+    # via the proposal so the local optimizer can attribute scores back
+    # to the variant that produced this architecture.
+    round_id = int(challenge.get("round_id", 0) or 0)
+    prompt = _load_active_prompt(round_id)
     min_flops = int(challenge.get("min_flops_equivalent", 0))
     max_flops = int(challenge.get("max_flops_equivalent", 0))
     frontier = challenge.get("feasible_frontier", []) or []
@@ -126,5 +159,5 @@ def design_architecture(challenge: dict, client=None) -> dict:
                            "lr": lr, "epochs": epochs},
             }
         ],
-        "prompt_id": "",
+        "prompt_id": prompt["id"],
     }
