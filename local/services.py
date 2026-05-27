@@ -8,8 +8,10 @@ without a real network. Endpoints:
   GET  /experiments/recent?limit=N
   GET  /experiments/{id}
   GET  /frontier
-  POST /llm/chat
+  POST /llm/chat                   — legacy {content, model} shape
+  POST /llm/v1/chat/completions    — OpenAI-compatible ChatCompletion
   GET  /llm/models
+  GET  /llm/v1/models              — OpenAI-compatible model list
   POST /desearch/search
   GET  /wiki                — JSON listing of available files
   GET  /wiki/<path>         — raw markdown content
@@ -29,6 +31,7 @@ from typing import Optional
 
 from local.providers import (
     WikiStore, desearch, llm_available_models, llm_dispatch,
+    llm_openai_dispatch,
 )
 from local.scoring import compute_pareto
 from local.store import LocalStore
@@ -98,6 +101,17 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/llm/models":
             return self._json(200, {"models": llm_available_models()})
 
+        if path == "/llm/v1/models":
+            now = 0
+            return self._json(200, {
+                "object": "list",
+                "data": [
+                    {"id": m, "object": "model", "created": now,
+                     "owned_by": "local"}
+                    for m in llm_available_models()
+                ],
+            })
+
         if path == "/wiki":
             return self._json(200, {"files": self.wiki.list()})
 
@@ -122,6 +136,12 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/llm/chat":
             try:
                 return self._json(200, llm_dispatch(payload))
+            except Exception as e:  # noqa: BLE001
+                return self._json(502, {"error": f"{type(e).__name__}: {e}"})
+
+        if path == "/llm/v1/chat/completions":
+            try:
+                return self._json(200, llm_openai_dispatch(payload))
             except Exception as e:  # noqa: BLE001
                 return self._json(502, {"error": f"{type(e).__name__}: {e}"})
 
