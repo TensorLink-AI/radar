@@ -98,6 +98,9 @@ def _build_challenge(round_id: int, store: LocalStore, task,
         "task": _task_dict(task),
         "feasible_frontier": feasible,
         "agent_seconds": 30,
+        # Dummy agent_token — local services.py doesn't enforce auth, but
+        # the real agents' startup checks require a non-empty value.
+        "agent_token": "local-dev",
         # URL surface the agent uses via GatedClient.
         "db_url": services_url,
         "llm_url": f"{services_url}/llm",

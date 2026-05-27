@@ -9,4 +9,5 @@ data/
 logs/
 prompts/
 local/radar_local.db*
+local/scratchpads/
 

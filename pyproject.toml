@@ -26,6 +26,11 @@ ts_forecasting = [
     "safetensors>=0.4",
     "httpx>=0.27",
 ]
+# Dependencies for the bundled real miner agents under miners/. All of
+# them import torch (FLOPs/shape inference), and the LLM-driving ones
+# (claude_style*, openai_sdk*) talk to the validator's OpenAI-compatible
+# /llm proxy via the openai SDK.
+miners = ["torch>=2.1", "openai>=1.30", "httpx>=0.27"]
 
 [tool.setuptools.packages.find]
 include = ["local*", "shared*", "miner_template*", "miners*", "runner*"]
