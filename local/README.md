@@ -105,9 +105,11 @@ carries the URLs and `allowed_urls`, and the miner builds a real
 | `GET  {db_url}/experiments/recent?limit=N` | Past experiment rows (SQLite) |
 | `GET  {db_url}/experiments/{id}` | One experiment by id |
 | `GET  {db_url}/frontier` | Current Pareto front |
-| `POST {llm_url}/chat`  `{model?, messages, max_tokens?, temperature?}` | LLM |
+| `POST {llm_url}/chat`  `{model?, messages, max_tokens?, temperature?}` | Legacy LLM ({content, model}) |
+| `POST {llm_url}/v1/chat/completions` | OpenAI-compatible ChatCompletion |
 | `GET  {llm_url}/models` | Available models |
-| `POST {desearch_url}/search`  `{query, max_results?}` | Arxiv via `export.arxiv.org` |
+| `GET  {llm_url}/v1/models` | OpenAI-compatible model list |
+| `POST {desearch_url}/search`  `{query, count?, tool?, date_filter?}` | Desearch SN22 (with `RADAR_DESEARCH_SN22_URL` + `DESEARCH_API_KEY`) or arxiv fallback |
 | `GET  {cognition_wiki_url}` | List markdown files |
 | `GET  {cognition_wiki_url}/<path>` | Raw markdown content |
 
@@ -123,6 +125,12 @@ Both providers expose the same OpenAI-compatible `POST /llm/chat` shape
 (`{model?, messages, temperature?, max_tokens?}`), so the agent code
 that ships in the other repo's example miner doesn't need to know
 which one is configured.
+
+Desearch: set `RADAR_DESEARCH_SN22_URL=https://api.desearch.ai` and
+`DESEARCH_API_KEY=dt_...` to proxy `/desearch/search` to the real SN22
+AI-search endpoint. Without those, the local stack hits the public
+arxiv Atom API instead (and degrades to an empty result set when egress
+is blocked).
 
 Wiki: pass `--wiki_dir <path>` to expose any markdown directory.
 

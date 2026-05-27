@@ -16,16 +16,13 @@ from __future__ import annotations
 import json
 import os
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional
-
-
-ARXIV_API = "http://export.arxiv.org/api/query"
-ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom"}
 
 
 # ── LLM ────────────────────────────────────────────────────────
@@ -146,20 +143,181 @@ def llm_available_models() -> list[str]:
     return ["stub"]
 
 
-# ── Arxiv (Desearch shim) ──────────────────────────────────────
+# ── Desearch (real SN22 API + arxiv fallback) ──────────────────
+
+ARXIV_API = "http://export.arxiv.org/api/query"
+ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom"}
+
+DESEARCH_DEFAULT_URL = "https://api.desearch.ai"
+DESEARCH_AI_PATH = "/desearch/ai/search"
+DESEARCH_DATE_FILTERS = {
+    "PAST_24_HOURS", "PAST_2_DAYS", "PAST_WEEK", "PAST_2_WEEKS",
+    "PAST_MONTH", "PAST_2_MONTHS", "PAST_YEAR", "PAST_2_YEARS",
+}
+
+
+def _desearch_remote(payload: dict, base_url: str, api_key: str) -> dict:
+    """Forward to the production Desearch SN22 AI-search endpoint.
+
+    Maps the local payload shape (``{query, count, max_results, tool,
+    date_filter}``) onto the upstream ``/desearch/ai/search`` schema and
+    normalises the response into ``{"results": [{title, abstract, url}]}``
+    so the miner's tool wrapper can consume it unchanged.
+    """
+    prompt = (
+        payload.get("prompt")
+        or payload.get("query")
+        or ""
+    ).strip()
+    if not prompt:
+        return {"results": []}
+
+    raw_n = payload.get("count", payload.get("max_results", 10))
+    try:
+        count = max(1, min(20, int(raw_n)))
+    except (TypeError, ValueError):
+        count = 10
+
+    # The miner sends `tool` (singular string: "arxiv" | "web"). Upstream
+    # expects a `tools` array of source identifiers.
+    tools = payload.get("tools")
+    if not tools:
+        tool = (payload.get("tool") or "").lower()
+        if tool == "arxiv":
+            tools = ["arxiv"]
+        elif tool == "web":
+            tools = ["web"]
+        else:
+            tools = ["web"]
+
+    date_filter = payload.get("date_filter")
+    if date_filter not in DESEARCH_DATE_FILTERS:
+        date_filter = "PAST_2_YEARS"
+
+    body = {
+        "prompt": prompt,
+        "tools": tools,
+        "count": count,
+        "date_filter": date_filter,
+        "streaming": False,
+    }
+    if payload.get("model"):
+        body["model"] = payload["model"]
+
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}{DESEARCH_AI_PATH}",
+        data=json.dumps(body).encode(),
+        method="POST",
+    )
+    # Desearch expects the raw key in the Authorization header — no
+    # "Bearer " prefix (per the official desearch-py SDK).
+    req.add_header("Authorization", api_key)
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read())
+
+    return {"results": _normalise_desearch_results(data, count)}
+
+
+def _normalise_desearch_results(data, limit: int) -> list[dict]:
+    """Coerce a desearch response into ``[{title, abstract, url}, ...]``.
+
+    The upstream schema bundles results under various keys depending on
+    which tools ran (``organic_results``, ``arxiv_search``,
+    ``web_search``, ``results``, ``sources`` …). We look at the obvious
+    candidates and pull whatever we can — anything we can't map shows
+    up as untitled with the raw URL.
+    """
+    if not isinstance(data, dict):
+        return []
+
+    candidates: list = []
+    for key in (
+        "results", "organic_results", "arxiv_search", "web_search",
+        "sources", "links", "data",
+    ):
+        v = data.get(key)
+        if isinstance(v, list):
+            candidates.extend(v)
+
+    out: list[dict] = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        out.append({
+            "title": (
+                item.get("title")
+                or item.get("name")
+                or "untitled"
+            ),
+            "abstract": (
+                item.get("abstract")
+                or item.get("summary")
+                or item.get("snippet")
+                or item.get("description")
+                or item.get("text")
+                or ""
+            ),
+            "arxiv_id": item.get("arxiv_id", ""),
+            "url": (
+                item.get("url")
+                or item.get("link")
+                or item.get("href")
+                or ""
+            ),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
 
 def desearch(payload: dict) -> dict:
-    query = (payload.get("query") or "").strip()
+    """Local desearch endpoint.
+
+    Resolution order:
+
+    1. If ``RADAR_DESEARCH_SN22_URL`` and ``DESEARCH_API_KEY`` are set,
+       forward to the production Desearch SN22 ``/desearch/ai/search``
+       endpoint.
+    2. Otherwise fall back to the public arxiv Atom API (works for
+       prompts about ML papers, requires egress to export.arxiv.org).
+    3. On any network/HTTP error, return ``{"results": [], "error":
+       "..."}`` so the miner sees "no papers found" instead of a 502.
+    """
+    sn22_url = os.environ.get("RADAR_DESEARCH_SN22_URL", "").strip()
+    api_key = os.environ.get("DESEARCH_API_KEY", "").strip()
+    if sn22_url and api_key:
+        try:
+            return _desearch_remote(payload, sn22_url, api_key)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            return {"results": [], "error": f"{type(exc).__name__}: {exc}"}
+        except (json.JSONDecodeError, ValueError) as exc:
+            return {"results": [], "error": f"{type(exc).__name__}: {exc}"}
+
+    # Accept the upstream `count` alias for `max_results` so callers
+    # written against the production desearch API work unchanged.
+    query = (payload.get("query") or payload.get("prompt") or "").strip()
     if not query:
         return {"results": []}
-    max_results = max(1, min(20, int(payload.get("max_results", 5))))
+    raw_n = payload.get("max_results", payload.get("count", 5))
+    try:
+        max_results = max(1, min(20, int(raw_n)))
+    except (TypeError, ValueError):
+        max_results = 5
     qs = urllib.parse.urlencode({
         "search_query": f"all:{query}",
         "start": 0,
         "max_results": max_results,
     })
-    with urllib.request.urlopen(f"{ARXIV_API}?{qs}", timeout=20) as resp:
-        body = resp.read()
+    try:
+        with urllib.request.urlopen(f"{ARXIV_API}?{qs}", timeout=20) as resp:
+            body = resp.read()
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        # Sandbox / offline environments routinely block egress to
+        # export.arxiv.org. Degrade to an empty result set instead of
+        # raising — the miner already handles "no papers found" cleanly,
+        # whereas a 502 just triggers a retry loop and a fallback round.
+        return {"results": [], "error": f"{type(exc).__name__}: {exc}"}
     root = ET.fromstring(body)
     results = []
     for entry in root.findall("atom:entry", ARXIV_NS):
