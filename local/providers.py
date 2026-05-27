@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -149,17 +150,30 @@ def llm_available_models() -> list[str]:
 # ── Arxiv (Desearch shim) ──────────────────────────────────────
 
 def desearch(payload: dict) -> dict:
+    # Accept the upstream `count` alias for `max_results` so callers
+    # written against the production desearch API work unchanged.
     query = (payload.get("query") or "").strip()
     if not query:
         return {"results": []}
-    max_results = max(1, min(20, int(payload.get("max_results", 5))))
+    raw_n = payload.get("max_results", payload.get("count", 5))
+    try:
+        max_results = max(1, min(20, int(raw_n)))
+    except (TypeError, ValueError):
+        max_results = 5
     qs = urllib.parse.urlencode({
         "search_query": f"all:{query}",
         "start": 0,
         "max_results": max_results,
     })
-    with urllib.request.urlopen(f"{ARXIV_API}?{qs}", timeout=20) as resp:
-        body = resp.read()
+    try:
+        with urllib.request.urlopen(f"{ARXIV_API}?{qs}", timeout=20) as resp:
+            body = resp.read()
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        # Sandbox / offline environments routinely block egress to
+        # export.arxiv.org. Degrade to an empty result set instead of
+        # raising — the miner already handles "no papers found" cleanly,
+        # whereas a 502 just triggers a retry loop and a fallback round.
+        return {"results": [], "error": f"{type(exc).__name__}: {exc}"}
     root = ET.fromstring(body)
     results = []
     for entry in root.findall("atom:entry", ARXIV_NS):
