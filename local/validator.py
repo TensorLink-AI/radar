@@ -28,17 +28,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from local.scoring import compute_pareto, passes_size_gate, score_round
 from local.services import ServicesServer
 from local.store import LocalStore
-from local.task import SIZE_BUCKETS, TaskSpec, TSForecastingSpec, make_spec
+from local.task import SIZE_BUCKETS, TaskSpec, TSForecastingSpec, buckets_for, make_spec
 from local.trainer import run_training
 
 
 logger = logging.getLogger("local.validator")
 
 
-def _pick_bucket(round_id: int) -> tuple[str, int, int]:
-    names = list(SIZE_BUCKETS.keys())
+def _pick_bucket(round_id: int, task=None) -> tuple[str, int, int]:
+    buckets = buckets_for(task) if task is not None else SIZE_BUCKETS
+    names = list(buckets.keys())
     name = names[round_id % len(names)]
-    lo, hi = SIZE_BUCKETS[name]
+    lo, hi = buckets[name]
     return name, lo, hi
 
 
@@ -71,8 +72,8 @@ def _task_dict(task) -> dict:
 
 
 def _build_challenge(round_id: int, store: LocalStore, task,
-                     services_url: str) -> dict:
-    name, lo, hi = _pick_bucket(round_id)
+                     services_url: str, agent_seconds: int = 180) -> dict:
+    name, lo, hi = _pick_bucket(round_id, task=task)
     all_exps = store.recent_experiments(n=10_000)
     pareto = compute_pareto(all_exps)
     feasible = [
@@ -97,7 +98,7 @@ def _build_challenge(round_id: int, store: LocalStore, task,
         "bucket": name,
         "task": _task_dict(task),
         "feasible_frontier": feasible,
-        "agent_seconds": 30,
+        "agent_seconds": int(agent_seconds),
         # Dummy agent_token — local services.py doesn't enforce auth, but
         # the real agents' startup checks require a non-empty value.
         "agent_token": "local-dev",
@@ -120,8 +121,11 @@ def _next_round_id(store: LocalStore) -> int:
 
 
 def run_round(store: LocalStore, task, round_id: int,
-              phase_a_seconds: float, services_url: str) -> None:
-    challenge = _build_challenge(round_id, store, task, services_url)
+              phase_a_seconds: float, services_url: str,
+              agent_seconds: int = 180) -> None:
+    challenge = _build_challenge(
+        round_id, store, task, services_url, agent_seconds=agent_seconds,
+    )
     challenge_id = challenge["challenge_id"]
     bucket = challenge["bucket"]
     logger.info(
@@ -235,8 +239,21 @@ def main(argv: list[str] | None = None) -> int:
                         help="SQLite path (default: local/radar_local.db)")
     parser.add_argument("--rounds", type=int, default=0,
                         help="Number of rounds to run; 0 = forever")
-    parser.add_argument("--phase_a_seconds", type=float, default=10.0,
-                        help="Max wait for miner proposals each round")
+    parser.add_argument("--phase_a_seconds", type=float, default=1900.0,
+                        help="Max wait for miner proposals each round. "
+                             "Should be ≥ --agent_seconds. Default 1900s "
+                             "leaves 100s of slack on top of a 30-min agent.")
+    parser.add_argument("--agent_seconds", type=int, default=1800,
+                        help="Time budget published to the agent in "
+                             "challenge['agent_seconds'] — LLM design loop. "
+                             "Agents reserve the last 30s for a fallback, "
+                             "so anything < 60 leaves no room for the LLM. "
+                             "Default 1800s (30 min).")
+    parser.add_argument("--training_seconds", type=int, default=3600,
+                        help="Phase B training budget for the ts_forecasting "
+                             "task (passed to runner.harness as time_budget). "
+                             "Default 3600s (1 hour). Ignored for "
+                             "synth_regression.")
     parser.add_argument("--gap_seconds", type=float, default=2.0,
                         help="Sleep between rounds")
     parser.add_argument("--services_port", type=int, default=0,
@@ -263,7 +280,13 @@ def main(argv: list[str] | None = None) -> int:
 
     store = LocalStore(args.db)
     task = make_spec(args.task)
-    logger.info("starting; db=%s task=%s", args.db, task.name)
+    if isinstance(task, TSForecastingSpec):
+        task.time_budget_seconds = args.training_seconds
+    logger.info(
+        "starting; db=%s task=%s agent_seconds=%d training_seconds=%s",
+        args.db, task.name, args.agent_seconds,
+        getattr(task, "time_budget_seconds", "n/a"),
+    )
 
     services = ServicesServer(
         store=store,
@@ -284,7 +307,8 @@ def main(argv: list[str] | None = None) -> int:
         while args.rounds == 0 or completed < args.rounds:
             run_round(store, task, round_id,
                       phase_a_seconds=args.phase_a_seconds,
-                      services_url=services_url)
+                      services_url=services_url,
+                      agent_seconds=args.agent_seconds)
             round_id += 1
             completed += 1
             if args.rounds == 0 or completed < args.rounds:

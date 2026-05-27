@@ -75,7 +75,10 @@ class TSForecastingSpec:
     # Comma-separated leaderboard names ("m4_hourly,electricity/H"). Empty =
     # use whatever is on disk under RADAR_GIFT_EVAL_CACHE.
     eval_datasets: str = ""
-    time_budget_seconds: int = 120
+    # Phase B (training) wallclock budget for the harness. Phase C eval
+    # runs in-process after and is not separately capped — see
+    # local/validator.py --training_seconds.
+    time_budget_seconds: int = 3600
 
 
 def make_spec(name: str):
@@ -89,13 +92,33 @@ def make_spec(name: str):
 
 # Size buckets in "FLOPs-equivalent" units (= 2 * forward-pass mac count
 # per sample, summed across layers). Real radar uses analytical FLOPs
-# counting; we approximate with parameter count × 2 for an MLP.
+# counting; for the synthetic task we approximate with parameter count × 2
+# on a small MLP, so the buckets are correspondingly tiny.
 SIZE_BUCKETS: dict[str, tuple[int, int]] = {
     "tiny":   (200,    2_000),
     "small":  (2_000,  10_000),
     "medium": (10_000, 50_000),
     "large":  (50_000, 200_000),
 }
+
+# ts_forecasting buckets — match the upstream radar values miners are
+# trained to target. Units are actual forward-pass FLOPs measured by
+# torch.utils.flop_counter.FlopCounterMode (see runner/timeseries_forecast/
+# flops.py). Sequence here matches radar-miner-examples/CLAUDE.md.
+TS_SIZE_BUCKETS: dict[str, tuple[int, int]] = {
+    "tiny":         (100_000,     500_000),
+    "small":        (500_000,   2_000_000),
+    "medium-small": (2_000_000, 10_000_000),
+    "medium":       (10_000_000, 50_000_000),
+    "large":        (50_000_000, 125_000_000),
+}
+
+
+def buckets_for(task) -> dict[str, tuple[int, int]]:
+    """Return the bucket dict appropriate for ``task``."""
+    if isinstance(task, TSForecastingSpec):
+        return TS_SIZE_BUCKETS
+    return SIZE_BUCKETS
 
 
 def make_dataset(seed: int = DATA_SEED) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
