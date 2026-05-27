@@ -139,7 +139,9 @@ def optimize(
     budget = int(config.get("budget", 30))
     score_key = str(config.get("score_key", "raw_score"))
 
-    # Configure reflector LM.
+    # Configure reflector LM.  Recent dspy.GEPA takes ``reflection_lm``
+    # directly; we still call ``dspy.configure`` so the compiled program
+    # itself has a default LM for any non-reflective rollouts.
     lm_kwargs = config.get("reflector_lm")
     if isinstance(lm_kwargs, dict):
         lm = dspy_mod.LM(**lm_kwargs)
@@ -176,7 +178,9 @@ def optimize(
         programs.append((p, prog))
 
     metric = _build_metric(score_key)
-    teleprompter = dspy_mod.GEPA(metric=metric, num_candidates=target, budget=budget)
+    teleprompter = _build_teleprompter(
+        dspy_mod, metric=metric, budget=budget, reflection_lm=lm,
+    )
 
     # GEPA compiles each seed program; we keep the best ``target``
     # programs by their reported score and map them back to Prompt rows.
@@ -206,6 +210,29 @@ def optimize(
     while len(new_pop) < target:
         new_pop.append(population[len(new_pop) % len(population)])
     return new_pop
+
+
+def _build_teleprompter(dspy_mod, *, metric, budget: int, reflection_lm):
+    """Construct ``dspy.GEPA`` across known API revisions.
+
+    The constructor signature has changed over dspy releases — ``budget``
+    + ``num_candidates`` were replaced with ``max_metric_calls`` /
+    ``auto``, and ``reflection_lm`` is now passed directly rather than
+    via ``dspy.configure``.  Try the modern signature first and fall
+    back if an older build is installed.
+    """
+    import inspect
+
+    sig = inspect.signature(dspy_mod.GEPA.__init__)
+    params = sig.parameters
+    kwargs: dict[str, Any] = {"metric": metric}
+    if "reflection_lm" in params:
+        kwargs["reflection_lm"] = reflection_lm
+    if "max_metric_calls" in params:
+        kwargs["max_metric_calls"] = budget
+    elif "budget" in params:
+        kwargs["budget"] = budget
+    return dspy_mod.GEPA(**kwargs)
 
 
 def _extract_instruction(program) -> str:
