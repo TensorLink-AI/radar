@@ -30,15 +30,18 @@ from typing import Callable, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from local.scratchpad import make_scratchpad_pair
 from local.store import LocalStore
 from shared.url_gate import GatedClient, parse_allowed_urls
 
 logger = logging.getLogger("local.miner")
 
 
-def _load_from_dir(agent_dir: Path) -> Callable:
+def _load_from_dir(agent_dir: Path) -> tuple[Callable, object]:
     """Load ``agent.py`` from a directory, making sibling files
-    importable from inside the agent module."""
+    importable from inside the agent module. Returns ``(design_fn, module)``
+    so the caller can inject helpers (load_scratchpad etc) into the
+    module's namespace."""
     if not agent_dir.is_dir():
         raise FileNotFoundError(f"agent dir not found: {agent_dir}")
     entry = agent_dir / "agent.py"
@@ -54,10 +57,10 @@ def _load_from_dir(agent_dir: Path) -> Callable:
         raise AttributeError(
             f"{entry} must define design_architecture(challenge, client?)"
         )
-    return fn
+    return fn, mod
 
 
-def _load_from_file(path: Path) -> Callable:
+def _load_from_file(path: Path) -> tuple[Callable, object]:
     spec = importlib.util.spec_from_file_location("user_agent", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -66,10 +69,10 @@ def _load_from_file(path: Path) -> Callable:
         raise AttributeError(
             f"{path} must define design_architecture(challenge, client?)"
         )
-    return fn
+    return fn, mod
 
 
-def _load_agent(agent_dir: str, agent_module: str) -> Callable:
+def _load_agent(agent_dir: str, agent_module: str) -> tuple[Callable, object]:
     if agent_dir:
         return _load_from_dir(Path(agent_dir).resolve())
     if agent_module:
@@ -77,8 +80,8 @@ def _load_agent(agent_dir: str, agent_module: str) -> Callable:
         if not p.exists():
             raise FileNotFoundError(f"agent module not found: {agent_module}")
         return _load_from_file(p)
-    from local.agent import design_architecture
-    return design_architecture
+    from local import agent as _agent_mod
+    return _agent_mod.design_architecture, _agent_mod
 
 
 def _call_agent(design: Callable, challenge: dict,
@@ -135,7 +138,13 @@ def main(argv: list[str] | None = None) -> int:
         datefmt="%H:%M:%S",
     )
 
-    design = _load_agent(args.agent_dir, args.agent_module)
+    design, agent_mod = _load_agent(args.agent_dir, args.agent_module)
+    # Inject scratchpad helpers into the agent's module namespace before
+    # any round runs. The real radar harness does this from runner/agent/
+    # harness.py; we replicate it with a local-disk-backed pair.
+    load_sp, save_sp = make_scratchpad_pair(args.miner_id)
+    agent_mod.load_scratchpad = load_sp
+    agent_mod.save_scratchpad = save_sp
     agent_label = args.agent_dir or args.agent_module or "local.agent"
     store = LocalStore(args.db)
     logger.info("starting; db=%s agent=%s", args.db, agent_label)
