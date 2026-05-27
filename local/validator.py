@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from local.scoring import compute_pareto, passes_size_gate, score_round
 from local.services import ServicesServer
 from local.store import LocalStore
-from local.task import SIZE_BUCKETS, TaskSpec
+from local.task import SIZE_BUCKETS, TaskSpec, TSForecastingSpec, make_spec
 from local.trainer import run_training
 
 
@@ -42,7 +42,35 @@ def _pick_bucket(round_id: int) -> tuple[str, int, int]:
     return name, lo, hi
 
 
-def _build_challenge(round_id: int, store: LocalStore, task: TaskSpec,
+def _task_dict(task) -> dict:
+    """Serialise a TaskSpec / TSForecastingSpec for the challenge payload.
+
+    Miners read this verbatim — see ``miners/*/agent.py`` and the
+    ``challenge['task']`` description in radar-miner-examples/README.md.
+    """
+    if isinstance(task, TSForecastingSpec):
+        return {
+            "name": task.name,
+            "task_params": {
+                "context_len": task.context_len,
+                "prediction_len": task.prediction_len,
+                "num_variates": task.num_variates,
+                "quantiles": list(task.quantiles),
+            },
+            "constraints": ["torch + stdlib only", "build_model(context_len, "
+                            "prediction_len, num_variates, quantiles) returns nn.Module"],
+            "objectives": [{"name": "val_loss", "primary": True, "minimize": True}],
+            "time_budget": task.time_budget_seconds,
+            "runner_dir": "ts_forecasting",
+        }
+    return {
+        "name": task.name,
+        "input_dim": task.input_dim,
+        "output_dim": task.output_dim,
+    }
+
+
+def _build_challenge(round_id: int, store: LocalStore, task,
                      services_url: str) -> dict:
     name, lo, hi = _pick_bucket(round_id)
     all_exps = store.recent_experiments(n=10_000)
@@ -67,11 +95,7 @@ def _build_challenge(round_id: int, store: LocalStore, task: TaskSpec,
         "min_flops_equivalent": lo,
         "max_flops_equivalent": hi,
         "bucket": name,
-        "task": {
-            "name": task.name,
-            "input_dim": task.input_dim,
-            "output_dim": task.output_dim,
-        },
+        "task": _task_dict(task),
         "feasible_frontier": feasible,
         "agent_seconds": 30,
         # URL surface the agent uses via GatedClient.
@@ -92,7 +116,7 @@ def _next_round_id(store: LocalStore) -> int:
     return int(rows["r"]) + 1
 
 
-def run_round(store: LocalStore, task: TaskSpec, round_id: int,
+def run_round(store: LocalStore, task, round_id: int,
               phase_a_seconds: float, services_url: str) -> None:
     challenge = _build_challenge(round_id, store, task, services_url)
     challenge_id = challenge["challenge_id"]
@@ -132,7 +156,13 @@ def run_round(store: LocalStore, task: TaskSpec, round_id: int,
         miner_id = p["miner_id"]
         name = payload.get("name", "unnamed")
         logger.info("  phase B/C: training '%s' from miner=%s", name, miner_id)
-        result = run_training(payload.get("code", ""), seed=round_id)
+        result = run_training(
+            payload.get("code", ""),
+            seed=round_id,
+            task=task,
+            min_flops=challenge["min_flops_equivalent"],
+            max_flops=challenge["max_flops_equivalent"],
+        )
         result["miner_id"] = miner_id
         result["name"] = name
         result["code"] = payload.get("code", "")
@@ -216,6 +246,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--wiki_dir", default="",
                         help="Local directory of markdown files exposed to "
                              "the agent at GET /wiki. Empty = no wiki.")
+    parser.add_argument("--task", default="synth_regression",
+                        choices=["synth_regression", "ts_forecasting"],
+                        help="Which task this validator drives.")
     parser.add_argument("--log_level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -226,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     store = LocalStore(args.db)
-    task = TaskSpec()
+    task = make_spec(args.task)
     logger.info("starting; db=%s task=%s", args.db, task.name)
 
     services = ServicesServer(

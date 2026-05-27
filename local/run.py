@@ -58,6 +58,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--wiki_dir", default="",
                         help="Local markdown directory exposed to the "
                              "agent at GET /wiki.")
+    parser.add_argument("--task", default="synth_regression",
+                        choices=["synth_regression", "ts_forecasting"],
+                        help="Task spec (synthetic regression or "
+                             "ts_forecasting with torch + GIFT-Eval data).")
     parser.add_argument("--log_level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -74,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         "--rounds", str(args.rounds),
         "--phase_a_seconds", str(args.phase_a_seconds),
         "--gap_seconds", str(args.gap_seconds),
+        "--task", args.task,
         "--log_level", args.log_level,
     ]
     if args.wiki_dir:

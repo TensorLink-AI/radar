@@ -52,6 +52,41 @@ class TaskSpec:
     max_epochs: int = MAX_EPOCHS
 
 
+# ── ts_forecasting task (real torch model + GIFT-Eval data) ─────────
+# Selected via ``python local/run.py --task ts_forecasting``. The miner
+# returns a torch ``build_model(context_len, prediction_len, num_variates,
+# quantiles)`` callable; the trainer dispatches it through
+# ``runner.harness.run_training`` which pretrains on parquet shards
+# (when cached or presigned) and evals on GIFT-Eval Arrow data.
+
+TS_CONTEXT_LEN = 512
+TS_PREDICTION_LEN = 96
+TS_NUM_VARIATES = 1
+TS_QUANTILES = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+
+
+@dataclass
+class TSForecastingSpec:
+    name: str = "ts_forecasting"
+    context_len: int = TS_CONTEXT_LEN
+    prediction_len: int = TS_PREDICTION_LEN
+    num_variates: int = TS_NUM_VARIATES
+    quantiles: tuple[float, ...] = TS_QUANTILES
+    # Comma-separated leaderboard names ("m4_hourly,electricity/H"). Empty =
+    # use whatever is on disk under RADAR_GIFT_EVAL_CACHE.
+    eval_datasets: str = ""
+    time_budget_seconds: int = 120
+
+
+def make_spec(name: str):
+    """Return a TaskSpec or TSForecastingSpec by short name."""
+    if name in (None, "", "synth_regression"):
+        return TaskSpec()
+    if name == "ts_forecasting":
+        return TSForecastingSpec()
+    raise ValueError(f"unknown task: {name!r}")
+
+
 # Size buckets in "FLOPs-equivalent" units (= 2 * forward-pass mac count
 # per sample, summed across layers). Real radar uses analytical FLOPs
 # counting; we approximate with parameter count × 2 for an MLP.

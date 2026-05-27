@@ -16,6 +16,16 @@ dependencies = [
 gepa = ["dspy>=2.4"]
 # GIFT-Eval data fetch + Arrow loading (R2/Hippius S3 + parquet/arrow files).
 gift_eval = ["boto3>=1.34", "pyarrow>=15.0"]
+# Real ts_forecasting task: pretrain on parquet shards + torch eval. Drags
+# in torch + the data deps. Skip this extra if you only need synth_regression.
+ts_forecasting = [
+    "torch>=2.1",
+    "boto3>=1.34",
+    "pyarrow>=15.0",
+    "pandas>=2.0",
+    "safetensors>=0.4",
+    "httpx>=0.27",
+]
 
 [tool.setuptools.packages.find]
-include = ["local*", "shared*", "miner_template*", "miners*"]
+include = ["local*", "shared*", "miner_template*", "miners*", "runner*"]
