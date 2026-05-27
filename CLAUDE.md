@@ -43,6 +43,36 @@ construction. The R2 prefix is
 `$RADAR_GIFT_EVAL_CACHE` (default `/tmp/radar_gift_eval`). Requires
 `pip install -e .[gift_eval]` (pulls boto3 + pyarrow).
 
+## Real ts_forecasting task
+
+`local/run.py --task ts_forecasting` (and `local/validator.py --task
+ts_forecasting`) flips from the numpy MLP regression task to the
+torch pretrain + GIFT-Eval pipeline. The dispatch lives in
+`local/trainer.py::_run_ts_forecasting`, which:
+
+1. Loads pretrain shards from `$RADAR_PRETRAIN_CACHE` (last one
+   reserved as val if ≥2 are present).
+2. Sets `CHECKPOINT_DIR`, `SUBMISSION_PATH`, `RADAR_*_LOCAL_PATHS`
+   in the env and calls `runner.harness.run_training` with a
+   `TSForecastingRunner`.
+3. Translates the harness's `train_loss_history` / `val_loss_history`
+   / `best_val_loss` into the `{success, metric, objectives,
+   loss_curve, ...}` shape that `local/validator.py` already writes
+   into SQLite.
+
+The frozen runner uses sibling-style imports (`from prepare import
+...`) inherited from the sandboxed-pod era — the dispatcher adds
+`runner/timeseries_forecast/` to `sys.path` so they resolve when
+driven from outside a pod.
+
+The pretrain bucket is **separate** from the eval bucket; both share
+credentials. Resolution order: `RADAR_PRETRAIN_BUCKET` →
+`HIPPIUS_PRETRAIN_BUCKET` → `R2_PRETRAIN_BUCKET` →
+`gift-eval-pretrain`. See `local/fetch_pretrain.py::_pretrain_bucket`.
+
+Heavy deps live in the `[ts_forecasting]` extra (torch, safetensors,
+pandas, httpx) so the synthetic stack stays numpy-only.
+
 ## Key files
 
 | File | Purpose |

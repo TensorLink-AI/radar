@@ -8,16 +8,32 @@ own minimal helpers in ``local/scoring.py``.
 
 The submission is plain Python source: we ``exec`` it in a sandboxed
 namespace (no real isolation — single-laptop only, you trust your own
-miner). It must define ``build_model(input_dim, output_dim)`` returning
-a config object with ``hidden_sizes``, ``activation``, ``learning_rate``,
-``epochs``.
+miner).
+
+Two dispatch paths:
+
+* ``synth_regression`` (default) — numpy MLP, the submission must
+  define ``build_model(input_dim, output_dim)`` returning a config
+  object with ``hidden_sizes`` / ``activation`` / ``learning_rate`` /
+  ``epochs``.
+
+* ``ts_forecasting`` — torch model, the submission must define
+  ``build_model(context_len, prediction_len, num_variates, quantiles)``
+  returning an ``nn.Module``. The harness in ``runner.harness`` owns
+  the loop; it can pretrain on parquet shards under
+  ``$RADAR_PRETRAIN_CACHE`` and eval on GIFT-Eval Arrow data under
+  ``$RADAR_GIFT_EVAL_CACHE``.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import sys
+import tempfile
 import time
 import traceback
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -25,6 +41,7 @@ import numpy as np
 from local.task import (
     MAX_EPOCHS, MAX_HIDDEN_LAYERS, MAX_HIDDEN_WIDTH,
     INPUT_DIM, OUTPUT_DIM, estimate_flops_equivalent, make_dataset,
+    TSForecastingSpec,
 )
 
 logger = logging.getLogger(__name__)
@@ -125,8 +142,20 @@ def _mse(y_pred: np.ndarray, y_true: np.ndarray) -> float:
     return float(np.mean((y_pred - y_true) ** 2))
 
 
-def run_training(code: str, *, seed: int = 0, log_every: int = 5) -> dict:
+def run_training(
+    code: str,
+    *,
+    seed: int = 0,
+    log_every: int = 5,
+    task: Any = None,
+    min_flops: int = 0,
+    max_flops: int = 0,
+) -> dict:
     """Phase B + Phase C, in one function. Returns the experiment record.
+
+    When ``task`` is a ``TSForecastingSpec`` the call is forwarded to
+    ``runner.harness.run_training`` (torch pretrain + eval). Otherwise
+    the legacy numpy MLP path runs.
 
     Result keys:
       ``success`` (bool), ``metric`` (MSE on test, lower is better, NaN
@@ -135,6 +164,11 @@ def run_training(code: str, *, seed: int = 0, log_every: int = 5) -> dict:
       one entry per logged epoch), ``analysis`` (str), ``error`` (str
       on failure).
     """
+    if isinstance(task, TSForecastingSpec):
+        return _run_ts_forecasting(
+            code, seed=seed, task=task,
+            min_flops=min_flops, max_flops=max_flops,
+        )
     started = time.time()
     try:
         build_model = _exec_submission(code)
@@ -206,4 +240,152 @@ def run_training(code: str, *, seed: int = 0, log_every: int = 5) -> dict:
             f"flops_equiv={flops_equiv}"
         ),
         "error": "",
+    }
+
+
+# ── ts_forecasting dispatch (torch path) ────────────────────────────
+
+
+def _ts_runner_paths_setup() -> None:
+    """The frozen runner uses sibling-style imports (``from prepare import
+    ...``). Add the package dir to sys.path so it resolves when the harness
+    is driven from outside the sandbox.
+    """
+    pkg = Path(__file__).resolve().parent.parent / "runner" / "timeseries_forecast"
+    p = str(pkg)
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+
+def _run_ts_forecasting(
+    code: str,
+    *,
+    seed: int,
+    task: TSForecastingSpec,
+    min_flops: int,
+    max_flops: int,
+) -> dict:
+    """Drive ``runner.harness.run_training`` against a ts_forecasting submission.
+
+    Sets the env vars the harness reads (CHECKPOINT_DIR, SUBMISSION_PATH,
+    RADAR_GIFT_EVAL_CACHE, pretrain shard lists) and translates the harness
+    result dict into the shape ``local/validator.py`` already expects.
+    """
+    started = time.time()
+    _ts_runner_paths_setup()
+
+    try:
+        from runner.harness import TrainingConfig, run_training as harness_run
+        from runner.timeseries_forecast.train import TSForecastingRunner
+    except Exception as e:  # noqa: BLE001
+        return {
+            "success": False,
+            "metric": None,
+            "objectives": {"flops_equivalent_size": 0, "num_params": 0,
+                           "train_seconds": 0.0},
+            "loss_curve": [],
+            "analysis": "ts_forecasting runner unavailable",
+            "error": f"{type(e).__name__}: {e} (install torch + the [gift_eval] extra)",
+        }
+
+    workdir = Path(tempfile.mkdtemp(prefix="radar_ts_"))
+    submission_path = workdir / "submission.py"
+    checkpoint_dir = workdir / "checkpoints"
+    logs_dir = workdir / "logs"
+    for d in (checkpoint_dir, logs_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    # The harness reads these from os.environ. Keep originals to restore.
+    cache_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "/tmp/radar_gift_eval")
+    pretrain_cache = os.environ.get("RADAR_PRETRAIN_CACHE", "/tmp/radar_pretrain")
+    shard_paths: list[str] = []
+    if Path(pretrain_cache).is_dir():
+        shard_paths = sorted(str(p) for p in Path(pretrain_cache).glob("*.parquet"))
+
+    overrides = {
+        "CHECKPOINT_DIR": str(checkpoint_dir),
+        "SUBMISSION_PATH": str(submission_path),
+        "RADAR_GIFT_EVAL_CACHE": cache_dir,
+    }
+    if shard_paths:
+        import json as _json
+        # Reserve the last shard as val when we have >=2; rest is train.
+        if len(shard_paths) >= 2:
+            train_paths, val_paths = shard_paths[:-1], shard_paths[-1:]
+        else:
+            train_paths, val_paths = shard_paths, []
+        overrides["RADAR_PRETRAIN_LOCAL_PATHS"] = _json.dumps(train_paths)
+        if val_paths:
+            overrides["RADAR_PRETRAIN_VAL_LOCAL_PATHS"] = _json.dumps(val_paths)
+    if task.eval_datasets:
+        overrides["RADAR_EVAL_DATASETS"] = task.eval_datasets
+
+    saved = {k: os.environ.get(k) for k in overrides}
+    os.environ.update(overrides)
+    try:
+        config = TrainingConfig(
+            seed=seed,
+            round_id=seed,
+            min_flops=min_flops,
+            max_flops=max_flops,
+            submission_id=f"local-{seed}",
+            time_budget=int(task.time_budget_seconds),
+        )
+        runner = TSForecastingRunner()
+        result = harness_run(runner, code, config)
+    except Exception as e:  # noqa: BLE001
+        return {
+            "success": False,
+            "metric": None,
+            "objectives": {"flops_equivalent_size": 0, "num_params": 0,
+                           "train_seconds": time.time() - started},
+            "loss_curve": [],
+            "analysis": "ts_forecasting harness crashed",
+            "error": f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=2)}",
+        }
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # Translate harness result → local validator shape.
+    status = result.get("status", "")
+    success = status in ("ok", "completed", "success")
+    flops_equiv = int(result.get("flops_equivalent_size") or 0)
+    num_params = int(round(float(result.get("num_params_M") or 0.0) * 1_000_000))
+    train_seconds = float(
+        result.get("training_time_seconds")
+        or result.get("train_seconds")
+        or (time.time() - started)
+    )
+    train_hist = result.get("train_loss_history") or []
+    val_hist = result.get("val_loss_history") or []
+    loss_curve = [float(x.get("loss", 0.0)) for x in train_hist]
+    # Metric priority: best val loss > last val loss > last train loss.
+    val_losses = [float(x.get("loss", 0.0)) for x in val_hist if x.get("loss") is not None]
+    if "best_val_loss" in result and result["best_val_loss"] is not None:
+        metric = float(result["best_val_loss"])
+    elif val_losses:
+        metric = val_losses[-1]
+    elif loss_curve:
+        metric = loss_curve[-1]
+    else:
+        metric = None
+
+    return {
+        "success": bool(success and metric is not None),
+        "metric": float(metric) if metric is not None else None,
+        "objectives": {
+            "flops_equivalent_size": flops_equiv,
+            "num_params": num_params,
+            "train_seconds": train_seconds,
+        },
+        "loss_curve": loss_curve,
+        "analysis": (
+            f"task=ts_forecasting status={status} pretrain_shards={len(shard_paths)} "
+            f"eval_datasets={task.eval_datasets or 'auto'}"
+        ),
+        "error": "" if success else str(result.get("error") or status),
     }
