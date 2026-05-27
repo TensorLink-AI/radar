@@ -12,10 +12,36 @@ full surface.
 
 ```
 local/           The whole stack (one file per responsibility).
+miners/          Self-contained miner agents (autonomous,
+                 claude_style[_v2], openai_sdk[_v2], patch_decoder).
+                 Each subdir is a valid --agent_dir target.
 miner_template/  Trimmed to prompts.py + optimizers/ for the
                  prompt-evolution loop.
-shared/          Trimmed to url_gate.py (GatedClient).
+shared/          url_gate.py (GatedClient) + gift_eval.py (manifest,
+                 R2 download, Arrow loader) + r2_audit.py
+                 (HippiusStorage / R2AuditLog S3 client).
+tests/           pytest suite for the shared/ modules.
 ```
+
+## GIFT-Eval / R2 access
+
+`shared.r2_audit.HippiusStorage` (alias `R2AuditLog`) is the
+S3-compatible client. It reads creds from env in this order:
+`HIPPIUS_*` first, then legacy `R2_*` (`R2_ACCOUNT_ID` derives the
+per-account endpoint). The default Hippius endpoint is
+`https://s3.hippius.com`; pointing at `*.r2.cloudflarestorage.com`
+forces region `auto` instead of `decentralized`.
+
+`shared.gift_eval` owns the GIFT-Eval manifest (key → R2 subpath),
+the SHORT/MED_LONG leaderboard lists, deterministic per-round
+dataset selection, Arrow IPC parsing, and rolling-origin window
+construction. The R2 prefix is
+`gift-eval-benchmark/gift-eval-full/{subpath}/data-00000-of-00001.arrow`.
+
+`python -m local.fetch_gift_eval` is the CLI wrapper over
+`ensure_datasets_cached()` — use it to prefetch Arrow files into
+`$RADAR_GIFT_EVAL_CACHE` (default `/tmp/radar_gift_eval`). Requires
+`pip install -e .[gift_eval]` (pulls boto3 + pyarrow).
 
 ## Key files
 
