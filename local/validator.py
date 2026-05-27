@@ -28,17 +28,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from local.scoring import compute_pareto, passes_size_gate, score_round
 from local.services import ServicesServer
 from local.store import LocalStore
-from local.task import SIZE_BUCKETS, TaskSpec, TSForecastingSpec, make_spec
+from local.task import SIZE_BUCKETS, TaskSpec, TSForecastingSpec, buckets_for, make_spec
 from local.trainer import run_training
 
 
 logger = logging.getLogger("local.validator")
 
 
-def _pick_bucket(round_id: int) -> tuple[str, int, int]:
-    names = list(SIZE_BUCKETS.keys())
+def _pick_bucket(round_id: int, task=None) -> tuple[str, int, int]:
+    buckets = buckets_for(task) if task is not None else SIZE_BUCKETS
+    names = list(buckets.keys())
     name = names[round_id % len(names)]
-    lo, hi = SIZE_BUCKETS[name]
+    lo, hi = buckets[name]
     return name, lo, hi
 
 
@@ -72,7 +73,7 @@ def _task_dict(task) -> dict:
 
 def _build_challenge(round_id: int, store: LocalStore, task,
                      services_url: str, agent_seconds: int = 180) -> dict:
-    name, lo, hi = _pick_bucket(round_id)
+    name, lo, hi = _pick_bucket(round_id, task=task)
     all_exps = store.recent_experiments(n=10_000)
     pareto = compute_pareto(all_exps)
     feasible = [
