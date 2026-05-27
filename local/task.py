@@ -75,7 +75,10 @@ class TSForecastingSpec:
     # Comma-separated leaderboard names ("m4_hourly,electricity/H"). Empty =
     # use whatever is on disk under RADAR_GIFT_EVAL_CACHE.
     eval_datasets: str = ""
-    time_budget_seconds: int = 120
+    # Phase B (training) wallclock budget for the harness. Phase C eval
+    # runs in-process after and is not separately capped — see
+    # local/validator.py --training_seconds.
+    time_budget_seconds: int = 3600
 
 
 def make_spec(name: str):

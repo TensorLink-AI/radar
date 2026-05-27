@@ -48,7 +48,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="Number of rounds; 0 = forever")
     parser.add_argument("--miners", type=int, default=1,
                         help="How many miner processes to launch")
-    parser.add_argument("--phase_a_seconds", type=float, default=10.0)
+    parser.add_argument("--phase_a_seconds", type=float, default=1900.0,
+                        help="Validator wait for proposals each round; "
+                             "should be ≥ --agent_seconds.")
     parser.add_argument("--gap_seconds", type=float, default=2.0)
     parser.add_argument("--agent_dir", default="",
                         help="Directory containing agent.py; passed to "
@@ -62,6 +64,11 @@ def main(argv: list[str] | None = None) -> int:
                         choices=["synth_regression", "ts_forecasting"],
                         help="Task spec (synthetic regression or "
                              "ts_forecasting with torch + GIFT-Eval data).")
+    parser.add_argument("--agent_seconds", type=int, default=1800,
+                        help="LLM agent budget (default 30 min).")
+    parser.add_argument("--training_seconds", type=int, default=3600,
+                        help="Phase B training budget for ts_forecasting "
+                             "(default 60 min).")
     parser.add_argument("--log_level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -79,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
         "--phase_a_seconds", str(args.phase_a_seconds),
         "--gap_seconds", str(args.gap_seconds),
         "--task", args.task,
+        "--agent_seconds", str(args.agent_seconds),
+        "--training_seconds", str(args.training_seconds),
         "--log_level", args.log_level,
     ]
     if args.wiki_dir:
