@@ -25,10 +25,18 @@ For LLM access, arxiv search, and the prompt-evolution loop see
 | Path | What it is |
 |---|---|
 | `local/` | The whole stack — validator, miner, trainer, SQLite store, agent-facing services |
+| `miners/` | Self-contained miner agents (`autonomous`, `claude_style[_v2]`, `openai_sdk[_v2]`, `patch_decoder`). Pass any subdir to `--agent_dir`. |
 | `miner_template/prompts.py` | Atomic-write prompt-population store (`active.json` + history) |
 | `miner_template/optimizers/` | Pluggable optimizer registry; built-ins `random_mutate` and `gepa` |
 | `shared/url_gate.py` | `GatedClient` the miner uses to reach validator services |
 | `pyproject.toml` | One dependency: `numpy`. GEPA needs `dspy` (extra). |
+
+## Running a real miner agent
+
+```bash
+python local/run.py --rounds 5 --agent_dir miners/autonomous
+python local/run.py --rounds 5 --agent_dir miners/patch_decoder
+```
 
 This repo started as a pruned-down fork of the distributed radar
 subnet (Postgres + Targon/RunPod hosting + image hardening + chain

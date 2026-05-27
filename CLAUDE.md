@@ -12,6 +12,9 @@ full surface.
 
 ```
 local/           The whole stack (one file per responsibility).
+miners/          Self-contained miner agents (autonomous,
+                 claude_style[_v2], openai_sdk[_v2], patch_decoder).
+                 Each subdir is a valid --agent_dir target.
 miner_template/  Trimmed to prompts.py + optimizers/ for the
                  prompt-evolution loop.
 shared/          Trimmed to url_gate.py (GatedClient).
