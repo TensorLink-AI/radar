@@ -8,8 +8,10 @@ without a real network. Endpoints:
   GET  /experiments/recent?limit=N
   GET  /experiments/{id}
   GET  /frontier
-  POST /llm/chat
-  GET  /llm/models
+  POST /llm/chat                      — native shape ``{content, model}``
+  GET  /llm/models                    — native list
+  POST /llm/v1/chat/completions       — OpenAI-compatible alias
+  GET  /llm/v1/models                 — OpenAI-compatible alias
   POST /desearch/search
   GET  /wiki                — JSON listing of available files
   GET  /wiki/<path>         — raw markdown content
@@ -23,7 +25,9 @@ import json
 import logging
 import socket
 import threading
+import time
 import urllib.parse
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
@@ -98,6 +102,11 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/llm/models":
             return self._json(200, {"models": llm_available_models()})
 
+        if path == "/llm/v1/models":
+            data = [{"id": m, "object": "model"}
+                    for m in llm_available_models()]
+            return self._json(200, {"object": "list", "data": data})
+
         if path == "/wiki":
             return self._json(200, {"files": self.wiki.list()})
 
@@ -124,6 +133,32 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, llm_dispatch(payload))
             except Exception as e:  # noqa: BLE001
                 return self._json(502, {"error": f"{type(e).__name__}: {e}"})
+
+        if path == "/llm/v1/chat/completions":
+            try:
+                native = llm_dispatch(payload)
+            except Exception as e:  # noqa: BLE001
+                return self._json(502, {"error": f"{type(e).__name__}: {e}"})
+            envelope = {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": native.get("model", payload.get("model", "stub")),
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": native.get("content", ""),
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+            return self._json(200, envelope)
 
         if path == "/desearch/search":
             try:

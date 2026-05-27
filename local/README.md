@@ -105,8 +105,10 @@ carries the URLs and `allowed_urls`, and the miner builds a real
 | `GET  {db_url}/experiments/recent?limit=N` | Past experiment rows (SQLite) |
 | `GET  {db_url}/experiments/{id}` | One experiment by id |
 | `GET  {db_url}/frontier` | Current Pareto front |
-| `POST {llm_url}/chat`  `{model?, messages, max_tokens?, temperature?}` | LLM |
+| `POST {llm_url}/chat`  `{model?, messages, max_tokens?, temperature?}` | LLM (native shape) |
 | `GET  {llm_url}/models` | Available models |
+| `POST {llm_url}/v1/chat/completions` | OpenAI-compatible alias (so agents using the OpenAI SDK with `base_url={llm_url}/v1` work unchanged) |
+| `GET  {llm_url}/v1/models` | OpenAI-compatible model list |
 | `POST {desearch_url}/search`  `{query, max_results?}` | Arxiv via `export.arxiv.org` |
 | `GET  {cognition_wiki_url}` | List markdown files |
 | `GET  {cognition_wiki_url}/<path>` | Raw markdown content |
