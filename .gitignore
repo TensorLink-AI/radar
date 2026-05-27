@@ -8,3 +8,5 @@ experiments/
 data/
 logs/
 prompts/
+local/radar_local.db*
+

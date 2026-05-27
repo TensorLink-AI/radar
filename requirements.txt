@@ -1,15 +1,4 @@
-# Core
-openai>=1.0
-anthropic>=0.20
-pyyaml>=6.0
-python-dotenv>=1.0
-tiktoken>=0.5
+numpy>=1.24
 
-# Data processing
-pyarrow
-
-# Postgres (async)
-asyncpg>=0.29.0
-
-# Cloud execution (optional — only needed for RUNNER_BACKEND=basilica)
-basilica-sdk
+# Optional, only if you use --optimizer gepa:
+# dspy>=2.4
