@@ -22,9 +22,21 @@ Config keys (passed via the ``optimize`` subcommand):
   ``population`` (int, default 8): target population size.
   ``budget``     (int, default 30): GEPA compile budget (rollouts).
   ``score_key``  (str, default "raw_score"): which scalar GEPA reads.
+  ``num_threads`` (int, default 1): cap on GEPA's reflective rollout
+    concurrency. Low values protect Chutes from 429-storms.
   ``reflector_lm`` (dict, optional): explicit DSPy LM kwargs.  When
     omitted, the adapter reads ``MINER_REFLECTOR_*`` / ``MINER_LLM_*``
-    env vars (see ``_default_lm()`` below).
+    env vars (see ``_default_lm()`` below).  Retry/timeout knobs from
+    ``_lm_extra_kwargs()`` are merged in unless the caller overrides
+    them explicitly.
+
+Rate-limit handling mirrors the miner clients in
+``miners/*/llm_client.py``: ``num_retries=5`` (litellm doubles backoff
+per attempt → ~2/4/8/16/32s) and ``timeout=180`` by default, overridable
+via ``MINER_LLM_NUM_RETRIES`` / ``MINER_LLM_TIMEOUT``. GEPA
+concurrency defaults to 1 so reflective rollouts don't burst the
+provider — bump it via ``MINER_GEPA_NUM_THREADS`` once you have
+headroom.
 
 The score the metric returns is the float at ``scores[score_key]`` for
 the matched row; missing rows score 0.  Override ``score_key`` to
@@ -60,20 +72,41 @@ def _import_dspy():
     return dspy
 
 
+def _lm_extra_kwargs() -> dict[str, Any]:
+    """Retry/timeout knobs passed to ``dspy.LM`` (→ litellm).
+
+    Matches the miner-client pattern in ``miners/*/llm_client.py``: enough
+    retries with exponential backoff to ride out a brief Chutes 429 burst,
+    and a read timeout in the same ballpark as ``LLM_READ_TIMEOUT`` so
+    slow reflective rollouts don't get killed mid-response.
+    """
+    out: dict[str, Any] = {}
+    try:
+        out["num_retries"] = int(os.getenv("MINER_LLM_NUM_RETRIES", "5"))
+    except ValueError:
+        out["num_retries"] = 5
+    try:
+        out["timeout"] = float(os.getenv("MINER_LLM_TIMEOUT", "180"))
+    except ValueError:
+        out["timeout"] = 180.0
+    return out
+
+
 def _default_lm(dspy_mod) -> Any:
     """Build a DSPy LM from environment, preferring an explicit
     reflector LM and falling back to the operator's LLM proxy."""
+    extra = _lm_extra_kwargs()
     base = os.getenv("MINER_REFLECTOR_API_BASE", "").strip()
     key = os.getenv("MINER_REFLECTOR_API_KEY", "").strip()
     model = os.getenv("MINER_REFLECTOR_MODEL", "").strip()
     if base and key and model:
-        return dspy_mod.LM(model=model, api_base=base, api_key=key)
+        return dspy_mod.LM(model=model, api_base=base, api_key=key, **extra)
 
     base = os.getenv("MINER_LLM_URL", "").strip()
     key = os.getenv("MINER_LLM_API_KEY", "").strip()
     model = os.getenv("MINER_LLM_MODEL", "").strip() or "moonshotai/Kimi-K2.6-TEE"
     if base and key:
-        return dspy_mod.LM(model=model, api_base=base, api_key=key)
+        return dspy_mod.LM(model=model, api_base=base, api_key=key, **extra)
 
     raise RuntimeError(
         "GEPA reflector LM not configured.  Set either "
@@ -138,13 +171,22 @@ def optimize(
     target = int(config.get("population", len(population) or 8))
     budget = int(config.get("budget", 30))
     score_key = str(config.get("score_key", "raw_score"))
+    try:
+        num_threads = int(
+            config.get("num_threads")
+            or os.getenv("MINER_GEPA_NUM_THREADS", "1")
+        )
+    except (TypeError, ValueError):
+        num_threads = 1
+    num_threads = max(1, num_threads)
 
     # Configure reflector LM.  Recent dspy.GEPA takes ``reflection_lm``
     # directly; we still call ``dspy.configure`` so the compiled program
     # itself has a default LM for any non-reflective rollouts.
     lm_kwargs = config.get("reflector_lm")
     if isinstance(lm_kwargs, dict):
-        lm = dspy_mod.LM(**lm_kwargs)
+        merged = {**_lm_extra_kwargs(), **lm_kwargs}
+        lm = dspy_mod.LM(**merged)
     else:
         lm = _default_lm(dspy_mod)
     dspy_mod.configure(lm=lm)
@@ -180,6 +222,7 @@ def optimize(
     metric = _build_metric(score_key)
     teleprompter = _build_teleprompter(
         dspy_mod, metric=metric, budget=budget, reflection_lm=lm,
+        num_threads=num_threads,
     )
 
     # GEPA compiles each seed program; we keep the best ``target``
@@ -212,7 +255,8 @@ def optimize(
     return new_pop
 
 
-def _build_teleprompter(dspy_mod, *, metric, budget: int, reflection_lm):
+def _build_teleprompter(dspy_mod, *, metric, budget: int, reflection_lm,
+                        num_threads: int = 1):
     """Construct ``dspy.GEPA`` across known API revisions.
 
     The constructor signature has changed over dspy releases — ``budget``
@@ -220,6 +264,11 @@ def _build_teleprompter(dspy_mod, *, metric, budget: int, reflection_lm):
     ``auto``, and ``reflection_lm`` is now passed directly rather than
     via ``dspy.configure``.  Try the modern signature first and fall
     back if an older build is installed.
+
+    ``num_threads`` caps GEPA's internal rollout concurrency when the
+    installed dspy build exposes it (newer releases). Older builds
+    silently ignore the value because we only pass parameters that the
+    constructor accepts.
     """
     import inspect
 
@@ -232,6 +281,8 @@ def _build_teleprompter(dspy_mod, *, metric, budget: int, reflection_lm):
         kwargs["max_metric_calls"] = budget
     elif "budget" in params:
         kwargs["budget"] = budget
+    if "num_threads" in params:
+        kwargs["num_threads"] = num_threads
     return dspy_mod.GEPA(**kwargs)
 
 
