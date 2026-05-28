@@ -112,7 +112,7 @@ def _ensure_seed(prompts_dir: Path) -> list[Prompt]:
 
 def _run_once(store: LocalStore, prompts_dir: Path, *, optimizer: str,
               population: int, budget: int, task: str,
-              score_key: str) -> int:
+              score_key: str, num_threads: int = 1) -> int:
     """One optimization pass. Returns the new population size."""
     pop = _ensure_seed(prompts_dir)
     results = _experiments_to_rows(store, task=task)
@@ -133,6 +133,7 @@ def _run_once(store: LocalStore, prompts_dir: Path, *, optimizer: str,
             "budget": budget,
             "score_key": score_key,
             "elite_k": max(1, population // 3),
+            "num_threads": num_threads,
         },
     )
     if not new_pop:
@@ -162,6 +163,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--population", type=int, default=6)
     parser.add_argument("--budget", type=int, default=20,
                         help="GEPA rollout budget (ignored by other optimizers).")
+    parser.add_argument("--num_threads", type=int, default=1,
+                        help="GEPA reflective-rollout concurrency. Keep low "
+                             "(1-2) when the reflector points at a "
+                             "rate-limited provider like Chutes.")
     parser.add_argument("--task", default="synth_regression")
     parser.add_argument("--score_key", default="raw_score")
     parser.add_argument("--watch", action="store_true",
@@ -190,7 +195,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _run_once(store, prompts_dir, optimizer=args.optimizer,
                   population=args.population, budget=args.budget,
-                  task=args.task, score_key=args.score_key)
+                  task=args.task, score_key=args.score_key,
+                  num_threads=args.num_threads)
         if not args.watch:
             return 0
 
