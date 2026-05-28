@@ -121,17 +121,27 @@ def compute_flops_analytical(
     """
     try:
         from torch.utils.flop_counter import FlopCounterMode
-        model.eval()
-        dummy = torch.randn(1, context_len, num_variates)
-        flop_counter = FlopCounterMode(display=False)
-        with flop_counter:
-            model(dummy)
-        total = flop_counter.get_total_flops()
-        if total > 0:
-            return int(total)
-        return None
     except Exception:
         return None
+    model.eval()
+    dummy = torch.randn(1, context_len, num_variates)
+    flop_counter = FlopCounterMode(display=False)
+    try:
+        with flop_counter:
+            model(dummy)
+    except Exception as e:
+        # Could be a FlopCounter limitation (unsupported op) or a real
+        # forward error. The caller has already run a sanity forward, so
+        # at this point we treat it as a counter limitation and fall back.
+        logger.debug("FlopCounterMode raised on miner forward: %s", e)
+        return None
+    try:
+        total = flop_counter.get_total_flops()
+    except Exception:
+        return None
+    if total > 0:
+        return int(total)
+    return None
 
 
 def _try_jit_analytical(
@@ -179,6 +189,21 @@ def compute_flops_equivalent(
     Analytical counting is exact for standard nn.Module ops.
     Falls back to jit.trace + analytical, then wallclock calibration.
     """
+    # Sanity-check the model on the contract input shape first. If forward
+    # raises here, it's a miner-side bug — surface it explicitly so the log
+    # blames the right side instead of looking like an internal counter
+    # failure (analytical swallows exceptions; wallclock leaks them raw).
+    model.eval()
+    sanity_dummy = torch.randn(1, context_len, num_variates, device=device)
+    try:
+        with torch.no_grad():
+            model(sanity_dummy)
+    except Exception as e:
+        raise RuntimeError(
+            f"miner forward failed on contract shape "
+            f"(B=1, L={context_len}, V={num_variates}): {e}"
+        ) from e
+
     # Try analytical first (device-independent, exact)
     analytical = compute_flops_analytical(model, context_len, num_variates)
     if analytical is not None:
@@ -196,12 +221,17 @@ def compute_flops_equivalent(
     flops_per_sec = calibrate(device, num_variates=num_variates)
     dummy = torch.randn(_MEASURE_BATCH, context_len, num_variates, device=device)
 
-    model.eval()
-
-    # Warmup
-    with torch.no_grad():
-        for _ in range(5):
-            model(dummy)
+    # Warmup — wrap so a batched-only failure (works at B=1, breaks at B=N)
+    # still gets a clear "miner forward failed" attribution.
+    try:
+        with torch.no_grad():
+            for _ in range(5):
+                model(dummy)
+    except Exception as e:
+        raise RuntimeError(
+            f"miner forward failed on contract shape "
+            f"(B={_MEASURE_BATCH}, L={context_len}, V={num_variates}): {e}"
+        ) from e
 
     # Timed runs
     times = []
