@@ -72,9 +72,6 @@ class TSForecastingSpec:
     prediction_len: int = TS_PREDICTION_LEN
     num_variates: int = TS_NUM_VARIATES
     quantiles: tuple[float, ...] = TS_QUANTILES
-    # Comma-separated leaderboard names ("m4_hourly,electricity/H"). Empty =
-    # use whatever is on disk under RADAR_GIFT_EVAL_CACHE.
-    eval_datasets: str = ""
     # Phase B (training) wallclock budget for the harness. Phase C eval
     # runs in-process after and is not separately capped — see
     # local/validator.py --training_seconds.

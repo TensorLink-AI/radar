@@ -318,8 +318,6 @@ def _run_ts_forecasting(
         overrides["RADAR_PRETRAIN_LOCAL_PATHS"] = _json.dumps(train_paths)
         if val_paths:
             overrides["RADAR_PRETRAIN_VAL_LOCAL_PATHS"] = _json.dumps(val_paths)
-    if task.eval_datasets:
-        overrides["RADAR_EVAL_DATASETS"] = task.eval_datasets
 
     saved = {k: os.environ.get(k) for k in overrides}
     os.environ.update(overrides)
@@ -379,8 +377,7 @@ def _run_ts_forecasting(
     if checkpoint_path and Path(checkpoint_path).exists():
         try:
             eval_metrics = _gift_eval_score(
-                code, checkpoint_path, cache_dir,
-                task.eval_datasets, seed,
+                code, checkpoint_path, cache_dir, seed,
             )
         except Exception as e:  # noqa: BLE001
             eval_error = f"{type(e).__name__}: {e}"
@@ -411,7 +408,7 @@ def _run_ts_forecasting(
 
     analysis = (
         f"task=ts_forecasting status={status} pretrain_shards={len(shard_paths)} "
-        f"eval_datasets={task.eval_datasets or 'auto'} metric_source={metric_source}"
+        f"metric_source={metric_source}"
     )
     if crps is not None and mase is not None:
         analysis += f" crps={crps:.4f} mase={mase:.4f}"
@@ -429,10 +426,10 @@ def _run_ts_forecasting(
 
 
 def _gift_eval_score(
-    code: str, checkpoint_path: str, cache_dir: str,
-    eval_datasets: str, seed: int,
+    code: str, checkpoint_path: str, cache_dir: str, seed: int,
 ) -> dict:
-    """Load the trained model from ``checkpoint_path`` and run GIFT-Eval.
+    """Load the trained model from ``checkpoint_path`` and run the full
+    GIFT-Eval leaderboard (all 97 tasks).
 
     Returns ``{"crps": float, "mase": float, "n_tasks": int, "per_task": [...]}``
     where crps/mase are the geomean of per-task normalized values (against
@@ -457,15 +454,7 @@ def _gift_eval_score(
         model.reset()
     model.eval()
 
-    dataset_names = None
-    if eval_datasets:
-        dataset_names = [s.strip() for s in eval_datasets.split(",") if s.strip()]
-
-    metrics = validate(
-        model, seed=seed,
-        data_dir=cache_dir,
-        dataset_names=dataset_names,
-    )
+    metrics = validate(model, seed=seed, data_dir=cache_dir)
     out = {"crps": float(metrics["crps"]), "mase": float(metrics["mase"])}
     if "n_tasks" in metrics:
         out["n_tasks"] = int(metrics["n_tasks"])
