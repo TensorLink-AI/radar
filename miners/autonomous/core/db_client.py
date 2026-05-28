@@ -44,16 +44,6 @@ def recent_failures(client, base_url: str, n: int = 5, task: str | None = None) 
     return _get(client, base_url, "/experiments/failures", params)
 
 
-def component_stats(client, base_url: str) -> dict | list:
-    """Fetch component success correlations."""
-    return _get(client, base_url, "/provenance/component_stats")
-
-
-def dead_ends(client, base_url: str) -> dict | list:
-    """Fetch patterns that consistently fail."""
-    return _get(client, base_url, "/provenance/dead_ends")
-
-
 def frontier(client, base_url: str, task: str | None = None) -> dict | list:
     """Fetch the current Pareto frontier — cheapest signal of what wins."""
     params = {"task": task} if task else None
@@ -74,8 +64,3 @@ def experiment(client, base_url: str, idx: int) -> dict | list:
 def experiment_diff(client, base_url: str, idx: int) -> dict | list:
     """Unified diff vs. parent. Credits the read on the access trail."""
     return _get(client, base_url, f"/experiments/{idx}/diff")
-
-
-def similar(client, base_url: str, idx: int, top_k: int = 5) -> dict | list:
-    """Top-K nearest code neighbors — call before submit to check novelty."""
-    return _get(client, base_url, f"/provenance/{idx}/similar", {"top_k": top_k})

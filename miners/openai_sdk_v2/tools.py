@@ -176,11 +176,6 @@ TOOLS: list[dict] = [
                 "/experiments/{idx}/lineage_diffs, "
                 "/experiments/diff/{a}/{b} (does NOT credit reads), "
                 "POST /experiments/search body {\"query\": \"...\"}.\n"
-                "Provenance: /provenance/{idx}/similar?top_k= "
-                "(novelty check before submit), "
-                "/provenance/{idx}/influences, /provenance/{idx}/impact, "
-                "/provenance/{idx}/graph, /provenance/components, "
-                "/provenance/component_stats, /provenance/dead_ends.\n"
                 "Responses >256 KB are returned but don't credit reads."
             ),
             "parameters": {

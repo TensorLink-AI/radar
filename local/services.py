@@ -2,21 +2,33 @@
 
 Miner agents get a real ``shared.url_gate.GatedClient`` pointed at this
 server, so the local stack matches the distributed agent-harness API
-without a real network. Endpoints:
+without a real network. Endpoints (handlers in ``experiments_api``):
 
   GET  /health
-  GET  /experiments/recent?limit=N
-  GET  /experiments/{id}
-  GET  /frontier
-  POST /llm/chat                   — legacy {content, model} shape
-  POST /llm/v1/chat/completions    — OpenAI-compatible ChatCompletion
+  GET  /frontier?task=
+  GET  /challenge
+  GET  /experiments/recent?n=         (``limit=`` accepted as alias)
+  GET  /experiments/pareto?task=
+  GET  /experiments/failures?n=
+  GET  /experiments/families?task=
+  GET  /experiments/stats?task=
+  GET  /experiments/tasks
+  GET  /experiments/{idx}
+  GET  /experiments/{idx}/diff
+  GET  /experiments/{idx}/lineage_diffs
+  GET  /experiments/lineage/{idx}
+  GET  /experiments/diff/{a}/{b}
+  POST /experiments/search            body ``{"query": "..."}``
+  POST /llm/chat                      legacy ``{content, model}`` shape
+  POST /llm/v1/chat/completions       OpenAI-compatible ChatCompletion
   GET  /llm/models
-  GET  /llm/v1/models              — OpenAI-compatible model list
+  GET  /llm/v1/models                 OpenAI-compatible model list
   POST /desearch/search
-  GET  /wiki                — JSON listing of available files
-  GET  /wiki/<path>         — raw markdown content
+  GET  /wiki                          JSON listing of available files
+  GET  /wiki/<path>                   raw markdown content
 
-Provider behavior lives in ``local/providers.py``.
+Provider behavior lives in ``local/providers.py``; experiment-query
+logic in ``local/experiments_api.py``.
 """
 
 from __future__ import annotations
@@ -29,11 +41,11 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
+from local import experiments_api as exp_api
 from local.providers import (
     WikiStore, desearch, llm_available_models, llm_dispatch,
     llm_openai_dispatch,
 )
-from local.scoring import compute_pareto
 from local.store import LocalStore
 
 logger = logging.getLogger("local.services")
@@ -80,9 +92,68 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/health":
             return self._json(200, {"status": "ok"})
 
+        if path == "/frontier":
+            task = q.get("task", [None])[0]
+            return self._json(200, exp_api.frontier(self.store, task=task))
+
+        if path == "/challenge":
+            return self._json(200, exp_api.active_challenge(self.store))
+
+        # /experiments/* — list/aggregate endpoints first, then the
+        # multi-segment paths, then the bare /experiments/{idx}.
         if path == "/experiments/recent":
-            limit = int(q.get("limit", ["10"])[0])
-            return self._json(200, self.store.recent_experiments(n=limit))
+            n = int(q.get("n", q.get("limit", ["10"]))[0])
+            task = q.get("task", [None])[0]
+            return self._json(200, exp_api.recent(self.store, n=n, task=task))
+
+        if path == "/experiments/pareto":
+            task = q.get("task", [None])[0]
+            return self._json(200, exp_api.pareto(self.store, task=task))
+
+        if path == "/experiments/failures":
+            n = int(q.get("n", ["5"])[0])
+            task = q.get("task", [None])[0]
+            return self._json(200, exp_api.failures(self.store, n=n, task=task))
+
+        if path == "/experiments/families":
+            task = q.get("task", [None])[0]
+            return self._json(200, exp_api.families(self.store, task=task))
+
+        if path == "/experiments/stats":
+            task = q.get("task", [None])[0]
+            return self._json(200, exp_api.stats(self.store, task=task))
+
+        if path == "/experiments/tasks":
+            return self._json(200, exp_api.tasks(self.store))
+
+        if path.startswith("/experiments/diff/"):
+            parts = path.split("/")
+            try:
+                a, b = int(parts[3]), int(parts[4])
+            except (IndexError, ValueError):
+                return self._json(400, {"error": "bad ids"})
+            return self._json(200, exp_api.pair_diff(self.store, a, b))
+
+        if path.startswith("/experiments/lineage/"):
+            try:
+                idx = int(path.rsplit("/", 1)[1])
+            except ValueError:
+                return self._json(400, {"error": "bad id"})
+            return self._json(200, exp_api.lineage(self.store, idx))
+
+        if path.startswith("/experiments/") and path.endswith("/diff"):
+            try:
+                idx = int(path.split("/")[2])
+            except (IndexError, ValueError):
+                return self._json(400, {"error": "bad id"})
+            return self._json(200, exp_api.parent_diff(self.store, idx))
+
+        if path.startswith("/experiments/") and path.endswith("/lineage_diffs"):
+            try:
+                idx = int(path.split("/")[2])
+            except (IndexError, ValueError):
+                return self._json(400, {"error": "bad id"})
+            return self._json(200, exp_api.lineage_diffs(self.store, idx))
 
         if path.startswith("/experiments/"):
             try:
@@ -93,10 +164,6 @@ class _Handler(BaseHTTPRequestHandler):
             if exp is None:
                 return self._json(404, {"error": "not found"})
             return self._json(200, exp)
-
-        if path == "/frontier":
-            all_exps = self.store.recent_experiments(n=10_000)
-            return self._json(200, {"frontier": compute_pareto(all_exps)})
 
         if path == "/llm/models":
             return self._json(200, {"models": llm_available_models()})
@@ -132,6 +199,11 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         payload = self._read_body()
+
+        if path == "/experiments/search":
+            return self._json(
+                200, exp_api.search(self.store, payload.get("query", "")),
+            )
 
         if path == "/llm/chat":
             try:

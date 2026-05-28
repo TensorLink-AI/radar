@@ -185,17 +185,8 @@ TOOLS: list[dict] = [
                 "  GET  /experiments/{idx}/lineage_diffs  per-step diffs along the chain\n"
                 "  GET  /experiments/diff/{a}/{b}         pair diff — does NOT credit reads\n"
                 "  POST /experiments/search   body {\"query\": \"...\"}   substring search\n\n"
-                "Provenance:\n"
-                "  GET  /provenance/{idx}/influences      likely ancestors\n"
-                "  GET  /provenance/{idx}/impact          descendants (fertile designs)\n"
-                "  GET  /provenance/{idx}/similar?top_k=5 nearest neighbors — use before submit\n"
-                "  GET  /provenance/{idx}/graph           full lineage graph\n"
-                "  GET  /provenance/components            inventory + usage counts\n"
-                "  GET  /provenance/component_stats       per-component success/score stats\n"
-                "  GET  /provenance/dead_ends             lineages that stopped improving\n\n"
-                "Notes: responses >256 KB are returned intact but skipped by the "
-                "provenance ID extractor (bulk dumps don't credit reads). 4xx/5xx "
-                "aren't logged as accesses."
+                "Notes: responses >256 KB are returned intact but bulk dumps "
+                "don't credit reads. 4xx/5xx aren't logged as accesses."
             ),
             "parameters": {
                 "type": "object",
@@ -207,7 +198,7 @@ TOOLS: list[dict] = [
                     },
                     "path": {
                         "type": "string",
-                        "description": "API path, e.g. '/experiments/recent?n=10' or '/provenance/component_stats'",
+                        "description": "API path, e.g. '/experiments/recent?n=10'",
                     },
                     "body": {
                         "type": "object",
