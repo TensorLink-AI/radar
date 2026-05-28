@@ -14,6 +14,7 @@ Endpoints:
   GET /api/leaderboard?n=N    top-N by metric ASC (lower=better)
   GET /api/recent?n=N         latest N by id
   GET /api/frontier           Pareto front on (metric, flops)
+  GET /api/frontier_crps_mase Pareto front on (crps, mase) — ts_forecasting only
   GET /api/experiment/<id>    full row (incl. code, loss_curve)
 """
 
@@ -133,6 +134,38 @@ def _frontier(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return front
 
 
+def _frontier_crps_mase(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Non-dominated set on (crps, mase). Both lower=better. Only experiments
+    that have both values in their objectives (i.e. GIFT-Eval succeeded)
+    contribute."""
+    rows = conn.execute(
+        "SELECT * FROM experiments WHERE success=1 AND metric IS NOT NULL"
+    ).fetchall()
+    points = [_row(r) for r in rows]
+    points = [
+        p for p in points
+        if p["objectives"].get("crps") is not None
+        and p["objectives"].get("mase") is not None
+    ]
+    front: list[dict[str, Any]] = []
+    for p in points:
+        pc = p["objectives"]["crps"]
+        pm = p["objectives"]["mase"]
+        dominated = False
+        for o in points:
+            if o is p:
+                continue
+            oc = o["objectives"]["crps"]
+            om = o["objectives"]["mase"]
+            if oc <= pc and om <= pm and (oc < pc or om < pm):
+                dominated = True
+                break
+        if not dominated:
+            front.append(p)
+    front.sort(key=lambda e: e["objectives"]["crps"])
+    return front
+
+
 def _experiment(conn: sqlite3.Connection, exp_id: int) -> dict[str, Any] | None:
     r = conn.execute(
         "SELECT * FROM experiments WHERE id=?", (exp_id,)
@@ -180,6 +213,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, _recent(conn, n))
             if path == "/api/frontier":
                 return self._json(200, _frontier(conn))
+            if path == "/api/frontier_crps_mase":
+                return self._json(200, _frontier_crps_mase(conn))
             if path.startswith("/api/experiment/"):
                 try:
                     exp_id = int(path.rsplit("/", 1)[1])

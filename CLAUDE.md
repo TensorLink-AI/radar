@@ -62,9 +62,11 @@ torch pretrain + GIFT-Eval pipeline. The dispatch lives in
    stack. Per-task CRPS/MASE are normalized against seasonal-naive
    and geomean'd; the SQLite `metric` is `sqrt(crps * mase)`
    (lower=better) and both raw values land in `objectives` alongside
-   `best_val_loss`. If the checkpoint or cache is missing the trainer
-   falls back to `best_val_loss` and logs
-   `metric_source=best_val_loss`.
+   `best_val_loss`. **No fallback** — if the checkpoint is missing,
+   the cache dir is missing, or GIFT-Eval raises / returns
+   non-finite values, the experiment is recorded as a failure
+   (`success=False`, `metric=None`). `best_val_loss` stays in
+   `objectives` for diagnostics but is never used as the score.
 
 The frozen runner uses sibling-style imports (`from prepare import
 ...`) inherited from the sandboxed-pod era — the dispatcher adds
