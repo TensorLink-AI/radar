@@ -189,8 +189,6 @@ def run_round(store: LocalStore, task, round_id: int,
             extra = ""
             if "crps" in objs and "mase" in objs:
                 extra = f" crps={objs['crps']:.4f} mase={objs['mase']:.4f}"
-            elif "best_val_loss" in objs:
-                extra = f" best_val_loss={objs['best_val_loss']:.6f} (no gift_eval)"
             logger.info(
                 "    metric=%.6f params=%d flops_eq=%d%s",
                 result["metric"], objs["num_params"],
@@ -242,8 +240,6 @@ def run_round(store: LocalStore, task, round_id: int,
     w_objs = winner.get("objectives", {}) or {}
     if "crps" in w_objs and "mase" in w_objs:
         win_extra = f" crps={w_objs['crps']:.4f} mase={w_objs['mase']:.4f}"
-    elif "best_val_loss" in w_objs:
-        win_extra = f" best_val_loss={w_objs['best_val_loss']:.6f} (no gift_eval)"
     else:
         win_extra = ""
     logger.info(

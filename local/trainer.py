@@ -412,77 +412,102 @@ def _run_ts_forecasting(
         else (val_losses[-1] if val_losses else (loss_curve[-1] if loss_curve else None))
     )
 
-    # Phase C — GIFT-Eval CRPS/MASE on the saved checkpoint. Combined
-    # leaderboard-style metric is geomean(normalized_crps, normalized_mase).
-    eval_metrics: dict = {}
-    eval_error = ""
-    checkpoint_path = result.get("checkpoint_path") if success else None
-    if not success:
-        logger.warning(
-            "GIFT-Eval skipped: training did not succeed (status=%s)", status,
-        )
-    elif not checkpoint_path:
-        logger.warning("GIFT-Eval skipped: harness did not return a checkpoint_path")
-    elif not Path(checkpoint_path).exists():
-        logger.warning("GIFT-Eval skipped: checkpoint missing at %s", checkpoint_path)
-    elif not Path(cache_dir).is_dir():
-        logger.warning(
-            "GIFT-Eval skipped: cache dir missing at %s "
-            "(set RADAR_GIFT_EVAL_CACHE / run `python -m local.fetch_gift_eval`)",
-            cache_dir,
-        )
-    else:
-        try:
-            eval_metrics = _gift_eval_score(
-                code, checkpoint_path, cache_dir, seed,
-            )
-        except Exception as e:  # noqa: BLE001
-            eval_error = f"{type(e).__name__}: {e}"
-            logger.warning(
-                "GIFT-Eval failed; falling back to best_val_loss: %s",
-                eval_error,
-            )
-
-    crps = eval_metrics.get("crps")
-    mase = eval_metrics.get("mase")
-    if crps is not None and mase is not None and math.isfinite(crps) and math.isfinite(mase):
-        # Geomean of the two normalized leaderboard aggregates. Both lower=better.
-        metric = math.sqrt(max(crps, 0.0) * max(mase, 0.0))
-        metric_source = "gift_eval"
-    else:
-        metric = best_val_loss
-        metric_source = "best_val_loss"
-
     objectives = {
         "flops_equivalent_size": flops_equiv,
         "num_params": num_params,
         "train_seconds": train_seconds,
     }
-    if crps is not None:
-        objectives["crps"] = float(crps)
-    if mase is not None:
-        objectives["mase"] = float(mase)
-    if "n_tasks" in eval_metrics:
-        objectives["n_tasks"] = int(eval_metrics["n_tasks"])
     if best_val_loss is not None:
         objectives["best_val_loss"] = float(best_val_loss)
 
+    # Phase C — GIFT-Eval CRPS/MASE on the saved checkpoint. Combined
+    # leaderboard-style metric is geomean(normalized_crps, normalized_mase).
+    # No fallback: if the full benchmark can't produce both values, the
+    # experiment fails.
+    checkpoint_path = result.get("checkpoint_path") if success else None
+    if not success:
+        return _ts_failure(
+            f"training did not succeed (status={status})",
+            objectives, loss_curve, workdir,
+            error=str(result.get("error") or status),
+        )
+    if not checkpoint_path:
+        return _ts_failure(
+            "harness did not return a checkpoint_path",
+            objectives, loss_curve, workdir,
+        )
+    if not Path(checkpoint_path).exists():
+        return _ts_failure(
+            f"checkpoint missing at {checkpoint_path}",
+            objectives, loss_curve, workdir,
+        )
+    if not Path(cache_dir).is_dir():
+        return _ts_failure(
+            f"GIFT-Eval cache dir missing at {cache_dir} "
+            f"(set RADAR_GIFT_EVAL_CACHE / run `python -m local.fetch_gift_eval`)",
+            objectives, loss_curve, workdir,
+        )
+    try:
+        eval_metrics = _gift_eval_score(
+            code, checkpoint_path, cache_dir, seed,
+        )
+    except Exception as e:  # noqa: BLE001
+        return _ts_failure(
+            f"GIFT-Eval failed: {type(e).__name__}: {e}",
+            objectives, loss_curve, workdir,
+        )
+
+    crps = eval_metrics.get("crps")
+    mase = eval_metrics.get("mase")
+    if (crps is None or mase is None
+            or not math.isfinite(crps) or not math.isfinite(mase)):
+        return _ts_failure(
+            f"GIFT-Eval returned non-finite metrics (crps={crps} mase={mase})",
+            objectives, loss_curve, workdir,
+        )
+
+    objectives["crps"] = float(crps)
+    objectives["mase"] = float(mase)
+    if "n_tasks" in eval_metrics:
+        objectives["n_tasks"] = int(eval_metrics["n_tasks"])
+
+    # Geomean of the two normalized leaderboard aggregates. Both lower=better.
+    metric = math.sqrt(max(crps, 0.0) * max(mase, 0.0))
+
     analysis = (
         f"task=ts_forecasting status={status} pretrain_shards={len(shard_paths)} "
-        f"metric_source={metric_source}"
+        f"crps={crps:.4f} mase={mase:.4f}"
     )
-    if crps is not None and mase is not None:
-        analysis += f" crps={crps:.4f} mase={mase:.4f}"
-    if eval_error:
-        analysis += f" gift_eval_error={eval_error}"
 
     return {
-        "success": bool(success and metric is not None),
-        "metric": float(metric) if metric is not None else None,
+        "success": True,
+        "metric": float(metric),
         "objectives": objectives,
         "loss_curve": loss_curve,
         "analysis": analysis,
-        "error": "" if success else str(result.get("error") or status),
+        "error": "",
+        "workdir": str(workdir),
+    }
+
+
+def _ts_failure(
+    reason: str,
+    objectives: dict,
+    loss_curve: list,
+    workdir: Path,
+    *,
+    error: str | None = None,
+) -> dict:
+    """Build a failed ts_forecasting result. No metric fallback — GIFT-Eval
+    is the only acceptable signal."""
+    logger.warning("ts_forecasting failed: %s", reason)
+    return {
+        "success": False,
+        "metric": None,
+        "objectives": objectives,
+        "loss_curve": loss_curve,
+        "analysis": f"task=ts_forecasting failed: {reason}",
+        "error": error if error is not None else reason,
         "workdir": str(workdir),
     }
 
