@@ -107,8 +107,6 @@ def build_researcher_system_prompt(
         "`/experiments/families?task=`, `/experiments/stats?task=`, "
         "`/experiments/{idx}`, `/experiments/{idx}/diff`, "
         "`/experiments/lineage/{idx}`, "
-        "`/provenance/component_stats`, `/provenance/dead_ends`, "
-        "`/provenance/{idx}/similar?top_k=` (novelty check). "
         "POST `/experiments/search` body `{\"query\": \"...\"}`. "
         "~60 calls/min; calls are logged on the public dashboard.\n"
         "- `search_papers` — arxiv search. Use sparingly — papers "

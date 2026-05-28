@@ -196,7 +196,8 @@ def run_round(store: LocalStore, task, round_id: int,
     )
 
     # Write experiments
-    for r in results:
+    for p, r in zip(proposals, results):
+        parent = p["payload"].get("parent_index")
         store.add_experiment(
             round_id=round_id,
             miner_id=r["miner_id"],
@@ -211,6 +212,7 @@ def run_round(store: LocalStore, task, round_id: int,
             score=r["score"],
             loss_curve=r["loss_curve"],
             analysis=r["analysis"],
+            parent_index=int(parent) if isinstance(parent, int) else None,
             prompt_id=r["prompt_id"],
             task=task.name,
         )
