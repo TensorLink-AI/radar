@@ -91,6 +91,36 @@ def tasks(store: LocalStore) -> dict:
     return {"tasks": names}
 
 
+def list_artifacts(
+    store: LocalStore,
+    *,
+    round_id: Optional[int] = None,
+    miner_id: Optional[str] = None,
+    task: Optional[str] = None,
+    kind: Optional[str] = None,
+    limit: int = 200,
+) -> dict:
+    rows = store.list_artifacts(
+        round_id=round_id, miner_id=miner_id, task=task, kind=kind, limit=limit,
+    )
+    return {"artifacts": rows}
+
+
+def artifacts_for_experiment(store: LocalStore, exp_id: int) -> dict:
+    exp = store.get_experiment(exp_id)
+    if exp is None:
+        return {"error": "not found", "artifacts": []}
+    rows = store.list_artifacts(
+        round_id=exp["round_id"], miner_id=exp["miner_id"], limit=500,
+    )
+    return {
+        "experiment_id": exp_id,
+        "round_id": exp["round_id"],
+        "miner_id": exp["miner_id"],
+        "artifacts": rows,
+    }
+
+
 def families(store: LocalStore, task: Optional[str] = None) -> dict:
     """Group successful experiments by ``name`` as a proxy for arch families.
 

@@ -302,10 +302,13 @@ def main(argv: list[str] | None = None) -> int:
         getattr(task, "time_budget_seconds", "n/a"),
     )
 
+    sink = ArtifactSink.from_env(store)
+
     services = ServicesServer(
         store=store,
         wiki_dir=args.wiki_dir or None,
         port=args.services_port,
+        sink=sink,
     )
     services_url = services.start()
     logger.info(
@@ -314,8 +317,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.services_url_file:
         Path(args.services_url_file).write_text(services_url)
-
-    sink = ArtifactSink.from_env()
 
     round_id = _next_round_id(store)
     completed = 0

@@ -68,7 +68,32 @@ CREATE TABLE IF NOT EXISTS experiments (
 );
 CREATE INDEX IF NOT EXISTS idx_exp_round ON experiments(round_id);
 CREATE INDEX IF NOT EXISTS idx_exp_success_metric ON experiments(success, metric);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id        INTEGER NOT NULL,
+    miner_id        TEXT NOT NULL DEFAULT '',
+    task            TEXT NOT NULL DEFAULT '',
+    kind            TEXT NOT NULL,
+    rel_path        TEXT NOT NULL DEFAULT '',
+    bucket          TEXT NOT NULL DEFAULT '',
+    s3_key          TEXT NOT NULL DEFAULT '',
+    size_bytes      INTEGER NOT NULL DEFAULT 0,
+    content_text    TEXT,
+    created_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_round_miner ON artifacts(round_id, miner_id);
+CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind);
 """
+
+
+# Kinds: artifacts.kind values. Text kinds get an inline copy of the
+# content in ``artifacts.content_text``; binary kinds only carry the
+# ``s3_key`` reference.
+ARTIFACT_KINDS = (
+    "challenge", "proposal", "submission", "result", "log", "checkpoint",
+)
+ARTIFACT_TEXT_KINDS = {"challenge", "proposal", "submission", "result", "log"}
 
 
 class LocalStore:
@@ -234,6 +259,60 @@ class LocalStore:
         ).fetchone()
         return _row_to_experiment(row) if row else None
 
+    # ── Artifacts ──────────────────────────────────────────
+
+    def add_artifact(
+        self, *, round_id: int, miner_id: str, task: str, kind: str,
+        rel_path: str = "", bucket: str = "", s3_key: str = "",
+        size_bytes: int = 0, content_text: Optional[str] = None,
+    ) -> int:
+        with self._tx() as c:
+            cur = c.execute(
+                "INSERT INTO artifacts "
+                "(round_id, miner_id, task, kind, rel_path, bucket, s3_key, "
+                " size_bytes, content_text, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    int(round_id), miner_id, task, kind, rel_path, bucket,
+                    s3_key, int(size_bytes), content_text, time.time(),
+                ),
+            )
+            return cur.lastrowid
+
+    def list_artifacts(
+        self, *, round_id: Optional[int] = None,
+        miner_id: Optional[str] = None, task: Optional[str] = None,
+        kind: Optional[str] = None, limit: int = 200,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list = []
+        if round_id is not None:
+            clauses.append("round_id = ?")
+            params.append(int(round_id))
+        if miner_id:
+            clauses.append("miner_id = ?")
+            params.append(miner_id)
+        if task:
+            clauses.append("task = ?")
+            params.append(task)
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(max(1, int(limit)))
+        rows = self._conn.execute(
+            "SELECT * FROM artifacts" + where +
+            " ORDER BY id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [_row_to_artifact(r, include_text=False) for r in rows]
+
+    def get_artifact(self, artifact_id: int) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM artifacts WHERE id = ?", (int(artifact_id),)
+        ).fetchone()
+        return _row_to_artifact(row, include_text=True) if row else None
+
     def stats(self) -> dict:
         row = self._conn.execute(
             "SELECT COUNT(*) AS total, "
@@ -251,6 +330,25 @@ class LocalStore:
             "worst_metric": row["worst"],
             "mean_metric": row["mean"],
         }
+
+
+def _row_to_artifact(row: sqlite3.Row, *, include_text: bool) -> dict:
+    out = {
+        "id": row["id"],
+        "round_id": row["round_id"],
+        "miner_id": row["miner_id"],
+        "task": row["task"],
+        "kind": row["kind"],
+        "rel_path": row["rel_path"],
+        "bucket": row["bucket"],
+        "s3_key": row["s3_key"],
+        "size_bytes": row["size_bytes"],
+        "created_at": row["created_at"],
+        "has_inline_text": row["content_text"] is not None,
+    }
+    if include_text:
+        out["content_text"] = row["content_text"]
+    return out
 
 
 def _row_to_experiment(row: sqlite3.Row) -> dict:
