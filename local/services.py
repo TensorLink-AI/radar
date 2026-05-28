@@ -69,11 +69,16 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _json(self, status: int, body) -> None:
         data = json.dumps(body).encode()
-        self.send_response(status)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            # Client (typically a miner that hit its own timeout) closed
+            # the socket before we could reply. Nothing to do.
+            logger.debug("svc client disconnected before response sent")
 
     def _read_body(self) -> dict:
         n = int(self.headers.get("content-length", 0) or 0)
@@ -186,11 +191,14 @@ class _Handler(BaseHTTPRequestHandler):
             data = self.wiki.read(path[len("/wiki/"):])
             if data is None:
                 return self._json(404, {"error": "not found"})
-            self.send_response(200)
-            self.send_header("content-type", "text/markdown; charset=utf-8")
-            self.send_header("content-length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(200)
+                self.send_header("content-type", "text/markdown; charset=utf-8")
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                logger.debug("svc client disconnected before wiki body sent")
             return
 
         self._json(404, {"error": f"unknown path {path}"})
