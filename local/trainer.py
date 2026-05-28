@@ -184,6 +184,7 @@ def run_training(
             "loss_curve": [],
             "analysis": "submission failed to load",
             "error": f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=2)}",
+            "workdir": "",
         }
 
     rng = np.random.default_rng(seed)
@@ -223,6 +224,7 @@ def run_training(
             "loss_curve": loss_curve,
             "analysis": "training crashed",
             "error": f"{type(e).__name__}: {e}",
+            "workdir": "",
         }
 
     train_seconds = time.time() - started
@@ -241,6 +243,7 @@ def run_training(
             f"flops_equiv={flops_equiv}"
         ),
         "error": "",
+        "workdir": "",
     }
 
 
@@ -287,6 +290,7 @@ def _run_ts_forecasting(
             "loss_curve": [],
             "analysis": "ts_forecasting runner unavailable",
             "error": f"{type(e).__name__}: {e} (install torch + the [gift_eval] extra)",
+            "workdir": "",
         }
 
     workdir = Path(tempfile.mkdtemp(prefix="radar_ts_"))
@@ -321,6 +325,26 @@ def _run_ts_forecasting(
 
     saved = {k: os.environ.get(k) for k in overrides}
     os.environ.update(overrides)
+    # Capture harness/runner Python logging into a file so the validator
+    # has a real training log to mirror as an artifact (the harness only
+    # logs to stdout otherwise).
+    train_log_path = logs_dir / "train.log"
+    file_handler = logging.FileHandler(train_log_path, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s %(message)s"
+    ))
+    capture_loggers = [
+        logging.getLogger("runner"),
+        logging.getLogger("runner.harness"),
+        logging.getLogger("runner.timeseries_forecast"),
+    ]
+    for lg in capture_loggers:
+        lg.addHandler(file_handler)
+        # Make sure INFO-level records reach the handler even if the root
+        # logger is set higher.
+        if lg.level == 0 or lg.level > logging.INFO:
+            lg.setLevel(logging.INFO)
     try:
         config = TrainingConfig(
             seed=seed,
@@ -333,6 +357,9 @@ def _run_ts_forecasting(
         runner = TSForecastingRunner()
         result = harness_run(runner, code, config)
     except Exception as e:  # noqa: BLE001
+        for lg in capture_loggers:
+            lg.removeHandler(file_handler)
+        file_handler.close()
         return {
             "success": False,
             "metric": None,
@@ -341,6 +368,7 @@ def _run_ts_forecasting(
             "loss_curve": [],
             "analysis": "ts_forecasting harness crashed",
             "error": f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=2)}",
+            "workdir": str(workdir),
         }
     finally:
         for k, v in saved.items():
@@ -348,6 +376,21 @@ def _run_ts_forecasting(
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+    for lg in capture_loggers:
+        lg.removeHandler(file_handler)
+    file_handler.close()
+
+    # Dump the raw harness result (val cadence, peak VRAM, val history,
+    # etc.) so miners can mine richer training telemetry than what fits
+    # into the validator's experiment row.
+    try:
+        import json as _json
+        (logs_dir / "harness_result.json").write_text(
+            _json.dumps(result, indent=2, default=str), encoding="utf-8",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("could not write harness_result.json: %s", e)
 
     # Translate harness result → local validator shape.
     status = result.get("status", "")
@@ -422,6 +465,7 @@ def _run_ts_forecasting(
         "loss_curve": loss_curve,
         "analysis": analysis,
         "error": "" if success else str(result.get("error") or status),
+        "workdir": str(workdir),
     }
 
 

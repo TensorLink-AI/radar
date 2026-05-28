@@ -14,10 +14,15 @@ without a real network. Endpoints (handlers in ``experiments_api``):
   GET  /experiments/stats?task=
   GET  /experiments/tasks
   GET  /experiments/{idx}
+  GET  /experiments/{idx}/artifacts
   GET  /experiments/{idx}/diff
   GET  /experiments/{idx}/lineage_diffs
   GET  /experiments/lineage/{idx}
   GET  /experiments/diff/{a}/{b}
+  GET  /artifacts?round_id=&miner_id=&task=&kind=&limit=
+  GET  /artifacts/{id}                metadata + inline text if available
+  GET  /artifacts/{id}/download       raw bytes (text inline or proxied
+                                      from object storage)
   POST /experiments/search            body ``{"query": "..."}``
   POST /llm/chat                      legacy ``{content, model}`` shape
   POST /llm/v1/chat/completions       OpenAI-compatible ChatCompletion
@@ -63,6 +68,7 @@ class _Handler(BaseHTTPRequestHandler):
     # Injected by ServicesServer.start.
     store: LocalStore = None  # type: ignore[assignment]
     wiki: WikiStore = None    # type: ignore[assignment]
+    sink: object = None       # ArtifactSink | None — set by ServicesServer.start
 
     def log_message(self, format, *args):  # noqa: A002
         logger.debug("svc %s - %s", self.address_string(), format % args)
@@ -79,6 +85,35 @@ class _Handler(BaseHTTPRequestHandler):
             # Client (typically a miner that hit its own timeout) closed
             # the socket before we could reply. Nothing to do.
             logger.debug("svc client disconnected before response sent")
+
+    def _serve_artifact_body(self, artifact_id: int) -> None:
+        art = self.store.get_artifact(artifact_id)
+        if art is None:
+            return self._json(404, {"error": "not found"})
+        # Inline text path — return immediately, no R2 round-trip needed.
+        if art.get("content_text") is not None:
+            data = art["content_text"].encode("utf-8")
+            rel = art.get("rel_path") or ""
+            ctype = "application/json" if rel.endswith(".json") else (
+                "text/x-python" if rel.endswith(".py") else "text/plain; charset=utf-8"
+            )
+            self.send_response(200)
+            self.send_header("content-type", ctype)
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        # Binary path — proxy from object storage via the sink.
+        if self.sink is None or not getattr(self.sink, "r2_enabled", False):
+            return self._json(503, {"error": "binary artifact requires R2 backend"})
+        body = self.sink.fetch_bytes(art["s3_key"])  # type: ignore[attr-defined]
+        if body is None:
+            return self._json(502, {"error": "object storage fetch failed"})
+        self.send_response(200)
+        self.send_header("content-type", "application/octet-stream")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _read_body(self) -> dict:
         n = int(self.headers.get("content-length", 0) or 0)
@@ -130,6 +165,46 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path == "/experiments/tasks":
             return self._json(200, exp_api.tasks(self.store))
+
+        if path == "/artifacts":
+            def _opt_int(name: str) -> Optional[int]:
+                v = q.get(name, [None])[0]
+                try:
+                    return int(v) if v is not None else None
+                except ValueError:
+                    return None
+            return self._json(200, exp_api.list_artifacts(
+                self.store,
+                round_id=_opt_int("round_id"),
+                miner_id=q.get("miner_id", [None])[0],
+                task=q.get("task", [None])[0],
+                kind=q.get("kind", [None])[0],
+                limit=int(q.get("limit", ["200"])[0] or "200"),
+            ))
+
+        if path.startswith("/artifacts/") and path.endswith("/download"):
+            try:
+                aid = int(path.split("/")[2])
+            except (IndexError, ValueError):
+                return self._json(400, {"error": "bad id"})
+            return self._serve_artifact_body(aid)
+
+        if path.startswith("/artifacts/"):
+            try:
+                aid = int(path.rsplit("/", 1)[1])
+            except ValueError:
+                return self._json(400, {"error": "bad id"})
+            art = self.store.get_artifact(aid)
+            if art is None:
+                return self._json(404, {"error": "not found"})
+            return self._json(200, art)
+
+        if path.startswith("/experiments/") and path.endswith("/artifacts"):
+            try:
+                idx = int(path.split("/")[2])
+            except (IndexError, ValueError):
+                return self._json(400, {"error": "bad id"})
+            return self._json(200, exp_api.artifacts_for_experiment(self.store, idx))
 
         if path.startswith("/experiments/diff/"):
             parts = path.split("/")
@@ -242,9 +317,10 @@ class ServicesServer:
     """
 
     def __init__(self, store: LocalStore, wiki_dir: Optional[str],
-                 port: int = 0):
+                 port: int = 0, sink: object = None):
         self.store = store
         self.wiki = WikiStore(wiki_dir)
+        self.sink = sink
         self._port = port
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -258,12 +334,14 @@ class ServicesServer:
         port = self._port or _pick_free_port()
         store = self.store
         wiki = self.wiki
+        sink = self.sink
 
         class BoundHandler(_Handler):
             pass
 
         BoundHandler.store = store
         BoundHandler.wiki = wiki
+        BoundHandler.sink = sink
 
         self._httpd = ThreadingHTTPServer(("127.0.0.1", port), BoundHandler)
         self._url = f"http://127.0.0.1:{port}"

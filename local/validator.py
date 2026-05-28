@@ -25,6 +25,7 @@ from pathlib import Path
 # Allow ``python local/validator.py`` from repo root without installing.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from local.artifacts import ArtifactSink, cleanup_workdir
 from local.scoring import compute_pareto, passes_size_gate, score_round
 from local.services import ServicesServer
 from local.store import LocalStore
@@ -122,7 +123,8 @@ def _next_round_id(store: LocalStore) -> int:
 
 def run_round(store: LocalStore, task, round_id: int,
               phase_a_seconds: float, services_url: str,
-              agent_seconds: int = 180) -> None:
+              agent_seconds: int = 180,
+              sink: ArtifactSink | None = None) -> None:
     challenge = _build_challenge(
         round_id, store, task, services_url, agent_seconds=agent_seconds,
     )
@@ -133,6 +135,9 @@ def run_round(store: LocalStore, task, round_id: int,
         round_id, bucket, challenge["min_flops_equivalent"],
         challenge["max_flops_equivalent"], len(challenge["feasible_frontier"]),
     )
+
+    if sink is not None:
+        sink.record_challenge(task.name, round_id, challenge)
 
     # ── Phase A: publish challenge, wait for proposals ──────
     store.post_challenge(challenge_id, round_id, challenge)
@@ -162,6 +167,8 @@ def run_round(store: LocalStore, task, round_id: int,
         payload = p["payload"]
         miner_id = p["miner_id"]
         name = payload.get("name", "unnamed")
+        if sink is not None:
+            sink.record_proposal(task.name, round_id, miner_id, payload)
         logger.info("  phase B/C: training '%s' from miner=%s", name, miner_id)
         result = run_training(
             payload.get("code", ""),
@@ -195,7 +202,7 @@ def run_round(store: LocalStore, task, round_id: int,
         frontier=challenge["feasible_frontier"],
     )
 
-    # Write experiments
+    # Write experiments + mirror artifacts to object storage
     for p, r in zip(proposals, results):
         parent = p["payload"].get("parent_index")
         store.add_experiment(
@@ -216,6 +223,11 @@ def run_round(store: LocalStore, task, round_id: int,
             prompt_id=r["prompt_id"],
             task=task.name,
         )
+        workdir_str = r.get("workdir") or ""
+        workdir = Path(workdir_str) if workdir_str else None
+        if sink is not None:
+            sink.record_result(task.name, round_id, r["miner_id"], r, workdir)
+        cleanup_workdir(workdir)
 
     store.mark_challenge(challenge_id, "done")
 
@@ -290,10 +302,13 @@ def main(argv: list[str] | None = None) -> int:
         getattr(task, "time_budget_seconds", "n/a"),
     )
 
+    sink = ArtifactSink.from_env(store)
+
     services = ServicesServer(
         store=store,
         wiki_dir=args.wiki_dir or None,
         port=args.services_port,
+        sink=sink,
     )
     services_url = services.start()
     logger.info(
@@ -310,7 +325,8 @@ def main(argv: list[str] | None = None) -> int:
             run_round(store, task, round_id,
                       phase_a_seconds=args.phase_a_seconds,
                       services_url=services_url,
-                      agent_seconds=args.agent_seconds)
+                      agent_seconds=args.agent_seconds,
+                      sink=sink)
             round_id += 1
             completed += 1
             if args.rounds == 0 or completed < args.rounds:
