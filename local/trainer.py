@@ -183,6 +183,7 @@ def run_training(
             "loss_curve": [],
             "analysis": "submission failed to load",
             "error": f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=2)}",
+            "workdir": "",
         }
 
     rng = np.random.default_rng(seed)
@@ -222,6 +223,7 @@ def run_training(
             "loss_curve": loss_curve,
             "analysis": "training crashed",
             "error": f"{type(e).__name__}: {e}",
+            "workdir": "",
         }
 
     train_seconds = time.time() - started
@@ -240,6 +242,7 @@ def run_training(
             f"flops_equiv={flops_equiv}"
         ),
         "error": "",
+        "workdir": "",
     }
 
 
@@ -286,6 +289,7 @@ def _run_ts_forecasting(
             "loss_curve": [],
             "analysis": "ts_forecasting runner unavailable",
             "error": f"{type(e).__name__}: {e} (install torch + the [gift_eval] extra)",
+            "workdir": "",
         }
 
     workdir = Path(tempfile.mkdtemp(prefix="radar_ts_"))
@@ -342,6 +346,7 @@ def _run_ts_forecasting(
             "loss_curve": [],
             "analysis": "ts_forecasting harness crashed",
             "error": f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=2)}",
+            "workdir": str(workdir),
         }
     finally:
         for k, v in saved.items():
@@ -388,4 +393,5 @@ def _run_ts_forecasting(
             f"eval_datasets={task.eval_datasets or 'auto'}"
         ),
         "error": "" if success else str(result.get("error") or status),
+        "workdir": str(workdir),
     }
