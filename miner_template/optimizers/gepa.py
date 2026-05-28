@@ -71,7 +71,7 @@ def _default_lm(dspy_mod) -> Any:
 
     base = os.getenv("MINER_LLM_URL", "").strip()
     key = os.getenv("MINER_LLM_API_KEY", "").strip()
-    model = os.getenv("MINER_LLM_MODEL", "").strip() or "deepseek-ai/DeepSeek-V3-0324"
+    model = os.getenv("MINER_LLM_MODEL", "").strip() or "moonshotai/Kimi-K2.6-TEE"
     if base and key:
         return dspy_mod.LM(model=model, api_base=base, api_key=key)
 

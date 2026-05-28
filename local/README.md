@@ -117,7 +117,7 @@ LLM provider rules (no key required for the stack to *run*):
 
 | Env var | What happens |
 |---|---|
-| `CHUTES_API_KEY` | Real proxy to Chutes AI (`https://llm.chutes.ai/v1`) — same provider real radar uses; default model `deepseek-ai/DeepSeek-V3-0324` |
+| `CHUTES_API_KEY` | Real proxy to Chutes AI (`https://llm.chutes.ai/v1`) — same provider real radar uses; default model `moonshotai/Kimi-K2.6-TEE` |
 | `OPENAI_API_KEY` | Real proxy to OpenAI Chat Completions |
 | neither | Deterministic stub — agent can still test the call path |
 

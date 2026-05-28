@@ -30,7 +30,7 @@ from typing import Optional
 # Matches the real validator's llm_proxy default — Chutes serves the
 # OpenAI-compatible API at /v1/chat/completions.
 CHUTES_BASE_URL = "https://llm.chutes.ai/v1"
-CHUTES_DEFAULT_MODEL = "deepseek-ai/DeepSeek-V3-0324"
+CHUTES_DEFAULT_MODEL = "moonshotai/Kimi-K2.6-TEE"
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 
