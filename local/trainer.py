@@ -28,6 +28,7 @@ Two dispatch paths:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
 import tempfile
@@ -363,29 +364,110 @@ def _run_ts_forecasting(
     train_hist = result.get("train_loss_history") or []
     val_hist = result.get("val_loss_history") or []
     loss_curve = [float(x.get("loss", 0.0)) for x in train_hist]
-    # Metric priority: best val loss > last val loss > last train loss.
     val_losses = [float(x.get("loss", 0.0)) for x in val_hist if x.get("loss") is not None]
-    if "best_val_loss" in result and result["best_val_loss"] is not None:
-        metric = float(result["best_val_loss"])
-    elif val_losses:
-        metric = val_losses[-1]
-    elif loss_curve:
-        metric = loss_curve[-1]
+    best_val_loss = (
+        float(result["best_val_loss"])
+        if result.get("best_val_loss") is not None
+        else (val_losses[-1] if val_losses else (loss_curve[-1] if loss_curve else None))
+    )
+
+    # Phase C — GIFT-Eval CRPS/MASE on the saved checkpoint. Combined
+    # leaderboard-style metric is geomean(normalized_crps, normalized_mase).
+    eval_metrics: dict = {}
+    eval_error = ""
+    checkpoint_path = result.get("checkpoint_path") if success else None
+    if checkpoint_path and Path(checkpoint_path).exists():
+        try:
+            eval_metrics = _gift_eval_score(
+                code, checkpoint_path, cache_dir,
+                task.eval_datasets, seed,
+            )
+        except Exception as e:  # noqa: BLE001
+            eval_error = f"{type(e).__name__}: {e}"
+
+    crps = eval_metrics.get("crps")
+    mase = eval_metrics.get("mase")
+    if crps is not None and mase is not None and math.isfinite(crps) and math.isfinite(mase):
+        # Geomean of the two normalized leaderboard aggregates. Both lower=better.
+        metric = math.sqrt(max(crps, 0.0) * max(mase, 0.0))
+        metric_source = "gift_eval"
     else:
-        metric = None
+        metric = best_val_loss
+        metric_source = "best_val_loss"
+
+    objectives = {
+        "flops_equivalent_size": flops_equiv,
+        "num_params": num_params,
+        "train_seconds": train_seconds,
+    }
+    if crps is not None:
+        objectives["crps"] = float(crps)
+    if mase is not None:
+        objectives["mase"] = float(mase)
+    if "n_tasks" in eval_metrics:
+        objectives["n_tasks"] = int(eval_metrics["n_tasks"])
+    if best_val_loss is not None:
+        objectives["best_val_loss"] = float(best_val_loss)
+
+    analysis = (
+        f"task=ts_forecasting status={status} pretrain_shards={len(shard_paths)} "
+        f"eval_datasets={task.eval_datasets or 'auto'} metric_source={metric_source}"
+    )
+    if crps is not None and mase is not None:
+        analysis += f" crps={crps:.4f} mase={mase:.4f}"
+    if eval_error:
+        analysis += f" gift_eval_error={eval_error}"
 
     return {
         "success": bool(success and metric is not None),
         "metric": float(metric) if metric is not None else None,
-        "objectives": {
-            "flops_equivalent_size": flops_equiv,
-            "num_params": num_params,
-            "train_seconds": train_seconds,
-        },
+        "objectives": objectives,
         "loss_curve": loss_curve,
-        "analysis": (
-            f"task=ts_forecasting status={status} pretrain_shards={len(shard_paths)} "
-            f"eval_datasets={task.eval_datasets or 'auto'}"
-        ),
+        "analysis": analysis,
         "error": "" if success else str(result.get("error") or status),
     }
+
+
+def _gift_eval_score(
+    code: str, checkpoint_path: str, cache_dir: str,
+    eval_datasets: str, seed: int,
+) -> dict:
+    """Load the trained model from ``checkpoint_path`` and run GIFT-Eval.
+
+    Returns ``{"crps": float, "mase": float, "n_tasks": int, "per_task": [...]}``
+    where crps/mase are the geomean of per-task normalized values (against
+    seasonal-naive) — both lower=better, comparable to the leaderboard.
+    """
+    if not Path(cache_dir).is_dir():
+        raise FileNotFoundError(f"GIFT-Eval cache dir missing: {cache_dir}")
+
+    import torch
+    from safetensors.torch import load_file
+
+    from prepare import (  # type: ignore[import-not-found]
+        CONTEXT_LEN, NUM_VARIATES, PREDICTION_LEN, QUANTILES, validate,
+    )
+
+    build_model = _exec_submission(code)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = build_model(CONTEXT_LEN, PREDICTION_LEN, NUM_VARIATES, QUANTILES).to(device)
+    state_dict = load_file(checkpoint_path, device=device)
+    model.load_state_dict(state_dict)
+    if hasattr(model, "reset"):
+        model.reset()
+    model.eval()
+
+    dataset_names = None
+    if eval_datasets:
+        dataset_names = [s.strip() for s in eval_datasets.split(",") if s.strip()]
+
+    metrics = validate(
+        model, seed=seed,
+        data_dir=cache_dir,
+        dataset_names=dataset_names,
+    )
+    out = {"crps": float(metrics["crps"]), "mase": float(metrics["mase"])}
+    if "n_tasks" in metrics:
+        out["n_tasks"] = int(metrics["n_tasks"])
+        out["per_task"] = metrics.get("per_task", [])
+    return out
