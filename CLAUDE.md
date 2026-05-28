@@ -55,10 +55,16 @@ torch pretrain + GIFT-Eval pipeline. The dispatch lives in
 2. Sets `CHECKPOINT_DIR`, `SUBMISSION_PATH`, `RADAR_*_LOCAL_PATHS`
    in the env and calls `runner.harness.run_training` with a
    `TSForecastingRunner`.
-3. Translates the harness's `train_loss_history` / `val_loss_history`
-   / `best_val_loss` into the `{success, metric, objectives,
-   loss_curve, ...}` shape that `local/validator.py` already writes
-   into SQLite.
+3. Reloads the saved checkpoint and runs
+   `runner.timeseries_forecast.prepare.validate` on the **full**
+   GIFT-Eval leaderboard — always all 97 tasks (SHORT_DATASETS
+   expanded with MED_LONG terms). No subset knob exists in the local
+   stack. Per-task CRPS/MASE are normalized against seasonal-naive
+   and geomean'd; the SQLite `metric` is `sqrt(crps * mase)`
+   (lower=better) and both raw values land in `objectives` alongside
+   `best_val_loss`. If the checkpoint or cache is missing the trainer
+   falls back to `best_val_loss` and logs
+   `metric_source=best_val_loss`.
 
 The frozen runner uses sibling-style imports (`from prepare import
 ...`) inherited from the sandboxed-pod era — the dispatcher adds
