@@ -13,7 +13,15 @@ Strategy (task-agnostic):
        - direct key             → ``key_name`` → ``tp["key_name"]``
        - ``len(...)``           → ``len(some_list)`` → ``len(tp["some_list"])``
        - unresolved name        → wildcard (``-1``) — skipped during compare
-  3. Compare against the actual tensor shape the model produces on a dummy
+  3. Fallback when no ``Output:`` constraint exists: if a ``build_model(...)``
+     signature constraint is present AND ``task_params`` contains a key that
+     names a per-sample output length (``pred*``, ``forecast*``, ``target*``,
+     ``out*``), derive the expected non-batch dims as the build_model params
+     in declared order, minus any param that looks input-like (sequence/
+     context, vocab, image, graph-node keys). The classic ts_forecasting
+     mismatch (model emits 96 vs target 64) is caught here without baking a
+     task name into the validator.
+  4. Compare against the actual tensor shape the model produces on a dummy
      forward pass. Works for 2D, 3D, 4D, or any rank that the constraint
      specifies.
 
@@ -26,6 +34,21 @@ from typing import Iterable
 
 
 _BATCH_TOKENS = frozenset({"b", "batch", "batch_size", "bs", "n", "nbatch"})
+
+# Soft pattern matchers (substring tests on lowercased key names).
+# Used by the build_model-signature fallback to decide which params belong
+# on the output side (kept) vs the input side (dropped). New tasks naming
+# their dims differently fall through and the fallback simply declines —
+# no false rejections, just no extra check.
+_INPUT_NAME_HINTS = (
+    "context", "ctx_", "input", "in_dim", "in_features",
+    "seq_len", "sequence", "block", "max_len", "max_length",
+    "vocab", "image", "img", "height", "width",
+    "node", "edge", "feature_size", "feature_dim", "d_model",
+)
+_OUTPUT_LENGTH_HINTS = (
+    "pred", "forecast", "target", "horizon", "out_len", "output_len",
+)
 
 # Anchors the shape extractor on the first "Output" mention. We then scan
 # forward to the next opening paren and extract a balanced paren group so
@@ -140,6 +163,77 @@ def _resolve_dim(token: str, tp: dict) -> int | None:
     return None
 
 
+_BUILD_MODEL_SIG_RE = re.compile(r"build_model\s*\(([^)]*)\)")
+
+
+def _looks_input_like(name: str) -> bool:
+    """Soft check: does this task_param name describe an input dimension?
+
+    Substring match on hints — keeps the heuristic generic. False negatives
+    (treating a true input dim as output) just produce a verifier wildcard
+    when the name doesn't resolve cleanly, so the worst case is no check.
+    """
+    low = name.lower()
+    return any(h in low for h in _INPUT_NAME_HINTS)
+
+
+def _has_output_length_key(task_params: dict) -> bool:
+    """Trigger guard for the build_model-signature fallback.
+
+    Returns True when task_params declares a per-sample output length under
+    one of the common name patterns. Without this we'd risk inferring an
+    output shape for tasks that don't have one (e.g. classification).
+    """
+    for k in task_params:
+        low = k.lower()
+        if any(h in low for h in _OUTPUT_LENGTH_HINTS):
+            return True
+    return False
+
+
+def _infer_from_build_model_signature(
+    task_params: dict, constraints: Iterable[str],
+) -> list[int] | None:
+    """Fallback: derive expected output dims from a build_model signature.
+
+    Looks for a ``build_model(p1, p2, ..., pN)`` string in the constraints,
+    drops params that look input-like by name, and resolves the rest in
+    declared order. List-valued params resolve to their length (e.g.
+    ``quantiles`` → ``len(quantiles)``).
+
+    Only fires when ``task_params`` advertises an output-length key — see
+    ``_has_output_length_key`` — to avoid synthesising an expected shape for
+    tasks that don't conceptually have one.
+    """
+    if not _has_output_length_key(task_params):
+        return None
+
+    for c in constraints:
+        if not isinstance(c, str):
+            continue
+        m = _BUILD_MODEL_SIG_RE.search(c)
+        if not m:
+            continue
+        params = [p.strip() for p in m.group(1).split(",") if p.strip()]
+        if not params:
+            continue
+        kept: list[int] = []
+        for p in params:
+            # Strip type annotations / defaults defensively (e.g. "ctx=512").
+            name = p.split(":")[0].split("=")[0].strip()
+            if not name or _looks_input_like(name):
+                continue
+            v = _resolve_dim(name, task_params)
+            if v is None:
+                # An output-side param we can't resolve to an int isn't a
+                # safe basis for a hard reject — back out entirely.
+                return None
+            kept.append(v)
+        if kept:
+            return kept
+    return None
+
+
 def infer_output_shape(task_params: dict,
                        constraints: Iterable[str] | None) -> list[int] | None:
     """Infer the expected output shape (excluding batch) from constraints.
@@ -173,7 +267,11 @@ def infer_output_shape(task_params: dict,
             resolved.append(v if v is not None else -1)
         return resolved
 
-    return None
+    # No explicit Output: constraint — fall back to deriving expected dims
+    # from the build_model signature when the task advertises a per-sample
+    # output length. Keeps the check task-agnostic: bails out for tasks
+    # whose params don't name an output-length dim.
+    return _infer_from_build_model_signature(task_params, constraints)
 
 
 def verify_output_shape(actual: tuple | list,
@@ -210,7 +308,10 @@ def verify_output_shape(actual: tuple | list,
                 f"expected {e}, got {a}. "
                 f"Full expected {_pretty_expected()}, actual {tuple(actual)}. "
                 "Make sure every dimension is derived from task_params — "
-                "never hardcode lengths."
+                "never hardcode lengths. Length-like params (e.g. context "
+                "and output/prediction lengths) are INDEPENDENT: a layer "
+                "that bridges them must project explicitly, e.g. "
+                "`nn.Linear(context_len // patch, output_len)`."
             )
 
     return None

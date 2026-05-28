@@ -141,7 +141,12 @@ def build_system_prompt(challenge: dict) -> str:
         "torch.nn.functional)\n"
         "- Do NOT import subprocess, socket, or ftplib\n"
         "- Use standard nn ops (nn.Linear, nn.Conv1d, nn.TransformerEncoderLayer, "
-        "nn.MultiheadAttention, nn.LayerNorm) so FLOPs counter works"
+        "nn.MultiheadAttention, nn.LayerNorm) so FLOPs counter works\n"
+        "- Length-like task_params are INDEPENDENT: an input length and an "
+        "output length are unrelated. Any layer that bridges them must "
+        "project explicitly (e.g. `nn.Linear(input_len // patch, "
+        "output_len)`); never assume one divides the other or rely on "
+        "implicit reshape/residual to align them"
     )
 
     return "\n\n".join(parts)
