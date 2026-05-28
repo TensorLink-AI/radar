@@ -78,50 +78,11 @@ def _safe(component: str) -> str:
     return _SAFE_ID.sub("_", component).strip("_") or "unknown"
 
 
-def _artifact_creds() -> Optional[dict]:
-    """Resolve credentials for the artifact bucket.
-
-    The artifact bucket is independent of the gift-eval / pretrain buckets
-    so it can live in a different account. Resolution order:
-
-    1. ``RADAR_ARTIFACT_*`` — the dedicated set.
-    2. ``HIPPIUS_*`` / ``R2_*`` — legacy single-credential setups.
-
-    Returns ``None`` when no usable credentials are configured.
-    """
-    ak = (
-        os.environ.get("RADAR_ARTIFACT_ACCESS_KEY_ID")
-        or os.environ.get("HIPPIUS_ACCESS_KEY_ID")
+def _have_creds() -> bool:
+    return bool(
+        os.environ.get("HIPPIUS_ACCESS_KEY_ID")
         or os.environ.get("R2_ACCESS_KEY_ID")
-        or ""
     )
-    sk = (
-        os.environ.get("RADAR_ARTIFACT_SECRET_ACCESS_KEY")
-        or os.environ.get("HIPPIUS_SECRET_ACCESS_KEY")
-        or os.environ.get("R2_SECRET_ACCESS_KEY")
-        or ""
-    )
-    if not (ak and sk):
-        return None
-    endpoint = os.environ.get("RADAR_ARTIFACT_ENDPOINT_URL", "")
-    account_id = os.environ.get("RADAR_ARTIFACT_ACCOUNT_ID", "")
-    # If the dedicated account ID is set but no explicit endpoint is, derive
-    # the R2 per-account URL here — otherwise an unrelated HIPPIUS_* env var
-    # could shadow it inside HippiusStorage's resolution logic.
-    if account_id and not endpoint:
-        endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
-    # Last-resort fallback to legacy single-account vars when nothing
-    # artifact-specific is set.
-    if not endpoint:
-        endpoint = os.environ.get("HIPPIUS_ENDPOINT_URL", "")
-    region = os.environ.get("RADAR_ARTIFACT_REGION") or ""
-    return {
-        "access_key_id": ak,
-        "secret_access_key": sk,
-        "endpoint_url": endpoint,
-        "account_id": account_id,
-        "region": region,
-    }
 
 
 @dataclass
@@ -141,23 +102,17 @@ class ArtifactSink:
     def from_env(cls, store: LocalStore) -> "ArtifactSink":
         bucket = os.environ.get("RADAR_ARTIFACT_BUCKET", _DEFAULT_BUCKET).strip() \
             or _DEFAULT_BUCKET
-        creds = _artifact_creds()
-        if creds is None:
+        if not _have_creds():
             logger.info(
-                "artifact sink: SQLite-only (no RADAR_ARTIFACT_* / "
-                "HIPPIUS_* / R2_* creds in env)"
+                "artifact sink: SQLite-only (no HIPPIUS_*/R2_* creds in env)"
             )
             return cls(store=store, bucket=bucket, r2_enabled=False)
         try:
+            # Pass only the bucket — every other knob (keys, endpoint,
+            # region, account id) comes from the shared HIPPIUS_*/R2_*
+            # env vars that the rest of the stack uses.
             from shared.r2_audit import HippiusStorage
-            client = HippiusStorage(
-                bucket=bucket,
-                access_key_id=creds["access_key_id"],
-                secret_access_key=creds["secret_access_key"],
-                endpoint_url=creds["endpoint_url"],
-                account_id=creds["account_id"],
-                region=creds["region"],
-            )
+            client = HippiusStorage(bucket=bucket)
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "artifact sink: SQLite-only (R2 init failed: %s)", e
