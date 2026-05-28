@@ -94,6 +94,7 @@ pandas, httpx) so the synthetic stack stays numpy-only.
 | `local/task.py` | Synthetic 8-dim regression + FLOPs-equivalent size buckets. |
 | `local/optimize.py` | Prompt-population CLI (`gepa` / `random_mutate`). |
 | `local/run.py` | Launches validator + N miners as subprocesses. |
+| `local/dashboard.py` + `local/dashboard.html` | Read-only stdlib HTTP dashboard over `radar_local.db`. `python -m local.dashboard --db ... --port 8765`, open in Chrome. |
 | `miner_template/prompts.py` | `active.json` + `history/gen_NNN.json` atomic-write population store. |
 | `miner_template/optimizers/` | Pluggable optimizer registry (`gepa`, `random_mutate`, `pkg.mod:func`). |
 | `shared/url_gate.py` | `GatedClient` enforcing the per-challenge `allowed_urls`. |
@@ -107,6 +108,10 @@ pip install -e .
 # Single-laptop run
 python local/run.py --rounds 5
 python local/run.py --agent_dir /path/to/agent --wiki_dir /path/to/notes --miners 3
+
+# Dashboard (read-only, runs beside the validator)
+python -m local.dashboard --db local/radar_local.db --port 8765
+# → open http://127.0.0.1:8765/ in Chrome
 
 # Prompt evolution
 python -m local.optimize --agent_dir /path/to/agent --optimizer random_mutate
