@@ -93,13 +93,13 @@ def _group_by_prompt(results: list[ResultRow]) -> dict[str, list[ResultRow]]:
 def _build_metric(score_key: str):
     """Return a metric callable GEPA invokes per rollout.
 
-    The default DSPy metric signature is ``metric(example, pred, trace)
-    -> float``; we don't need the example/trace here because we already
-    know which prompt produced which scored row.  GEPA passes through
-    user-supplied kwargs, so we attach ``score_key`` as a closure.
+    Recent DSPy releases require the GEPA metric to accept five
+    arguments — ``(gold, pred, trace, pred_name, pred_trace)`` — and
+    validate the signature at construction time.  We accept all five
+    but only inspect ``pred`` to look up the score on the wrapped row.
     """
 
-    def metric(example, pred, trace=None) -> float:
+    def metric(gold, pred, trace=None, pred_name=None, pred_trace=None) -> float:
         # GEPA stores result metadata on ``pred`` when wrapped through
         # this adapter; the caller's program puts ``scores`` there.
         scores = getattr(pred, "scores", None) or {}
