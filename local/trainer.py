@@ -417,13 +417,31 @@ def _run_ts_forecasting(
     eval_metrics: dict = {}
     eval_error = ""
     checkpoint_path = result.get("checkpoint_path") if success else None
-    if checkpoint_path and Path(checkpoint_path).exists():
+    if not success:
+        logger.warning(
+            "GIFT-Eval skipped: training did not succeed (status=%s)", status,
+        )
+    elif not checkpoint_path:
+        logger.warning("GIFT-Eval skipped: harness did not return a checkpoint_path")
+    elif not Path(checkpoint_path).exists():
+        logger.warning("GIFT-Eval skipped: checkpoint missing at %s", checkpoint_path)
+    elif not Path(cache_dir).is_dir():
+        logger.warning(
+            "GIFT-Eval skipped: cache dir missing at %s "
+            "(set RADAR_GIFT_EVAL_CACHE / run `python -m local.fetch_gift_eval`)",
+            cache_dir,
+        )
+    else:
         try:
             eval_metrics = _gift_eval_score(
                 code, checkpoint_path, cache_dir, seed,
             )
         except Exception as e:  # noqa: BLE001
             eval_error = f"{type(e).__name__}: {e}"
+            logger.warning(
+                "GIFT-Eval failed; falling back to best_val_loss: %s",
+                eval_error,
+            )
 
     crps = eval_metrics.get("crps")
     mase = eval_metrics.get("mase")

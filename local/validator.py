@@ -185,10 +185,16 @@ def run_round(store: LocalStore, task, round_id: int,
         result["tool_calls"] = payload.get("tool_calls", [])
         result["prompt_id"] = payload.get("prompt_id", "")
         if result["success"]:
+            objs = result["objectives"]
+            extra = ""
+            if "crps" in objs and "mase" in objs:
+                extra = f" crps={objs['crps']:.4f} mase={objs['mase']:.4f}"
+            elif "best_val_loss" in objs:
+                extra = f" best_val_loss={objs['best_val_loss']:.6f} (no gift_eval)"
             logger.info(
-                "    metric=%.6f params=%d flops_eq=%d",
-                result["metric"], result["objectives"]["num_params"],
-                result["objectives"]["flops_equivalent_size"],
+                "    metric=%.6f params=%d flops_eq=%d%s",
+                result["metric"], objs["num_params"],
+                objs["flops_equivalent_size"], extra,
             )
         else:
             logger.warning("    failed: %s", result.get("error", "?"))
@@ -233,11 +239,19 @@ def run_round(store: LocalStore, task, round_id: int,
 
     # ── Round summary ───────────────────────────────────────
     winner = max(results, key=lambda r: r.get("score", 0.0))
+    w_objs = winner.get("objectives", {}) or {}
+    if "crps" in w_objs and "mase" in w_objs:
+        win_extra = f" crps={w_objs['crps']:.4f} mase={w_objs['mase']:.4f}"
+    elif "best_val_loss" in w_objs:
+        win_extra = f" best_val_loss={w_objs['best_val_loss']:.6f} (no gift_eval)"
+    else:
+        win_extra = ""
     logger.info(
-        "  round done: winner=%s metric=%s score=%.3f",
+        "  round done: winner=%s metric=%s score=%.3f%s",
         winner["name"],
         f"{winner['metric']:.6f}" if winner.get("metric") is not None else "FAIL",
         winner.get("score", 0.0),
+        win_extra,
     )
     stats = store.stats()
     logger.info(
