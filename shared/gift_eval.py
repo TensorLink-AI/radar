@@ -272,13 +272,17 @@ def get_base_prediction_length(freq: str, dataset_name: str) -> int:
 
 
 def _parse_dataset_spec(name: str) -> tuple[str, str]:
-    """Split a leaderboard name into (dataset, freq).
+    """Split a leaderboard name or manifest key into (dataset, freq).
 
-    "ett1/15T" → ("ett1", "15T")
-    "hospital"  → ("hospital", "M") via _DATASET_PROPERTIES lookup
+    "ett1/15T"        → ("ett1", "15T")   leaderboard spelling
+    "ett1__15T"       → ("ett1", "15T")   manifest-key spelling
+    "hospital"        → ("hospital", "M") via _DATASET_PROPERTIES lookup
     """
     if "/" in name:
         dataset, freq = name.split("/", 1)
+        return dataset, freq
+    if "__" in name:
+        dataset, freq = name.split("__", 1)
         return dataset, freq
     key = _PRETTY_NAMES.get(name.lower(), name.lower())
     freq = _DATASET_PROPERTIES.get(key)
