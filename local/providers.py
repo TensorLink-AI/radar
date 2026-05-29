@@ -156,14 +156,15 @@ DESEARCH_DATE_FILTERS = {
     "PAST_MONTH", "PAST_2_MONTHS", "PAST_YEAR", "PAST_2_YEARS",
 }
 
-# Miner tool wrappers POST to /desearch/search with a ~15s client deadline
-# (``TOOL_HTTP_TIMEOUT`` in miners/*/tools.py) and give up + retry once it
-# elapses. The server's upstream call therefore has to come back *under*
-# that budget, otherwise the miner times out before we can answer and
-# desearch "never works". We bound the upstream call below the client
-# deadline (env-overridable via ``RADAR_DESEARCH_TIMEOUT``).
+# Miner tool wrappers POST to /desearch/search with a ~50s client deadline
+# (``SEARCH_HTTP_TIMEOUT`` in miners/*/tools.py) and give up + retry once it
+# elapses. The server's upstream call has to come back *under* that budget,
+# otherwise the miner times out before we can answer and desearch "never
+# works". Real SN22 AI search routinely takes 20-45s, so we bound the
+# upstream call at 45s — just under the client deadline, leaving margin for
+# the local round-trip (env-overridable via ``RADAR_DESEARCH_TIMEOUT``).
 DESEARCH_UPSTREAM_TIMEOUT = float(
-    os.environ.get("RADAR_DESEARCH_TIMEOUT", "12")
+    os.environ.get("RADAR_DESEARCH_TIMEOUT", "45")
 )
 
 
@@ -305,9 +306,9 @@ def desearch(payload: dict) -> dict:
 
     Resolution order:
 
-    1. If ``RADAR_DESEARCH_SN22_URL`` and ``DESEARCH_API_KEY`` are set,
-       forward to the production Desearch SN22 ``/desearch/ai/search``
-       endpoint.
+    1. If ``DESEARCH_API_KEY`` is set, forward to the production Desearch
+       SN22 ``/desearch/ai/search`` endpoint (``RADAR_DESEARCH_SN22_URL``
+       overrides the host; defaults to ``DESEARCH_DEFAULT_URL``).
     2. Otherwise fall back to the public arxiv Atom API (works for
        prompts about ML papers, requires egress to export.arxiv.org).
     3. On any network/HTTP error, return ``{"results": [], "error":
@@ -315,6 +316,12 @@ def desearch(payload: dict) -> dict:
     """
     sn22_url = os.environ.get("RADAR_DESEARCH_SN22_URL", "").strip()
     api_key = os.environ.get("DESEARCH_API_KEY", "").strip()
+    # A Desearch key alone is enough — default to the public SN22
+    # endpoint when no explicit URL is configured. (Previously the key
+    # was silently ignored unless RADAR_DESEARCH_SN22_URL was also set,
+    # so a key-only setup fell through to the arxiv fallback.)
+    if api_key and not sn22_url:
+        sn22_url = DESEARCH_DEFAULT_URL
     if sn22_url and api_key:
         try:
             return _desearch_remote(payload, sn22_url, api_key)

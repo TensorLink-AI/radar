@@ -36,6 +36,7 @@ from core import call_with_timeout
 from core.trace import trace_architecture, format_trace
 
 TOOL_HTTP_TIMEOUT = 15   # seconds per research/DB request
+SEARCH_HTTP_TIMEOUT = 50  # paper search hits Desearch AI (slower upstream)
 FRONTIER_HTTP_TIMEOUT = 10  # seconds for frontier fetch
 
 # Circuit breaker for tools that keep returning the same error. The agent
@@ -637,7 +638,7 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
             resp = call_with_timeout(
                 client.post_json,
                 args=(f"{desearch_url}/search", payload),
-                timeout=TOOL_HTTP_TIMEOUT,
+                timeout=SEARCH_HTTP_TIMEOUT,
             )
             results = resp.get("results", [])
             if not results:
@@ -651,7 +652,7 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
                 lines.append("")
             return "\n".join(lines)
         except TimeoutError:
-            return f"Paper search timed out after {TOOL_HTTP_TIMEOUT}s."
+            return f"Paper search timed out after {SEARCH_HTTP_TIMEOUT}s."
         except Exception as exc:
             return f"Paper search failed: {exc}"
 

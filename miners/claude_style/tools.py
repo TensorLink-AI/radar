@@ -48,6 +48,7 @@ from core.trace import format_trace, trace_architecture
 from core.validation import validate_code
 
 TOOL_HTTP_TIMEOUT = 15       # seconds per research/DB request
+SEARCH_HTTP_TIMEOUT = 50     # paper search hits Desearch AI (slower upstream)
 FRONTIER_HTTP_TIMEOUT = 10   # seconds for frontier fetch
 
 # Scratchpad file tool limits. The scratchpad upload itself is capped by
@@ -1049,7 +1050,7 @@ def build_handlers(
             resp = call_with_timeout(
                 client.post_json,
                 args=(f"{desearch_url}/search", payload),
-                timeout=TOOL_HTTP_TIMEOUT,
+                timeout=SEARCH_HTTP_TIMEOUT,
             )
             results = resp.get("results", []) if isinstance(resp, dict) else []
             if not results:
@@ -1063,7 +1064,7 @@ def build_handlers(
                 lines.append("")
             return "\n".join(lines)
         except TimeoutError:
-            return f"paper search timed out after {TOOL_HTTP_TIMEOUT}s"
+            return f"paper search timed out after {SEARCH_HTTP_TIMEOUT}s"
         except Exception as exc:
             return f"paper search failed: {exc}"
 
