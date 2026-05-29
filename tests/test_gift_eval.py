@@ -233,6 +233,39 @@ def test_build_task_configs_produces_97_tasks():
         assert "/" in t["config_name"]
 
 
+def test_parse_dataset_spec_accepts_manifest_keys():
+    """_parse_dataset_spec handles both leaderboard and manifest-key spellings.
+
+    Regression: `--all` iterates GIFT_EVAL_DATASETS (manifest keys using the
+    `name__freq` form), which previously fell through to the single-freq
+    lookup and raised KeyError for multi-freq datasets like LOOP_SEATTLE__5T.
+    """
+    from shared.gift_eval import _parse_dataset_spec
+
+    assert _parse_dataset_spec("LOOP_SEATTLE/5T") == ("LOOP_SEATTLE", "5T")
+    assert _parse_dataset_spec("LOOP_SEATTLE__5T") == ("LOOP_SEATTLE", "5T")
+    assert _parse_dataset_spec("ett1__15T") == ("ett1", "15T")
+    # Single-freq datasets still infer freq from _DATASET_PROPERTIES.
+    assert _parse_dataset_spec("hospital") == ("hospital", "M")
+
+
+def test_parse_dataset_spec_resolves_every_manifest_key():
+    """Every key in GIFT_EVAL_DATASETS parses and maps back to the manifest.
+
+    Guards the `--all` code path end to end (parse → manifest bridge).
+    """
+    from shared.gift_eval import (
+        GIFT_EVAL_DATASETS,
+        GIFT_EVAL_MANIFEST,
+        _dataset_key_to_manifest,
+        _parse_dataset_spec,
+    )
+
+    for name in GIFT_EVAL_DATASETS:
+        dataset, freq = _parse_dataset_spec(name)
+        assert _dataset_key_to_manifest(dataset, freq) in GIFT_EVAL_MANIFEST
+
+
 def test_m4_not_in_med_long():
     """No m4_* dataset should appear in MED_LONG_DATASETS."""
     from shared.gift_eval import MED_LONG_DATASETS
