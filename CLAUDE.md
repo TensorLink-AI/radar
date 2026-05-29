@@ -35,8 +35,10 @@ forces region `auto` instead of `decentralized`.
 `shared.gift_eval` owns the GIFT-Eval manifest (key → R2 subpath),
 the SHORT/MED_LONG leaderboard lists, deterministic per-round
 dataset selection, Arrow IPC parsing, and rolling-origin window
-construction. The R2 prefix is
-`gift-eval-benchmark/gift-eval-full/{subpath}/data-00000-of-00001.arrow`.
+construction. Within the `gift-eval-benchmark` bucket the object key
+is `gift-eval-full/{subpath}/data-00000-of-00001.arrow` (the bucket
+name is **not** part of the key — `r2_prefix` defaults to
+`gift-eval-full`).
 
 `python -m local.fetch_gift_eval` is the CLI wrapper over
 `ensure_datasets_cached()` — use it to prefetch Arrow files into
