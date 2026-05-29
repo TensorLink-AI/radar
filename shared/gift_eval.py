@@ -409,7 +409,7 @@ class GiftEvalBenchmark:
         self,
         r2: "R2AuditLog | None" = None,
         cache_dir: str = "/tmp/radar_gift_eval",
-        r2_prefix: str = "gift-eval-benchmark/gift-eval-full",
+        r2_prefix: str = "gift-eval-full",
     ):
         self.r2 = r2
         self.cache_dir = Path(cache_dir)
