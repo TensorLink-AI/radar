@@ -36,6 +36,10 @@ def _default_cache_dir() -> str:
     return os.environ.get("RADAR_PRETRAIN_CACHE", "/tmp/radar_pretrain")
 
 
+def _default_val_cache_dir() -> str:
+    return os.environ.get("RADAR_PRETRAIN_VAL_CACHE", "/tmp/radar_pretrain_val")
+
+
 def _pretrain_bucket() -> str:
     """Resolve the pretrain bucket name from env. Independent of the
     benchmark bucket so operators can split read scopes per credential."""
@@ -77,7 +81,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--val", action="store_true",
                    help="Also download the val shard split (held out).")
     p.add_argument("--cache_dir", default=_default_cache_dir(),
-                   help=f"Local cache directory (default: {_default_cache_dir()}).")
+                   help=f"Training-shard cache directory (default: {_default_cache_dir()}).")
+    p.add_argument("--val_cache_dir", default=_default_val_cache_dir(),
+                   help="Held-out val-shard cache directory — kept separate from "
+                        "the training shards so the in-training val split is fixed "
+                        f"across rounds (default: {_default_val_cache_dir()}).")
     p.add_argument("--list", action="store_true",
                    help="Print available shard keys and exit (no downloads).")
     args = p.parse_args(argv)
@@ -125,17 +133,25 @@ def main(argv: list[str] | None = None) -> int:
     cache = Path(args.cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
 
-    targets: list[str] = []
+    # (key, destination_dir) pairs. Training shards land in the train cache;
+    # val shards land in their own dir so the trainer's fixed held-out split
+    # never overlaps the round-varying training shards.
+    targets: list[tuple[str, Path]] = []
     if args.all or args.n <= 0:
-        targets.extend(all_keys)
+        targets.extend((k, cache) for k in all_keys)
     else:
-        targets.extend(bench.select_shards(seed=args.seed, n=args.n))
+        targets.extend((k, cache) for k in bench.select_shards(seed=args.seed, n=args.n))
     if args.val:
-        targets.extend(val_keys)
+        if not val_keys:
+            log.warning("--val requested but the manifest declares no val shards")
+        else:
+            val_cache = Path(args.val_cache_dir)
+            val_cache.mkdir(parents=True, exist_ok=True)
+            targets.extend((k, val_cache) for k in val_keys)
 
     ok = fail = skipped = 0
-    for key in targets:
-        local_path = cache / Path(key).name
+    for key, dest in targets:
+        local_path = dest / Path(key).name
         if local_path.exists() and local_path.stat().st_size > 0:
             skipped += 1
             continue
@@ -146,7 +162,8 @@ def main(argv: list[str] | None = None) -> int:
             fail += 1
             log.warning("failed to download %s", key)
 
-    print(f"\n{ok} downloaded, {skipped} cached, {fail} failed (cache_dir={cache})")
+    print(f"\n{ok} downloaded, {skipped} cached, {fail} failed "
+          f"(cache_dir={cache}, val_cache_dir={args.val_cache_dir})")
     return 0 if fail == 0 else 1
 
 

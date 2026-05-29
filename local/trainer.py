@@ -303,22 +303,38 @@ def _run_ts_forecasting(
     # The harness reads these from os.environ. Keep originals to restore.
     cache_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "/tmp/radar_gift_eval")
     pretrain_cache = os.environ.get("RADAR_PRETRAIN_CACHE", "/tmp/radar_pretrain")
-    shard_paths: list[str] = []
+    # The in-training val split lives in its own cache dir so it is a
+    # *fixed* held-out set — never drawn from the (round-varying) training
+    # shards. This keeps val loss curves comparable across runs. Populate it
+    # with `python -m local.fetch_pretrain --val`.
+    val_cache = os.environ.get("RADAR_PRETRAIN_VAL_CACHE", "/tmp/radar_pretrain_val")
+
+    train_paths: list[str] = []
     if Path(pretrain_cache).is_dir():
-        shard_paths = sorted(str(p) for p in Path(pretrain_cache).glob("*.parquet"))
+        train_paths = sorted(str(p) for p in Path(pretrain_cache).glob("*.parquet"))
+    val_paths: list[str] = []
+    if Path(val_cache).is_dir() and os.path.realpath(val_cache) != os.path.realpath(pretrain_cache):
+        val_paths = sorted(str(p) for p in Path(val_cache).glob("*.parquet"))
+    # If the two dirs happen to point at the same place, fall back to
+    # reserving the deterministic last shard so train and val never overlap.
+    if not val_paths and len(train_paths) >= 2 and (
+        os.path.realpath(val_cache) == os.path.realpath(pretrain_cache)
+    ):
+        train_paths, val_paths = train_paths[:-1], train_paths[-1:]
+    if not val_paths and len(train_paths) >= 2:
+        logger.warning(
+            "No val shards in RADAR_PRETRAIN_VAL_CACHE=%s — in-training val "
+            "is disabled. Run `python -m local.fetch_pretrain --val` to fetch "
+            "the fixed held-out split.", val_cache,
+        )
 
     overrides = {
         "CHECKPOINT_DIR": str(checkpoint_dir),
         "SUBMISSION_PATH": str(submission_path),
         "RADAR_GIFT_EVAL_CACHE": cache_dir,
     }
-    if shard_paths:
+    if train_paths:
         import json as _json
-        # Reserve the last shard as val when we have >=2; rest is train.
-        if len(shard_paths) >= 2:
-            train_paths, val_paths = shard_paths[:-1], shard_paths[-1:]
-        else:
-            train_paths, val_paths = shard_paths, []
         overrides["RADAR_PRETRAIN_LOCAL_PATHS"] = _json.dumps(train_paths)
         if val_paths:
             overrides["RADAR_PRETRAIN_VAL_LOCAL_PATHS"] = _json.dumps(val_paths)
@@ -475,8 +491,8 @@ def _run_ts_forecasting(
     metric = math.sqrt(max(crps, 0.0) * max(mase, 0.0))
 
     analysis = (
-        f"task=ts_forecasting status={status} pretrain_shards={len(shard_paths)} "
-        f"crps={crps:.4f} mase={mase:.4f}"
+        f"task=ts_forecasting status={status} pretrain_shards={len(train_paths)} "
+        f"val_shards={len(val_paths)} crps={crps:.4f} mase={mase:.4f}"
     )
 
     return {
