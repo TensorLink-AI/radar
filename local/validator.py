@@ -25,7 +25,7 @@ from pathlib import Path
 # Allow ``python local/validator.py`` from repo root without installing.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from local.artifacts import ArtifactSink, cleanup_workdir
+from local.artifacts import ArtifactSink, cleanup_workdir, sweep_orphan_workdirs
 from local.scoring import compute_pareto, passes_size_gate, score_round
 from local.services import ServicesServer
 from local.store import LocalStore
@@ -229,9 +229,13 @@ def run_round(store: LocalStore, task, round_id: int,
         )
         workdir_str = r.get("workdir") or ""
         workdir = Path(workdir_str) if workdir_str else None
-        if sink is not None:
-            sink.record_result(task.name, round_id, r["miner_id"], r, workdir)
-        cleanup_workdir(workdir)
+        try:
+            if sink is not None:
+                sink.record_result(task.name, round_id, r["miner_id"], r, workdir)
+        finally:
+            # Always reclaim the trainer workdir, even if mirroring raised —
+            # otherwise the /tmp/radar_ts_* dir leaks for the run's lifetime.
+            cleanup_workdir(workdir)
 
     store.mark_challenge(challenge_id, "done")
 
@@ -301,6 +305,10 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [validator] %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # Reclaim trainer workdirs orphaned by a prior crashed/killed run before
+    # we start minting new ones.
+    sweep_orphan_workdirs()
 
     store = LocalStore(args.db)
     task = make_spec(args.task)

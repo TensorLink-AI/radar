@@ -342,4 +342,35 @@ def cleanup_workdir(workdir: Optional[Path]) -> None:
         logger.debug("could not remove workdir %s: %s", workdir, e)
 
 
-__all__ = ["ArtifactSink", "cleanup_workdir"]
+def sweep_orphan_workdirs(prefix: str = "radar_ts_") -> int:
+    """Remove trainer workdirs left behind by crashed / killed runs.
+
+    Each ts_forecasting round mints a ``tempfile.mkdtemp(prefix="radar_ts_")``
+    workdir that is normally cleaned by :func:`cleanup_workdir` once its
+    artifacts are mirrored. If the validator is killed mid-round, those dirs
+    survive in the system temp dir and accumulate. Call this once at startup
+    to sweep stragglers from prior runs. Returns the number removed.
+    """
+    import tempfile
+
+    tmp_root = Path(tempfile.gettempdir())
+    removed = 0
+    try:
+        candidates = list(tmp_root.glob(f"{prefix}*"))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("could not scan %s for orphan workdirs: %s", tmp_root, e)
+        return 0
+    for path in candidates:
+        if not path.is_dir():
+            continue
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+        except Exception as e:  # noqa: BLE001
+            logger.debug("could not remove orphan workdir %s: %s", path, e)
+    if removed:
+        logger.info("swept %d orphan trainer workdir(s) from %s", removed, tmp_root)
+    return removed
+
+
+__all__ = ["ArtifactSink", "cleanup_workdir", "sweep_orphan_workdirs"]
