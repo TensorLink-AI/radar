@@ -234,7 +234,13 @@ def build_designer_system_prompt(
         "3. Only torch + stdlib — no external dependencies\n"
         "4. Read all dimensions from `build_model` arguments — never "
         "hardcode\n"
-        "5. Always call `validate_code` before `submit`"
+        "5. Treat each length-like task_param as INDEPENDENT — an input "
+        "length (e.g. `context_len`) and an output length (e.g. "
+        "`prediction_len`) are not related and must not be conflated. "
+        "Any layer that bridges them must project explicitly "
+        "(`nn.Linear(context_len // patch, prediction_len)`), never via "
+        "implicit reshape or residual add\n"
+        "6. Always call `validate_code` before `submit`"
     )
 
     parts.append(
