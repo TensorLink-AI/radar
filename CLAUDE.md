@@ -50,14 +50,23 @@ ts_forecasting`) flips from the numpy MLP regression task to the
 torch pretrain + GIFT-Eval pipeline. The dispatch lives in
 `local/trainer.py::_run_ts_forecasting`, which:
 
-1. Loads training shards from `$RADAR_PRETRAIN_CACHE` and the
-   in-training val split from `$RADAR_PRETRAIN_VAL_CACHE` (default
-   `/tmp/radar_pretrain_val`, fetched via `fetch_pretrain --val`).
-   The val split is a **fixed held-out set** kept in its own dir so it
-   never overlaps the round-varying training shards — val loss curves
-   stay comparable across runs. If the two dirs resolve to the same
-   path it falls back to reserving the deterministic last shard as val;
-   if no val shards are found, in-training val is disabled.
+1. Sources training shards and a fixed in-training val split:
+   - **Training shards stream by default.** The pretrain corpus is
+     multi-TB, so rather than download it the dispatcher presigns a
+     deterministic per-seed subset (`PretrainBenchmark.select_shards`,
+     which auto-excludes the manifest's `val_shard_keys`) and sets
+     `RADAR_PRETRAIN_SHARD_URLS`; the loader fetches one shard at a time.
+     `RADAR_PRETRAIN_STREAM_N` caps the subset (0 = all). Prefetched
+     local shards in `$RADAR_PRETRAIN_CACHE` win when present (offline
+     runs keep working). Streaming needs creds + `boto3`/`httpx`; with
+     none, training falls back to GIFT-Eval data.
+   - **The val split is a small, fixed download.** It lives in its own
+     dir `$RADAR_PRETRAIN_VAL_CACHE` (default `/tmp/radar_pretrain_val`,
+     fetched via `fetch_pretrain --val`) so it never overlaps the
+     round-varying training shards — val loss curves stay comparable
+     across runs. If the val dir resolves to the same path as the train
+     dir it falls back to reserving the deterministic last shard; if no
+     val shards are found, in-training val is disabled.
 2. Sets `CHECKPOINT_DIR`, `SUBMISSION_PATH`, `RADAR_*_LOCAL_PATHS`
    in the env and calls `runner.harness.run_training` with a
    `TSForecastingRunner`.

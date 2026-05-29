@@ -261,6 +261,42 @@ def _ts_runner_paths_setup() -> None:
         sys.path.insert(0, p)
 
 
+def _pretrain_train_urls(seed: int, ttl: int) -> list[str]:
+    """Presign training-shard URLs so the loader can stream (not download) them.
+
+    Selects a deterministic per-seed subset from the pretrain manifest;
+    ``select_shards`` auto-excludes the manifest's ``val_shard_keys`` so the
+    held-out val shard never leaks into training. ``RADAR_PRETRAIN_STREAM_N``
+    caps the subset size (0 = all training shards; the loader still only
+    fetches as many as the time budget consumes).
+
+    Returns ``[]`` when boto3/creds/manifest are unavailable — the caller then
+    leaves the shard env unset and the runner falls back to GIFT-Eval data.
+    """
+    try:
+        from local.fetch_pretrain import make_pretrain_client
+        from shared.pretrain_data import PretrainBenchmark
+    except Exception as e:  # noqa: BLE001
+        logger.debug("pretrain streaming unavailable (import): %s", e)
+        return []
+    client = make_pretrain_client()
+    if client is None:
+        return []
+    try:
+        bench = PretrainBenchmark(r2=client)
+        n = int(os.environ.get("RADAR_PRETRAIN_STREAM_N", "0"))
+        keys = bench.select_shards(seed=seed, n=n)
+        if not keys:
+            logger.warning("pretrain manifest exposed no training shards to stream")
+            return []
+        urls = bench.generate_presigned_shard_urls(keys, ttl=ttl)
+        logger.info("streaming %d pretrain training shards via presigned URLs", len(urls))
+        return urls
+    except Exception as e:  # noqa: BLE001
+        logger.warning("pretrain streaming URL generation failed: %s", e)
+        return []
+
+
 def _run_ts_forecasting(
     code: str,
     *,
@@ -321,23 +357,40 @@ def _run_ts_forecasting(
         os.path.realpath(val_cache) == os.path.realpath(pretrain_cache)
     ):
         train_paths, val_paths = train_paths[:-1], train_paths[-1:]
-    if not val_paths and len(train_paths) >= 2:
+
+    # Training shards stream by default: the pretrain corpus is multi-TB, so
+    # rather than download it we presign a deterministic per-seed subset and
+    # let the loader fetch one shard at a time. The fixed val shard is the
+    # exception — it's small and stays a local download (above) so val curves
+    # are comparable across runs. Local training shards, when present, win
+    # (offline / prefetched runs keep working).
+    train_urls: list[str] = []
+    if not train_paths:
+        ttl = max(5400, int(task.time_budget_seconds) * 2)
+        train_urls = _pretrain_train_urls(seed, ttl)
+
+    if not val_paths and (train_paths or train_urls):
         logger.warning(
             "No val shards in RADAR_PRETRAIN_VAL_CACHE=%s — in-training val "
             "is disabled. Run `python -m local.fetch_pretrain --val` to fetch "
             "the fixed held-out split.", val_cache,
         )
 
+    # Set every shard env var explicitly (empty string = unset, since
+    # _decode_json_list treats "" as None) so a value left over from a prior
+    # in-process call can never pick the wrong source. Local train paths win;
+    # otherwise stream via URLs. Val is local-only here.
+    import json as _json
     overrides = {
         "CHECKPOINT_DIR": str(checkpoint_dir),
         "SUBMISSION_PATH": str(submission_path),
         "RADAR_GIFT_EVAL_CACHE": cache_dir,
+        "RADAR_PRETRAIN_LOCAL_PATHS": _json.dumps(train_paths) if train_paths else "",
+        "RADAR_PRETRAIN_SHARD_URLS": (
+            _json.dumps(train_urls) if (train_urls and not train_paths) else ""
+        ),
+        "RADAR_PRETRAIN_VAL_LOCAL_PATHS": _json.dumps(val_paths) if val_paths else "",
     }
-    if train_paths:
-        import json as _json
-        overrides["RADAR_PRETRAIN_LOCAL_PATHS"] = _json.dumps(train_paths)
-        if val_paths:
-            overrides["RADAR_PRETRAIN_VAL_LOCAL_PATHS"] = _json.dumps(val_paths)
 
     saved = {k: os.environ.get(k) for k in overrides}
     os.environ.update(overrides)
@@ -490,8 +543,11 @@ def _run_ts_forecasting(
     # Geomean of the two normalized leaderboard aggregates. Both lower=better.
     metric = math.sqrt(max(crps, 0.0) * max(mase, 0.0))
 
+    train_src = (
+        f"local={len(train_paths)}" if train_paths else f"streamed={len(train_urls)}"
+    )
     analysis = (
-        f"task=ts_forecasting status={status} pretrain_shards={len(train_paths)} "
+        f"task=ts_forecasting status={status} pretrain_shards({train_src}) "
         f"val_shards={len(val_paths)} crps={crps:.4f} mase={mase:.4f}"
     )
 
