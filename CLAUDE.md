@@ -50,8 +50,14 @@ ts_forecasting`) flips from the numpy MLP regression task to the
 torch pretrain + GIFT-Eval pipeline. The dispatch lives in
 `local/trainer.py::_run_ts_forecasting`, which:
 
-1. Loads pretrain shards from `$RADAR_PRETRAIN_CACHE` (last one
-   reserved as val if ≥2 are present).
+1. Loads training shards from `$RADAR_PRETRAIN_CACHE` and the
+   in-training val split from `$RADAR_PRETRAIN_VAL_CACHE` (default
+   `/tmp/radar_pretrain_val`, fetched via `fetch_pretrain --val`).
+   The val split is a **fixed held-out set** kept in its own dir so it
+   never overlaps the round-varying training shards — val loss curves
+   stay comparable across runs. If the two dirs resolve to the same
+   path it falls back to reserving the deterministic last shard as val;
+   if no val shards are found, in-training val is disabled.
 2. Sets `CHECKPOINT_DIR`, `SUBMISSION_PATH`, `RADAR_*_LOCAL_PATHS`
    in the env and calls `runner.harness.run_training` with a
    `TSForecastingRunner`.
