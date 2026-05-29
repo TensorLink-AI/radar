@@ -11,12 +11,16 @@ it defaults to ``gift-eval-pretrain`` and can be overridden via
 ``R2_PRETRAIN_BUCKET``). S3 credentials and endpoint are shared with the
 benchmark client.
 
+Training shards STREAM at train time and are never downloaded by default;
+this tool exists mainly to fetch the small fixed held-out val shard.
+Downloading training shards is opt-in (offline runs only).
+
 Usage::
 
     python -m local.fetch_pretrain --list
-    python -m local.fetch_pretrain --n 8                  # 8 training shards
-    python -m local.fetch_pretrain --all
-    python -m local.fetch_pretrain --val                  # held-out val shards
+    python -m local.fetch_pretrain --val                  # the fixed val shard (typical)
+    python -m local.fetch_pretrain --n 8                  # opt-in: prefetch 8 train shards (offline)
+    python -m local.fetch_pretrain --all                  # opt-in: prefetch every train shard (offline)
 """
 
 from __future__ import annotations
@@ -73,11 +77,12 @@ def make_pretrain_client():
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--n", type=int, default=0,
-                   help="How many training shards to download (0 = all).")
+                   help="Opt-in: prefetch this many TRAINING shards for offline "
+                        "use (0 = none; training streams by default).")
     p.add_argument("--seed", type=int, default=42,
                    help="Selection seed when --n < total shard count.")
     p.add_argument("--all", action="store_true",
-                   help="Download every training shard.")
+                   help="Opt-in: prefetch every TRAINING shard (offline use only).")
     p.add_argument("--val", action="store_true",
                    help="Also download the val shard split (held out).")
     p.add_argument("--cache_dir", default=_default_cache_dir(),
@@ -131,16 +136,24 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     cache = Path(args.cache_dir)
-    cache.mkdir(parents=True, exist_ok=True)
 
-    # (key, destination_dir) pairs. Training shards land in the train cache;
-    # val shards land in their own dir so the trainer's fixed held-out split
-    # never overlaps the round-varying training shards.
+    # Training shards STREAM at train time — we never download them by
+    # default. Downloading is opt-in only (explicit --all or --n K) for rare
+    # offline runs, and even then it warns. `--val` alone fetches just the
+    # single fixed held-out val shard.
     targets: list[tuple[str, Path]] = []
-    if args.all or args.n <= 0:
-        targets.extend((k, cache) for k in all_keys)
-    else:
-        targets.extend((k, cache) for k in bench.select_shards(seed=args.seed, n=args.n))
+    want_train = args.all or args.n > 0
+    if want_train:
+        cache.mkdir(parents=True, exist_ok=True)
+        if args.all:
+            train_keys = all_keys
+        else:
+            train_keys = bench.select_shards(seed=args.seed, n=args.n)
+        log.warning(
+            "Downloading %d TRAINING shards to %s — training normally streams; "
+            "only prefetch for offline runs.", len(train_keys), cache,
+        )
+        targets.extend((k, cache) for k in train_keys)
     if args.val:
         if not val_keys:
             log.warning("--val requested but the manifest declares no val shards")
@@ -148,6 +161,14 @@ def main(argv: list[str] | None = None) -> int:
             val_cache = Path(args.val_cache_dir)
             val_cache.mkdir(parents=True, exist_ok=True)
             targets.extend((k, val_cache) for k in val_keys)
+
+    if not targets:
+        log.warning(
+            "Nothing to download. Training shards stream at train time; pass "
+            "--val to fetch the fixed held-out val shard (or --all / --n K to "
+            "explicitly prefetch training shards for offline use)."
+        )
+        return 0
 
     ok = fail = skipped = 0
     for key, dest in targets:
