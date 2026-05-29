@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -155,6 +156,36 @@ DESEARCH_DATE_FILTERS = {
     "PAST_MONTH", "PAST_2_MONTHS", "PAST_YEAR", "PAST_2_YEARS",
 }
 
+# Miner tool wrappers POST to /desearch/search with a ~50s client deadline
+# (``SEARCH_HTTP_TIMEOUT`` in miners/*/tools.py) and give up + retry once it
+# elapses. The server's upstream call has to come back *under* that budget,
+# otherwise the miner times out before we can answer and desearch "never
+# works". Real SN22 AI search routinely takes 20-45s, so we bound the
+# upstream call at 45s — just under the client deadline, leaving margin for
+# the local round-trip (env-overridable via ``RADAR_DESEARCH_TIMEOUT``).
+DESEARCH_UPSTREAM_TIMEOUT = float(
+    os.environ.get("RADAR_DESEARCH_TIMEOUT", "45")
+)
+
+
+def _urlopen_bounded(req, timeout: float) -> bytes:
+    """``urlopen`` with the connect phase bounded too.
+
+    ``urllib``'s ``timeout=`` only caps the read phase once the TCP
+    connection is established — it does NOT cap the connect phase, so an
+    unreachable or slow-to-accept host (the norm behind a locked-down
+    egress policy) can hang for ~75-127s regardless. We pin
+    ``socket.setdefaulttimeout`` for the duration of the call so the
+    connect phase is bounded too, then restore the previous default.
+    """
+    prev = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    finally:
+        socket.setdefaulttimeout(prev)
+
 
 def _desearch_remote(payload: dict, base_url: str, api_key: str) -> dict:
     """Forward to the production Desearch SN22 AI-search endpoint.
@@ -213,8 +244,7 @@ def _desearch_remote(payload: dict, base_url: str, api_key: str) -> dict:
     # "Bearer " prefix (per the official desearch-py SDK).
     req.add_header("Authorization", api_key)
     req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read())
+    data = json.loads(_urlopen_bounded(req, DESEARCH_UPSTREAM_TIMEOUT))
 
     return {"results": _normalise_desearch_results(data, count)}
 
@@ -276,9 +306,9 @@ def desearch(payload: dict) -> dict:
 
     Resolution order:
 
-    1. If ``RADAR_DESEARCH_SN22_URL`` and ``DESEARCH_API_KEY`` are set,
-       forward to the production Desearch SN22 ``/desearch/ai/search``
-       endpoint.
+    1. If ``DESEARCH_API_KEY`` is set, forward to the production Desearch
+       SN22 ``/desearch/ai/search`` endpoint (``RADAR_DESEARCH_SN22_URL``
+       overrides the host; defaults to ``DESEARCH_DEFAULT_URL``).
     2. Otherwise fall back to the public arxiv Atom API (works for
        prompts about ML papers, requires egress to export.arxiv.org).
     3. On any network/HTTP error, return ``{"results": [], "error":
@@ -286,6 +316,12 @@ def desearch(payload: dict) -> dict:
     """
     sn22_url = os.environ.get("RADAR_DESEARCH_SN22_URL", "").strip()
     api_key = os.environ.get("DESEARCH_API_KEY", "").strip()
+    # A Desearch key alone is enough — default to the public SN22
+    # endpoint when no explicit URL is configured. (Previously the key
+    # was silently ignored unless RADAR_DESEARCH_SN22_URL was also set,
+    # so a key-only setup fell through to the arxiv fallback.)
+    if api_key and not sn22_url:
+        sn22_url = DESEARCH_DEFAULT_URL
     if sn22_url and api_key:
         try:
             return _desearch_remote(payload, sn22_url, api_key)
@@ -310,8 +346,8 @@ def desearch(payload: dict) -> dict:
         "max_results": max_results,
     })
     try:
-        with urllib.request.urlopen(f"{ARXIV_API}?{qs}", timeout=20) as resp:
-            body = resp.read()
+        req = urllib.request.Request(f"{ARXIV_API}?{qs}", method="GET")
+        body = _urlopen_bounded(req, DESEARCH_UPSTREAM_TIMEOUT)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         # Sandbox / offline environments routinely block egress to
         # export.arxiv.org. Degrade to an empty result set instead of
