@@ -200,6 +200,25 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
         except Exception as e:
             logger.warning("init_weights() failed: %s", e)
 
+    # Continuation warm-start: load a parent checkpoint over the freshly
+    # built (and possibly init_weights'd) model. strict=True so an
+    # architecture that doesn't match the parent's tensor shapes is
+    # rejected here rather than silently training a half-loaded model —
+    # the validator turns ``checkpoint_incompatible`` into a fresh retry.
+    parent_ckpt = os.environ.get("PARENT_CHECKPOINT_PATH", "")
+    if parent_ckpt:
+        try:
+            from safetensors.torch import load_file
+            state = load_file(parent_ckpt, device=device)
+            model.load_state_dict(state, strict=True)
+            logger.info("warm-started from parent checkpoint %s", parent_ckpt)
+        except Exception as e:
+            return _fail(
+                config, "checkpoint_incompatible",
+                f"parent checkpoint load failed: {e}",
+                flops_equivalent_size=flops_equiv,
+            )
+
     try:
         loop_result = _training_loop(runner, sub, model, device, effective_budget, start)
     except Exception as e:
@@ -220,6 +239,18 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
     from safetensors.torch import save_file
     save_file(state_to_save, checkpoint_path)
 
+    # Continuation bookkeeping: shift step/flops coordinates by the
+    # lineage offset so a stitched trajectory across rounds is monotonic,
+    # and report cumulative_flops (this run) for the continuation frontier.
+    step_offset = int(os.environ.get("RADAR_STEP_OFFSET", "0") or 0)
+    flops_offset = int(os.environ.get("RADAR_FLOPS_OFFSET", "0") or 0)
+    this_flops = int(loop_result.get("cumulative_flops", 0))
+    train_hist = _offset_history(loop_result["train_history"], step_offset, flops_offset)
+    val_hist = _offset_history(loop_result["val_history"], step_offset, flops_offset)
+    best_val_step = loop_result["best_val_step"]
+    if best_val_step is not None and best_val_step >= 0:
+        best_val_step += step_offset
+
     return {
         "round_id": config.round_id,
         "submission_id": config.submission_id,
@@ -227,19 +258,21 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
         "flops_equivalent_size": flops_equiv,
         "training_time_seconds": time.time() - start,
         "effective_time_budget": effective_budget,
-        "num_steps": step,
+        "num_steps": step + step_offset,
         "num_params_M": num_params / 1e6,
         "peak_vram_mb": torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else 0.0,
         "checkpoint_path": checkpoint_path,
-        "train_loss_history": loop_result["train_history"],
-        "val_loss_history": loop_result["val_history"],
+        "train_loss_history": train_hist,
+        "val_loss_history": val_hist,
         "best_val_loss": loop_result["best_val_loss"],
-        "best_val_step": loop_result["best_val_step"],
+        "best_val_step": best_val_step,
         "val_cadence_unit": loop_result["val_cadence_unit"],
         "val_base": loop_result["val_base"],
         "val_growth": loop_result["val_growth"],
         "val_eval_tokens": loop_result["val_eval_tokens"],
         "flops_per_step_estimate": loop_result["flops_per_step_estimate"],
+        "this_run_flops": this_flops,
+        "cumulative_flops": flops_offset + this_flops,
         "reference_eval_loss_history": [],
     }
 
@@ -308,6 +341,25 @@ def _read_config(sub) -> dict:
         except Exception:
             pass
     return cfg
+
+
+def _offset_history(history: list[dict], step_offset: int, flops_offset: int) -> list[dict]:
+    """Shift step/flops coordinates into lineage-absolute space.
+
+    No-op when both offsets are zero (fresh runs), so non-continuation
+    trajectories are byte-for-byte unchanged.
+    """
+    if not step_offset and not flops_offset:
+        return history
+    out: list[dict] = []
+    for entry in history:
+        e = dict(entry)
+        if "step" in e and isinstance(e["step"], (int, float)):
+            e["step"] = e["step"] + step_offset
+        if "flops" in e and isinstance(e["flops"], (int, float)):
+            e["flops"] = e["flops"] + flops_offset
+        out.append(e)
+    return out
 
 
 def _next_val_step(current_step: int, base: int, growth: float) -> int:

@@ -151,6 +151,11 @@ def run_training(
     task: Any = None,
     min_flops: int = 0,
     max_flops: int = 0,
+    parent_checkpoint_path: str | None = None,
+    compute_offset: float = 0.0,
+    step_offset: int = 0,
+    shard_paths: list[str] | None = None,
+    shard_reuse: bool = False,
 ) -> dict:
     """Phase B + Phase C, in one function. Returns the experiment record.
 
@@ -169,6 +174,9 @@ def run_training(
         return _run_ts_forecasting(
             code, seed=seed, task=task,
             min_flops=min_flops, max_flops=max_flops,
+            parent_checkpoint_path=parent_checkpoint_path,
+            compute_offset=compute_offset, step_offset=step_offset,
+            shard_paths=shard_paths, shard_reuse=shard_reuse,
         )
     started = time.time()
     try:
@@ -268,12 +276,23 @@ def _run_ts_forecasting(
     task: TSForecastingSpec,
     min_flops: int,
     max_flops: int,
+    parent_checkpoint_path: str | None = None,
+    compute_offset: float = 0.0,
+    step_offset: int = 0,
+    shard_paths: list[str] | None = None,
+    shard_reuse: bool = False,
 ) -> dict:
     """Drive ``runner.harness.run_training`` against a ts_forecasting submission.
 
     Sets the env vars the harness reads (CHECKPOINT_DIR, SUBMISSION_PATH,
     RADAR_GIFT_EVAL_CACHE, pretrain shard lists) and translates the harness
     result dict into the shape ``local/validator.py`` already expects.
+
+    For continuation runs ``parent_checkpoint_path`` is forwarded to the
+    harness (warm-start), and ``compute_offset`` / ``step_offset`` shift the
+    recorded curve coordinates into lineage-absolute space so a stitched
+    trajectory is monotonic. ``shard_paths`` overrides the cache glob with
+    the validator's lineage-disjoint assignment.
     """
     started = time.time()
     _ts_runner_paths_setup()
@@ -303,15 +322,25 @@ def _run_ts_forecasting(
     # The harness reads these from os.environ. Keep originals to restore.
     cache_dir = os.environ.get("RADAR_GIFT_EVAL_CACHE", "/tmp/radar_gift_eval")
     pretrain_cache = os.environ.get("RADAR_PRETRAIN_CACHE", "/tmp/radar_pretrain")
-    shard_paths: list[str] = []
-    if Path(pretrain_cache).is_dir():
-        shard_paths = sorted(str(p) for p in Path(pretrain_cache).glob("*.parquet"))
+    # The validator passes a lineage-disjoint shard assignment for
+    # continuations; otherwise glob the cache (legacy fresh-run behaviour).
+    if shard_paths is None:
+        shard_paths = []
+        if Path(pretrain_cache).is_dir():
+            shard_paths = sorted(
+                str(p) for p in Path(pretrain_cache).glob("*.parquet")
+            )
 
     overrides = {
         "CHECKPOINT_DIR": str(checkpoint_dir),
         "SUBMISSION_PATH": str(submission_path),
         "RADAR_GIFT_EVAL_CACHE": cache_dir,
+        "RADAR_STEP_OFFSET": str(int(step_offset)),
+        "RADAR_FLOPS_OFFSET": str(int(compute_offset)),
     }
+    if parent_checkpoint_path:
+        overrides["PARENT_CHECKPOINT_PATH"] = str(parent_checkpoint_path)
+    train_paths: list[str] = []
     if shard_paths:
         import json as _json
         # Reserve the last shard as val when we have >=2; rest is train.
@@ -412,10 +441,24 @@ def _run_ts_forecasting(
         else (val_losses[-1] if val_losses else (loss_curve[-1] if loss_curve else None))
     )
 
+    # Training compute for this run (Σ FLOPs the harness accrued), summed
+    # with the lineage offset → cumulative_compute, the continuation
+    # frontier's x-axis. Shard provenance lets a child exclude what its
+    # ancestors trained on.
+    this_compute = float(result.get("this_run_flops") or 0.0)
+    cumulative_compute = float(
+        result.get("cumulative_flops")
+        if result.get("cumulative_flops") is not None
+        else float(compute_offset) + this_compute
+    )
     objectives = {
         "flops_equivalent_size": flops_equiv,
         "num_params": num_params,
         "train_seconds": train_seconds,
+        "this_compute": this_compute,
+        "cumulative_compute": cumulative_compute,
+        "pretrain_shards": [Path(p).name for p in train_paths],
+        "shard_reuse": bool(shard_reuse),
     }
     if best_val_loss is not None:
         objectives["best_val_loss"] = float(best_val_loss)
@@ -426,11 +469,15 @@ def _run_ts_forecasting(
     # experiment fails.
     checkpoint_path = result.get("checkpoint_path") if success else None
     if not success:
-        return _ts_failure(
+        fail = _ts_failure(
             f"training did not succeed (status={status})",
             objectives, loss_curve, workdir,
             error=str(result.get("error") or status),
         )
+        # Surface a shape-incompatible warm-start so the validator can
+        # retry the proposal as a fresh run instead of just failing it.
+        fail["harness_status"] = status
+        return fail
     if not checkpoint_path:
         return _ts_failure(
             "harness did not return a checkpoint_path",
@@ -471,12 +518,23 @@ def _run_ts_forecasting(
     if "n_tasks" in eval_metrics:
         objectives["n_tasks"] = int(eval_metrics["n_tasks"])
 
+    # Capture the checkpoint's tensor signature (names + shapes, from the
+    # safetensors header — no torch) so the /signature endpoint can tell a
+    # continuation miner exactly what shapes a compatible warm-start needs.
+    try:
+        from local.checkpoints import read_signature
+        sig = read_signature(checkpoint_path)
+        if sig:
+            objectives["param_signature"] = sig
+    except Exception as e:  # noqa: BLE001
+        logger.debug("could not capture param signature: %s", e)
+
     # Geomean of the two normalized leaderboard aggregates. Both lower=better.
     metric = math.sqrt(max(crps, 0.0) * max(mase, 0.0))
 
     analysis = (
-        f"task=ts_forecasting status={status} pretrain_shards={len(shard_paths)} "
-        f"crps={crps:.4f} mase={mase:.4f}"
+        f"task=ts_forecasting status={status} pretrain_shards={len(train_paths)} "
+        f"reuse={int(bool(shard_reuse))} crps={crps:.4f} mase={mase:.4f}"
     )
 
     return {

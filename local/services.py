@@ -139,6 +139,20 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/challenge":
             return self._json(200, exp_api.active_challenge(self.store))
 
+        if path == "/parents":
+            def _opt(name):
+                v = q.get(name, [None])[0]
+                try:
+                    return int(v) if v is not None else None
+                except ValueError:
+                    return None
+            return self._json(200, exp_api.parents(
+                self.store,
+                task=q.get("task", [None])[0],
+                min_flops=_opt("min_flops"),
+                max_flops=_opt("max_flops"),
+            ))
+
         # /experiments/* — list/aggregate endpoints first, then the
         # multi-segment paths, then the bare /experiments/{idx}.
         if path == "/experiments/recent":
@@ -234,6 +248,20 @@ class _Handler(BaseHTTPRequestHandler):
             except (IndexError, ValueError):
                 return self._json(400, {"error": "bad id"})
             return self._json(200, exp_api.lineage_diffs(self.store, idx))
+
+        if path.startswith("/experiments/") and path.endswith("/trajectory"):
+            try:
+                idx = int(path.split("/")[2])
+            except (IndexError, ValueError):
+                return self._json(400, {"error": "bad id"})
+            return self._json(200, exp_api.trajectory(self.store, idx))
+
+        if path.startswith("/experiments/") and path.endswith("/signature"):
+            try:
+                idx = int(path.split("/")[2])
+            except (IndexError, ValueError):
+                return self._json(400, {"error": "bad id"})
+            return self._json(200, exp_api.signature(self.store, idx))
 
         if path.startswith("/experiments/"):
             try:

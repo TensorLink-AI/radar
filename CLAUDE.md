@@ -81,6 +81,21 @@ credentials. Resolution order: `RADAR_PRETRAIN_BUCKET` →
 Heavy deps live in the `[ts_forecasting]` extra (torch, safetensors,
 pandas, httpx) so the synthetic stack stays numpy-only.
 
+## Continuation training
+
+`--continuation auto|on|off` (auto = on for ts_forecasting) lets a miner
+warm-start a run from a prior checkpoint instead of training from
+scratch. The miner sets `mode`/`parent_index` in its proposal; the
+validator gates eligible parents, runs lineage-disjoint shard assignment
+(`--shards_per_round`), and scores continuations on a **second frontier**
+— `cumulative_compute` vs GIFT-eval Δ (`parent.metric − this.metric`) —
+separate from the absolute initial frontier. Val loss is never scored.
+Checkpoints persist via `local/checkpoints.py`. Agent surface:
+`/parents`, `/experiments/{id}/trajectory`, `/experiments/{id}/signature`,
+and a `continuation` block on `/frontier`. Full write-up in
+`docs/continuation_training.md`. Code: `local/continuation.py`,
+`local/shards.py`, `local/checkpoints.py`.
+
 ## Key files
 
 | File | Purpose |

@@ -10,6 +10,8 @@ from __future__ import annotations
 import math
 from typing import Optional
 
+from local.continuation import score_continuation
+
 
 SIZE_GATE_TOLERANCE = 0.1   # 10%, matches Config.SIZE_GATE_TOLERANCE
 
@@ -91,6 +93,7 @@ def score_round(
     min_flops: int,
     max_flops: int,
     frontier: list[dict],
+    continuation_frontier: Optional[list[dict]] = None,
 ) -> list[dict]:
     """One scoring pass for a round. Mutates the input list with
     ``score`` and ``analysis`` fields and returns it.
@@ -98,8 +101,14 @@ def score_round(
     ``proposals_with_metrics`` items must have keys ``success``,
     ``metric``, ``objectives``. Failures and size-gate violations score
     zero.
+
+    Continuation runs — items the validator marked with
+    ``mode == "continue"`` and a ``parent_metric`` — are scored on the
+    continuation frontier (GIFT-eval Δ vs cumulative compute) instead of
+    the absolute initial frontier. Validation loss is never read here.
     """
     out = []
+    cont_frontier = continuation_frontier or []
     feasible_metrics = [
         f.get("metric") for f in frontier
         if f.get("metric") is not None
@@ -117,6 +126,23 @@ def score_round(
             p["analysis"] = (
                 (p.get("analysis") or "")
                 + f" [score=0: outside bucket {min_flops}-{max_flops}]"
+            )
+            out.append(p)
+            continue
+
+        if p.get("mode") == "continue" and p.get("parent_metric") is not None:
+            score, delta = score_continuation(
+                metric=p["metric"],
+                parent_metric=p["parent_metric"],
+                cumulative_compute=float(
+                    p.get("objectives", {}).get("cumulative_compute", 0.0)
+                ),
+                frontier=cont_frontier,
+            )
+            p["score"] = score
+            p["analysis"] = (
+                (p.get("analysis") or "")
+                + f" [score={score:.3f} continuation Δ={delta:.4f}]"
             )
             out.append(p)
             continue

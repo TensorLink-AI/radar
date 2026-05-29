@@ -64,6 +64,10 @@ CREATE TABLE IF NOT EXISTS experiments (
     generation      INTEGER NOT NULL DEFAULT 0,
     prompt_id       TEXT NOT NULL DEFAULT '',
     task            TEXT NOT NULL DEFAULT '',
+    checkpoint_ref  TEXT,
+    n_rounds        INTEGER NOT NULL DEFAULT 1,
+    cumulative_compute REAL NOT NULL DEFAULT 0,
+    mode            TEXT NOT NULL DEFAULT 'new',
     timestamp       REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_exp_round ON experiments(round_id);
@@ -118,6 +122,30 @@ class LocalStore:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        self._ensure_columns()
+
+    def _ensure_columns(self) -> None:
+        """Additively migrate older DBs: add continuation columns if absent.
+
+        SQLite tolerates ``ALTER TABLE ADD COLUMN`` with a default, so old
+        experiment rows read back with sensible continuation defaults
+        (``n_rounds=1``, ``mode='new'``) and nothing breaks.
+        """
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(experiments)").fetchall()
+        }
+        migrations = {
+            "checkpoint_ref": "TEXT",
+            "n_rounds": "INTEGER NOT NULL DEFAULT 1",
+            "cumulative_compute": "REAL NOT NULL DEFAULT 0",
+            "mode": "TEXT NOT NULL DEFAULT 'new'",
+        }
+        for name, decl in migrations.items():
+            if name not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE experiments ADD COLUMN {name} {decl}"
+                )
 
     def close(self) -> None:
         self._conn.close()
@@ -207,24 +235,77 @@ class LocalStore:
                        loss_curve: list, analysis: str = "",
                        parent_index: Optional[int] = None,
                        generation: int = 0, prompt_id: str = "",
-                       task: str = "") -> int:
+                       task: str = "", checkpoint_ref: Optional[str] = None,
+                       n_rounds: int = 1, cumulative_compute: float = 0.0,
+                       mode: str = "new") -> int:
         with self._tx() as c:
             cur = c.execute(
                 "INSERT INTO experiments "
                 "(round_id, miner_id, name, code, motivation, reasoning, "
                 " tool_calls_json, metric, success, objectives_json, score, "
                 " loss_curve_json, analysis, parent_index, generation, "
-                " prompt_id, task, timestamp) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " prompt_id, task, checkpoint_ref, n_rounds, "
+                " cumulative_compute, mode, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                " ?, ?, ?, ?, ?)",
                 (
                     round_id, miner_id, name, code, motivation, reasoning,
                     json.dumps(tool_calls), metric, 1 if success else 0,
                     json.dumps(objectives), score, json.dumps(loss_curve),
                     analysis, parent_index, generation, prompt_id, task,
-                    time.time(),
+                    checkpoint_ref, int(n_rounds), float(cumulative_compute),
+                    mode, time.time(),
                 ),
             )
             return cur.lastrowid
+
+    def set_checkpoint_ref(self, exp_id: int, ref: Optional[str]) -> None:
+        """Attach a durable checkpoint handle to an experiment row."""
+        with self._tx() as c:
+            c.execute(
+                "UPDATE experiments SET checkpoint_ref = ? WHERE id = ?",
+                (ref, int(exp_id)),
+            )
+
+    def lineage(self, exp_id: int) -> list[dict]:
+        """Walk ``parent_index`` to the root; return experiments root-first."""
+        chain: list[dict] = []
+        seen: set[int] = set()
+        cur = self.get_experiment(exp_id)
+        while cur is not None and cur["id"] not in seen:
+            seen.add(cur["id"])
+            chain.append(cur)
+            pid = cur.get("parent_index")
+            if pid is None:
+                break
+            cur = self.get_experiment(pid)
+        chain.reverse()
+        return chain
+
+    def eligible_parents(
+        self, *, task: Optional[str], min_flops: int, max_flops: int,
+    ) -> list[dict]:
+        """Fully-eval'd, checkpoint-bearing experiments usable as parents.
+
+        A parent must have succeeded, carry a finite metric and a saved
+        ``checkpoint_ref``, and fall inside the round's size bucket
+        (warm-start can't change architecture across the gate cleanly).
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM experiments WHERE success = 1 "
+            "AND metric IS NOT NULL AND checkpoint_ref IS NOT NULL"
+        ).fetchall()
+        lo = int(min_flops * 0.9)
+        hi = int(max_flops * 1.1)
+        out: list[dict] = []
+        for r in rows:
+            exp = _row_to_experiment(r)
+            if task is not None and exp.get("task") != task:
+                continue
+            flops = exp["objectives"].get("flops_equivalent_size", 0)
+            if lo <= flops <= hi:
+                out.append(exp)
+        return out
 
     def get_experiment(self, exp_id: int) -> Optional[dict]:
         row = self._conn.execute(
@@ -371,5 +452,9 @@ def _row_to_experiment(row: sqlite3.Row) -> dict:
         "generation": row["generation"],
         "prompt_id": row["prompt_id"],
         "task": row["task"],
+        "checkpoint_ref": row["checkpoint_ref"],
+        "n_rounds": row["n_rounds"],
+        "cumulative_compute": row["cumulative_compute"],
+        "mode": row["mode"],
         "timestamp": row["timestamp"],
     }
