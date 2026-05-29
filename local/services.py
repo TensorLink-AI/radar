@@ -65,6 +65,20 @@ def _pick_free_port() -> int:
 
 
 class _Handler(BaseHTTPRequestHandler):
+    # HTTP/1.1 keep-alive: every response below sets Content-Length, so the
+    # client can reuse one warm connection for the whole round instead of
+    # opening a fresh TCP socket per call. That matters because this server
+    # runs as a daemon thread inside the validator process — while the
+    # validator is GIL-bound (torch pretrain + the 97-task GIFT-Eval pass)
+    # the accept loop is starved, and the default 5-slot listen backlog
+    # overflows, refusing brand-new connections (the miner sees an instant
+    # APIConnectionError). Reusing a connection sidesteps that window
+    # entirely; ``_Services`` widens the backlog for the unavoidable ones.
+    protocol_version = "HTTP/1.1"
+    # Bound idle keep-alive connections so a parked socket doesn't pin its
+    # handler thread forever (BaseHTTPRequestHandler closes on read timeout).
+    timeout = 120
+
     # Injected by ServicesServer.start.
     store: LocalStore = None  # type: ignore[assignment]
     wiki: WikiStore = None    # type: ignore[assignment]
@@ -309,6 +323,22 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": f"unknown path {path}"})
 
 
+class _Services(ThreadingHTTPServer):
+    """``ThreadingHTTPServer`` tuned for a starved accept loop.
+
+    The server thread shares a process (and the GIL) with the validator's
+    training/eval work, so the accept loop can stall for long stretches.
+    A 5-slot listen backlog (the stdlib default) overflows in that window
+    and the kernel refuses new connections; widening it lets bursts queue
+    instead of bouncing. Daemon threads keep ``stop()`` from blocking on
+    in-flight keep-alive handlers.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 128
+
+
 class ServicesServer:
     """Threaded HTTP server bound to 127.0.0.1.
 
@@ -343,7 +373,7 @@ class ServicesServer:
         BoundHandler.wiki = wiki
         BoundHandler.sink = sink
 
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", port), BoundHandler)
+        self._httpd = _Services(("127.0.0.1", port), BoundHandler)
         self._url = f"http://127.0.0.1:{port}"
         self._thread = threading.Thread(
             target=self._httpd.serve_forever, daemon=True,
