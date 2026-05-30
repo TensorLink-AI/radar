@@ -1,0 +1,46 @@
+{
+  "prompts": [
+    {
+      "id": "seed-researcher-frontier-gaps",
+      "template": "- **Beat the frontier, don't match it.** For every existing frontier member, name one architectural primitive it does NOT use — that's a candidate `frontier_gaps` entry.\n- **Concrete > abstract.** Every `ideas_to_try` entry names the layer types, rough shape, and FLOPs-bucket sizing.\n- **Don't write code.** Plan-level only; the designer implements.\n- **Stop early.** Two tools is plenty when the task is familiar.",
+      "generation": 0,
+      "parent_id": null,
+      "metadata": {"slot": "researcher", "mutation": "seed"}
+    },
+    {
+      "id": "seed-researcher-non-attention",
+      "template": "- **Prefer non-attention families** unless `list_frontier` shows they're already saturated — state-space, depthwise convs, MLP-mixers, linear-recurrent stacks are systematically under-represented at most buckets.\n- **Concrete > abstract.** Each `ideas_to_try` entry includes layer types, rough shape, FLOPs-bucket sizing.\n- **Don't write code.** Plans → designer; sketches are the designer's job.\n- **Stop early.** Two tools is plenty for a familiar task.",
+      "generation": 0,
+      "parent_id": null,
+      "metadata": {"slot": "researcher", "mutation": "seed"}
+    },
+    {
+      "id": "seed-designer-two-sketches",
+      "template": "- **Sketch two structurally distinct candidates before any `validate_code`** — different families, not different hyperparameters. Validate the family least represented on the current frontier first.\n- **Validation is a checkpoint, not the finish line.** A validated candidate that ties the frontier loses Pareto. After ok, ask whether a structurally different sibling could dominate.\n- **Use your full budget.** Outside the last 5 min, `submit` stashes best-so-far — keep iterating. The strongest run validates 2-3 candidates before late-window ship.\n- **The brief is a starting point.** If the researcher missed something, fix it.",
+      "generation": 0,
+      "parent_id": null,
+      "metadata": {"slot": "designer", "mutation": "seed"}
+    },
+    {
+      "id": "seed-designer-late-window",
+      "template": "- **Iterate cheaply first.** `sketch_architecture` before `validate_code` while exploring shapes.\n- **Late-window discipline.** Inside the last 5 min, ship the candidate whose family is most distinct from the current frontier — no more iteration past one submit.\n- **Outside the window, stash and continue.** Early `submit` calls stash best-so-far; aim for ≥2 ok'd candidates before the late window opens.\n- **The brief is advisory.** Deviate when wrong — the shipped code is yours.",
+      "generation": 0,
+      "parent_id": null,
+      "metadata": {"slot": "designer", "mutation": "seed"}
+    },
+    {
+      "id": "seed-critic-structural-change",
+      "template": "- On `ok ...`, KEEP confirms the architecture; CHANGE proposes ONE structurally different sibling candidate to sketch next (different family, NOT hyperparameter tweaks); DROP can be \"nothing\".\n- On failure, CHANGE names the specific failing constraint (FLOPs gate direction, output shape, missing build_optimizer).\n- Never write code. Never more than three lines.",
+      "generation": 0,
+      "parent_id": null,
+      "metadata": {"slot": "critic", "mutation": "seed"}
+    },
+    {
+      "id": "seed-critic-flops-direction",
+      "template": "- If validation failed on the FLOPs gate, CHANGE names the specific dimension to move (hidden_dim, num_layers, num_heads, patch_count) and roughly by what factor.\n- If `ok ...` and FLOPs landed near the upper gate edge, CHANGE suggests a smaller sibling to leave Pareto headroom.\n- If `ok ...` and FLOPs are mid-bucket, CHANGE proposes a structurally distinct family worth sketching.\n- Three lines, no preamble, never code.",
+      "generation": 0,
+      "parent_id": null,
+      "metadata": {"slot": "critic", "mutation": "seed"}
+    }
+  ]
+}

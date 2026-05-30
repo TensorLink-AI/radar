@@ -167,19 +167,13 @@ def _build_subagent(
     if extra_user_msg:
         user_prompt = user_prompt + "\n\n" + extra_user_msg
 
-    researcher_sys = build_researcher_system_prompt(challenge, bucket)
-    # Per-slot operator directive (GEPA-evolved). Appended verbatim;
-    # the researcher's hardcoded prompt already defines the brief
-    # schema, so this directive is free-form strategy guidance.
+    # Per-slot operator directive (GEPA-evolved) replaces the
+    # ``## Principles`` body section in-place — higher leverage than
+    # tail-appending. Empty directive → hardcoded principles used.
     op_directive = challenge.get("_operator_prompt_researcher") or ""
-    op_id = challenge.get("_operator_prompt_researcher_id") or ""
-    if op_directive:
-        researcher_sys = (
-            f"{researcher_sys}\n\n"
-            f"## Operator Directive — researcher slot "
-            f"(variant {op_id[:8]})\n"
-            f"{op_directive}"
-        )
+    researcher_sys = build_researcher_system_prompt(
+        challenge, bucket, operator_directive=op_directive,
+    )
 
     return Subagent(
         name="researcher",

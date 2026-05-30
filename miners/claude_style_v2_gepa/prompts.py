@@ -44,8 +44,24 @@ BRIEF_SCHEMA_EXAMPLE = {
 
 # ── Researcher prompts ────────────────────────────────────────────────
 
+_DEFAULT_RESEARCHER_PRINCIPLES = (
+    "- **Beat the frontier, don't match it.** A tie loses the "
+    "Pareto dominance bonus. Your `frontier_gaps` should make "
+    "this concrete.\n"
+    "- **Concrete > abstract.** \"Try a transformer\" is "
+    "useless. \"Try PatchTST with patch_len=16, FLOPs target "
+    "{target:,}\" is actionable.\n"
+    "- **Don't write code.** That's the designer's job. If you "
+    "find yourself sketching architectures, stop and rephrase as "
+    "a plan step.\n"
+    "- **Stop early.** A two-tool brief is fine if you already "
+    "know the task. Spend tools when you don't."
+)
+
+
 def build_researcher_system_prompt(
     challenge: dict, bucket: str | None = None,
+    operator_directive: str = "",
 ) -> str:
     """Researcher system prompt.
 
@@ -54,6 +70,11 @@ def build_researcher_system_prompt(
     submit (those tools aren't even in its surface). Its only job is
     to surface what's been tried, what's missing, and a 3-5 step
     plan.
+
+    ``operator_directive`` (GEPA-evolved) REPLACES the principles
+    section in-body. Empty → fall back to the hardcoded principles.
+    Body-injection gives the directive more leverage than appending
+    at the tail of an 8k system prompt.
     """
     task = challenge.get("task", {}) or {}
     task_name = task.get("name", "unknown")
@@ -115,20 +136,11 @@ def build_researcher_system_prompt(
         "round. The orchestrator caps you at 90s; budget accordingly."
     )
 
-    parts.append(
-        "## Principles\n\n"
-        "- **Beat the frontier, don't match it.** A tie loses the "
-        "Pareto dominance bonus. Your `frontier_gaps` should make "
-        "this concrete.\n"
-        "- **Concrete > abstract.** \"Try a transformer\" is "
-        "useless. \"Try PatchTST with patch_len=16, FLOPs target "
-        f"{target:,}\" is actionable.\n"
-        "- **Don't write code.** That's the designer's job. If you "
-        "find yourself sketching architectures, stop and rephrase as "
-        "a plan step.\n"
-        "- **Stop early.** A two-tool brief is fine if you already "
-        "know the task. Spend tools when you don't."
+    principles = (
+        operator_directive.strip() if operator_directive
+        else _DEFAULT_RESEARCHER_PRINCIPLES.format(target=target)
     )
+    parts.append("## Principles\n\n" + principles)
 
     parts.append(
         "## Final turn\n\n"
@@ -159,8 +171,28 @@ def build_researcher_user_prompt(challenge: dict) -> str:
 
 # ── Designer prompts ──────────────────────────────────────────────────
 
+_DEFAULT_DESIGNER_PRINCIPLES = (
+    "- **Iterate cheaply before iterating expensively.** "
+    "`sketch_architecture` is faster than `validate_code`. Use "
+    "it while exploring shapes.\n"
+    "- **Validation is a checkpoint, not the finish line.** A "
+    "validated candidate that ties the frontier loses the Pareto "
+    "bonus. After validation, ask: is there a structurally "
+    "different candidate that might dominate this one?\n"
+    "- **Use your full budget.** Calling submit before the "
+    "late-round window stashes your candidate as best-so-far and "
+    "prompts you to keep iterating. The strongest submission "
+    "usually comes from comparing 2-3 validated candidates, not "
+    "the first one that runs.\n"
+    "- **The brief is a starting point, not a contract.** If the "
+    "researcher missed something, fix it. If the plan is wrong, "
+    "deviate. The shipped code is yours."
+)
+
+
 def build_designer_system_prompt(
     challenge: dict, bucket: str | None = None,
+    operator_directive: str = "",
 ) -> str:
     """Designer system prompt.
 
@@ -169,6 +201,12 @@ def build_designer_system_prompt(
     are well-tuned and a re-write would just regress them. The
     designer-specific additions are: critic feedback contract,
     submit hook contract, and the smaller tool surface.
+
+    ``operator_directive`` (GEPA-evolved) REPLACES the principles
+    section in-body so the mutation has leverage; empty falls back
+    to the hardcoded principles. The body-injection design lets the
+    optimizer steer the highest-signal section (strategy) without
+    touching the FLOPs gate / code-shape contract.
     """
     task = challenge.get("task", {}) or {}
     tp = task.get("task_params", {}) or {}
@@ -277,24 +315,11 @@ def build_designer_system_prompt(
 
     parts.append(_compute_sizing_guidance(challenge))
 
-    parts.append(
-        "## A few principles\n\n"
-        "- **Iterate cheaply before iterating expensively.** "
-        "`sketch_architecture` is faster than `validate_code`. Use "
-        "it while exploring shapes.\n"
-        "- **Validation is a checkpoint, not the finish line.** A "
-        "validated candidate that ties the frontier loses the Pareto "
-        "bonus. After validation, ask: is there a structurally "
-        "different candidate that might dominate this one?\n"
-        "- **Use your full budget.** Calling submit before the "
-        "late-round window stashes your candidate as best-so-far and "
-        "prompts you to keep iterating. The strongest submission "
-        "usually comes from comparing 2-3 validated candidates, not "
-        "the first one that runs.\n"
-        "- **The brief is a starting point, not a contract.** If the "
-        "researcher missed something, fix it. If the plan is wrong, "
-        "deviate. The shipped code is yours."
+    principles = (
+        operator_directive.strip() if operator_directive
+        else _DEFAULT_DESIGNER_PRINCIPLES
     )
+    parts.append("## A few principles\n\n" + principles)
 
     return "\n\n".join(parts)
 
@@ -336,12 +361,32 @@ def build_designer_user_prompt(challenge: dict, brief: dict) -> str:
 
 # ── Critic prompts ────────────────────────────────────────────────────
 
-def build_critic_system_prompt() -> str:
+_DEFAULT_CRITIC_RULES = (
+    "- If validation passed (`ok ...`), KEEP the architecture "
+    "and tell the designer to submit. CHANGE / DROP can be "
+    "\"nothing\".\n"
+    "- If validation failed, focus CHANGE on the specific "
+    "failing constraint (FLOPs gate, output shape, missing "
+    "build_optimizer, etc.).\n"
+    "- Never write code. Never write more than three lines. "
+    "Never explain — the designer is already an expert."
+)
+
+
+def build_critic_system_prompt(operator_directive: str = "") -> str:
     """Critic system prompt — three-line KEEP/CHANGE/DROP template.
 
     Kept short on purpose: the critic is a single call between
     designer iterations and we don't want it generating prose.
+
+    ``operator_directive`` (GEPA-evolved) REPLACES the rules block.
+    The three-line response contract is hardcoded above the rules so
+    the directive can't accidentally break format on mutation.
     """
+    rules = (
+        operator_directive.strip() if operator_directive
+        else _DEFAULT_CRITIC_RULES
+    )
     return (
         "You are the **critic subagent** in a multi-agent miner. "
         "You see the designer's current code and the latest "
@@ -352,14 +397,7 @@ def build_critic_system_prompt() -> str:
         "CHANGE: <one sentence — the single most impactful revision>\n"
         "DROP: <one sentence — what to remove or stop doing>\n\n"
         "Rules:\n"
-        "- If validation passed (`ok ...`), KEEP the architecture "
-        "and tell the designer to submit. CHANGE / DROP can be "
-        "\"nothing\".\n"
-        "- If validation failed, focus CHANGE on the specific "
-        "failing constraint (FLOPs gate, output shape, missing "
-        "build_optimizer, etc.).\n"
-        "- Never write code. Never write more than three lines. "
-        "Never explain — the designer is already an expert."
+        + rules
     )
 
 

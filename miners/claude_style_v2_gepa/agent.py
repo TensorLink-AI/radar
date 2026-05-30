@@ -113,20 +113,60 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_PROMPTS_DIR = os.path.join(_HERE, "prompts")
 
 
+def _pick_elite(bucket: list) -> dict:
+    """Pick the 'elite' variant for a slot.
+
+    Elite = highest ``generation`` (i.e. most-recently-evolved row),
+    breaking ties by ``id`` lexicographically for determinism. The
+    optimizer is responsible for putting GEPA's keep-best children
+    at the top generation; until generation 1, the elite is just the
+    deterministic first seed row.
+    """
+    return max(bucket, key=lambda r: (int(r.get("generation", 0) or 0),
+                                       str(r.get("id", ""))))
+
+
+def _resolve_varied_slot() -> str:
+    """Resolve the ``RADAR_GEPA_VARIED_SLOT`` policy.
+
+    Returns one of:
+      - ``"researcher"`` / ``"designer"`` / ``"critic"`` — vary only
+        that slot per round, freeze the others to their elite.
+      - ``"all"`` — vary every slot independently (the old behaviour;
+        useful once each slot has been individually optimized).
+      - ``"rotate"`` — round-robin across slots by ``round_id``;
+        actual slot chosen by the caller.
+
+    Default is ``"designer"`` because designer is the highest-leverage
+    slot and single-slot evolution gives clean credit assignment.
+    """
+    raw = (os.getenv("RADAR_GEPA_VARIED_SLOT") or "designer").strip().lower()
+    if raw in SLOTS or raw in ("all", "rotate"):
+        return raw
+    return "designer"
+
+
 def _load_active_prompts(round_id: int) -> dict:
     """Return ``{slot: {id, template}}`` for each subagent slot.
 
     Reads ``prompts/active.json`` (override via ``MINER_PROMPTS_DIR``,
-    defaults to ``<agent_dir>/prompts``), groups rows by
-    ``metadata.slot``, and round-robins within each slot by
-    ``round_id``. Rows without a slot tag (or with an unknown one)
-    are ignored — the corresponding subagent then runs on its
-    hardcoded system prompt alone. Empty / unreadable file → all
-    slots return ``{"id": "", "template": ""}``.
+    defaults to ``<agent_dir>/prompts``) and groups rows by
+    ``metadata.slot``. The slot to vary this round is resolved from
+    ``RADAR_GEPA_VARIED_SLOT`` (default: ``designer``):
 
-    Each slot's ``id`` round-trips back via the composite
-    ``prompt_id`` on the submission so the optimizer can attribute
-    Phase C scores to specific slot variants.
+      - The varied slot round-robins by ``round_id`` across its
+        bucket so all variants get sampled.
+      - Non-varied slots are pinned to their elite (highest
+        generation) so every round shares the same baseline for
+        those slots — clean credit assignment for the varied slot.
+
+    Set ``RADAR_GEPA_VARIED_SLOT=all`` to restore the old behaviour
+    of varying every slot every round (high variance but full
+    co-evolution). Set it to ``rotate`` to cycle which slot is
+    varied across rounds.
+
+    Empty / unreadable file → all slots return blank, and the
+    subagents run on their hardcoded prompts.
     """
     blank = {slot: {"id": "", "template": ""} for slot in SLOTS}
     prompts_dir = os.getenv("MINER_PROMPTS_DIR", _DEFAULT_PROMPTS_DIR)
@@ -148,12 +188,23 @@ def _load_active_prompts(round_id: int) -> dict:
         if slot in by_slot:
             by_slot[slot].append(row)
 
+    policy = _resolve_varied_slot()
+    if policy == "rotate":
+        varied = SLOTS[round_id % len(SLOTS)]
+    elif policy == "all":
+        varied = "all"
+    else:
+        varied = policy  # one specific slot
+
     picks = dict(blank)
     for slot in SLOTS:
         bucket = by_slot[slot]
         if not bucket:
             continue
-        pick = bucket[round_id % len(bucket)]
+        if varied == "all" or slot == varied:
+            pick = bucket[round_id % len(bucket)]
+        else:
+            pick = _pick_elite(bucket)
         picks[slot] = {
             "id": str(pick.get("id", "")),
             "template": str(pick.get("template", "")),
@@ -212,15 +263,28 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     round_id = int(challenge.get("round_id", 0) or 0)
     active_prompts = _load_active_prompts(round_id)
     prompt_id_composite = _composite_prompt_id(active_prompts)
+    varied_policy = _resolve_varied_slot()
+    varied_now = (
+        SLOTS[round_id % len(SLOTS)] if varied_policy == "rotate"
+        else varied_policy
+    )
+    _log(
+        f"[orchestrator] varied_slot={varied_now} "
+        f"(policy={varied_policy}, round_id={round_id})"
+    )
     for slot in SLOTS:
         slot_data = active_prompts[slot]
         if not slot_data["id"]:
             continue
         challenge[f"_operator_prompt_{slot}"] = slot_data["template"]
         challenge[f"_operator_prompt_{slot}_id"] = slot_data["id"]
+        role = (
+            "varied" if (varied_now == "all" or slot == varied_now)
+            else "elite"
+        )
         _log(
             f"[orchestrator] {slot} variant {slot_data['id'][:8]}… "
-            f"(round_id={round_id})"
+            f"({role})"
         )
 
     # ── Scratchpad load ─────────────────────────────────────────

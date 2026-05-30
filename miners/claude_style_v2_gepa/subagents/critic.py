@@ -52,14 +52,12 @@ def run_critic(
     if not validation_result:
         return ""
 
-    system_prompt = build_critic_system_prompt()
-    if operator_directive:
-        system_prompt = (
-            f"{system_prompt}\n\n"
-            f"## Operator Directive — critic slot "
-            f"(variant {operator_directive_id[:8]})\n"
-            f"{operator_directive}"
-        )
+    # Operator directive replaces the rules block inside the critic
+    # system prompt — keeps the three-line response contract intact
+    # while letting GEPA mutate the strategy guidance.
+    system_prompt = build_critic_system_prompt(
+        operator_directive=operator_directive,
+    )
     user_prompt = build_critic_prompt(code, validation_result)
     messages = [
         {"role": "system", "content": system_prompt},

@@ -8,6 +8,11 @@ experiments/
 data/
 logs/
 prompts/
+# Track the shipped seed populations for GEPA-tuned agents — the
+# generic ``prompts/`` ignore above covers per-run on-disk state,
+# but checked-in seed files are part of the agent definition.
+!miners/claude_style_v2_gepa/prompts/
+!miners/claude_style_v2_gepa/prompts/active.json
 local/radar_local.db*
 local/scratchpads/
 

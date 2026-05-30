@@ -131,19 +131,13 @@ def run_designer(
         critic_directive_id=challenge.get("_operator_prompt_critic_id") or "",
     )
 
-    designer_sys = build_designer_system_prompt(challenge, bucket)
-    # Per-slot operator directive (GEPA-evolved). Appending it lets the
-    # prompt optimizer steer the designer's instructions without us
-    # forking ``build_designer_system_prompt`` for every variant.
+    # Per-slot operator directive (GEPA-evolved) replaces the
+    # ``## A few principles`` body section in-place — higher leverage
+    # than tail-appending. Empty → hardcoded principles used.
     op_directive = challenge.get("_operator_prompt_designer") or ""
-    op_id = challenge.get("_operator_prompt_designer_id") or ""
-    if op_directive:
-        designer_sys = (
-            f"{designer_sys}\n\n"
-            f"## Operator Directive — designer slot "
-            f"(variant {op_id[:8]})\n"
-            f"{op_directive}"
-        )
+    designer_sys = build_designer_system_prompt(
+        challenge, bucket, operator_directive=op_directive,
+    )
 
     sub = Subagent(
         name="designer",
