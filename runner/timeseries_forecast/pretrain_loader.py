@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 import random
 from typing import Iterator
 
@@ -84,6 +85,11 @@ def iter_series(
 
             if len(values) > MAX_SERIES_LEN:
                 values = values[:MAX_SERIES_LEN]
+
+            # Drop series containing any non-finite values — they propagate
+            # NaN/inf through the model and trip the divergence guard.
+            if any(not math.isfinite(v) for v in values):
+                continue
 
             yield values
 
