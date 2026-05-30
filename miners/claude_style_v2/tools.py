@@ -177,6 +177,14 @@ TOOLS: list[dict] = [
                 "/experiments/{idx}/lineage_diffs, "
                 "/experiments/diff/{a}/{b} (does NOT credit reads), "
                 "POST /experiments/search body {\"query\": \"...\"}.\n"
+                "Artifacts (full training logs, result JSONs, checkpoints): "
+                "/artifacts?round_id=&miner_id=&task=&kind=&limit= "
+                "(kind ∈ {challenge,proposal,submission,result,log,checkpoint}), "
+                "/artifacts/{id} (inline text if available), "
+                "/artifacts/{id}/download (raw bytes), "
+                "/experiments/{idx}/artifacts (bundle for one experiment). "
+                "Failure analysis already includes the trainer's traceback — "
+                "use /artifacts only when you need the full log or a checkpoint.\n"
                 "Responses >256 KB are returned but don't credit reads."
             ),
             "parameters": {
