@@ -225,8 +225,82 @@ async function showDetail(id) {
     + `<h2>analysis</h2><pre>${esc(e.analysis)}</pre>`
     + (e.motivation ? `<h2>motivation</h2><pre>${esc(e.motivation)}</pre>` : '')
     + (e.reasoning ? `<h2>reasoning</h2><pre>${esc(e.reasoning)}</pre>` : '')
-    + `<h2>loss curve</h2><pre>${esc(JSON.stringify(e.loss_curve))}</pre>`
+    + `<h2>loss curve</h2>`
+    + (Array.isArray(e.loss_curve) && e.loss_curve.length > 0
+        ? `<canvas id="lossCurve" width="520" height="220"></canvas>`
+          + `<div class="muted" id="lossMeta"></div>`
+        : `<div class="muted">no loss curve recorded</div>`)
     + `<h2>code</h2><pre>${esc(e.code)}</pre>`;
+  if (Array.isArray(e.loss_curve) && e.loss_curve.length > 0) {
+    drawLossCurve(e.loss_curve);
+  }
+}
+
+function drawLossCurve(curve) {
+  const c = document.getElementById('lossCurve');
+  if (!c) return;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#161820'; ctx.fillRect(0, 0, c.width, c.height);
+  // Accept either [y, y, ...] or [[x, y], ...] or [{step, loss}, ...].
+  const pts = curve.map((v, i) => {
+    if (Array.isArray(v)) return { x: v[0], y: v[1] };
+    if (v && typeof v === 'object')
+      return { x: v.step ?? v.x ?? i, y: v.loss ?? v.y };
+    return { x: i, y: v };
+  }).filter(p => Number.isFinite(p.x) && Number.isFinite(p.y));
+  if (pts.length === 0) {
+    ctx.fillStyle = '#777e8b'; ctx.font = '12px monospace';
+    ctx.fillText('no finite points', 20, 30);
+    return;
+  }
+  const pad = 36;
+  const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const yMin = Math.min(...ys), yMax = Math.max(...ys);
+  const xRange = Math.max(1e-9, xMax - xMin);
+  const yRange = Math.max(1e-9, yMax - yMin);
+  const px = x => pad + (x - xMin) / xRange * (c.width - 2 * pad);
+  const py = y => c.height - pad - (y - yMin) / yRange * (c.height - 2 * pad);
+  // axes
+  ctx.strokeStyle = '#2a2e3a'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(pad, pad/2); ctx.lineTo(pad, c.height - pad);
+  ctx.lineTo(c.width - pad/2, c.height - pad);
+  ctx.stroke();
+  // y ticks
+  ctx.fillStyle = '#777e8b'; ctx.font = '10px monospace';
+  for (let i = 0; i <= 4; i++) {
+    const yv = yMin + (yRange * i / 4);
+    const yy = py(yv);
+    ctx.strokeStyle = '#1c1f28';
+    ctx.beginPath(); ctx.moveTo(pad, yy); ctx.lineTo(c.width - pad/2, yy); ctx.stroke();
+    ctx.fillText(yv.toFixed(3), 2, yy + 3);
+  }
+  // line
+  ctx.strokeStyle = '#7ec97e'; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  pts.forEach((p, i) => {
+    const x = px(p.x), y = py(p.y);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  // points (only if few)
+  if (pts.length <= 80) {
+    ctx.fillStyle = '#7ec97e';
+    for (const p of pts) {
+      ctx.beginPath();
+      ctx.arc(px(p.x), py(p.y), 2, 0, 2*Math.PI);
+      ctx.fill();
+    }
+  }
+  ctx.fillStyle = '#777e8b';
+  ctx.fillText('step →', c.width - 60, c.height - 6);
+  ctx.save(); ctx.translate(10, 60); ctx.rotate(-Math.PI/2);
+  ctx.fillText('loss →', 0, 0); ctx.restore();
+  const meta = document.getElementById('lossMeta');
+  if (meta) meta.textContent =
+    `${pts.length} points · first=${ys[0].toFixed(4)} · last=${ys[ys.length-1].toFixed(4)} `
+    + `· min=${yMin.toFixed(4)} · max=${yMax.toFixed(4)}`;
 }
 
 async function refresh() {
