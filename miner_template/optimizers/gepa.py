@@ -239,12 +239,18 @@ def optimize(
             optimized.append((parent, prog))
             continue
         new_instruction = _extract_instruction(compiled)
+        # Preserve parent metadata fields that downstream agents key on
+        # (notably ``slot`` for multi-slot populations like the
+        # claude_v2_gepa miner). ``mutation`` / ``budget`` overwrite so
+        # the audit trail reflects this generation.
+        child_metadata = dict(parent.metadata or {})
+        child_metadata.update({"mutation": "gepa", "budget": budget})
         optimized.append((
             Prompt.new(
                 template=new_instruction or parent.template,
                 generation=next_gen,
                 parent_id=parent.id,
-                metadata={"mutation": "gepa", "budget": budget},
+                metadata=child_metadata,
             ),
             compiled,
         ))

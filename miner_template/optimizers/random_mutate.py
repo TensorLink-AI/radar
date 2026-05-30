@@ -66,14 +66,18 @@ def _perturb(parent: Prompt, child_idx: int, generation: int) -> Prompt:
         f"{parent.id}:{child_idx}".encode()
     ).digest()
     idx = seed[0] % len(_PERTURBATIONS)
+    # Preserve parent metadata (e.g. ``slot`` for multi-slot
+    # populations) so mutated children stay routable.
+    child_metadata = dict(parent.metadata or {})
+    child_metadata.update({
+        "mutation": "random_mutate",
+        "perturbation_idx": idx,
+    })
     return Prompt.new(
         template=parent.template + _PERTURBATIONS[idx],
         generation=generation,
         parent_id=parent.id,
-        metadata={
-            "mutation": "random_mutate",
-            "perturbation_idx": idx,
-        },
+        metadata=child_metadata,
     )
 
 
