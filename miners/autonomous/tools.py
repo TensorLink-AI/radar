@@ -54,6 +54,14 @@ CIRCUIT_BREAKER_ERROR_MARKERS = (
     "error", "failed", "not found", "timeout", "rejected", "unavailable",
 )
 
+# Sentinel for "search ran fine but matched nothing." A successful empty
+# result is short and would otherwise be flagged as an error and trip the
+# breaker after a few distinct-but-empty queries (see ``search_papers``).
+# It is exempted so a working-but-empty tool is never disabled; genuine
+# upstream failures still return distinct error strings that DO trip it.
+NO_PAPERS_SENTINEL = "No papers found."
+CIRCUIT_BREAKER_BENIGN_RESULTS = frozenset({NO_PAPERS_SENTINEL})
+
 # Keyed by tool name. Cleared at the start of each round in ``build_handlers``.
 _tool_error_counters: dict = {}
 
@@ -67,7 +75,11 @@ def _looks_like_error(result: str) -> bool:
 
     Short results are treated as errors (most handler error paths return
     <200 chars), and longer results are scanned for common error markers.
+    Known-benign sentinels (e.g. a successful but empty search) are
+    exempted so they never count toward the breaker.
     """
+    if result in CIRCUIT_BREAKER_BENIGN_RESULTS:
+        return False
     if len(result) <= CIRCUIT_BREAKER_ERROR_MAX_LEN:
         return True
     low = result.lower()
@@ -640,9 +652,17 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
                 args=(f"{desearch_url}/search", payload),
                 timeout=SEARCH_HTTP_TIMEOUT,
             )
-            results = resp.get("results", [])
+            results = resp.get("results", []) if isinstance(resp, dict) else []
             if not results:
-                return "No papers found."
+                # The local /desearch endpoint reports upstream failures
+                # (missing key, blocked egress, 403, ...) via an "error"
+                # field while still returning an empty result set. Surface
+                # it so the cause is visible and the breaker can act on a
+                # genuine outage instead of a silent, identical sentinel.
+                err = resp.get("error") if isinstance(resp, dict) else None
+                if err:
+                    return f"Paper search unavailable: {err}"
+                return NO_PAPERS_SENTINEL
             lines = []
             for r in results[:max_results]:
                 lines.append(f"**{r.get('title', 'untitled')}**")
