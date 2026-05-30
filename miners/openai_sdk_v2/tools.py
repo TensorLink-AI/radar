@@ -904,12 +904,22 @@ _CIRCUIT_BREAKER_ERROR_MARKERS = (
     "unavailable", "timeout", "timed out",
 )
 
+# Sentinel for "search ran fine but matched nothing." A successful empty
+# result is short and would otherwise be flagged as an error and trip the
+# breaker after a few distinct-but-empty queries (see ``search_papers``).
+# It is exempted so a working-but-empty tool is never disabled; genuine
+# upstream failures still return distinct error strings that DO trip it.
+NO_PAPERS_SENTINEL = "no papers found"
+_CIRCUIT_BREAKER_BENIGN_RESULTS = frozenset({NO_PAPERS_SENTINEL})
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
 def _looks_like_error(result: str) -> bool:
+    if result in _CIRCUIT_BREAKER_BENIGN_RESULTS:
+        return False
     if len(result) <= CIRCUIT_BREAKER_ERROR_MAX_LEN:
         return True
     low = result.lower()
@@ -1060,7 +1070,15 @@ def build_handlers(
             )
             results = resp.get("results", []) if isinstance(resp, dict) else []
             if not results:
-                return "no papers found"
+                # The local /desearch endpoint reports upstream failures
+                # (missing key, blocked egress, 403, ...) via an "error"
+                # field while still returning an empty result set. Surface
+                # it so the cause is visible and the breaker acts on a
+                # genuine outage instead of a silent, identical sentinel.
+                err = resp.get("error") if isinstance(resp, dict) else None
+                if err:
+                    return f"paper search unavailable: {err}"
+                return NO_PAPERS_SENTINEL
             lines = []
             for r in results[:max_results]:
                 lines.append(f"**{r.get('title', 'untitled')}**")
