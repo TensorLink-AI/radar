@@ -209,6 +209,14 @@ def run_round(store: LocalStore, task, round_id: int,
     # Write experiments + mirror artifacts to object storage
     for p, r in zip(proposals, results):
         parent = p["payload"].get("parent_index")
+        # On failure, fold the trainer's error trace into analysis so
+        # /experiments/failures returns something actionable to other
+        # miners (the analysis label alone is just "training crashed").
+        analysis = r["analysis"]
+        if not r["success"]:
+            err = (r.get("error") or "").strip()
+            if err and err not in analysis:
+                analysis = f"{analysis}\n{err}" if analysis else err
         store.add_experiment(
             round_id=round_id,
             miner_id=r["miner_id"],
@@ -222,7 +230,7 @@ def run_round(store: LocalStore, task, round_id: int,
             objectives=r["objectives"],
             score=r["score"],
             loss_curve=r["loss_curve"],
-            analysis=r["analysis"],
+            analysis=analysis,
             parent_index=int(parent) if isinstance(parent, int) else None,
             prompt_id=r["prompt_id"],
             task=task.name,
