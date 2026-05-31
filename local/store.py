@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS experiments (
     objectives_json TEXT NOT NULL DEFAULT '{}',
     score           REAL NOT NULL DEFAULT 0,
     loss_curve_json TEXT NOT NULL DEFAULT '[]',
+    val_curve_json  TEXT NOT NULL DEFAULT '[]',
     analysis        TEXT NOT NULL DEFAULT '',
     parent_index    INTEGER,
     generation      INTEGER NOT NULL DEFAULT 0,
@@ -118,6 +119,14 @@ class LocalStore:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        # Idempotent migration for dbs created before val_curve_json existed.
+        try:
+            self._conn.execute(
+                "ALTER TABLE experiments "
+                "ADD COLUMN val_curve_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        except sqlite3.OperationalError:
+            pass
 
     def close(self) -> None:
         self._conn.close()
@@ -207,19 +216,21 @@ class LocalStore:
                        loss_curve: list, analysis: str = "",
                        parent_index: Optional[int] = None,
                        generation: int = 0, prompt_id: str = "",
-                       task: str = "") -> int:
+                       task: str = "",
+                       val_curve: Optional[list] = None) -> int:
         with self._tx() as c:
             cur = c.execute(
                 "INSERT INTO experiments "
                 "(round_id, miner_id, name, code, motivation, reasoning, "
                 " tool_calls_json, metric, success, objectives_json, score, "
-                " loss_curve_json, analysis, parent_index, generation, "
-                " prompt_id, task, timestamp) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " loss_curve_json, val_curve_json, analysis, parent_index, "
+                " generation, prompt_id, task, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     round_id, miner_id, name, code, motivation, reasoning,
                     json.dumps(tool_calls), metric, 1 if success else 0,
                     json.dumps(objectives), score, json.dumps(loss_curve),
+                    json.dumps(val_curve or []),
                     analysis, parent_index, generation, prompt_id, task,
                     time.time(),
                 ),
@@ -366,6 +377,7 @@ def _row_to_experiment(row: sqlite3.Row) -> dict:
         "objectives": json.loads(row["objectives_json"]),
         "score": row["score"],
         "loss_curve": json.loads(row["loss_curve_json"]),
+        "val_curve": json.loads(row["val_curve_json"] or "[]"),
         "analysis": row["analysis"],
         "parent_index": row["parent_index"],
         "generation": row["generation"],
