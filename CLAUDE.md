@@ -114,6 +114,7 @@ pandas, httpx) so the synthetic stack stays numpy-only.
 | `local/task.py` | Synthetic 8-dim regression + FLOPs-equivalent size buckets. |
 | `local/optimize.py` | Prompt-population CLI (`gepa` / `random_mutate`). |
 | `local/run.py` | Launches validator + N miners as subprocesses. |
+| `local/backup.py` | R2/Hippius backup of `radar_local.db`. Restores `<prefix>/latest.db.gz` at validator start if the local DB is missing, then a daemon thread snapshots (sqlite online backup → gzip) every `RADAR_BACKUP_INTERVAL_SEC` to `<prefix>/snapshots/<UTC>.db.gz` + overwrites `latest.db.gz`. **Default-on whenever `HIPPIUS_*`/`R2_*` creds are set** — defaults bucket=`radar-backups`, prefix=`radar-backups`, interval=3600s. Override with `RADAR_BACKUP_BUCKET`/`RADAR_BACKUP_PREFIX`; set `RADAR_BACKUP_DISABLE=1` to opt out. |
 | `local/dashboard.py` + `local/dashboard.html` | Read-only stdlib HTTP dashboard over `radar_local.db`. `python -m local.dashboard --db ... --port 8765`, open in Chrome. |
 | `miner_template/prompts.py` | `active.json` + `history/gen_NNN.json` atomic-write population store. |
 | `miner_template/optimizers/` | Pluggable optimizer registry (`gepa`, `random_mutate`, `pkg.mod:func`). |
