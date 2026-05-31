@@ -1,0 +1,85 @@
+:root { color-scheme: dark; }
+body { font: 13px/1.4 ui-monospace, Menlo, monospace; margin: 0; padding: 16px;
+       background: #0e0f12; color: #d5d7dc; }
+h1, h2 { font-weight: 600; margin: 0 0 8px; }
+h1 { font-size: 18px; }
+h2 { font-size: 14px; margin-top: 20px; color: #9aa0aa; text-transform: uppercase;
+     letter-spacing: 0.05em; display: flex; align-items: center; gap: 8px; }
+
+.topbar { display: flex; justify-content: space-between; align-items: baseline; }
+.topbar-right { display: flex; align-items: center; gap: 12px; }
+.refresh { color: #777e8b; font-size: 11px; }
+.toggle { color: #9aa0aa; font-size: 11px; display: flex; align-items: center; gap: 4px;
+          cursor: pointer; user-select: none; }
+.toggle input { accent-color: #7ec97e; }
+
+.stats { display: flex; gap: 16px; flex-wrap: wrap; }
+.stat { background: #161820; border: 1px solid #232631; padding: 8px 12px;
+        border-radius: 4px; min-width: 110px; }
+.stat .k { color: #777e8b; font-size: 11px; text-transform: uppercase; }
+.stat .v { font-size: 18px; color: #e8eaf0; margin-top: 2px; }
+
+.table-wrap { max-height: 360px; overflow: auto; border: 1px solid #1c1f28; border-radius: 4px;
+              margin-top: 6px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #1c1f28; }
+thead th { position: sticky; top: 0; background: #161820; z-index: 1;
+           color: #9aa0aa; font-weight: 500; font-size: 11px; text-transform: uppercase; }
+tr.row { cursor: pointer; }
+tr.row:hover { background: #1a1d26; }
+tr.row.selected { background: #1f2735; outline: 1px solid #3a5478; }
+td.metric, td.score, td.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.fail { color: #ff6b6b; }
+td.ok { color: #7ec97e; }
+.rank { color: #777e8b; width: 32px; }
+
+.chart-host { position: relative; display: inline-block; }
+canvas { background: #161820; border: 1px solid #232631; border-radius: 4px;
+         display: block; margin-top: 6px; max-width: 100%; }
+.chart-expand { background: #1c1f28; border: 1px solid #2a2e3a; color: #9aa0aa;
+                font: 12px ui-monospace, monospace; padding: 2px 8px; cursor: pointer;
+                border-radius: 3px; margin-left: auto; }
+.chart-expand:hover { color: #e8eaf0; border-color: #3a4050; }
+
+.tooltip { position: absolute; pointer-events: none; background: #0a0b0e;
+           border: 1px solid #3a4050; border-radius: 4px; padding: 6px 8px;
+           font-size: 11px; color: #e8eaf0; display: none; z-index: 100;
+           box-shadow: 0 4px 16px rgba(0,0,0,0.5); white-space: nowrap;
+           font-variant-numeric: tabular-nums; }
+.tooltip .k { color: #777e8b; }
+.tooltip b { color: #f0a040; }
+
+#detail { position: fixed; right: 0; top: 0; bottom: 0; width: 50%;
+          background: #0a0b0e; border-left: 1px solid #232631; padding: 16px;
+          overflow: auto; display: none; z-index: 50;
+          box-shadow: -8px 0 24px rgba(0,0,0,0.5); }
+#detail.open { display: block; }
+#detail pre { background: #161820; padding: 8px; border-radius: 4px;
+              white-space: pre-wrap; word-break: break-word; font-size: 12px;
+              max-height: 320px; overflow: auto; }
+#detail .close { float: right; cursor: pointer; color: #9aa0aa; font-size: 18px;
+                 padding: 0 6px; }
+#detail .close:hover { color: #e8eaf0; }
+.loss-controls { display: flex; gap: 8px; align-items: center; margin-top: 4px;
+                 font-size: 11px; color: #9aa0aa; }
+.loss-controls button { background: #1c1f28; border: 1px solid #2a2e3a; color: #9aa0aa;
+                        padding: 2px 8px; cursor: pointer; border-radius: 3px;
+                        font: 11px ui-monospace, monospace; }
+.loss-controls button.active { background: #2a3548; color: #e8eaf0; border-color: #3a5478; }
+.copy-btn { background: #1c1f28; border: 1px solid #2a2e3a; color: #9aa0aa;
+            padding: 2px 8px; cursor: pointer; border-radius: 3px;
+            font: 11px ui-monospace, monospace; margin-left: 8px; }
+.copy-btn:hover { color: #e8eaf0; }
+
+.modal { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none;
+         z-index: 100; align-items: center; justify-content: center; padding: 24px; }
+.modal.open { display: flex; }
+.modal-inner { background: #0a0b0e; border: 1px solid #232631; border-radius: 6px;
+               max-width: 95vw; max-height: 95vh; overflow: auto; padding: 16px; }
+.modal-head { display: flex; justify-content: space-between; align-items: center;
+              margin-bottom: 12px; color: #9aa0aa; font-size: 12px; }
+.modal-head .close { cursor: pointer; font-size: 18px; padding: 0 6px; }
+.modal-head .close:hover { color: #e8eaf0; }
+
+.muted { color: #777e8b; }
+.spark { vertical-align: middle; margin-left: 6px; }

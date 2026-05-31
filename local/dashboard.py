@@ -32,6 +32,8 @@ from urllib.parse import parse_qs, urlparse
 logger = logging.getLogger(__name__)
 
 _HTML_PATH = Path(__file__).with_name("dashboard.html")
+_CSS_PATH = Path(__file__).with_name("dashboard.css")
+_JS_PATH = Path(__file__).with_name("dashboard.js")
 
 
 def _connect_ro(db_path: str) -> sqlite3.Connection:
@@ -181,6 +183,8 @@ def _experiment(conn: sqlite3.Connection, exp_id: int) -> dict[str, Any] | None:
 class _Handler(BaseHTTPRequestHandler):
     db_path: str = ""
     html: bytes = b""
+    css: bytes = b""
+    js: bytes = b""
 
     def log_message(self, format, *args):  # noqa: A002
         logger.debug("dash %s - %s", self.address_string(), format % args)
@@ -202,6 +206,10 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path == "/":
             return self._send(200, self.html, "text/html; charset=utf-8")
+        if path == "/dashboard.css":
+            return self._send(200, self.css, "text/css; charset=utf-8")
+        if path == "/dashboard.js":
+            return self._send(200, self.js, "application/javascript; charset=utf-8")
 
         if not path.startswith("/api/"):
             return self._json(404, {"error": "not found"})
@@ -237,6 +245,8 @@ class _Handler(BaseHTTPRequestHandler):
 def serve(db_path: str, host: str, port: int) -> None:
     _Handler.db_path = db_path
     _Handler.html = _HTML_PATH.read_bytes()
+    _Handler.css = _CSS_PATH.read_bytes() if _CSS_PATH.exists() else b""
+    _Handler.js = _JS_PATH.read_bytes() if _JS_PATH.exists() else b""
     server = ThreadingHTTPServer((host, port), _Handler)
     logger.info("dashboard listening on http://%s:%d (db=%s)", host, port, db_path)
     print(f"dashboard → http://{host}:{port}/  (db={db_path})")
