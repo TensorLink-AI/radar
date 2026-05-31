@@ -134,7 +134,7 @@ is blocked).
 
 Wiki: by default the validator downloads the per-task cognition-wiki
 tarball from R2/Hippius on startup (bucket `radar-cognition-wiki`, key
-`cognition_wiki/v1/<task_name>/wiki.tar.gz`) and serves the extracted
+`cognition_wiki/v2/<task_name>/wiki.tar.gz`) and serves the extracted
 markdown at `GET /wiki`. Needs the same `HIPPIUS_*` / `R2_*` creds as
 the eval bucket. Override the bucket with `RADAR_COGNITION_WIKI_BUCKET`
 or skip R2 entirely by passing `--wiki_dir <path>` to point at any local

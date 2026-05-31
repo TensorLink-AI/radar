@@ -60,7 +60,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"bucket    = {bucket}")
         print(f"prefix    = {prefix}")
         print(f"key       = {key}")
-        print(f"cache_dir = {cache}/{args.task}")
+        version = Path(prefix.rstrip("/")).name or "default"
+        print(f"cache_dir = {cache}/{version}/{args.task}")
         return 0
 
     cached = ensure_wiki_cached(

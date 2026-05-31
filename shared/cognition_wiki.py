@@ -3,7 +3,7 @@
 Each task ships a markdown reference corpus (architectural notes, prior-art
 summaries, recipe hints) bundled as a single ``wiki.tar.gz`` on R2/Hippius
 under ``<prefix>/<task_name>/wiki.tar.gz`` (default prefix
-``cognition_wiki/v1``).
+``cognition_wiki/v2``).
 
 In the distributed stack the validator presigns one GET URL per round and
 attaches it to ``challenge.cognition_wiki_url`` so the agent fetches the
@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_PREFIX = "cognition_wiki/v1"
+DEFAULT_PREFIX = "cognition_wiki/v2"
 DEFAULT_BUCKET = "radar-cognition-wiki"
 DEFAULT_CACHE_DIR = "/tmp/radar_cognition_wiki"
 
@@ -129,13 +129,18 @@ def ensure_wiki_cached(
     the tarball is unreachable. Idempotent: re-uses an existing cache dir
     that already contains ``*.md`` unless ``force=True``.
     """
+    resolved_prefix = prefix or wiki_prefix()
     try:
-        key = wiki_key(task_name, prefix or wiki_prefix())
+        key = wiki_key(task_name, resolved_prefix)
     except ValueError as e:
         logger.warning("cognition-wiki: %s", e)
         return None
 
-    root = Path(cache_dir or wiki_cache_dir()) / task_name
+    # Namespace the cache by the prefix's tail (e.g. "v2") so bumping
+    # RADAR_COGNITION_WIKI_PREFIX from v1 → v2 doesn't serve stale markdown
+    # from an earlier extract.
+    version = Path(resolved_prefix.rstrip("/")).name or "default"
+    root = Path(cache_dir or wiki_cache_dir()) / version / task_name
     if not force and root.is_dir() and any(root.rglob("*.md")):
         logger.debug("cognition-wiki: cache hit at %s", root)
         return root
