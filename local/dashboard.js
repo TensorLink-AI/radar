@@ -299,12 +299,17 @@ async function showDetail(id) {
   const objJson = esc(JSON.stringify(e.objectives, null, 2));
   const ts = e.timestamp ? new Date(e.timestamp * 1000).toLocaleString() : '—';
   const hasLoss = Array.isArray(e.loss_curve) && e.loss_curve.length > 0;
+  const spikes = obj(e, 'num_spikes_skipped');
   d.innerHTML = `<span class="close" id="detailClose">×</span>`
     + `<h2>experiment ${e.id}</h2>`
     + `<div class="muted">round ${e.round_id} · miner ${esc(e.miner_id)} · `
     + `task ${esc(e.task) || '?'} · gen ${e.generation} · ${ts}</div>`
     + `<p><b>name</b> ${esc(e.name)}<br><b>metric</b> ${fmt(e.metric)} `
-    + ` <b>score</b> ${fmt(e.score, 3)} <b>success</b> ${e.success}</p>`
+    + ` <b>score</b> ${fmt(e.score, 3)} <b>success</b> ${e.success}`
+    + (spikes
+        ? ` · <span style="color:#e8b87e">spikes skipped: ${spikes}</span>`
+        : '')
+    + `</p>`
     + `<h2>objectives</h2><pre>${objJson}</pre>`
     + `<h2>analysis</h2><pre>${esc(e.analysis)}</pre>`
     + (e.motivation ? `<h2>motivation</h2><pre>${esc(e.motivation)}</pre>` : '')
@@ -404,11 +409,38 @@ function renderLossCurve(canvas, curve, valCurve, logY, metaEl) {
   const allPts = pts.concat(valPts);
   const xs = allPts.map(p => p.x), ys = allPts.map(p => yT(p.y));
   const xMin = Math.min(...xs), xMax = Math.max(...xs);
-  const yMin = Math.min(...ys), yMax = Math.max(...ys);
+  const yMinAll = Math.min(...ys), yMaxAll = Math.max(...ys);
+  // Robust y-axis: a single loss spike (e.g. 141k vs ~1.0 nominal) squashes
+  // the rest of the curve into a flat line. Cap the visible upper bound at
+  // median + 5*(p95 - median) and clamp out-of-range points to the top edge
+  // so the spike still shows as a vertical excursion. Disabled on log y
+  // since the log already compresses outliers.
+  let yMaxDisp = yMaxAll;
+  let clipped = 0;
+  if (!effLog && ys.length >= 4) {
+    const sorted = [...ys].sort((a, b) => a - b);
+    const quantile = q => {
+      const i = (sorted.length - 1) * q;
+      const lo = Math.floor(i), hi = Math.ceil(i);
+      return sorted[lo] + (sorted[hi] - sorted[lo]) * (i - lo);
+    };
+    const med = quantile(0.5);
+    const p95 = quantile(0.95);
+    const cap = med + 5 * Math.max(0, p95 - med);
+    if (cap > yMinAll && cap < yMaxAll) {
+      yMaxDisp = cap;
+      clipped = ys.filter(y => y > cap).length;
+    }
+  }
+  const yMin = yMinAll, yMax = yMaxDisp;
   const xRange = Math.max(1e-9, xMax - xMin);
   const yRange = Math.max(1e-9, yMax - yMin);
   const px = x => pad + (x - xMin) / xRange * (c.width - 2 * pad);
-  const py = y => c.height - pad - (yT(y) - yMin) / yRange * (c.height - 2 * pad);
+  const py = y => {
+    const t = yT(y);
+    const clamped = t > yMax ? yMax : t;
+    return c.height - pad - (clamped - yMin) / yRange * (c.height - 2 * pad);
+  };
   drawGrid(ctx, c, pad);
   // y ticks (in original units, even on log scale)
   ctx.fillStyle = '#777e8b'; ctx.font = '10px ui-monospace, monospace';
@@ -469,6 +501,7 @@ function renderLossCurve(canvas, curve, valCurve, logY, metaEl) {
       text += ` · val: ${valPts.length} pts · last=${valYs[valYs.length-1].toFixed(4)} `
         + `· best=${Math.min(...valYs).toFixed(4)}`;
     }
+    if (clipped > 0) text += ` · ${clipped} spike(s) clipped from view`;
     metaEl.textContent = text;
   }
   // Save state for hover hit-testing on this canvas.

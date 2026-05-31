@@ -492,6 +492,9 @@ def _run_ts_forecasting(
     }
     if best_val_loss is not None:
         objectives["best_val_loss"] = float(best_val_loss)
+    spikes = result.get("num_spikes_skipped")
+    if spikes:
+        objectives["num_spikes_skipped"] = int(spikes)
 
     # Phase C — GIFT-Eval CRPS/MASE on the saved checkpoint. Combined
     # leaderboard-style metric is geomean(normalized_crps, normalized_mase).

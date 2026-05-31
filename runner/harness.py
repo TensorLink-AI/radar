@@ -240,6 +240,7 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
         "val_growth": loop_result["val_growth"],
         "val_eval_tokens": loop_result["val_eval_tokens"],
         "flops_per_step_estimate": loop_result["flops_per_step_estimate"],
+        "num_spikes_skipped": loop_result["num_spikes_skipped"],
         "reference_eval_loss_history": [],
     }
 
@@ -261,6 +262,13 @@ _DEFAULTS = {
     # val_loss_history with only the end-of-run flush.
     "val_base_flops": 1e10,
     "val_growth": 2.0,
+    # Loss-spike guard: if a finite per-step loss exceeds
+    # ``spike_skip_k * ema(loss)`` after ``spike_warmup_steps`` updates, drop
+    # the batch (zero grads, no optim step). Catches single-batch outliers
+    # before they push a huge gradient through the optimizer. Set
+    # ``spike_skip_k`` to 0 to disable.
+    "spike_skip_k": 8.0,
+    "spike_warmup_steps": 20,
 }
 _CLAMPS = {
     "batch_size": (1, 512),
@@ -270,6 +278,8 @@ _CLAMPS = {
     "val_base_step": (1, 10000),
     "val_base_flops": (1e8, 1e22),
     "val_growth": (1.1, 10.0),
+    "spike_skip_k": (0.0, 1000.0),
+    "spike_warmup_steps": (0, 100000),
 }
 _VAL_SCHEDULES = ("logarithmic", "fixed", "none")
 _DEFAULT_VAL_SCHEDULE = "logarithmic"
@@ -408,6 +418,12 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
     optim_step = 0
     nan_streak = 0
     _MAX_NAN_STREAK = 50
+
+    # Spike-skip state: EMA of finite per-step losses (unscaled by grad_accum).
+    loss_ema = 0.0
+    loss_count = 0
+    num_spikes_skipped = 0
+    _SPIKE_EMA_ALPHA = 0.1
     for batch in runner.get_dataloader(batch_size=cfg["batch_size"]):
         if time.time() - start > time_budget:
             break
@@ -515,6 +531,25 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
             step += 1
             continue
         nan_streak = 0
+
+        # Spike-skip: drop batches whose loss is wildly above the running EMA
+        # before backward(), so one bad sample doesn't blow up the model with
+        # a giant gradient update. Operates on the unscaled per-step loss so
+        # grad_accum_steps doesn't shift the threshold.
+        loss_scalar = float(loss.item() * cfg["grad_accum_steps"])
+        if (cfg["spike_skip_k"] > 0
+                and loss_count >= cfg["spike_warmup_steps"]
+                and loss_ema > 0
+                and loss_scalar > cfg["spike_skip_k"] * loss_ema):
+            optimizer.zero_grad(set_to_none=True)
+            num_spikes_skipped += 1
+            step += 1
+            continue
+        loss_ema = (
+            loss_scalar if loss_count == 0
+            else _SPIKE_EMA_ALPHA * loss_scalar + (1 - _SPIKE_EMA_ALPHA) * loss_ema
+        )
+        loss_count += 1
 
         loss.backward()
         if (step + 1) % cfg["grad_accum_steps"] == 0:
@@ -641,6 +676,7 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
         "val_eval_tokens": int(val_eval_tokens),
         "flops_per_step_estimate": float(flops_per_optim_step),
         "cumulative_flops": int(cumulative_flops),
+        "num_spikes_skipped": int(num_spikes_skipped),
     }
 
 
