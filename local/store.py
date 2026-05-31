@@ -408,6 +408,32 @@ class LocalStore:
         for row in self._conn.execute(sql, params):
             yield _row_to_agent_event(row)
 
+    def delete_agent_events(
+        self, *, round_id: Optional[int] = None,
+        max_id: Optional[int] = None,
+    ) -> int:
+        """Delete agent_events rows. Pass ``round_id`` to drop one round's
+        worth (the end-of-round flush case) or ``max_id`` to drop
+        everything up to and including that id (the snapshot-and-prune
+        case where rows may have been added during upload). Returns the
+        deleted row count."""
+        clauses: list[str] = []
+        params: list = []
+        if round_id is not None:
+            clauses.append("round_id = ?")
+            params.append(int(round_id))
+        if max_id is not None:
+            clauses.append("id <= ?")
+            params.append(int(max_id))
+        if not clauses:
+            raise ValueError("delete_agent_events: pass round_id or max_id")
+        with self._tx() as c:
+            cur = c.execute(
+                "DELETE FROM agent_events WHERE " + " AND ".join(clauses),
+                params,
+            )
+            return cur.rowcount or 0
+
     def agent_event_stats(self) -> dict:
         row = self._conn.execute(
             "SELECT COUNT(*) AS n, MIN(id) AS first_id, MAX(id) AS last_id "

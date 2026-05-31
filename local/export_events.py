@@ -30,6 +30,50 @@ from typing import Iterable, Optional
 
 from local.store import LocalStore
 
+
+DEFAULT_R2_PREFIX = "agent-events"
+
+
+def _round_shard_key(prefix: str, round_id: int) -> str:
+    return f"{prefix.rstrip('/')}/round={round_id:06d}.jsonl"
+
+
+def flush_round_to_r2(
+    store: LocalStore, round_id: int, bucket: str,
+    *, prefix: str = DEFAULT_R2_PREFIX, delete_after: bool = True,
+) -> tuple[bool, int]:
+    """Upload one round's events to R2 as a single JSONL shard, then
+    drop the local rows. Returns ``(uploaded, n_events)``.
+
+    Used by the validator's round-end hook. Failure to upload leaves the
+    local rows in place so the next round (or a manual export) can retry
+    — we never delete without a confirmed upload.
+    """
+    events = list(store.iter_agent_events(round_id=round_id))
+    if not events:
+        return True, 0
+
+    try:
+        from shared.r2_audit import HippiusStorage
+    except ImportError as e:
+        logger.error("R2 flush requires boto3: %s", e)
+        return False, len(events)
+
+    text = "\n".join(json.dumps(ev, default=str) for ev in events) + "\n"
+    key = _round_shard_key(prefix, round_id)
+    storage = HippiusStorage(bucket=bucket)
+    if not storage.upload_text(key, text):
+        logger.warning("agent-events upload failed for round=%d", round_id)
+        return False, len(events)
+
+    if delete_after:
+        store.delete_agent_events(round_id=round_id)
+    logger.info(
+        "flushed %d agent events for round=%d → s3://%s/%s",
+        len(events), round_id, bucket, key,
+    )
+    return True, len(events)
+
 logger = logging.getLogger("local.export_events")
 
 

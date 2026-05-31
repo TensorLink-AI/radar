@@ -16,7 +16,8 @@ from pathlib import Path
 
 import pytest
 
-from local.export_events import write_jsonl
+from local import export_events
+from local.export_events import flush_round_to_r2, write_jsonl
 from local.services import ServicesServer
 from local.store import LocalStore
 
@@ -130,6 +131,94 @@ def test_service_llm_chat_writes_event(tmp_path: Path):
     assert row["latency_ms"] is not None and row["latency_ms"] >= 0
     assert row["request"] == {"content": "hello", "model": "stub"}
     store.close()
+
+
+def test_delete_agent_events_by_round(store: LocalStore):
+    store.record_agent_event(kind="llm_chat", miner_id="m1", round_id=1)
+    store.record_agent_event(kind="llm_chat", miner_id="m1", round_id=1)
+    store.record_agent_event(kind="llm_chat", miner_id="m1", round_id=2)
+    n = store.delete_agent_events(round_id=1)
+    assert n == 2
+    remaining = list(store.iter_agent_events())
+    assert [r["round_id"] for r in remaining] == [2]
+
+
+def test_delete_agent_events_requires_filter(store: LocalStore):
+    with pytest.raises(ValueError):
+        store.delete_agent_events()
+
+
+def test_flush_round_to_r2_uploads_and_prunes(
+    store: LocalStore, tmp_path: Path, monkeypatch,
+):
+    """End-to-end flush: rows for round 5 go to R2 as a single JSONL
+    shard and are deleted from SQLite; rows for round 6 stay."""
+    store.record_agent_event(kind="llm_chat", miner_id="m1", round_id=5,
+                             request={"q": "a"}, response={"a": 1})
+    store.record_agent_event(kind="desearch", miner_id="m1", round_id=5,
+                             request={"q": "b"}, response={"hits": []})
+    store.record_agent_event(kind="llm_chat", miner_id="m1", round_id=6,
+                             request={"q": "c"}, response={"a": 2})
+
+    uploads: dict[str, str] = {}
+
+    class FakeStorage:
+        def __init__(self, bucket: str = "") -> None:
+            self.bucket = bucket
+
+        def upload_text(self, key: str, text: str) -> bool:
+            uploads[key] = text
+            return True
+
+    # Patch the import inside flush_round_to_r2.
+    import shared.r2_audit as r2_audit
+    monkeypatch.setattr(r2_audit, "HippiusStorage", FakeStorage)
+
+    ok, n = flush_round_to_r2(store, 5, bucket="test-bucket")
+    assert ok is True
+    assert n == 2
+
+    # Round 5 rows are gone; round 6 row survived.
+    rounds_left = [r["round_id"] for r in store.iter_agent_events()]
+    assert rounds_left == [6]
+
+    # The shard key follows agent-events/round=NNNNNN.jsonl and contains
+    # exactly two JSON lines.
+    assert list(uploads.keys()) == ["agent-events/round=000005.jsonl"]
+    lines = uploads["agent-events/round=000005.jsonl"].strip().splitlines()
+    assert len(lines) == 2
+    parsed = [json.loads(l) for l in lines]
+    assert {p["kind"] for p in parsed} == {"llm_chat", "desearch"}
+
+
+def test_flush_keeps_rows_on_upload_failure(
+    store: LocalStore, monkeypatch,
+):
+    """A failed upload must NOT delete the local rows — they're the only
+    copy until R2 confirms receipt."""
+    store.record_agent_event(kind="llm_chat", miner_id="m1", round_id=9)
+
+    class FailStorage:
+        def __init__(self, bucket: str = "") -> None:
+            pass
+
+        def upload_text(self, key: str, text: str) -> bool:
+            return False
+
+    import shared.r2_audit as r2_audit
+    monkeypatch.setattr(r2_audit, "HippiusStorage", FailStorage)
+
+    ok, n = flush_round_to_r2(store, 9, bucket="test-bucket")
+    assert ok is False
+    assert n == 1
+    # Row is still there for the next retry.
+    assert len(list(store.iter_agent_events(round_id=9))) == 1
+
+
+def test_flush_empty_round_is_noop(store: LocalStore):
+    ok, n = flush_round_to_r2(store, 42, bucket="test-bucket")
+    assert ok is True
+    assert n == 0
 
 
 def test_service_skips_logging_without_miner_header(tmp_path: Path):
