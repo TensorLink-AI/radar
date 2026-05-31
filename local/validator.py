@@ -396,11 +396,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--task", default="synth_regression",
                         choices=["synth_regression", "ts_forecasting"],
                         help="Which task this validator drives.")
-    parser.add_argument("--skip_cache_check", action="store_true",
-                        help="Skip the ts_forecasting startup cache check "
-                             "(GIFT-Eval + pretrain val shard). Useful for "
-                             "offline reruns where you know the caches are "
-                             "already populated.")
     parser.add_argument("--log_level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -418,11 +413,11 @@ def main(argv: list[str] | None = None) -> int:
     task = make_spec(args.task)
     if isinstance(task, TSForecastingSpec):
         task.time_budget_seconds = args.training_seconds
-        if not args.skip_cache_check and not _ensure_ts_caches():
-            logger.error(
-                "ts_forecasting caches not ready — aborting. "
-                "Pass --skip_cache_check to bypass (rounds will fail Phase C).",
-            )
+        # GIFT-Eval is non-negotiable: Phase C always runs the full 97-task
+        # leaderboard, so there's no point starting rounds without it. No
+        # skip flag — fix creds / disk and rerun.
+        if not _ensure_ts_caches():
+            logger.error("ts_forecasting caches not ready — aborting.")
             return 2
     logger.info(
         "starting; db=%s task=%s agent_seconds=%d training_seconds=%s",
