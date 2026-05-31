@@ -27,6 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from local.artifacts import ArtifactSink, cleanup_workdir, sweep_orphan_workdirs
+from local.backup import from_env as backup_from_env
 from local.scoring import compute_pareto, passes_size_gate, score_round
 from local.services import ServicesServer
 from local.store import LocalStore
@@ -410,7 +411,16 @@ def main(argv: list[str] | None = None) -> int:
     # we start minting new ones.
     sweep_orphan_workdirs()
 
+    # Optional R2/Hippius backup: restore latest snapshot if the local DB
+    # is missing, then run a periodic upload daemon for the lifetime of
+    # the validator. No-op unless RADAR_BACKUP_BUCKET is set.
+    backup = backup_from_env(args.db)
+    if backup is not None:
+        backup.restore_if_missing()
+
     store = LocalStore(args.db)
+    if backup is not None:
+        backup.start()
     task = make_spec(args.task)
     if isinstance(task, TSForecastingSpec):
         task.time_budget_seconds = args.training_seconds
@@ -460,6 +470,8 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         services.stop()
         store.close()
+        if backup is not None:
+            backup.stop(final=True)
     return 0
 
 
