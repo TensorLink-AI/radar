@@ -41,6 +41,16 @@ logger = logging.getLogger(__name__)
 
 LATEST_KEY = "latest.db.gz"
 SNAPSHOT_DIR = "snapshots"
+DEFAULT_BUCKET = "radar-backups"
+DEFAULT_PREFIX = "radar-backups"
+
+
+def _has_s3_creds() -> bool:
+    """True if HIPPIUS_* or R2_* access creds are set in the env."""
+    return bool(
+        (os.getenv("HIPPIUS_ACCESS_KEY_ID") and os.getenv("HIPPIUS_SECRET_ACCESS_KEY"))
+        or (os.getenv("R2_ACCESS_KEY_ID") and os.getenv("R2_SECRET_ACCESS_KEY"))
+    )
 
 
 def _now_stamp() -> str:
@@ -215,11 +225,21 @@ class R2Backup:
 
 
 def from_env(db_path: str | Path) -> Optional[R2Backup]:
-    """Construct an ``R2Backup`` from env, or ``None`` if disabled."""
+    """Construct an ``R2Backup`` from env, or ``None`` if disabled.
+
+    Defaults to bucket ``radar-backups`` / prefix ``radar-backups`` whenever
+    HIPPIUS/R2 creds are present, so a properly-configured operator gets
+    backups for free. Set ``RADAR_BACKUP_DISABLE=1`` to opt out, or
+    override ``RADAR_BACKUP_BUCKET`` / ``RADAR_BACKUP_PREFIX`` to retarget.
+    """
+    if os.getenv("RADAR_BACKUP_DISABLE", "").strip() in ("1", "true", "yes"):
+        return None
     bucket = os.getenv("RADAR_BACKUP_BUCKET", "").strip()
     if not bucket:
-        return None
-    prefix = os.getenv("RADAR_BACKUP_PREFIX", "radar-backups").strip()
+        if not _has_s3_creds():
+            return None
+        bucket = DEFAULT_BUCKET
+    prefix = os.getenv("RADAR_BACKUP_PREFIX", DEFAULT_PREFIX).strip()
     try:
         interval = float(os.getenv("RADAR_BACKUP_INTERVAL_SEC", "3600"))
     except ValueError:
