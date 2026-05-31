@@ -40,11 +40,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import socket
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional
+from typing import Callable, Optional
 
 from local import experiments_api as exp_api
 from local.providers import (
@@ -86,6 +88,60 @@ class _Handler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):  # noqa: A002
         logger.debug("svc %s - %s", self.address_string(), format % args)
+
+    # ── Agent event capture ────────────────────────────────
+    #
+    # Every miner request flows through these handlers, so this is the one
+    # chokepoint where we can observe what an agent does without touching
+    # the agent code. ``X-Miner-Id`` is set by ``local/miner.py`` on the
+    # GatedClient default headers; the active round is whatever challenge
+    # is currently ``open`` in the store. Logging is best-effort: if the
+    # store write fails, the handler must still serve the response.
+
+    def _miner_id(self) -> str:
+        return self.headers.get("X-Miner-Id", "") or ""
+
+    def _active_round_id(self) -> Optional[int]:
+        try:
+            ch = self.store.open_challenge()
+        except Exception:  # noqa: BLE001
+            return None
+        return ch["round_id"] if ch else None
+
+    def _log_event(self, kind: str, endpoint: str, request: object,
+                   response: object, status: int, latency_ms: float,
+                   error: Optional[str] = None) -> None:
+        if os.getenv("RADAR_DISABLE_EVENT_LOG"):
+            return
+        miner_id = self._miner_id()
+        # Skip non-miner callers (dashboard, internal validator reads).
+        if not miner_id:
+            return
+        try:
+            self.store.record_agent_event(
+                kind=kind, miner_id=miner_id,
+                round_id=self._active_round_id(),
+                endpoint=endpoint, status=status, latency_ms=latency_ms,
+                request=request, response=response, error=error,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("agent event log failed: %s", e)
+
+    def _logged(self, kind: str, endpoint: str, request: object,
+                fn: Callable[[], dict]) -> tuple[int, dict]:
+        """Run ``fn`` (the provider call), persist a log row, return
+        (status, body) so the caller can respond."""
+        t0 = time.perf_counter()
+        try:
+            body = fn()
+        except Exception as e:  # noqa: BLE001
+            latency = (time.perf_counter() - t0) * 1000.0
+            err = f"{type(e).__name__}: {e}"
+            self._log_event(kind, endpoint, request, None, 502, latency, err)
+            return 502, {"error": err}
+        latency = (time.perf_counter() - t0) * 1000.0
+        self._log_event(kind, endpoint, request, body, 200, latency)
+        return 200, body
 
     def _json(self, status: int, body) -> None:
         data = json.dumps(body).encode()
@@ -277,9 +333,21 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(200, {"files": self.wiki.list()})
 
         if path.startswith("/wiki/"):
-            data = self.wiki.read(path[len("/wiki/"):])
+            rel = path[len("/wiki/"):]
+            t0 = time.perf_counter()
+            data = self.wiki.read(rel)
+            latency = (time.perf_counter() - t0) * 1000.0
             if data is None:
+                self._log_event(
+                    "wiki_read", path, {"path": rel}, None, 404, latency,
+                    error="not found",
+                )
                 return self._json(404, {"error": "not found"})
+            self._log_event(
+                "wiki_read", path, {"path": rel},
+                {"bytes": len(data), "text": data.decode("utf-8", "replace")},
+                200, latency,
+            )
             try:
                 self.send_response(200)
                 self.send_header("content-type", "text/markdown; charset=utf-8")
@@ -303,22 +371,23 @@ class _Handler(BaseHTTPRequestHandler):
             )
 
         if path == "/llm/chat":
-            try:
-                return self._json(200, llm_dispatch(payload))
-            except Exception as e:  # noqa: BLE001
-                return self._json(502, {"error": f"{type(e).__name__}: {e}"})
+            status, body = self._logged(
+                "llm_chat", path, payload, lambda: llm_dispatch(payload),
+            )
+            return self._json(status, body)
 
         if path == "/llm/v1/chat/completions":
-            try:
-                return self._json(200, llm_openai_dispatch(payload))
-            except Exception as e:  # noqa: BLE001
-                return self._json(502, {"error": f"{type(e).__name__}: {e}"})
+            status, body = self._logged(
+                "llm_chat_openai", path, payload,
+                lambda: llm_openai_dispatch(payload),
+            )
+            return self._json(status, body)
 
         if path == "/desearch/search":
-            try:
-                return self._json(200, desearch(payload))
-            except Exception as e:  # noqa: BLE001
-                return self._json(502, {"error": f"{type(e).__name__}: {e}"})
+            status, body = self._logged(
+                "desearch", path, payload, lambda: desearch(payload),
+            )
+            return self._json(status, body)
 
         self._json(404, {"error": f"unknown path {path}"})
 

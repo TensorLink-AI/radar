@@ -102,8 +102,9 @@ pandas, httpx) so the synthetic stack stays numpy-only.
 
 | File | Purpose |
 |------|---------|
-| `local/store.py` | SQLite (WAL) broker — challenges, proposals, experiments. |
-| `local/services.py` | Threaded stdlib HTTP server on 127.0.0.1 — `/experiments`, `/llm/chat`, `/desearch/search`, `/wiki`. |
+| `local/store.py` | SQLite (WAL) broker — challenges, proposals, experiments, artifacts, agent_events. |
+| `local/services.py` | Threaded stdlib HTTP server on 127.0.0.1 — `/experiments`, `/llm/chat`, `/desearch/search`, `/wiki`. Logs every miner call (identified by `X-Miner-Id`) to `agent_events`. |
+| `local/export_events.py` | Dump `agent_events` to JSONL (`--out`), optionally upload to R2/Hippius (`--r2-bucket --r2-key`). Disable capture with `RADAR_DISABLE_EVENT_LOG=1`. |
 | `local/providers.py` | LLM (Chutes → OpenAI → stub), arxiv via `export.arxiv.org`, file-backed wiki. |
 | `local/validator.py` | Round loop: picks bucket → publishes challenge → drains proposals → trains + evaluates → scores. |
 | `local/miner.py` | Polls for challenges, loads the agent from `--agent_dir`, calls `design_architecture(challenge, client?)`. |
