@@ -132,12 +132,22 @@ AI-search endpoint. Without those, the local stack hits the public
 arxiv Atom API instead (and degrades to an empty result set when egress
 is blocked).
 
-Wiki: pass `--wiki_dir <path>` to expose any markdown directory.
+Wiki: by default the validator downloads the per-task cognition-wiki
+tarball from R2/Hippius on startup (bucket `radar-cognition-wiki`, key
+`cognition_wiki/v1/<task_name>/wiki.tar.gz`) and serves the extracted
+markdown at `GET /wiki`. Needs the same `HIPPIUS_*` / `R2_*` creds as
+the eval bucket. Override the bucket with `RADAR_COGNITION_WIKI_BUCKET`
+or skip R2 entirely by passing `--wiki_dir <path>` to point at any local
+markdown directory. Prefetch out-of-band with:
+
+```bash
+python -m local.fetch_cognition_wiki --task ts_forecasting
+```
 
 ```bash
 CHUTES_API_KEY=cpk_... python local/run.py \
     --agent_dir /path/to/my_agent \
-    --wiki_dir  /path/to/notes
+    --wiki_dir  /path/to/notes        # optional override; otherwise R2
 ```
 
 ## Prompt-population optimizer (GEPA / random_mutate)

@@ -428,9 +428,21 @@ def main(argv: list[str] | None = None) -> int:
 
     sink = ArtifactSink.from_env(store)
 
+    wiki_dir = args.wiki_dir or None
+    if not wiki_dir:
+        try:
+            from shared.cognition_wiki import ensure_wiki_cached
+            cached = ensure_wiki_cached(task.name)
+        except Exception as e:
+            logger.warning("cognition-wiki fetch raised %s — continuing without", e)
+            cached = None
+        if cached is not None:
+            wiki_dir = str(cached)
+            logger.info("cognition-wiki: serving %s at /wiki", wiki_dir)
+
     services = ServicesServer(
         store=store,
-        wiki_dir=args.wiki_dir or None,
+        wiki_dir=wiki_dir,
         port=args.services_port,
         sink=sink,
     )
