@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 import uuid
@@ -110,6 +111,96 @@ def _build_challenge(round_id: int, store: LocalStore, task,
         "cognition_wiki_url": f"{services_url}/wiki",
         "allowed_urls": services_url,
     }
+
+
+def _ensure_ts_caches() -> bool:
+    """Ensure the GIFT-Eval benchmark cache and the held-out pretrain val
+    shard are populated before the validator starts a ts_forecasting round.
+
+    Returns True on success (caches ready), False on hard failure (no creds /
+    download failed) — caller exits early so we don't blow ``--training_seconds``
+    on every round only to fail Phase C.
+    """
+    gift_cache = os.environ.get("RADAR_GIFT_EVAL_CACHE", "/tmp/radar_gift_eval")
+    val_cache = os.environ.get("RADAR_PRETRAIN_VAL_CACHE", "/tmp/radar_pretrain_val")
+
+    # 1. GIFT-Eval benchmark — every leaderboard dataset must be on disk so
+    # Phase C can iterate the full 97-task list. Skip the import + R2 dance
+    # when everything is already cached.
+    try:
+        from shared.gift_eval import (
+            MED_LONG_DATASETS, SHORT_DATASETS, ensure_datasets_cached,
+        )
+    except ImportError as e:
+        logger.error("ts_forecasting requires shared.gift_eval: %s", e)
+        return False
+
+    leaderboard = sorted({*SHORT_DATASETS, *MED_LONG_DATASETS})
+    Path(gift_cache).mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "checking GIFT-Eval cache (%d datasets) at %s", len(leaderboard), gift_cache,
+    )
+    status = ensure_datasets_cached(leaderboard, cache_dir=gift_cache)
+    missing = [k for k, ok in status.items() if not ok]
+    if missing or not status:
+        logger.error(
+            "GIFT-Eval cache incomplete (%d missing). First few: %s. "
+            "Check HIPPIUS_*/R2_* creds and re-run.",
+            len(missing) or len(leaderboard), missing[:5],
+        )
+        return False
+    logger.info("GIFT-Eval cache OK (%d datasets ready)", len(status))
+
+    # 2. Pretrain val shard — small fixed held-out split. If the dir already
+    # has parquet files we trust them; otherwise pull from the pretrain bucket.
+    val_dir = Path(val_cache)
+    existing_val = sorted(val_dir.glob("*.parquet")) if val_dir.is_dir() else []
+    if existing_val:
+        logger.info(
+            "pretrain val cache OK (%d shard(s) at %s)", len(existing_val), val_cache,
+        )
+        return True
+
+    logger.info("pretrain val cache empty at %s — fetching", val_cache)
+    try:
+        from local.fetch_pretrain import make_pretrain_client
+        from shared.pretrain_data import PretrainBenchmark
+    except ImportError as e:
+        logger.error("cannot fetch val shard (missing deps): %s", e)
+        return False
+
+    r2 = make_pretrain_client()
+    if r2 is None:
+        logger.error(
+            "no pretrain S3 client (install boto3 + set HIPPIUS_*/R2_* env)",
+        )
+        return False
+    bench = PretrainBenchmark(r2=r2)
+    val_keys = bench.get_val_shard_keys()
+    if not val_keys:
+        logger.warning(
+            "pretrain manifest declares no val shards — in-training val "
+            "will be disabled by trainer fallback",
+        )
+        return True
+
+    val_dir.mkdir(parents=True, exist_ok=True)
+    ok = fail = 0
+    for key in val_keys:
+        dest = val_dir / Path(key).name
+        if dest.exists() and dest.stat().st_size > 0:
+            continue
+        if r2.download_file_to_disk(key, str(dest)):
+            ok += 1
+            logger.info("  fetched %s (%d bytes)", dest.name, dest.stat().st_size)
+        else:
+            fail += 1
+            logger.error("  failed to download %s", key)
+    if fail:
+        logger.error("pretrain val fetch failed (%d/%d shards)", fail, ok + fail)
+        return False
+    logger.info("pretrain val cache ready (%d shard(s))", ok)
+    return True
 
 
 def _next_round_id(store: LocalStore) -> int:
@@ -305,6 +396,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--task", default="synth_regression",
                         choices=["synth_regression", "ts_forecasting"],
                         help="Which task this validator drives.")
+    parser.add_argument("--skip_cache_check", action="store_true",
+                        help="Skip the ts_forecasting startup cache check "
+                             "(GIFT-Eval + pretrain val shard). Useful for "
+                             "offline reruns where you know the caches are "
+                             "already populated.")
     parser.add_argument("--log_level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -322,6 +418,12 @@ def main(argv: list[str] | None = None) -> int:
     task = make_spec(args.task)
     if isinstance(task, TSForecastingSpec):
         task.time_budget_seconds = args.training_seconds
+        if not args.skip_cache_check and not _ensure_ts_caches():
+            logger.error(
+                "ts_forecasting caches not ready — aborting. "
+                "Pass --skip_cache_check to bypass (rounds will fail Phase C).",
+            )
+            return 2
     logger.info(
         "starting; db=%s task=%s agent_seconds=%d training_seconds=%s",
         args.db, task.name, args.agent_seconds,
