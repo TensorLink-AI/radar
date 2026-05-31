@@ -3,7 +3,7 @@
 Each task ships a markdown reference corpus (architectural notes, prior-art
 summaries, recipe hints) bundled as a single ``wiki.tar.gz`` on R2/Hippius
 under ``<prefix>/<task_name>/wiki.tar.gz`` (default prefix
-``cognition_wiki/v2``).
+``cognition_wiki/v1``).
 
 In the distributed stack the validator presigns one GET URL per round and
 attaches it to ``challenge.cognition_wiki_url`` so the agent fetches the
@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_PREFIX = "cognition_wiki/v2"
+DEFAULT_PREFIX = "cognition_wiki/v1"
 DEFAULT_BUCKET = "radar-cognition-wiki"
 DEFAULT_CACHE_DIR = "/tmp/radar_cognition_wiki"
 
