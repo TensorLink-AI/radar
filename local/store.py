@@ -85,6 +85,23 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_round_miner ON artifacts(round_id, miner_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind);
+
+CREATE TABLE IF NOT EXISTS agent_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              REAL NOT NULL,
+    round_id        INTEGER,
+    miner_id        TEXT NOT NULL DEFAULT '',
+    kind            TEXT NOT NULL,
+    endpoint        TEXT NOT NULL DEFAULT '',
+    status          INTEGER,
+    latency_ms      REAL,
+    request_json    TEXT,
+    response_json   TEXT,
+    error           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agent_events_round ON agent_events(round_id);
+CREATE INDEX IF NOT EXISTS idx_agent_events_miner ON agent_events(miner_id);
+CREATE INDEX IF NOT EXISTS idx_agent_events_kind ON agent_events(kind);
 """
 
 
@@ -324,6 +341,116 @@ class LocalStore:
         ).fetchone()
         return _row_to_artifact(row, include_text=True) if row else None
 
+    # ── Agent events ───────────────────────────────────────
+
+    def record_agent_event(
+        self, *, kind: str, miner_id: str = "", round_id: Optional[int] = None,
+        endpoint: str = "", status: Optional[int] = None,
+        latency_ms: Optional[float] = None,
+        request: object = None, response: object = None,
+        error: Optional[str] = None, max_bytes: int = 262_144,
+    ) -> int:
+        """Insert one structured event row. ``request``/``response`` are
+        JSON-serialised; anything not JSON-encodable is stringified.
+        Either side is clipped to ``max_bytes`` with a truncation marker
+        so a huge LLM transcript can't bloat the DB unboundedly."""
+        def _enc(obj: object) -> Optional[str]:
+            if obj is None:
+                return None
+            try:
+                s = json.dumps(obj, default=str)
+            except (TypeError, ValueError):
+                s = json.dumps({"_repr": repr(obj)})
+            if len(s) > max_bytes:
+                s = json.dumps({
+                    "_truncated": True,
+                    "_original_bytes": len(s),
+                    "head": s[:max_bytes],
+                })
+            return s
+
+        with self._tx() as c:
+            cur = c.execute(
+                "INSERT INTO agent_events "
+                "(ts, round_id, miner_id, kind, endpoint, status, latency_ms, "
+                " request_json, response_json, error) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    time.time(), round_id, miner_id, kind, endpoint,
+                    status, latency_ms, _enc(request), _enc(response), error,
+                ),
+            )
+            return cur.lastrowid
+
+    def iter_agent_events(
+        self, *, round_id: Optional[int] = None,
+        miner_id: Optional[str] = None, kind: Optional[str] = None,
+        since_id: int = 0, limit: Optional[int] = None,
+    ) -> Iterator[dict]:
+        clauses: list[str] = ["id > ?"]
+        params: list = [int(since_id)]
+        if round_id is not None:
+            clauses.append("round_id = ?")
+            params.append(int(round_id))
+        if miner_id:
+            clauses.append("miner_id = ?")
+            params.append(miner_id)
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        sql = (
+            "SELECT * FROM agent_events WHERE " + " AND ".join(clauses) +
+            " ORDER BY id ASC"
+        )
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        for row in self._conn.execute(sql, params):
+            yield _row_to_agent_event(row)
+
+    def delete_agent_events(
+        self, *, round_id: Optional[int] = None,
+        max_id: Optional[int] = None,
+    ) -> int:
+        """Delete agent_events rows. Pass ``round_id`` to drop one round's
+        worth (the end-of-round flush case) or ``max_id`` to drop
+        everything up to and including that id (the snapshot-and-prune
+        case where rows may have been added during upload). Returns the
+        deleted row count."""
+        clauses: list[str] = []
+        params: list = []
+        if round_id is not None:
+            clauses.append("round_id = ?")
+            params.append(int(round_id))
+        if max_id is not None:
+            clauses.append("id <= ?")
+            params.append(int(max_id))
+        if not clauses:
+            raise ValueError("delete_agent_events: pass round_id or max_id")
+        with self._tx() as c:
+            cur = c.execute(
+                "DELETE FROM agent_events WHERE " + " AND ".join(clauses),
+                params,
+            )
+            return cur.rowcount or 0
+
+    def agent_event_stats(self) -> dict:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n, MIN(id) AS first_id, MAX(id) AS last_id "
+            "FROM agent_events"
+        ).fetchone()
+        by_kind = {
+            r["kind"]: r["n"] for r in self._conn.execute(
+                "SELECT kind, COUNT(*) AS n FROM agent_events GROUP BY kind"
+            )
+        }
+        return {
+            "total": row["n"] or 0,
+            "first_id": row["first_id"],
+            "last_id": row["last_id"],
+            "by_kind": by_kind,
+        }
+
     def stats(self) -> dict:
         row = self._conn.execute(
             "SELECT COUNT(*) AS total, "
@@ -341,6 +468,29 @@ class LocalStore:
             "worst_metric": row["worst"],
             "mean_metric": row["mean"],
         }
+
+
+def _row_to_agent_event(row: sqlite3.Row) -> dict:
+    def _maybe_json(s: Optional[str]) -> object:
+        if s is None:
+            return None
+        try:
+            return json.loads(s)
+        except (TypeError, ValueError):
+            return s
+    return {
+        "id": row["id"],
+        "ts": row["ts"],
+        "round_id": row["round_id"],
+        "miner_id": row["miner_id"],
+        "kind": row["kind"],
+        "endpoint": row["endpoint"],
+        "status": row["status"],
+        "latency_ms": row["latency_ms"],
+        "request": _maybe_json(row["request_json"]),
+        "response": _maybe_json(row["response_json"]),
+        "error": row["error"],
+    }
 
 
 def _row_to_artifact(row: sqlite3.Row, *, include_text: bool) -> dict:

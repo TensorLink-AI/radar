@@ -360,6 +360,21 @@ def run_round(store: LocalStore, task, round_id: int,
         f"{stats['best_metric']:.6f}" if stats["best_metric"] is not None else "—",
     )
 
+    # Flush this round's agent events to R2 if configured. On success the
+    # local rows are dropped so the SQLite file stays bounded on long runs;
+    # on failure they're kept and the next round (or a manual export) can
+    # retry. Wrapped in try/except because the round is already complete
+    # by this point and the flush must not break the loop.
+    bucket = os.getenv("RADAR_EVENT_LOG_R2_BUCKET", "").strip()
+    if bucket:
+        try:
+            from local.export_events import flush_round_to_r2
+            prefix = os.getenv("RADAR_EVENT_LOG_R2_PREFIX", "agent-events")
+            flush_round_to_r2(store, round_id, bucket, prefix=prefix)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("agent-events flush failed for round=%d: %s",
+                           round_id, e)
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Local radar validator")
