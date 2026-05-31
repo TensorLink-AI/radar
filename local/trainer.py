@@ -474,7 +474,11 @@ def _run_ts_forecasting(
     train_hist = result.get("train_loss_history") or []
     val_hist = result.get("val_loss_history") or []
     loss_curve = [float(x.get("loss", 0.0)) for x in train_hist]
-    val_losses = [float(x.get("loss", 0.0)) for x in val_hist if x.get("loss") is not None]
+    val_curve = [
+        {"step": int(x.get("step", i)), "loss": float(x["loss"])}
+        for i, x in enumerate(val_hist) if x.get("loss") is not None
+    ]
+    val_losses = [p["loss"] for p in val_curve]
     best_val_loss = (
         float(result["best_val_loss"])
         if result.get("best_val_loss") is not None
@@ -499,22 +503,26 @@ def _run_ts_forecasting(
             f"training did not succeed (status={status})",
             objectives, loss_curve, workdir,
             error=str(result.get("error") or status),
+            val_curve=val_curve,
         )
     if not checkpoint_path:
         return _ts_failure(
             "harness did not return a checkpoint_path",
             objectives, loss_curve, workdir,
+            val_curve=val_curve,
         )
     if not Path(checkpoint_path).exists():
         return _ts_failure(
             f"checkpoint missing at {checkpoint_path}",
             objectives, loss_curve, workdir,
+            val_curve=val_curve,
         )
     if not Path(cache_dir).is_dir():
         return _ts_failure(
             f"GIFT-Eval cache dir missing at {cache_dir} "
             f"(set RADAR_GIFT_EVAL_CACHE / run `python -m local.fetch_gift_eval`)",
             objectives, loss_curve, workdir,
+            val_curve=val_curve,
         )
     try:
         eval_metrics = _gift_eval_score(
@@ -524,6 +532,7 @@ def _run_ts_forecasting(
         return _ts_failure(
             f"GIFT-Eval failed: {type(e).__name__}: {e}",
             objectives, loss_curve, workdir,
+            val_curve=val_curve,
         )
 
     crps = eval_metrics.get("crps")
@@ -533,6 +542,7 @@ def _run_ts_forecasting(
         return _ts_failure(
             f"GIFT-Eval returned non-finite metrics (crps={crps} mase={mase})",
             objectives, loss_curve, workdir,
+            val_curve=val_curve,
         )
 
     objectives["crps"] = float(crps)
@@ -556,6 +566,7 @@ def _run_ts_forecasting(
         "metric": float(metric),
         "objectives": objectives,
         "loss_curve": loss_curve,
+        "val_curve": val_curve,
         "analysis": analysis,
         "error": "",
         "workdir": str(workdir),
@@ -569,6 +580,7 @@ def _ts_failure(
     workdir: Path,
     *,
     error: str | None = None,
+    val_curve: list | None = None,
 ) -> dict:
     """Build a failed ts_forecasting result. No metric fallback — GIFT-Eval
     is the only acceptable signal."""
@@ -578,6 +590,7 @@ def _ts_failure(
         "metric": None,
         "objectives": objectives,
         "loss_curve": loss_curve,
+        "val_curve": val_curve or [],
         "analysis": f"task=ts_forecasting failed: {reason}",
         "error": error if error is not None else reason,
         "workdir": str(workdir),

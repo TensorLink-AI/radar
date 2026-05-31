@@ -232,29 +232,46 @@ async function showDetail(id) {
         : `<div class="muted">no loss curve recorded</div>`)
     + `<h2>code</h2><pre>${esc(e.code)}</pre>`;
   if (Array.isArray(e.loss_curve) && e.loss_curve.length > 0) {
-    drawLossCurve(e.loss_curve);
+    drawLossCurve(e.loss_curve, e.val_curve);
   }
 }
 
-function drawLossCurve(curve) {
-  const c = document.getElementById('lossCurve');
-  if (!c) return;
-  const ctx = c.getContext('2d');
-  ctx.fillStyle = '#161820'; ctx.fillRect(0, 0, c.width, c.height);
-  // Accept either [y, y, ...] or [[x, y], ...] or [{step, loss}, ...].
-  const pts = curve.map((v, i) => {
+function normalizeCurve(curve) {
+  if (!Array.isArray(curve)) return [];
+  return curve.map((v, i) => {
     if (Array.isArray(v)) return { x: v[0], y: v[1] };
     if (v && typeof v === 'object')
       return { x: v.step ?? v.x ?? i, y: v.loss ?? v.y };
     return { x: i, y: v };
   }).filter(p => Number.isFinite(p.x) && Number.isFinite(p.y));
+}
+
+function drawLossCurve(curve, valCurve) {
+  const c = document.getElementById('lossCurve');
+  if (!c) return;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#161820'; ctx.fillRect(0, 0, c.width, c.height);
+  // Accept either [y, y, ...] or [[x, y], ...] or [{step, loss}, ...].
+  const pts = normalizeCurve(curve);
+  const valPts = normalizeCurve(valCurve);
   if (pts.length === 0) {
     ctx.fillStyle = '#777e8b'; ctx.font = '12px monospace';
     ctx.fillText('no finite points', 20, 30);
     return;
   }
+  // If train was logged as bare floats (x=index), map onto the val step
+  // axis so the two curves share the same x range when val steps exist.
+  const trainStepless = pts.every((p, i) => p.x === i);
+  if (trainStepless && valPts.length > 0) {
+    const valMax = Math.max(...valPts.map(p => p.x));
+    const n = pts.length;
+    if (n > 1 && valMax > 0) {
+      for (let i = 0; i < n; i++) pts[i].x = (i / (n - 1)) * valMax;
+    }
+  }
   const pad = 36;
-  const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+  const allPts = pts.concat(valPts);
+  const xs = allPts.map(p => p.x), ys = allPts.map(p => p.y);
   const xMin = Math.min(...xs), xMax = Math.max(...xs);
   const yMin = Math.min(...ys), yMax = Math.max(...ys);
   const xRange = Math.max(1e-9, xMax - xMin);
@@ -276,7 +293,7 @@ function drawLossCurve(curve) {
     ctx.beginPath(); ctx.moveTo(pad, yy); ctx.lineTo(c.width - pad/2, yy); ctx.stroke();
     ctx.fillText(yv.toFixed(3), 2, yy + 3);
   }
-  // line
+  // train line
   ctx.strokeStyle = '#7ec97e'; ctx.lineWidth = 1.5;
   ctx.beginPath();
   pts.forEach((p, i) => {
@@ -284,7 +301,7 @@ function drawLossCurve(curve) {
     if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
   });
   ctx.stroke();
-  // points (only if few)
+  // train points (only if few)
   if (pts.length <= 80) {
     ctx.fillStyle = '#7ec97e';
     for (const p of pts) {
@@ -293,14 +310,45 @@ function drawLossCurve(curve) {
       ctx.fill();
     }
   }
+  // val line + points
+  if (valPts.length > 0) {
+    ctx.strokeStyle = '#f0a040'; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    valPts.forEach((p, i) => {
+      const x = px(p.x), y = py(p.y);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.fillStyle = '#f0a040';
+    for (const p of valPts) {
+      ctx.beginPath();
+      ctx.arc(px(p.x), py(p.y), 2.5, 0, 2*Math.PI);
+      ctx.fill();
+    }
+  }
+  // legend
+  ctx.font = '11px monospace';
+  ctx.fillStyle = '#7ec97e'; ctx.fillText('■ train', c.width - 150, 16);
+  if (valPts.length > 0) {
+    ctx.fillStyle = '#f0a040'; ctx.fillText('■ val', c.width - 80, 16);
+  }
   ctx.fillStyle = '#777e8b';
   ctx.fillText('step →', c.width - 60, c.height - 6);
   ctx.save(); ctx.translate(10, 60); ctx.rotate(-Math.PI/2);
   ctx.fillText('loss →', 0, 0); ctx.restore();
   const meta = document.getElementById('lossMeta');
-  if (meta) meta.textContent =
-    `${pts.length} points · first=${ys[0].toFixed(4)} · last=${ys[ys.length-1].toFixed(4)} `
-    + `· min=${yMin.toFixed(4)} · max=${yMax.toFixed(4)}`;
+  if (meta) {
+    const trainYs = pts.map(p => p.y);
+    let text = `train: ${pts.length} pts · first=${trainYs[0].toFixed(4)} `
+      + `· last=${trainYs[trainYs.length-1].toFixed(4)} `
+      + `· min=${Math.min(...trainYs).toFixed(4)}`;
+    if (valPts.length > 0) {
+      const valYs = valPts.map(p => p.y);
+      text += ` · val: ${valPts.length} pts · last=${valYs[valYs.length-1].toFixed(4)} `
+        + `· best=${Math.min(...valYs).toFixed(4)}`;
+    }
+    meta.textContent = text;
+  }
 }
 
 async function refresh() {

@@ -63,6 +63,11 @@ def _row(r: sqlite3.Row, *, with_code: bool = False) -> dict[str, Any]:
         out["motivation"] = r["motivation"]
         out["reasoning"] = r["reasoning"]
         out["loss_curve"] = json.loads(r["loss_curve_json"] or "[]")
+        try:
+            out["val_curve"] = json.loads(r["val_curve_json"] or "[]")
+        except (IndexError, KeyError):
+            # Older db schemas without the val_curve_json column.
+            out["val_curve"] = []
         out["tool_calls"] = json.loads(r["tool_calls_json"] or "[]")
     return out
 
