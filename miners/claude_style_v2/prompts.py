@@ -23,21 +23,26 @@ from core.prompt_builder import _compute_sizing_guidance, _format_task_params
 
 BRIEF_SCHEMA_EXAMPLE = {
     "relevant_prior_work": [
-        "PatchTST (Nie 2022) — patch-level transformer with shared "
-        "channel head",
+        "<paper or method> (<author year>) — <one-line core idea, "
+        "described by mechanism, not by brand name>",
     ],
     "frontier_gaps": [
-        "current frontier members all use full attention; depthwise "
-        "convs are absent",
+        "<inductive bias / op family / objective / regularizer / "
+        "tokenization choice that no frontier member currently uses>",
     ],
     "ideas_to_try": [
-        "depthwise-separable conv1d backbone with linear head",
-        "patch the input then apply a small MLP-mixer",
+        "<concrete architectural idea described by its operations, "
+        "shapes, and information flow — no need to attach a paper "
+        "name; if a novel combination fits the task, prefer that "
+        "over a famous one>",
+        "<a structurally different second idea that explores a "
+        "different point on the design space (different op family, "
+        "different bridging strategy, different objective, etc.)>",
     ],
     "plan": [
-        "sketch_architecture for a depthwise-sep conv baseline",
-        "size the hidden dim with size_to_flops to land mid-bucket",
-        "validate_code, then submit with a hypothesis note",
+        "<3-5 short steps the designer should run, written as "
+        "tool-call intents rather than recipes — the designer owns "
+        "the implementation choices>",
     ],
 }
 
@@ -125,9 +130,17 @@ def build_researcher_system_prompt(
         "- **Beat the frontier, don't match it.** A tie loses the "
         "Pareto dominance bonus. Your `frontier_gaps` should make "
         "this concrete.\n"
-        "- **Concrete > abstract.** \"Try a transformer\" is "
-        "useless. \"Try PatchTST with patch_len=16, FLOPs target "
-        f"{target:,}\" is actionable.\n"
+        "- **Concrete > abstract.** Name the operations, shapes, "
+        "and information flow. \"Try a transformer\" is useless. "
+        "\"Stack of <op family A> over patches of size P with a "
+        f"<bridge type> head, target ~{target:,} FLOPs\" is "
+        "actionable — describe the mechanism, not the brand.\n"
+        "- **Reach past the familiar shortlist.** Don't default to "
+        "the same handful of named architectures every round. Novel "
+        "combinations of standard PyTorch ops (gated convs, "
+        "spectral mixing, state-space recurrences, learned routing, "
+        "non-standard tokenizers, alternative loss formulations, "
+        "etc.) are fair game and often unexplored on the frontier.\n"
         "- **Don't write code.** That's the designer's job. If you "
         "find yourself sketching architectures, stop and rephrase as "
         "a plan step.\n"
@@ -242,9 +255,11 @@ def build_designer_system_prompt(
         "5. Treat each length-like task_param as INDEPENDENT — an input "
         "length (e.g. `context_len`) and an output length (e.g. "
         "`prediction_len`) are not related and must not be conflated. "
-        "Any layer that bridges them must project explicitly "
-        "(`nn.Linear(context_len // patch, prediction_len)`), never via "
-        "implicit reshape or residual add\n"
+        "Any layer that bridges them must project explicitly along the "
+        "length axis (any op whose output length depends on "
+        "`prediction_len` is fine — linear, attention pooling, learned "
+        "queries, transposed conv, interpolation + refine, etc.), never "
+        "via implicit reshape or residual add\n"
         "6. Always call `validate_code` before `submit`"
     )
 

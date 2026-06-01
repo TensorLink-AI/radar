@@ -24,15 +24,30 @@ from miner_template.prompts import Prompt
 # Cheap deterministic prompt perturbations.  Picked by hashing the
 # parent's id + child index so two runs on the same inputs produce the
 # same children — important for reproducibility.
+#
+# Perturbations are deliberately architecture-agnostic: they nudge the
+# *process* (exploration, frontier analysis, hypothesis tracking) rather
+# than prescribing a specific op family. Architecture-prescriptive
+# directives compound across generations and collapse the population
+# toward whatever the prompt currently favors — exactly what the
+# Pareto-front sampler is supposed to prevent.
 _PERTURBATIONS: list[str] = [
     "\n\nThink step by step before answering.",
-    "\n\nFavor architectures with explicit attention sparsity.",
-    "\n\nPrefer designs that reuse parameters across layers.",
-    "\n\nConsider hybrid CNN+attention encoders.",
-    "\n\nWhen in doubt, fall back to a small transformer baseline.",
+    "\n\nBefore committing to a design, list at least three structurally "
+    "different candidates and pick the one whose inductive bias best "
+    "matches the task — do not default to a familiar shortlist.",
+    "\n\nSurvey the current frontier for op families that are absent "
+    "(state-space, spectral mixing, gated convs, learned routing, etc.) "
+    "and consider whether one of those gaps is worth exploring.",
+    "\n\nState the hypothesis your architecture is testing in one "
+    "sentence in the motivation field, so future rounds can tell "
+    "exploration from exploitation.",
     "\n\nReport hyperparameter choices in the motivation field.",
     "\n\nOptimize for sample efficiency over raw capacity.",
-    "\n\nAvoid recurrent layers unless justified by data length.",
+    "\n\nDescribe each layer by its operation, shape, and information "
+    "flow — name the mechanism, not the brand.",
+    "\n\nIf the frontier is narrow, prefer a structurally novel "
+    "candidate over a marginal tweak of an existing member.",
 ]
 
 

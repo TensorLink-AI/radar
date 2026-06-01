@@ -52,18 +52,27 @@ def _compute_sizing_guidance(challenge: dict) -> str:
         "with score=0.",
         "",
         "**Rules:**",
-        "1. Use standard nn ops (nn.Linear, nn.Conv1d, nn.MultiheadAttention, etc.) "
-        "so the FLOPs counter can see them",
+        "1. Any standard PyTorch op the FLOPs counter can see is fair game — "
+        "linear/conv/attention/recurrence/SSM/spectral/gated/sparse/etc. "
+        "If an op isn't in the formula table below, measure its actual cost "
+        "with `estimate_layer_flops` on a minimal prototype",
         "2. ALWAYS call `validate_code` before `submit` — it runs the real FLOPs check",
         "3. If validate_code says FLOPs are off, follow its resize suggestion",
         f"4. Target ~{target:,} FLOPs (60% of max). Hard gate: [{gate_min:,}, {gate_max:,}]",
         "",
         "## FLOPs Calculator",
         "",
-        "**FLOPs formulas for common ops:**",
+        "**Reference formulas (not a menu — any measurable op is allowed):**",
         "- `nn.Linear(in, out)` on input `(batch, seq, in)` -> `2 * in * out * seq` FLOPs",
         "- `nn.Conv1d(C_in, C_out, K)` on length L -> `2 * C_in * K * C_out * L_out` FLOPs",
+        "- `nn.Conv1d(..., groups=G)` divides the above by G (depthwise: G = C_in)",
         "- `nn.MultiheadAttention(d, heads)` on seq S -> `8 * S * d^2 + 2 * S^2 * d` FLOPs",
+        "- `nn.GRU(h)` / `nn.LSTM(h)` over seq S -> ~`8 * h^2 * S` (LSTM ~`16 * h^2 * S`)",
+        "- Elementwise / norms / residuals -> ~`elements` FLOPs (cheap; rarely the budget driver)",
+        "- FFT-based mixing -> `~5 * N * log2(N) * channels` FLOPs",
+        "- For anything else (state-space recurrences, learned routing, sparse "
+        "ops, custom kernels expressed as nn ops): prototype it and call "
+        "`estimate_layer_flops` — the counter is the source of truth",
         "- Note: if your model reshapes to `(batch * V, ...)`, V is already in the batch "
         "-- do NOT double-count",
         "",
@@ -140,8 +149,12 @@ def build_system_prompt(challenge: dict) -> str:
         "- Use only standard PyTorch (torch, torch.nn, torch.optim, "
         "torch.nn.functional)\n"
         "- Do NOT import subprocess, socket, or ftplib\n"
-        "- Use standard nn ops (nn.Linear, nn.Conv1d, nn.TransformerEncoderLayer, "
-        "nn.MultiheadAttention, nn.LayerNorm) so FLOPs counter works\n"
+        "- Any standard PyTorch op the FLOPs counter can see is allowed — "
+        "Linear/Conv/Attention/RNN families, plus anything you can express "
+        "via nn / nn.functional (gated, spectral, depthwise, learned "
+        "routing, state-space recurrences, etc.). Don't restrict yourself "
+        "to a shortlist; measure unfamiliar ops with the validator before "
+        "committing\n"
         "- Length-like task_params are INDEPENDENT: an input length and an "
         "output length are unrelated. Any layer that bridges them must "
         "project explicitly (e.g. `nn.Linear(input_len // patch, "

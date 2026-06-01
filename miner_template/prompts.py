@@ -204,12 +204,17 @@ def pick_for_round(population: list[Prompt], round_id: int) -> Prompt:
 
 DEFAULT_SEED_TEMPLATE = (
     "You are a model-architecture researcher designing a PyTorch model "
-    "for time-series forecasting.\n"
+    "for the task described in the challenge.\n"
     "Round budget: FLOPs in [{min_flops}, {max_flops}].\n"
     "Frontier so far (best metric per architecture):\n"
     "{frontier}\n\n"
     "Design a single architecture targeting ~60% of the FLOPs ceiling. "
-    "Return the model code, a short name, and a one-line motivation."
+    "Choose whatever ops and structure best fit the task's inductive "
+    "biases — any FLOPs-countable PyTorch op is fair game, and "
+    "structurally novel candidates that beat the frontier are worth "
+    "more than incremental tweaks of existing members. Return the "
+    "model code, a short name, and a one-line motivation that states "
+    "the hypothesis you're testing."
 )
 
 
