@@ -144,16 +144,27 @@ def llm_available_models() -> list[str]:
     return ["stub"]
 
 
-# ── Desearch (real SN22 API + arxiv fallback) ──────────────────
+# ── Desearch (real SN22 API + arxiv / OpenAlex fallback) ───────
 
 ARXIV_API = "http://export.arxiv.org/api/query"
 ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom"}
+
+OPENALEX_API = "https://api.openalex.org/works"
 
 DESEARCH_DEFAULT_URL = "https://api.desearch.ai"
 DESEARCH_AI_PATH = "/desearch/ai/search"
 DESEARCH_DATE_FILTERS = {
     "PAST_24_HOURS", "PAST_2_DAYS", "PAST_WEEK", "PAST_2_WEEKS",
     "PAST_MONTH", "PAST_2_MONTHS", "PAST_YEAR", "PAST_2_YEARS",
+}
+
+# Date-filter → "papers published since" cutoff, used by the OpenAlex
+# fallback (which takes ISO dates, not enum strings). Anything outside
+# this table falls back to PAST_2_YEARS' window.
+_DATE_FILTER_DAYS = {
+    "PAST_24_HOURS": 1, "PAST_2_DAYS": 2, "PAST_WEEK": 7,
+    "PAST_2_WEEKS": 14, "PAST_MONTH": 31, "PAST_2_MONTHS": 62,
+    "PAST_YEAR": 366, "PAST_2_YEARS": 731,
 }
 
 # Miner tool wrappers POST to /desearch/search with a ~50s client deadline
@@ -301,59 +312,18 @@ def _normalise_desearch_results(data, limit: int) -> list[dict]:
     return out
 
 
-def desearch(payload: dict) -> dict:
-    """Local desearch endpoint.
-
-    Resolution order:
-
-    1. If ``DESEARCH_API_KEY`` is set, forward to the production Desearch
-       SN22 ``/desearch/ai/search`` endpoint (``RADAR_DESEARCH_SN22_URL``
-       overrides the host; defaults to ``DESEARCH_DEFAULT_URL``).
-    2. Otherwise fall back to the public arxiv Atom API (works for
-       prompts about ML papers, requires egress to export.arxiv.org).
-    3. On any network/HTTP error, return ``{"results": [], "error":
-       "..."}`` so the miner sees "no papers found" instead of a 502.
-    """
-    sn22_url = os.environ.get("RADAR_DESEARCH_SN22_URL", "").strip()
-    api_key = os.environ.get("DESEARCH_API_KEY", "").strip()
-    # A Desearch key alone is enough — default to the public SN22
-    # endpoint when no explicit URL is configured. (Previously the key
-    # was silently ignored unless RADAR_DESEARCH_SN22_URL was also set,
-    # so a key-only setup fell through to the arxiv fallback.)
-    if api_key and not sn22_url:
-        sn22_url = DESEARCH_DEFAULT_URL
-    if sn22_url and api_key:
-        try:
-            return _desearch_remote(payload, sn22_url, api_key)
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            return {"results": [], "error": f"{type(exc).__name__}: {exc}"}
-        except (json.JSONDecodeError, ValueError) as exc:
-            return {"results": [], "error": f"{type(exc).__name__}: {exc}"}
-
-    # Accept the upstream `count` alias for `max_results` so callers
-    # written against the production desearch API work unchanged.
-    query = (payload.get("query") or payload.get("prompt") or "").strip()
-    if not query:
-        return {"results": []}
-    raw_n = payload.get("max_results", payload.get("count", 5))
-    try:
-        max_results = max(1, min(20, int(raw_n)))
-    except (TypeError, ValueError):
-        max_results = 5
+def _arxiv_search(query: str, max_results: int) -> list[dict]:
+    """Public arxiv Atom API. Sorted newest-first so "recent SOTA"
+    queries surface fresh papers."""
     qs = urllib.parse.urlencode({
         "search_query": f"all:{query}",
         "start": 0,
         "max_results": max_results,
+        "sortBy": "submittedDate",
+        "sortOrder": "descending",
     })
-    try:
-        req = urllib.request.Request(f"{ARXIV_API}?{qs}", method="GET")
-        body = _urlopen_bounded(req, DESEARCH_UPSTREAM_TIMEOUT)
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        # Sandbox / offline environments routinely block egress to
-        # export.arxiv.org. Degrade to an empty result set instead of
-        # raising — the miner already handles "no papers found" cleanly,
-        # whereas a 502 just triggers a retry loop and a fallback round.
-        return {"results": [], "error": f"{type(exc).__name__}: {exc}"}
+    req = urllib.request.Request(f"{ARXIV_API}?{qs}", method="GET")
+    body = _urlopen_bounded(req, DESEARCH_UPSTREAM_TIMEOUT)
     root = ET.fromstring(body)
     results = []
     for entry in root.findall("atom:entry", ARXIV_NS):
@@ -371,7 +341,148 @@ def desearch(payload: dict) -> dict:
             "arxiv_id": arxiv_id,
             "url": link or arxiv_id,
         })
-    return {"results": results}
+    return results
+
+
+def _openalex_abstract(inverted: dict) -> str:
+    """Rebuild prose from OpenAlex's `abstract_inverted_index`
+    (``{word: [positions...]}``)."""
+    if not isinstance(inverted, dict) or not inverted:
+        return ""
+    slots: dict[int, str] = {}
+    for word, positions in inverted.items():
+        if not isinstance(positions, list):
+            continue
+        for p in positions:
+            if isinstance(p, int):
+                slots[p] = word
+    if not slots:
+        return ""
+    return " ".join(slots[i] for i in sorted(slots))
+
+
+def _openalex_search(query: str, max_results: int, date_filter: str) -> list[dict]:
+    """OpenAlex `/works` search. Keyless; we pass `mailto=` to land in
+    the polite pool. Filters by publication date so results match the
+    miner's intent."""
+    days = _DATE_FILTER_DAYS.get(date_filter, _DATE_FILTER_DAYS["PAST_2_YEARS"])
+    cutoff = time.strftime(
+        "%Y-%m-%d", time.gmtime(time.time() - days * 86400)
+    )
+    params = {
+        "search": query,
+        "filter": f"from_publication_date:{cutoff},type:article",
+        "sort": "cited_by_count:desc",
+        "per-page": max_results,
+    }
+    mailto = os.environ.get("RADAR_OPENALEX_MAILTO", "").strip()
+    if mailto:
+        params["mailto"] = mailto
+    qs = urllib.parse.urlencode(params)
+    req = urllib.request.Request(f"{OPENALEX_API}?{qs}", method="GET")
+    # OpenAlex also accepts the contact email in the User-Agent — both
+    # routes land in the polite pool; we set both when available.
+    if mailto:
+        req.add_header("User-Agent", f"radar-local (mailto:{mailto})")
+    data = json.loads(_urlopen_bounded(req, DESEARCH_UPSTREAM_TIMEOUT))
+    out: list[dict] = []
+    for w in (data.get("results") or [])[:max_results]:
+        if not isinstance(w, dict):
+            continue
+        out.append({
+            "title": (w.get("title") or w.get("display_name") or "untitled"),
+            "abstract": _openalex_abstract(w.get("abstract_inverted_index")),
+            "arxiv_id": "",
+            "url": (
+                w.get("doi")
+                or (w.get("primary_location") or {}).get("landing_page_url")
+                or w.get("id")
+                or ""
+            ),
+        })
+    return out
+
+
+def _is_retryable_http(exc: Exception) -> bool:
+    """Treat 429 + 5xx as 'try the next provider'."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code == 429 or 500 <= exc.code < 600
+    return False
+
+
+def desearch(payload: dict) -> dict:
+    """Local desearch endpoint.
+
+    Resolution order:
+
+    1. If ``DESEARCH_API_KEY`` is set, forward to the production Desearch
+       SN22 ``/desearch/ai/search`` endpoint (``RADAR_DESEARCH_SN22_URL``
+       overrides the host; defaults to ``DESEARCH_DEFAULT_URL``).
+    2. On Desearch 429/5xx or network failure, fall through to the
+       public arxiv Atom API (keyless, requires egress to
+       ``export.arxiv.org``).
+    3. On arxiv failure, fall through to OpenAlex
+       (``api.openalex.org``, keyless, covers non-arxiv venues).
+    4. If all providers fail, return ``{"results": [], "error": "..."}``
+       so the miner sees "no papers found" instead of a 502.
+
+    Set ``RADAR_DESEARCH_DISABLE_FALLBACKS=1`` to keep the historical
+    "Desearch only" behaviour.
+    """
+    query = (payload.get("query") or payload.get("prompt") or "").strip()
+    if not query:
+        return {"results": []}
+    raw_n = payload.get("count", payload.get("max_results", 5))
+    try:
+        max_results = max(1, min(20, int(raw_n)))
+    except (TypeError, ValueError):
+        max_results = 5
+    date_filter = payload.get("date_filter")
+    if date_filter not in DESEARCH_DATE_FILTERS:
+        date_filter = "PAST_2_YEARS"
+
+    disable_fallbacks = bool(
+        os.environ.get("RADAR_DESEARCH_DISABLE_FALLBACKS", "").strip()
+    )
+
+    sn22_url = os.environ.get("RADAR_DESEARCH_SN22_URL", "").strip()
+    api_key = os.environ.get("DESEARCH_API_KEY", "").strip()
+    # A Desearch key alone is enough — default to the public SN22
+    # endpoint when no explicit URL is configured.
+    if api_key and not sn22_url:
+        sn22_url = DESEARCH_DEFAULT_URL
+
+    errors: list[str] = []
+
+    if sn22_url and api_key:
+        try:
+            return _desearch_remote(payload, sn22_url, api_key)
+        except urllib.error.HTTPError as exc:
+            errors.append(f"desearch: HTTPError {exc.code}")
+            if disable_fallbacks or not _is_retryable_http(exc):
+                return {"results": [], "error": "; ".join(errors)}
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            errors.append(f"desearch: {type(exc).__name__}: {exc}")
+            if disable_fallbacks:
+                return {"results": [], "error": "; ".join(errors)}
+        except (json.JSONDecodeError, ValueError) as exc:
+            errors.append(f"desearch: {type(exc).__name__}: {exc}")
+            if disable_fallbacks:
+                return {"results": [], "error": "; ".join(errors)}
+
+    try:
+        return {"results": _arxiv_search(query, max_results)}
+    except (urllib.error.URLError, TimeoutError, OSError, ET.ParseError) as exc:
+        errors.append(f"arxiv: {type(exc).__name__}: {exc}")
+
+    try:
+        return {"results": _openalex_search(query, max_results, date_filter)}
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        errors.append(f"openalex: {type(exc).__name__}: {exc}")
+    except (json.JSONDecodeError, ValueError) as exc:
+        errors.append(f"openalex: {type(exc).__name__}: {exc}")
+
+    return {"results": [], "error": "; ".join(errors)}
 
 
 # ── Wiki ───────────────────────────────────────────────────────
