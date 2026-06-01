@@ -306,18 +306,29 @@ def run_round(store: LocalStore, task, round_id: int,
               ckpt_store: CheckpointStore | None = None,
               continuation_enabled: bool = False,
               continuation_equilibrium: float = 0.7,
-              continuation_ramp_rounds: int = 50,
-              continuation_rate_start: float = 0.0,
+              continuation_warmup_rounds: int = 100,
+              continuation_step_pct: float = 1.0,
+              continuation_step_every: int = 5,
               shards_per_round: int = 0) -> None:
-    # The validator owns the cadence: a scheduled coin flip (rate ramps
-    # linearly to the equilibrium) decides whether this is a continuation
-    # round; _build_challenge downgrades to "new" when no eligible parents
-    # exist yet.
-    scheduled = continuation_enabled and is_continuation_round(
-        round_id,
+    # The validator owns the cadence: a scheduled coin flip decides whether
+    # this is a continuation round. The rate stays at 0 until
+    # ``warmup_rounds`` successful rounds, then climbs as a staircase to the
+    # equilibrium; _build_challenge further downgrades to "new" when no
+    # eligible parents exist yet.
+    successful_rounds = store.successful_round_count(task=task.name)
+    rate = continuation_rate(
+        successful_rounds,
         equilibrium=continuation_equilibrium,
-        ramp_rounds=continuation_ramp_rounds,
-        start=continuation_rate_start,
+        warmup_rounds=continuation_warmup_rounds,
+        step_pct=continuation_step_pct,
+        step_every=continuation_step_every,
+    ) if continuation_enabled else 0.0
+    scheduled = continuation_enabled and is_continuation_round(
+        round_id, successful_rounds,
+        equilibrium=continuation_equilibrium,
+        warmup_rounds=continuation_warmup_rounds,
+        step_pct=continuation_step_pct,
+        step_every=continuation_step_every,
     )
     challenge = _build_challenge(
         round_id, store, task, services_url, agent_seconds=agent_seconds,
@@ -327,16 +338,13 @@ def run_round(store: LocalStore, task, round_id: int,
     challenge_id = challenge["challenge_id"]
     bucket = challenge["bucket"]
     continuation_allowed = challenge["continuation_allowed"]
-    rate = continuation_rate(
-        round_id, equilibrium=continuation_equilibrium,
-        ramp_rounds=continuation_ramp_rounds, start=continuation_rate_start,
-    ) if continuation_enabled else 0.0
     logger.info(
         "round=%d bucket=%s flops=[%d, %d] frontier=%d type=%s "
-        "(cont_rate=%.2f parents=%d)",
+        "(cont_rate=%.2f ok_rounds=%d parents=%d)",
         round_id, bucket, challenge["min_flops_equivalent"],
         challenge["max_flops_equivalent"], len(challenge["feasible_frontier"]),
-        challenge["round_type"], rate, len(challenge["eligible_parents"]),
+        challenge["round_type"], rate, successful_rounds,
+        len(challenge["eligible_parents"]),
     )
 
     if sink is not None:
@@ -596,12 +604,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--continuation_equilibrium", type=float, default=0.7,
                         help="Steady-state fraction of rounds the validator "
                              "schedules as continuations (default 0.70).")
-    parser.add_argument("--continuation_ramp_rounds", type=int, default=50,
-                        help="Rounds over which the continuation rate climbs "
-                             "linearly from --continuation_rate_start to "
-                             "--continuation_equilibrium (default 50).")
-    parser.add_argument("--continuation_rate_start", type=float, default=0.0,
-                        help="Continuation rate at round 0 (default 0.0).")
+    parser.add_argument("--continuation_warmup_rounds", type=int, default=100,
+                        help="Successful rounds with 0%% continuation before "
+                             "the ramp starts (default 100).")
+    parser.add_argument("--continuation_step_pct", type=float, default=1.0,
+                        help="Percentage points the continuation rate climbs "
+                             "per step after warmup (default 1.0).")
+    parser.add_argument("--continuation_step_every", type=int, default=5,
+                        help="Successful rounds per ramp step (default 5). "
+                             "Defaults give 0→70%% over ~350 rounds post-warmup.")
     parser.add_argument("--log_level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -644,11 +655,12 @@ def main(argv: list[str] | None = None) -> int:
 
     logger.info(
         "starting; db=%s task=%s agent_seconds=%d training_seconds=%s "
-        "continuation=%s (eq=%.2f ramp=%d) shards_per_round=%d",
+        "continuation=%s (eq=%.2f warmup=%d +%.1f%%/%d) shards_per_round=%d",
         args.db, task.name, args.agent_seconds,
         getattr(task, "time_budget_seconds", "n/a"),
         continuation_enabled, args.continuation_equilibrium,
-        args.continuation_ramp_rounds, args.shards_per_round,
+        args.continuation_warmup_rounds, args.continuation_step_pct,
+        args.continuation_step_every, args.shards_per_round,
     )
 
     sink = ArtifactSink.from_env(store)
@@ -694,8 +706,9 @@ def main(argv: list[str] | None = None) -> int:
                       ckpt_store=ckpt_store,
                       continuation_enabled=continuation_enabled,
                       continuation_equilibrium=args.continuation_equilibrium,
-                      continuation_ramp_rounds=args.continuation_ramp_rounds,
-                      continuation_rate_start=args.continuation_rate_start,
+                      continuation_warmup_rounds=args.continuation_warmup_rounds,
+                      continuation_step_pct=args.continuation_step_pct,
+                      continuation_step_every=args.continuation_step_every,
                       shards_per_round=args.shards_per_round)
             round_id += 1
             completed += 1

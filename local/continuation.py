@@ -26,46 +26,53 @@ _DELTA_K = 5.0
 
 
 def continuation_rate(
-    round_id: int,
+    successful_rounds: int,
     *,
-    equilibrium: float,
-    ramp_rounds: int,
-    start: float = 0.0,
+    equilibrium: float = 0.7,
+    warmup_rounds: int = 100,
+    step_pct: float = 1.0,
+    step_every: int = 5,
 ) -> float:
-    """Target fraction of rounds that should be continuations at ``round_id``.
+    """Target continuation fraction given the count of successful rounds.
 
-    Linear ramp from ``start`` to ``equilibrium`` over ``ramp_rounds``, then
-    flat. The validator drives the per-round type from this so continuation
-    pressure builds slowly (early rounds have no parents anyway) and settles
-    at the equilibrium — exploitation rising as the frontier matures while a
-    fixed slice of fresh exploration remains.
+    Stays at **0** until ``warmup_rounds`` successful rounds have completed
+    (let the frontier establish first), then climbs as a staircase —
+    ``step_pct`` percentage points every ``step_every`` rounds — up to
+    ``equilibrium``. With the defaults (warmup 100, +1%/5 rounds, eq 0.70)
+    it reaches 70% about 350 successful rounds after the warmup.
     """
     eq = max(0.0, min(1.0, equilibrium))
-    st = max(0.0, min(1.0, start))
-    if ramp_rounds <= 0:
+    if successful_rounds < warmup_rounds:
+        return 0.0
+    if step_every <= 0:
         return eq
-    frac = min(1.0, max(0.0, round_id / ramp_rounds))
-    return st + (eq - st) * frac
+    steps = (successful_rounds - warmup_rounds) // step_every
+    return min(eq, max(0.0, (step_pct / 100.0) * steps))
 
 
 def is_continuation_round(
     round_id: int,
+    successful_rounds: int,
     *,
-    equilibrium: float,
-    ramp_rounds: int,
-    start: float = 0.0,
+    equilibrium: float = 0.7,
+    warmup_rounds: int = 100,
+    step_pct: float = 1.0,
+    step_every: int = 5,
 ) -> bool:
     """Deterministic per-round coin flip at the scheduled rate.
 
     Seeded by ``round_id`` so the schedule is reproducible and independent
-    of the training seed. Realized continuation frequency tracks
-    ``continuation_rate``; whether a scheduled continuation round actually
-    runs as one still depends on eligible parents existing (the validator
-    downgrades to a fresh round when none do).
+    of the training seed; the *rate* is driven by ``successful_rounds``.
+    Whether a scheduled continuation round actually runs as one still
+    depends on eligible parents existing (the validator downgrades to a
+    fresh round when none do).
     """
     rate = continuation_rate(
-        round_id, equilibrium=equilibrium, ramp_rounds=ramp_rounds, start=start,
+        successful_rounds, equilibrium=equilibrium, warmup_rounds=warmup_rounds,
+        step_pct=step_pct, step_every=step_every,
     )
+    if rate <= 0.0:
+        return False
     return random.Random(f"continuation-schedule-{round_id}").random() < rate
 
 

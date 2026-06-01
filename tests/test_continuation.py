@@ -190,6 +190,14 @@ def test_scoring_never_reads_val_loss():
 
 # ── store lineage / eligible parents ─────────────────────────────────
 
+def test_successful_round_count(store):
+    _add(store, metric=1.0)                       # round 1 success
+    _add(store, metric=0.9, success=False, ckpt=False)  # round 1 (n_rounds=1) — same round_id
+    _add(store, metric=0.8, n_rounds=2)           # round 2 success
+    # _add uses n_rounds as round_id; distinct successful rounds = {1, 2}.
+    assert store.successful_round_count(task="ts_forecasting") == 2
+
+
 def test_store_lineage_and_eligible(store):
     e1 = _add(store, metric=1.0, shards=["s1.parquet"])
     e2 = _add(store, metric=0.8, mode="continue", parent=e1, n_rounds=2,
@@ -316,29 +324,31 @@ def test_choose_continuation_new_round_is_fresh():
 
 # ── validator-scheduled cadence ──────────────────────────────────────
 
-def test_continuation_rate_linear_ramp():
+def test_continuation_rate_warmup_then_staircase():
     from local.continuation import continuation_rate
-    assert continuation_rate(0, equilibrium=0.7, ramp_rounds=50) == 0.0
-    assert continuation_rate(25, equilibrium=0.7, ramp_rounds=50) == pytest.approx(0.35)
-    assert continuation_rate(50, equilibrium=0.7, ramp_rounds=50) == pytest.approx(0.7)
-    # Flat at equilibrium beyond the ramp.
-    assert continuation_rate(999, equilibrium=0.7, ramp_rounds=50) == pytest.approx(0.7)
-    # start floor honored
-    assert continuation_rate(0, equilibrium=0.7, ramp_rounds=50, start=0.1) == pytest.approx(0.1)
+    # 0% through the whole warmup window.
+    assert continuation_rate(0) == 0.0
+    assert continuation_rate(99) == 0.0
+    assert continuation_rate(100) == pytest.approx(0.0)   # ramp starts here
+    # +1% per 5 successful rounds after warmup.
+    assert continuation_rate(105) == pytest.approx(0.01)
+    assert continuation_rate(150) == pytest.approx(0.10)
+    # Reaches the 0.70 equilibrium ~350 rounds after warmup, then holds.
+    assert continuation_rate(100 + 350) == pytest.approx(0.70)
+    assert continuation_rate(100 + 999) == pytest.approx(0.70)
 
 
-def test_is_continuation_round_deterministic_and_tracks_rate():
+def test_is_continuation_round_warmup_and_tracking():
     from local.continuation import is_continuation_round
-    # Deterministic per round_id.
-    a = is_continuation_round(7, equilibrium=0.7, ramp_rounds=50)
-    b = is_continuation_round(7, equilibrium=0.7, ramp_rounds=50)
+    # Inside warmup: never a continuation regardless of round_id.
+    assert not any(is_continuation_round(r, 50) for r in range(200))
+    # Deterministic per (round_id, successful_rounds).
+    a = is_continuation_round(7, 100 + 350)
+    b = is_continuation_round(7, 100 + 350)
     assert a == b
-    # Realized frequency over many rounds at flat equilibrium tracks the rate.
-    hits = sum(is_continuation_round(r, equilibrium=0.7, ramp_rounds=0)
-               for r in range(2000))
+    # Realized frequency at the equilibrium tracks 0.70.
+    hits = sum(is_continuation_round(r, 100 + 350) for r in range(2000))
     assert 0.65 < hits / 2000 < 0.75
-    # Round 0 with start=0 is never a continuation (rate 0).
-    assert not is_continuation_round(0, equilibrium=0.7, ramp_rounds=50)
 
 
 # ── harness offset helper ────────────────────────────────────────────

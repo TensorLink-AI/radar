@@ -103,10 +103,11 @@ pandas, httpx) so the synthetic stack stays numpy-only.
 `--continuation auto|on|off` (auto = on for ts_forecasting) lets a miner
 warm-start a run from a prior checkpoint instead of training from scratch.
 **The validator owns the cadence**: each round it flips a seeded coin at a
-scheduled rate and stamps `challenge['round_type']` (`continuation`/`new`),
-ramping the continuation rate linearly from `--continuation_rate_start`
-(0.0) to `--continuation_equilibrium` (0.70) over
-`--continuation_ramp_rounds` (50). A scheduled continuation round
+scheduled rate and stamps `challenge['round_type']` (`continuation`/`new`).
+The rate is keyed on **successful rounds** — 0% until
+`--continuation_warmup_rounds` (100), then +`--continuation_step_pct` (1%)
+every `--continuation_step_every` (5) up to `--continuation_equilibrium`
+(0.70): 0→70% over ~350 rounds post-warmup. A scheduled continuation round
 downgrades to `new` when no eligible parents exist yet. The **miner only
 picks which parent** (`mode`/`parent_index`) on continuation rounds. The
 validator gates eligible parents, runs lineage-disjoint shard assignment
