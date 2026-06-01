@@ -1,20 +1,22 @@
 # claude_style_v3 — analyst-augmented, divergence-stimulated miner
 
-A fork of `miners/claude_style_v2_gepa` that adds three creativity-
-stimulating mechanisms on top of the GEPA wiring. The base wiring
-(multi-slot body-injected prompts, freeze-except-one varied slot,
-`min_samples` gate) carries over unchanged.
+A fork of `miners/claude_style_v2` (the non-GEPA variant) with three
+creativity-stimulating mechanisms added: a landscape-analyst pre-pass,
+a two-phase brainstorm-then-prune researcher, and per-round
+architectural primitive injection. The single-slot `_operator_prompt`
+that v2 passes to the designer is preserved unchanged — v3 is **not**
+a multi-slot GEPA fork. If you want per-slot prompt evolution, see
+`miners/claude_style_v2_gepa`.
 
-## What's new vs. `claude_style_v2_gepa`
+## What's new vs. `claude_style_v2`
 
-| Concern | `v2_gepa` | `v3` |
+| Concern | `v2` | `v3` |
 |---|---|---|
 | Pipeline | `researcher → designer ↔ critic` | `analyst → (phase A) → researcher → designer ↔ critic` |
-| GEPA slots | `{researcher, designer, critic}` | `{analyst, researcher, designer, critic}` |
-| `prompt_id` | `r:<rid>\|d:<did>\|c:<cid>` | `a:<aid>\|r:<rid>\|d:<did>\|c:<cid>` |
 | Landscape reflection | researcher calls `query_db` ad hoc | dedicated **analyst** subagent emits an *axes-of-variation* digest before researcher runs (technique #1) |
 | Researcher ideation | single tool-driven brief pass | **two-phase**: Phase A high-temperature brainstorm with hard quotas → Phase B prunes to brief (technique #3) |
 | Creativity steering | seed prompt nudges only | deterministic per-round **primitive injection** — analyst + researcher must address each one (technique #5) |
+| GEPA prompt evolution | designer-slot only (single `_operator_prompt`) | same (unchanged) — no analyst/researcher/critic slot evolution in v3 |
 
 ## The three mechanisms
 
@@ -27,7 +29,7 @@ tool surface (`query_db`, `list_frontier`, `analyze_task`,
 ```json
 {
   "axes_explored":            [...],
-  "axes_fixed_across_frontier": [...],  // highest-signal field
+  "axes_fixed_across_frontier": [...],
   "saturated_families":       [...],
   "absent_families":          [...],
   "failure_patterns":         [...],
@@ -81,60 +83,44 @@ Each round samples 2 primitives deterministically on `(round_id,
 task_name)`. The analyst classifies each one against the DB; the
 researcher must either use each primitive in an `ideas_to_try` entry
 or explicitly reject it with reason. Determinism means parallel
-miners on the same round see the same injection — GEPA can attribute
-outcomes to specific injections cleanly.
-
-## GEPA workflow (extended for the analyst slot)
-
-Same as `v2_gepa`, plus the analyst as a fourth slot:
-
-```bash
-# Vary the analyst slot, freeze the other three to their elites.
-RADAR_GEPA_VARIED_SLOT=analyst python local/run.py \
-    --agent_dir miners/claude_style_v3 \
-    --task synth_regression --rounds 100
-
-python -m local.optimize --optimizer gepa --slot analyst \
-    --min_samples 3 --task synth_regression --watch
-```
-
-`RADAR_GEPA_VARIED_SLOT=rotate` cycles `analyst → researcher →
-designer → critic` across rounds. The default remains `designer`
-(highest-leverage slot).
-
-## Seed prompts
-
-`prompts/active.json` ships **eight** seeds — two per slot now that
-the analyst is in the rotation:
-
-- `seed-analyst-saturation` — focus on saturated vs. absent families.
-- `seed-analyst-trend` — focus on frontier turnover + failure clusters.
-- `seed-researcher-frontier-gaps` / `seed-researcher-non-attention`
-  (unchanged from v2_gepa).
-- `seed-designer-two-sketches` / `seed-designer-late-window`
-  (unchanged).
-- `seed-critic-structural-change` / `seed-critic-flops-direction`
-  (unchanged).
+miners on the same round see the same injection, and the same
+round-seed reproduces identical primitives across reruns.
 
 ## Tunables
 
-| Env var | Default | Effect |
+| Constant (in `agent.py`) | Default | Effect |
 |---|---|---|
-| `RADAR_GEPA_VARIED_SLOT` | `designer` | Which slot varies per round; v3 accepts `analyst` in addition to the v2_gepa values. |
-| `ANALYST_BUDGET_FRACTION` | 0.10 (constant) | Fraction of round budget for the analyst. |
-| `PRIMITIVES_PER_ROUND` | 2 (constant) | How many primitives are injected per round. |
-| `PHASE_A_TEMPERATURE` | 0.95 (constant) | Temperature for the Phase A brainstorm. |
+| `ANALYST_BUDGET_FRACTION` | 0.10 | Fraction of round budget for the analyst. |
+| `ANALYST_BUDGET_CAP` | 120 | Absolute cap on analyst wall-clock seconds. |
+| `RESEARCHER_BUDGET_FRACTION` | 0.12 | Fraction for researcher (Phase A + Phase B). Lower than v2's 0.15 to fund the analyst. |
+| `DESIGNER_BUDGET_FRACTION` | 0.78 | Fraction for the designer (down from v2's 0.80). |
+| `PRIMITIVES_PER_ROUND` | 2 | How many primitives are injected per round. |
+| `PHASE_A_TEMPERATURE` (in `subagents/researcher.py`) | 0.95 | Brainstorm temperature. |
 
-## What to watch to know if v3 beats v2_gepa
+## What to watch to know if v3 beats v2
 
-- Frontier-turnover rate on the same task — higher means the analyst
-  is successfully redirecting toward absent families.
-- Researcher `query_db` call count per round — should drop sharply
+- **Frontier turnover rate** on the same task — higher means the
+  analyst is successfully redirecting toward absent families.
+- **Researcher `query_db` calls per round** — should drop sharply
   (the digest replaces ad-hoc DB browsing).
-- Whether `recommend_explore` families actually appear in submitted
-  designer code (causal check that the digest steers).
-- Injected-primitive usage rate in `ideas_to_try` vs.
-  `primitive_rejections` — calibrates whether the injection pool is
-  set right or needs broader / narrower primitives.
-- GEPA on the analyst slot — does an evolved analyst principle beat
-  the seeds within ~20 rounds?
+- **`recommend_explore` → shipped design** — causal check that the
+  digest actually steers the designer, not just the researcher.
+- **Injected-primitive usage rate** in `ideas_to_try` vs.
+  `primitive_rejections` — calibrates the injection pool. If
+  primitives are rejected >80% of the time the pool is too out-of-
+  distribution; if accepted ~100% the pool isn't pushing hard enough.
+
+## Compatibility notes
+
+- Inherits v2's `_operator_prompt` flow unchanged: the designer
+  reads it from the challenge dict; the orchestrator stashes the
+  active variant ID as `prompt_id` on the submission. Run
+  `local/optimize.py --optimizer gepa` against this agent and you'll
+  evolve the designer slot the same way v2 does.
+- No `prompts/active.json` is shipped. Drop one in if you want
+  designer-slot variants; otherwise the designer falls back to its
+  hardcoded principles.
+- The three new pieces (analyst, Phase A, primitives) have no
+  operator-prompt hooks. They're hardcoded — if you want to evolve
+  them, fork to `claude_style_v2_gepa` and add `metadata.slot:
+  "analyst"` rows to its `active.json`.

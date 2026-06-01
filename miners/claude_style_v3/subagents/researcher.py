@@ -254,16 +254,11 @@ def _build_subagent(
     )
     if extra_user_msg:
         user_prompt = user_prompt + "\n\n" + extra_user_msg
-
-    op_directive = challenge.get("_operator_prompt_researcher") or ""
-    researcher_sys = build_researcher_system_prompt(
-        challenge, bucket, operator_directive=op_directive,
-        primitives=primitives,
-    )
-
     return Subagent(
         name="researcher",
-        system_prompt=researcher_sys,
+        system_prompt=build_researcher_system_prompt(
+            challenge, bucket, primitives=primitives,
+        ),
         user_prompt=user_prompt,
         tools=tools,
         handlers=handlers,

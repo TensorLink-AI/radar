@@ -1,30 +1,32 @@
 """Orchestrator for the claude_style_v3 multi-subagent miner.
 
-v3 extends ``claude_style_v2_gepa`` with three creativity-stimulating
-mechanisms:
+v3 extends ``claude_style_v2`` with three creativity-stimulating
+mechanisms (no GEPA multi-slot wiring — single ``_operator_prompt``
+inherited from v2 still flows to the designer only):
 
 1. **Analyst subagent** runs first (before researcher) and emits a
    structured *axes-of-variation* digest over the global experiment
-   DB (technique #1). The digest tells the researcher which
-   architectural axes the frontier doesn't vary on.
+   DB (technique #1).
 
 2. **Two-phase researcher** (technique #3). Phase A is a high-
-   temperature, text-only brainstorm with hard quotas (3 risky
-   ideas, 2 cross-domain, every injected primitive used). Phase B
-   prunes the brainstorm into the JSON brief the designer reads.
+   temperature text-only brainstorm with hard quotas (3 risky,
+   2 cross-domain, every injected primitive used). Phase B prunes
+   the brainstorm into the JSON brief the designer reads.
 
 3. **Primitive injection** (technique #5). Per round the
    orchestrator samples 2 architectural primitives from
    ``core.primitives.PRIMITIVE_POOL`` (deterministic on round_id +
-   task_name) and threads them through the analyst, Phase A, and
-   Phase B as required ingredients.
+   task_name) and threads them through analyst, Phase A, and Phase B
+   as required ingredients.
 
 Pipeline: ``analyst → (phase A) → researcher → designer ↔ critic``.
 
 Entry point: ``design_architecture(challenge, gated_client) -> dict``
 
-Composite ``prompt_id`` is ``a:<aid>|r:<rid>|d:<did>|c:<cid>``.
-``RADAR_GEPA_VARIED_SLOT`` accepts ``analyst`` as a new option.
+Budget split: analyst 10% (cap 120s), researcher 12% (cap 300s),
+designer 78%. Last 30s reserved for packaging / fallback. Designer
+falls through to ``core.fallback_templates.generate_fallback`` on
+failure so the round still produces a valid submission.
 """
 from __future__ import annotations
 
@@ -80,7 +82,7 @@ FALLBACK_RESERVE_SECONDS = 30
 # cheap (read-only, ≤6 tool calls) so 10% / 120s cap is plenty.
 ANALYST_BUDGET_FRACTION = 0.10
 ANALYST_BUDGET_CAP = 120
-# Was 0.15 in v2_gepa — drop slightly to fund the analyst. Phase A
+# Was 0.15 — dropped slightly to fund the analyst. Phase A
 # brainstorm draws from this slice too.
 RESEARCHER_BUDGET_FRACTION = 0.12
 RESEARCHER_BUDGET_CAP = 300
@@ -127,125 +129,33 @@ def _package(
     return out
 
 
-SLOTS = ("analyst", "researcher", "designer", "critic")
+def _load_active_prompt(round_id: int) -> dict:
+    """Return ``{id, template}`` for the prompt variant this round.
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_DEFAULT_PROMPTS_DIR = os.path.join(_HERE, "prompts")
-
-
-def _pick_elite(bucket: list) -> dict:
-    """Pick the 'elite' variant for a slot.
-
-    Elite = highest ``generation`` (i.e. most-recently-evolved row),
-    breaking ties by ``id`` lexicographically for determinism. The
-    optimizer is responsible for putting GEPA's keep-best children
-    at the top generation; until generation 1, the elite is just the
-    deterministic first seed row.
+    Reads ``prompts/active.json`` (override via ``MINER_PROMPTS_DIR``)
+    and round-robins the population by ``round_id``. Empty when the
+    miner hasn't run ``miner/neuron.py optimize`` — designer then
+    falls back to its hardcoded system prompt. ``id`` round-trips back
+    via ``experiments.prompt_id`` so Phase C scores attribute to the
+    variant that produced them, closing the GEPA loop.
     """
-    return max(bucket, key=lambda r: (int(r.get("generation", 0) or 0),
-                                       str(r.get("id", ""))))
-
-
-def _resolve_varied_slot() -> str:
-    """Resolve the ``RADAR_GEPA_VARIED_SLOT`` policy.
-
-    Returns one of:
-      - ``"researcher"`` / ``"designer"`` / ``"critic"`` — vary only
-        that slot per round, freeze the others to their elite.
-      - ``"all"`` — vary every slot independently (the old behaviour;
-        useful once each slot has been individually optimized).
-      - ``"rotate"`` — round-robin across slots by ``round_id``;
-        actual slot chosen by the caller.
-
-    Default is ``"designer"`` because designer is the highest-leverage
-    slot and single-slot evolution gives clean credit assignment.
-    """
-    raw = (os.getenv("RADAR_GEPA_VARIED_SLOT") or "designer").strip().lower()
-    if raw in SLOTS or raw in ("all", "rotate"):
-        return raw
-    return "designer"
-
-
-def _load_active_prompts(round_id: int) -> dict:
-    """Return ``{slot: {id, template}}`` for each subagent slot.
-
-    Reads ``prompts/active.json`` (override via ``MINER_PROMPTS_DIR``,
-    defaults to ``<agent_dir>/prompts``) and groups rows by
-    ``metadata.slot``. The slot to vary this round is resolved from
-    ``RADAR_GEPA_VARIED_SLOT`` (default: ``designer``):
-
-      - The varied slot round-robins by ``round_id`` across its
-        bucket so all variants get sampled.
-      - Non-varied slots are pinned to their elite (highest
-        generation) so every round shares the same baseline for
-        those slots — clean credit assignment for the varied slot.
-
-    Set ``RADAR_GEPA_VARIED_SLOT=all`` to restore the old behaviour
-    of varying every slot every round (high variance but full
-    co-evolution). Set it to ``rotate`` to cycle which slot is
-    varied across rounds.
-
-    Empty / unreadable file → all slots return blank, and the
-    subagents run on their hardcoded prompts.
-    """
-    blank = {slot: {"id": "", "template": ""} for slot in SLOTS}
-    prompts_dir = os.getenv("MINER_PROMPTS_DIR", _DEFAULT_PROMPTS_DIR)
+    prompts_dir = os.getenv("MINER_PROMPTS_DIR", "prompts")
     path = os.path.join(prompts_dir, "active.json")
     try:
         with open(path) as f:
             payload = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return blank
+        return {"id": "", "template": ""}
     rows = payload.get("prompts") if isinstance(payload, dict) else payload
     if not isinstance(rows, list) or not rows:
-        return blank
-
-    by_slot: dict[str, list[dict]] = {slot: [] for slot in SLOTS}
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        slot = (row.get("metadata") or {}).get("slot")
-        if slot in by_slot:
-            by_slot[slot].append(row)
-
-    policy = _resolve_varied_slot()
-    if policy == "rotate":
-        varied = SLOTS[round_id % len(SLOTS)]
-    elif policy == "all":
-        varied = "all"
-    else:
-        varied = policy  # one specific slot
-
-    picks = dict(blank)
-    for slot in SLOTS:
-        bucket = by_slot[slot]
-        if not bucket:
-            continue
-        if varied == "all" or slot == varied:
-            pick = bucket[round_id % len(bucket)]
-        else:
-            pick = _pick_elite(bucket)
-        picks[slot] = {
-            "id": str(pick.get("id", "")),
-            "template": str(pick.get("template", "")),
-        }
-    return picks
-
-
-def _composite_prompt_id(picks: dict) -> str:
-    """Compose ``a:<aid>|r:<rid>|d:<did>|c:<cid>``. Empty pieces are
-    dropped so a missing slot doesn't pollute the audit string."""
-    parts = []
-    for prefix, slot in (
-        ("a", "analyst"),
-        ("r", "researcher"),
-        ("d", "designer"),
-        ("c", "critic"),
-    ):
-        pid = (picks.get(slot) or {}).get("id") or ""
-        if pid:
-            parts.append(f"{prefix}:{pid}")
-    return "|".join(parts)
+        return {"id": "", "template": ""}
+    pick = rows[round_id % len(rows)]
+    if not isinstance(pick, dict):
+        return {"id": "", "template": ""}
+    return {
+        "id": str(pick.get("id", "")),
+        "template": str(pick.get("template", "")),
+    }
 
 
 def _llm_kwargs(challenge: dict) -> dict:
@@ -280,37 +190,20 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     flops_min, flops_max = extract_flops_budget(challenge)
     bucket = identify_bucket(flops_min, flops_max)
 
-    # ── Active prompt variants (GEPA co-evolution, one per slot) ─
-    # Each subagent reads its own ``_operator_prompt_<slot>`` and
-    # appends it to its hand-written system prompt. The composite
-    # ``prompt_id`` round-trips all three variant IDs so the
-    # optimizer can attribute Phase C scores to per-slot variants.
+    # ── Active prompt variant (GEPA / random_mutate coevolution) ─
+    # Stashed under "_operator_prompt" so the designer subagent can
+    # append it to its system prompt without changing its builder
+    # signature. ``id`` round-trips back via the returned dict so
+    # Phase C scores attribute to this variant.
     round_id = int(challenge.get("round_id", 0) or 0)
-    active_prompts = _load_active_prompts(round_id)
-    prompt_id_composite = _composite_prompt_id(active_prompts)
-    varied_policy = _resolve_varied_slot()
-    varied_now = (
-        SLOTS[round_id % len(SLOTS)] if varied_policy == "rotate"
-        else varied_policy
-    )
-    _log(
-        f"[orchestrator] varied_slot={varied_now} "
-        f"(policy={varied_policy}, round_id={round_id})"
-    )
-    for slot in SLOTS:
-        slot_data = active_prompts[slot]
-        if not slot_data["id"]:
-            continue
-        challenge[f"_operator_prompt_{slot}"] = slot_data["template"]
-        challenge[f"_operator_prompt_{slot}_id"] = slot_data["id"]
-        role = (
-            "varied" if (varied_now == "all" or slot == varied_now)
-            else "elite"
-        )
+    active_prompt = _load_active_prompt(round_id)
+    if active_prompt["id"]:
         _log(
-            f"[orchestrator] {slot} variant {slot_data['id'][:8]}… "
-            f"({role})"
+            f"[orchestrator] prompt variant {active_prompt['id'][:8]}… "
+            f"(round_id={round_id})"
         )
+        challenge["_operator_prompt"] = active_prompt["template"]
+        challenge["_operator_prompt_id"] = active_prompt["id"]
 
     # ── Scratchpad load ─────────────────────────────────────────
     scratch_dir: Optional[str] = None
@@ -360,7 +253,8 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
 
     # ── Primitive injection (technique #5) ──────────────────────
     # Deterministic on (round_id, task_name) so parallel miners on the
-    # same round see the same injection — clean attribution for GEPA.
+    # same round see the same injection — clean attribution if you
+    # ever want to A/B specific primitives across miners.
     task_name = (challenge.get("task") or {}).get("name") or ""
     primitives = sample_primitives(
         round_id=round_id, task_name=task_name, n=PRIMITIVES_PER_ROUND,
@@ -394,9 +288,8 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
         digest_block = format_digest_for_researcher(digest)
 
         # ── Phase 2: researcher (two-phase, technique #3) ───────
-        # End-of-researcher cap, cumulative from t_start. If the
-        # analyst finished early the researcher reclaims that slack
-        # naturally — the deadline is wall-clock, not budget-relative.
+        # Cumulative-from-t_start cap; if the analyst finished
+        # early the researcher reclaims the slack naturally.
         researcher_deadline = min(
             deadline,
             t_start + min(
@@ -483,7 +376,7 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     if submit_sig is not None:
         return _package(
             submit_sig.code, submit_sig.name, submit_sig.motivation,
-            prompt_id=prompt_id_composite,
+            prompt_id=active_prompt["id"],
         )
 
     # Recovery: deadline hit and no SubmitSignal raised, but the LLM
@@ -500,7 +393,7 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
                 best["code"],
                 best.get("name") or f"best_so_far_{bucket}",
                 best.get("motivation") or "Auto-shipped best-so-far candidate.",
-                prompt_id=prompt_id_composite,
+                prompt_id=active_prompt["id"],
             )
 
     if last_validated_code:
@@ -509,7 +402,7 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
             f"auto_submit_{bucket}",
             "Auto-submitted validated code — designer did not call "
             "submit explicitly.",
-            prompt_id=prompt_id_composite,
+            prompt_id=active_prompt["id"],
         )
 
     # Designer failed → fallback template path.
@@ -521,5 +414,5 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
         else "FALLBACK: designer failed to produce validated code"
     )
     return _package(
-        fb_code, fb_name, motivation, prompt_id=prompt_id_composite,
+        fb_code, fb_name, motivation, prompt_id=active_prompt["id"],
     )

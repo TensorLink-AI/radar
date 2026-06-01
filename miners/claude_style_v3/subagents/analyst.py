@@ -179,11 +179,8 @@ def run_analyst(
 ) -> dict:
     """Run the analyst subagent and return a digest."""
     tools = build_tools(challenge, role="analyst")
-
-    op_directive = challenge.get("_operator_prompt_analyst") or ""
     system_prompt = build_analyst_system_prompt(
         challenge, bucket, primitives,
-        operator_directive=op_directive,
     )
     user_prompt = build_analyst_user_prompt(challenge, primitives)
 
@@ -235,6 +232,6 @@ def _assistant_contents(messages: list[dict]):
 
 
 def format_digest_for_researcher(digest: dict) -> str:
-    """Render the digest as the body of a fenced JSON block plus a
-    short human-readable summary the researcher can scan quickly."""
+    """Render the digest as a fenced JSON block for the researcher's
+    user prompt."""
     return "```json\n" + json.dumps(digest, indent=2) + "\n```"

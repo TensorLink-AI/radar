@@ -1,28 +1,24 @@
 """Claude-Code-style multi-subagent miner agent — v3.
 
-Fork of ``miners/claude_style_v2_gepa``. Adds an **analyst** subagent
-that runs before the researcher, a **two-phase researcher** (high-
+Fork of ``miners/claude_style_v2``. Adds an **analyst** subagent that
+runs before the researcher, a **two-phase researcher** (high-
 temperature brainstorm → tool-driven brief), and **primitive
 injection** — a per-round sample from ``core.primitives.PRIMITIVE_POOL``
 threaded through analyst and researcher as required ingredients.
 
 Pipeline: ``analyst → (phase A brainstorm) → researcher → designer ↔ critic``.
 
-Prompt-population surface has four slots in v3:
-``metadata.slot`` ∈ {``analyst``, ``researcher``, ``designer``,
-``critic``}. Each subagent's GEPA-evolved directive replaces the
-``## Principles`` body section of its hardcoded system prompt.
-Submission ``prompt_id`` is the composite
-``a:<aid>|r:<rid>|d:<did>|c:<cid>``. See ``README.md`` for full
-wiring.
+Inherits v2's single-slot ``_operator_prompt`` mechanism (designer
+only). No GEPA multi-slot wiring — keep it simple. See ``README.md``
+for the full wiring.
 
 A Claude-Code-inspired harness on top of the OpenAI-compatible LLM
 transport: an orchestrator coordinates four specialist subagents
 (analyst, researcher, designer, critic) with their own message lists
 and tool subsets. The Claude Agent SDK / `claude` CLI / `anthropic`
-package are NOT used — the sandbox doesn't have them. We borrow
-only the patterns (subagent split, structured plan, pre-tool-call
-hooks, context isolation).
+package are NOT used — the sandbox doesn't have them. We borrow only
+the patterns (subagent split, structured plan, pre-tool-call hooks,
+context isolation).
 
 This package is structured so it can be deployed two ways:
 

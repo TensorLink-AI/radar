@@ -37,27 +37,15 @@ def run_critic(
     validation_result: str,
     deadline: float,
     llm_kwargs: dict,
-    operator_directive: str = "",
-    operator_directive_id: str = "",
 ) -> str:
     """Return a short critique string. Empty string on failure or
-    when there's no code to critique.
-
-    ``operator_directive`` is the GEPA-evolved critic-slot prompt;
-    when set, it's appended to the hardcoded critic system prompt so
-    the active variant steers the KEEP/CHANGE/DROP critique.
-    """
+    when there's no code to critique."""
     if not code or not code.strip():
         return ""
     if not validation_result:
         return ""
 
-    # Operator directive replaces the rules block inside the critic
-    # system prompt — keeps the three-line response contract intact
-    # while letting GEPA mutate the strategy guidance.
-    system_prompt = build_critic_system_prompt(
-        operator_directive=operator_directive,
-    )
+    system_prompt = build_critic_system_prompt()
     user_prompt = build_critic_prompt(code, validation_result)
     messages = [
         {"role": "system", "content": system_prompt},

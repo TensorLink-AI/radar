@@ -70,18 +70,10 @@ def _resolve_code_from_args(
     return record.get("code") or ""
 
 
-def _make_critic_callback(
-    *, handlers: dict, deadline: float, llm_kwargs: dict,
-    critic_directive: str = "", critic_directive_id: str = "",
-):
+def _make_critic_callback(*, handlers: dict, deadline: float, llm_kwargs: dict):
     """Build the on_tool_result callback that fires the critic after
     each ``validate_code``. The callback returns the critique string
-    so the Subagent loop appends it as a user message.
-
-    ``critic_directive`` is the GEPA-evolved operator prompt for the
-    critic slot. Threaded into each ``run_critic`` call so the active
-    variant is appended to the critic's system prompt this round.
-    """
+    so the Subagent loop appends it as a user message."""
 
     def _on_tool_result(
         name: str, args: dict, result: str, state: dict,
@@ -96,8 +88,6 @@ def _make_critic_callback(
             validation_result=result,
             deadline=deadline,
             llm_kwargs=llm_kwargs,
-            operator_directive=critic_directive,
-            operator_directive_id=critic_directive_id,
         )
         if not critique:
             return None
@@ -127,17 +117,22 @@ def run_designer(
         handlers=handlers,
         deadline=deadline,
         llm_kwargs=llm_kwargs,
-        critic_directive=challenge.get("_operator_prompt_critic") or "",
-        critic_directive_id=challenge.get("_operator_prompt_critic_id") or "",
     )
 
-    # Per-slot operator directive (GEPA-evolved) replaces the
-    # ``## A few principles`` body section in-place — higher leverage
-    # than tail-appending. Empty → hardcoded principles used.
-    op_directive = challenge.get("_operator_prompt_designer") or ""
-    designer_sys = build_designer_system_prompt(
-        challenge, bucket, operator_directive=op_directive,
-    )
+    designer_sys = build_designer_system_prompt(challenge, bucket)
+    # Operator prompt directive (GEPA / random_mutate variant for this
+    # round) is stashed by the orchestrator. Appending it lets the
+    # subnet's prompt optimizer steer the designer's instructions
+    # without us forking ``build_designer_system_prompt`` for every
+    # variant.
+    op_directive = challenge.get("_operator_prompt") or ""
+    op_id = challenge.get("_operator_prompt_id") or ""
+    if op_directive:
+        designer_sys = (
+            f"{designer_sys}\n\n"
+            f"## Operator Directive (prompt variant {op_id[:8]})\n"
+            f"{op_directive}"
+        )
 
     sub = Subagent(
         name="designer",

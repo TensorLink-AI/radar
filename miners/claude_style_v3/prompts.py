@@ -1,22 +1,13 @@
 """Per-subagent system / user prompt builders.
 
-Forked from claude_style_v2_gepa. The FLOPs / sizing / code-requirements
-sections are copied verbatim because they're well-tuned. v3 adds:
-
-  * **Analyst** prompts — landscape-reflection digest with axes-of-
-    variation focus (technique #1).
-  * **Two-phase researcher** prompts — Phase A is a high-temperature
-    text-only brainstorm with quotas (bad ideas + cross-domain),
-    Phase B is the existing tool-driven brief assembly seeded by
-    Phase A's output (technique #3).
-  * **Primitive injection** plumbing — both analyst and researcher
-    receive a per-round list of architectural primitives drawn from
-    ``core.primitives.PRIMITIVE_POOL`` and treat them as required
-    ingredients (technique #5).
+Ported from ``agents/openai_sdk/prompts.py`` and restructured for the
+subagent split. The FLOPs / sizing / code-requirements sections are
+copied verbatim because they're well-tuned; the researcher and critic
+prompts are bespoke (the openai_sdk single-loop prompt is too broad
+to reuse for a researcher whose only output is a JSON brief).
 
 Size targets (loosely enforced by tests, not asserted here):
-  * analyst:    ~3-4k chars  (DB tools + digest contract)
-  * researcher: ~4-5k chars  (phase A and phase B share a system msg)
+  * researcher: ~3-4k chars  (small tool surface, plan-only output)
   * designer:   ~6-8k chars  (full code-shape + hooks + critic context)
   * critic:     ~500 chars   (three-line template)
 """
@@ -33,21 +24,26 @@ from core.prompt_builder import _compute_sizing_guidance, _format_task_params
 
 BRIEF_SCHEMA_EXAMPLE = {
     "relevant_prior_work": [
-        "PatchTST (Nie 2022) — patch-level transformer with shared "
-        "channel head",
+        "<paper or method> (<author year>) — <one-line core idea, "
+        "described by mechanism, not by brand name>",
     ],
     "frontier_gaps": [
-        "current frontier members all use full attention; depthwise "
-        "convs are absent",
+        "<inductive bias / op family / objective / regularizer / "
+        "tokenization choice that no frontier member currently uses>",
     ],
     "ideas_to_try": [
-        "depthwise-separable conv1d backbone with linear head",
-        "patch the input then apply a small MLP-mixer",
+        "<concrete architectural idea described by its operations, "
+        "shapes, and information flow — no need to attach a paper "
+        "name; if a novel combination fits the task, prefer that "
+        "over a famous one>",
+        "<a structurally different second idea that explores a "
+        "different point on the design space (different op family, "
+        "different bridging strategy, different objective, etc.)>",
     ],
     "plan": [
-        "sketch_architecture for a depthwise-sep conv baseline",
-        "size the hidden dim with size_to_flops to land mid-bucket",
-        "validate_code, then submit with a hypothesis note",
+        "<3-5 short steps the designer should run, written as "
+        "tool-call intents rather than recipes — the designer owns "
+        "the implementation choices>",
     ],
 }
 
@@ -90,27 +86,9 @@ DIGEST_SCHEMA_EXAMPLE = {
 }
 
 
-_DEFAULT_ANALYST_PRINCIPLES = (
-    "- **Compute axes, not lists.** The researcher needs to know "
-    "which architectural dimensions the frontier varies on (and "
-    "which it doesn't). Listing 50 model names is noise; naming the "
-    "3 axes nobody varies is signal.\n"
-    "- **Saturated ≠ bad.** A saturated family means the next "
-    "candidate from that family probably ties an existing member — "
-    "and a tie loses the Pareto bonus. Mark saturated families so "
-    "the researcher routes around them.\n"
-    "- **Classify every injected primitive.** Check the DB before "
-    "guessing — `/experiments/search` with the primitive's name is "
-    "the fast path.\n"
-    "- **No code, no architecture sketches, no submissions.** Your "
-    "only output is the digest JSON."
-)
-
-
 def build_analyst_system_prompt(
     challenge: dict, bucket: str | None = None,
     primitives: list[str] | None = None,
-    operator_directive: str = "",
 ) -> str:
     """Analyst system prompt.
 
@@ -118,10 +96,6 @@ def build_analyst_system_prompt(
     plus the current frontier and emits a structured digest the
     researcher embeds verbatim. It does NOT propose code, does NOT
     submit, does NOT call validate_code.
-
-    ``operator_directive`` (GEPA-evolved) REPLACES the ``## Principles``
-    section in-body for the analyst slot, same pattern as the other
-    subagents.
     """
     task = challenge.get("task", {}) or {}
     task_name = task.get("name", "unknown")
@@ -201,11 +175,22 @@ def build_analyst_system_prompt(
             + format_primitives_for_prompt(primitives)
         )
 
-    principles = (
-        operator_directive.strip() if operator_directive
-        else _DEFAULT_ANALYST_PRINCIPLES
+    parts.append(
+        "## Principles\n\n"
+        "- **Compute axes, not lists.** The researcher needs to know "
+        "which architectural dimensions the frontier varies on (and "
+        "which it doesn't). Listing 50 model names is noise; naming "
+        "the 3 axes nobody varies is signal.\n"
+        "- **Saturated ≠ bad.** A saturated family means the next "
+        "candidate from that family probably ties an existing member "
+        "— and a tie loses the Pareto bonus. Mark saturated families "
+        "so the researcher routes around them.\n"
+        "- **Classify every injected primitive.** Check the DB before "
+        "guessing — `/experiments/search` with the primitive's name "
+        "is the fast path.\n"
+        "- **No code, no architecture sketches, no submissions.** "
+        "Your only output is the digest JSON."
     )
-    parts.append("## Principles\n\n" + principles)
 
     parts.append(
         "## Final turn\n\n"
@@ -241,212 +226,6 @@ def build_analyst_user_prompt(
             + format_primitives_for_prompt(primitives)
         )
     return body
-
-
-# ── Researcher prompts ────────────────────────────────────────────────
-
-_DEFAULT_RESEARCHER_PRINCIPLES = (
-    "- **The analyst already mapped the landscape.** Treat its "
-    "`axes_fixed_across_frontier` as a generative signal: an idea "
-    "is interesting if it moves on an axis nobody varies.\n"
-    "- **Beat the frontier, don't match it.** A tie loses the "
-    "Pareto dominance bonus. Your `frontier_gaps` should make "
-    "this concrete.\n"
-    "- **Concrete > abstract.** \"Try a transformer\" is "
-    "useless. \"Try PatchTST with patch_len=16, FLOPs target "
-    "{target:,}\" is actionable.\n"
-    "- **Use injected primitives or justify skipping them.** Each "
-    "primitive must appear in at least one brainstorm idea OR be "
-    "explicitly rejected with a reason in your final brief.\n"
-    "- **Don't write code.** That's the designer's job. If you "
-    "find yourself sketching architectures, stop and rephrase as "
-    "a plan step.\n"
-    "- **Stop early.** With the analyst's digest in hand you "
-    "rarely need more than 2 tool calls. Spend them only when the "
-    "digest leaves a real gap."
-)
-
-
-def build_researcher_system_prompt(
-    challenge: dict, bucket: str | None = None,
-    operator_directive: str = "",
-    primitives: list[str] | None = None,
-) -> str:
-    """Researcher system prompt.
-
-    Goal: a JSON brief the designer can act on. The researcher does
-    NOT write code, sketch architectures, or call validate_code /
-    submit (those tools aren't even in its surface). Its only job is
-    to surface what's been tried, what's missing, and a 3-5 step
-    plan.
-
-    In v3 the researcher receives:
-      * a landscape digest from the analyst (in its user message),
-      * a Phase A brainstorm output (also in its user message),
-      * a list of injected primitives it must address.
-
-    ``operator_directive`` (GEPA-evolved) REPLACES the principles
-    section in-body. Empty → fall back to the hardcoded principles.
-    Body-injection gives the directive more leverage than appending
-    at the tail of an 8k system prompt.
-    """
-    task = challenge.get("task", {}) or {}
-    task_name = task.get("name", "unknown")
-    flops_min, flops_max = extract_flops_budget(challenge)
-    bucket = bucket or identify_bucket(flops_min, flops_max)
-    target = int(flops_max * 0.6) if flops_max else 0
-
-    parts: list[str] = []
-
-    parts.append(
-        "You are the **researcher subagent** in a multi-agent miner "
-        "competing on the Radar subnet. The orchestrator runs you "
-        "first, then hands your output to a designer subagent that "
-        "writes the actual code.\n\n"
-        f"Task: `{task_name}`. Bucket: `{bucket}`. "
-        f"FLOPs range: [{flops_min:,}, {flops_max:,}] (target ~{target:,})."
-    )
-
-    parts.append(
-        "## Your output (the brief)\n\n"
-        "Produce a single JSON object with these keys. The designer "
-        "reads this verbatim — be specific, not generic.\n\n"
-        "- `relevant_prior_work`: list of strings — papers / methods "
-        "you found that bear on this task. Brief citations + the "
-        "key idea, not abstracts.\n"
-        "- `frontier_gaps`: list of strings — what the current "
-        "frontier is *missing* (architectures absent, ideas un-tried, "
-        "objectives no member optimizes for).\n"
-        "- `ideas_to_try`: list of strings — concrete architectural "
-        "ideas the designer could implement. Each one should fit the "
-        "FLOPs bucket.\n"
-        "- `plan`: list of 3-5 short strings — the exact sequence of "
-        "tool calls / decisions you'd run if you were the designer.\n\n"
-        "Example shape:\n```json\n"
-        + json.dumps(BRIEF_SCHEMA_EXAMPLE, indent=2)
-        + "\n```"
-    )
-
-    parts.append(
-        "## Inputs in your user message\n\n"
-        "- **Analyst digest** — JSON with axes-of-variation, saturated "
-        "/ absent families, failure patterns, and per-primitive "
-        "evaluations. Treat `axes_fixed_across_frontier` and "
-        "`recommend_explore` as your default starting points.\n"
-        "- **Phase A brainstorm** — 10 candidate ideas you generated "
-        "in a prior high-temperature pass (with quotas: 3 bad, 2 "
-        "cross-domain). Pick the 2 strongest, drop the rest. The "
-        "bad/cross-domain quotas exist to widen the distribution; "
-        "you are not required to ship them.\n"
-        "- **Injected primitives** — primitives the orchestrator "
-        "sampled for this round. Each one must either appear in your "
-        "`ideas_to_try` or be explicitly rejected with reason in a "
-        "`primitive_rejections` field."
-    )
-
-    parts.append(
-        "## Tools available to you\n\n"
-        "The analyst already swept the DB. You usually do NOT need to "
-        "re-query — call these only when the digest leaves a gap.\n\n"
-        "- `analyze_task` — task spec, params, constraints, "
-        "objectives, FLOPs budget as JSON.\n"
-        "- `list_frontier` — current best models on this bucket.\n"
-        "- `cognition_wiki_index` / `cognition_wiki_read` — curated "
-        "task-specific design recipes. Cheaper than search_papers.\n"
-        "- `query_db` — experiment DB. Useful paths: "
-        "`/frontier?task=`, `/experiments/recent?n=`, "
-        "`/experiments/pareto?task=`, `/experiments/failures?n=`, "
-        "`/experiments/families?task=`, `/experiments/stats?task=`, "
-        "POST `/experiments/search` body `{\"query\": \"...\"}`.\n"
-        "- `search_papers` — arxiv search. Use sparingly.\n"
-        "- `time_remaining` — seconds left in your slice of the round."
-    )
-
-    if primitives:
-        parts.append(
-            "## Injected primitives this round\n\n"
-            "Each MUST be addressed in your brief (used or rejected "
-            "with reason):\n\n"
-            + format_primitives_for_prompt(primitives)
-        )
-
-    principles = (
-        operator_directive.strip() if operator_directive
-        else _DEFAULT_RESEARCHER_PRINCIPLES.format(target=target)
-    )
-    parts.append("## Principles\n\n" + principles)
-
-    parts.append(
-        "## Final turn\n\n"
-        "When you're ready, return ONLY a single fenced ```json block "
-        "with the brief. No prose around it, no other commentary in "
-        "that final message. The orchestrator parses your last "
-        "assistant message — anything else costs context for nothing."
-    )
-
-    return "\n\n".join(parts)
-
-
-def build_researcher_user_prompt(
-    challenge: dict,
-    digest_block: str = "",
-    phase_a_output: str = "",
-    primitives: list[str] | None = None,
-) -> str:
-    """Kickoff message for the Phase B researcher.
-
-    ``digest_block`` is the analyst digest rendered as a fenced JSON
-    block (analyst.format_digest_for_researcher). ``phase_a_output``
-    is the brainstorm text from Phase A. Both are embedded verbatim;
-    the researcher reads them, prunes, and emits the final brief.
-    """
-    task = challenge.get("task", {}) or {}
-    frontier = (
-        challenge.get("feasible_frontier")
-        or challenge.get("pareto_frontier")
-        or []
-    )
-    primitives = primitives or []
-
-    parts: list[str] = []
-    parts.append(
-        f"You are designing for task `{task.get('name', 'unknown')}`. "
-        f"Frontier currently has {len(frontier)} model(s)."
-    )
-
-    if digest_block:
-        parts.append("## Analyst digest\n\n" + digest_block)
-    else:
-        parts.append(
-            "## Analyst digest\n\n(analyst skipped — fall back to "
-            "calling the tools yourself)"
-        )
-
-    if phase_a_output:
-        parts.append(
-            "## Phase A brainstorm (high-temperature, with quotas)\n\n"
-            "These 10 ideas came out of a brainstorm pass. The bad / "
-            "cross-domain quotas are intentional — they widen the "
-            "distribution. Pick the 2 strongest, drop the rest, and "
-            "carry them into the brief.\n\n"
-            + phase_a_output.strip()
-        )
-
-    if primitives:
-        parts.append(
-            "## Injected primitives (you MUST address each one)\n\n"
-            + format_primitives_for_prompt(primitives)
-            + "\n\nIn the brief: either include an `ideas_to_try` "
-            "entry that uses the primitive, or add it to a "
-            "`primitive_rejections` list with a one-line reason."
-        )
-
-    parts.append(
-        "Now: prune the Phase A list, run any tools you need to fill "
-        "gaps the analyst missed, and return the brief as a single "
-        "fenced ```json block."
-    )
-    return "\n\n".join(parts)
 
 
 # ── Researcher Phase A (high-temperature brainstorm) ──────────────────
@@ -539,30 +318,208 @@ def build_phase_a_user_prompt(challenge: dict) -> str:
     )
 
 
+# ── Researcher prompts ────────────────────────────────────────────────
+
+def build_researcher_system_prompt(
+    challenge: dict, bucket: str | None = None,
+    primitives: list[str] | None = None,
+) -> str:
+    """Researcher system prompt.
+
+    Goal: a JSON brief the designer can act on. The researcher does
+    NOT write code, sketch architectures, or call validate_code /
+    submit (those tools aren't even in its surface). Its only job is
+    to surface what's been tried, what's missing, and a 3-5 step
+    plan.
+
+    In v3 the researcher receives:
+      * a landscape digest from the analyst (in its user message),
+      * a Phase A brainstorm output (also in its user message),
+      * a list of injected primitives it must address.
+    """
+    task = challenge.get("task", {}) or {}
+    task_name = task.get("name", "unknown")
+    flops_min, flops_max = extract_flops_budget(challenge)
+    bucket = bucket or identify_bucket(flops_min, flops_max)
+    target = int(flops_max * 0.6) if flops_max else 0
+
+    parts: list[str] = []
+
+    parts.append(
+        "You are the **researcher subagent** in a multi-agent miner "
+        "competing on the Radar subnet. The orchestrator runs you "
+        "first, then hands your output to a designer subagent that "
+        "writes the actual code.\n\n"
+        f"Task: `{task_name}`. Bucket: `{bucket}`. "
+        f"FLOPs range: [{flops_min:,}, {flops_max:,}] (target ~{target:,})."
+    )
+
+    parts.append(
+        "## Your output (the brief)\n\n"
+        "Produce a single JSON object with these keys. The designer "
+        "reads this verbatim — be specific, not generic.\n\n"
+        "- `relevant_prior_work`: list of strings — papers / methods "
+        "you found that bear on this task. Brief citations + the "
+        "key idea, not abstracts.\n"
+        "- `frontier_gaps`: list of strings — what the current "
+        "frontier is *missing* (architectures absent, ideas un-tried, "
+        "objectives no member optimizes for).\n"
+        "- `ideas_to_try`: list of strings — concrete architectural "
+        "ideas the designer could implement. Each one should fit the "
+        "FLOPs bucket.\n"
+        "- `plan`: list of 3-5 short strings — the exact sequence of "
+        "tool calls / decisions you'd run if you were the designer.\n\n"
+        "Example shape:\n```json\n"
+        + json.dumps(BRIEF_SCHEMA_EXAMPLE, indent=2)
+        + "\n```"
+    )
+
+    parts.append(
+        "## Tools available to you\n\n"
+        "- `analyze_task` — task spec, params, constraints, "
+        "objectives, FLOPs budget as JSON. Call this first.\n"
+        "- `list_frontier` — current best models on this bucket. "
+        "Read for ideas, not to copy.\n"
+        "- `cognition_wiki_index` / `cognition_wiki_read` — curated "
+        "task-specific design recipes. Try the wiki before "
+        "`search_papers` — it's cheaper and pre-filtered for this task.\n"
+        "- `query_db` — experiment DB. Useful paths: "
+        "`/frontier?task=`, `/experiments/recent?n=`, "
+        "`/experiments/pareto?task=`, `/experiments/failures?n=`, "
+        "`/experiments/families?task=`, `/experiments/stats?task=`, "
+        "`/experiments/{idx}`, `/experiments/{idx}/diff`, "
+        "`/experiments/lineage/{idx}`, "
+        "POST `/experiments/search` body `{\"query\": \"...\"}`. "
+        "Artifacts: `/artifacts?miner_id=&task=&kind=` "
+        "(kinds: result, log, checkpoint, …), `/artifacts/{id}`, "
+        "`/artifacts/{id}/download`, `/experiments/{idx}/artifacts` — "
+        "use these for full training logs / checkpoints. Failure traces "
+        "are already in the `analysis` field of `/experiments/failures`. "
+        "~60 calls/min; calls are logged on the public dashboard.\n"
+        "- `search_papers` — arxiv search. Use sparingly — papers "
+        "are expensive and the LLM context is bounded.\n"
+        "- `time_remaining` — seconds left in your slice of the "
+        "round. The orchestrator caps you at 90s; budget accordingly."
+    )
+
+    primitives = primitives or []
+    if primitives:
+        parts.append(
+            "## Injected primitives this round\n\n"
+            "Each MUST be addressed in your brief (used in "
+            "`ideas_to_try` or rejected with reason in "
+            "`primitive_rejections`):\n\n"
+            + format_primitives_for_prompt(primitives)
+        )
+
+    parts.append(
+        "## Principles\n\n"
+        "- **The analyst already mapped the landscape.** Treat its "
+        "`axes_fixed_across_frontier` as a generative signal: an "
+        "idea is interesting if it moves on an axis nobody varies.\n"
+        "- **Beat the frontier, don't match it.** A tie loses the "
+        "Pareto dominance bonus. Your `frontier_gaps` should make "
+        "this concrete.\n"
+        "- **Concrete > abstract.** Name the operations, shapes, "
+        "and information flow. \"Try a transformer\" is useless. "
+        "\"Stack of <op family A> over patches of size P with a "
+        f"<bridge type> head, target ~{target:,} FLOPs\" is "
+        "actionable — describe the mechanism, not the brand.\n"
+        "- **Use injected primitives or justify skipping them.** "
+        "Each primitive must appear in at least one Phase A idea AND "
+        "in your final brief, either in `ideas_to_try` or in "
+        "`primitive_rejections` with a one-line reason.\n"
+        "- **Reach past the familiar shortlist.** Don't default to "
+        "the same handful of named architectures every round. Novel "
+        "combinations of standard PyTorch ops (gated convs, "
+        "spectral mixing, state-space recurrences, learned routing, "
+        "non-standard tokenizers, alternative loss formulations, "
+        "etc.) are fair game and often unexplored on the frontier.\n"
+        "- **Don't write code.** That's the designer's job. If you "
+        "find yourself sketching architectures, stop and rephrase as "
+        "a plan step.\n"
+        "- **Stop early.** With the analyst's digest in hand you "
+        "rarely need more than 2 tool calls. Spend them only when "
+        "the digest leaves a real gap."
+    )
+
+    parts.append(
+        "## Final turn\n\n"
+        "When you're ready, return ONLY a single fenced ```json block "
+        "with the brief. No prose around it, no other commentary in "
+        "that final message. The orchestrator parses your last "
+        "assistant message — anything else costs context for nothing."
+    )
+
+    return "\n\n".join(parts)
+
+
+def build_researcher_user_prompt(
+    challenge: dict,
+    digest_block: str = "",
+    phase_a_output: str = "",
+    primitives: list[str] | None = None,
+) -> str:
+    """Kickoff message for the Phase B researcher.
+
+    ``digest_block`` is the analyst digest rendered as a fenced JSON
+    block (analyst.format_digest_for_researcher). ``phase_a_output``
+    is the brainstorm text from Phase A. Both are embedded verbatim;
+    the researcher reads them, prunes, and emits the final brief.
+    """
+    task = challenge.get("task", {}) or {}
+    frontier = (
+        challenge.get("feasible_frontier")
+        or challenge.get("pareto_frontier")
+        or []
+    )
+    primitives = primitives or []
+
+    parts: list[str] = []
+    parts.append(
+        f"You are designing for task `{task.get('name', 'unknown')}`. "
+        f"Frontier currently has {len(frontier)} model(s)."
+    )
+
+    if digest_block:
+        parts.append("## Analyst digest\n\n" + digest_block)
+    else:
+        parts.append(
+            "## Analyst digest\n\n(analyst skipped — fall back to "
+            "calling the tools yourself)"
+        )
+
+    if phase_a_output:
+        parts.append(
+            "## Phase A brainstorm (high-temperature, with quotas)\n\n"
+            "These 10 ideas came out of a brainstorm pass. The bad / "
+            "cross-domain quotas are intentional — they widen the "
+            "distribution. Pick the 2 strongest, drop the rest, and "
+            "carry them into the brief.\n\n"
+            + phase_a_output.strip()
+        )
+
+    if primitives:
+        parts.append(
+            "## Injected primitives (you MUST address each one)\n\n"
+            + format_primitives_for_prompt(primitives)
+            + "\n\nIn the brief: either include an `ideas_to_try` "
+            "entry that uses the primitive, or add it to a "
+            "`primitive_rejections` list with a one-line reason."
+        )
+
+    parts.append(
+        "Now: prune the Phase A list, run any tools you need to fill "
+        "gaps the analyst missed, and return the brief as a single "
+        "fenced ```json block."
+    )
+    return "\n\n".join(parts)
+
+
 # ── Designer prompts ──────────────────────────────────────────────────
-
-_DEFAULT_DESIGNER_PRINCIPLES = (
-    "- **Iterate cheaply before iterating expensively.** "
-    "`sketch_architecture` is faster than `validate_code`. Use "
-    "it while exploring shapes.\n"
-    "- **Validation is a checkpoint, not the finish line.** A "
-    "validated candidate that ties the frontier loses the Pareto "
-    "bonus. After validation, ask: is there a structurally "
-    "different candidate that might dominate this one?\n"
-    "- **Use your full budget.** Calling submit before the "
-    "late-round window stashes your candidate as best-so-far and "
-    "prompts you to keep iterating. The strongest submission "
-    "usually comes from comparing 2-3 validated candidates, not "
-    "the first one that runs.\n"
-    "- **The brief is a starting point, not a contract.** If the "
-    "researcher missed something, fix it. If the plan is wrong, "
-    "deviate. The shipped code is yours."
-)
-
 
 def build_designer_system_prompt(
     challenge: dict, bucket: str | None = None,
-    operator_directive: str = "",
 ) -> str:
     """Designer system prompt.
 
@@ -571,12 +528,6 @@ def build_designer_system_prompt(
     are well-tuned and a re-write would just regress them. The
     designer-specific additions are: critic feedback contract,
     submit hook contract, and the smaller tool surface.
-
-    ``operator_directive`` (GEPA-evolved) REPLACES the principles
-    section in-body so the mutation has leverage; empty falls back
-    to the hardcoded principles. The body-injection design lets the
-    optimizer steer the highest-signal section (strategy) without
-    touching the FLOPs gate / code-shape contract.
     """
     task = challenge.get("task", {}) or {}
     tp = task.get("task_params", {}) or {}
@@ -645,9 +596,11 @@ def build_designer_system_prompt(
         "5. Treat each length-like task_param as INDEPENDENT — an input "
         "length (e.g. `context_len`) and an output length (e.g. "
         "`prediction_len`) are not related and must not be conflated. "
-        "Any layer that bridges them must project explicitly "
-        "(`nn.Linear(context_len // patch, prediction_len)`), never via "
-        "implicit reshape or residual add\n"
+        "Any layer that bridges them must project explicitly along the "
+        "length axis (any op whose output length depends on "
+        "`prediction_len` is fine — linear, attention pooling, learned "
+        "queries, transposed conv, interpolation + refine, etc.), never "
+        "via implicit reshape or residual add\n"
         "6. Always call `validate_code` before `submit`"
     )
 
@@ -685,11 +638,24 @@ def build_designer_system_prompt(
 
     parts.append(_compute_sizing_guidance(challenge))
 
-    principles = (
-        operator_directive.strip() if operator_directive
-        else _DEFAULT_DESIGNER_PRINCIPLES
+    parts.append(
+        "## A few principles\n\n"
+        "- **Iterate cheaply before iterating expensively.** "
+        "`sketch_architecture` is faster than `validate_code`. Use "
+        "it while exploring shapes.\n"
+        "- **Validation is a checkpoint, not the finish line.** A "
+        "validated candidate that ties the frontier loses the Pareto "
+        "bonus. After validation, ask: is there a structurally "
+        "different candidate that might dominate this one?\n"
+        "- **Use your full budget.** Calling submit before the "
+        "late-round window stashes your candidate as best-so-far and "
+        "prompts you to keep iterating. The strongest submission "
+        "usually comes from comparing 2-3 validated candidates, not "
+        "the first one that runs.\n"
+        "- **The brief is a starting point, not a contract.** If the "
+        "researcher missed something, fix it. If the plan is wrong, "
+        "deviate. The shipped code is yours."
     )
-    parts.append("## A few principles\n\n" + principles)
 
     return "\n\n".join(parts)
 
@@ -731,32 +697,12 @@ def build_designer_user_prompt(challenge: dict, brief: dict) -> str:
 
 # ── Critic prompts ────────────────────────────────────────────────────
 
-_DEFAULT_CRITIC_RULES = (
-    "- If validation passed (`ok ...`), KEEP the architecture "
-    "and tell the designer to submit. CHANGE / DROP can be "
-    "\"nothing\".\n"
-    "- If validation failed, focus CHANGE on the specific "
-    "failing constraint (FLOPs gate, output shape, missing "
-    "build_optimizer, etc.).\n"
-    "- Never write code. Never write more than three lines. "
-    "Never explain — the designer is already an expert."
-)
-
-
-def build_critic_system_prompt(operator_directive: str = "") -> str:
+def build_critic_system_prompt() -> str:
     """Critic system prompt — three-line KEEP/CHANGE/DROP template.
 
     Kept short on purpose: the critic is a single call between
     designer iterations and we don't want it generating prose.
-
-    ``operator_directive`` (GEPA-evolved) REPLACES the rules block.
-    The three-line response contract is hardcoded above the rules so
-    the directive can't accidentally break format on mutation.
     """
-    rules = (
-        operator_directive.strip() if operator_directive
-        else _DEFAULT_CRITIC_RULES
-    )
     return (
         "You are the **critic subagent** in a multi-agent miner. "
         "You see the designer's current code and the latest "
@@ -767,7 +713,14 @@ def build_critic_system_prompt(operator_directive: str = "") -> str:
         "CHANGE: <one sentence — the single most impactful revision>\n"
         "DROP: <one sentence — what to remove or stop doing>\n\n"
         "Rules:\n"
-        + rules
+        "- If validation passed (`ok ...`), KEEP the architecture "
+        "and tell the designer to submit. CHANGE / DROP can be "
+        "\"nothing\".\n"
+        "- If validation failed, focus CHANGE on the specific "
+        "failing constraint (FLOPs gate, output shape, missing "
+        "build_optimizer, etc.).\n"
+        "- Never write code. Never write more than three lines. "
+        "Never explain — the designer is already an expert."
     )
 
 

@@ -14,8 +14,8 @@ expand on.
 
 Sampling is deterministic on ``(round_id, task_name)`` so:
   * parallel miners on the same round see the same injection,
-  * GEPA can attribute outcomes to specific injections,
-  * reruns of a round produce identical primitives.
+  * reruns of a round produce identical primitives,
+  * round-over-round attribution stays clean.
 """
 from __future__ import annotations
 
@@ -64,9 +64,8 @@ def sample_primitives(
     seed_bytes = f"{round_id}|{task_name}".encode("utf-8")
     digest = hashlib.sha256(seed_bytes).digest()
     start = digest[0] % pool_n
-    # Stride coprime with pool_n keeps the walk full-period. We force
-    # odd-ness; with PRIMITIVE_POOL length 15 this gives 8 valid
-    # strides, which is plenty.
+    # Force the stride odd so it's coprime with even-length pools;
+    # with PRIMITIVE_POOL length 15 this gives a full-period walk.
     stride = (digest[1] | 1) % pool_n or 1
 
     picks: list[str] = []
