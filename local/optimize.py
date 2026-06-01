@@ -28,6 +28,7 @@ the fallback. Without either key, GEPA refuses to run — use
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import os
 import sys
@@ -110,15 +111,125 @@ def _ensure_seed(prompts_dir: Path) -> list[Prompt]:
     return seeded
 
 
+_SLOT_PREFIX = {"researcher": "r", "designer": "d", "critic": "c"}
+
+
+def _filter_results_for_slot(
+    results: list[ResultRow], slot: str, slot_ids: set[str],
+) -> list[ResultRow]:
+    """Keep result rows whose composite ``prompt_id`` references one of
+    ``slot_ids`` under the slot's prefix (``r:`` / ``d:`` / ``c:``).
+
+    The agent emits composite IDs like ``r:<rid>|d:<did>|c:<cid>``; we
+    rewrite each row's ``prompt_id`` to the slot's bare ID so GEPA's
+    own group-by-prompt_id logic attributes scores correctly.
+    """
+    prefix = _SLOT_PREFIX[slot] + ":"
+    out: list[ResultRow] = []
+    for r in results:
+        pid = r.prompt_id or ""
+        if not pid:
+            continue
+        # Composite format: ``r:<id>|d:<id>|c:<id>``. Bare IDs (legacy
+        # single-slot agents) match only if the slot is "designer" —
+        # we treat them as designer attribution since that was the
+        # historical single-slot meaning.
+        if "|" in pid or pid.startswith(("r:", "d:", "c:")):
+            for part in pid.split("|"):
+                if part.startswith(prefix):
+                    inner = part[len(prefix):]
+                    if inner in slot_ids:
+                        out.append(dataclasses.replace(r, prompt_id=inner))
+                        break
+        elif slot == "designer" and pid in slot_ids:
+            out.append(r)
+    return out
+
+
+def _partition_by_min_samples(
+    pop: list[Prompt], results: list[ResultRow], min_samples: int,
+) -> tuple[list[Prompt], list[Prompt]]:
+    """Split ``pop`` into (tested, untested) by sample count.
+
+    Tested = variants whose ``id`` appears in ``results`` at least
+    ``min_samples`` times. Untested = the rest — kept alive without
+    mutation so they accumulate trials before GEPA reflects on them.
+
+    Called per slot (after ``_filter_results_for_slot``) so the IDs
+    in ``results`` are bare slot IDs that match ``Prompt.id``.
+    """
+    if min_samples <= 1:
+        return list(pop), []
+    counts: dict[str, int] = {}
+    for r in results:
+        if r.prompt_id:
+            counts[r.prompt_id] = counts.get(r.prompt_id, 0) + 1
+    tested = [p for p in pop if counts.get(p.id, 0) >= min_samples]
+    untested = [p for p in pop if counts.get(p.id, 0) < min_samples]
+    return tested, untested
+
+
 def _run_once(store: LocalStore, prompts_dir: Path, *, optimizer: str,
               population: int, budget: int, task: str,
-              score_key: str, num_threads: int = 1) -> int:
-    """One optimization pass. Returns the new population size."""
+              score_key: str, num_threads: int = 1,
+              slot: str = "", min_samples: int = 1) -> int:
+    """One optimization pass. Returns the new population size.
+
+    When ``slot`` is set (``researcher`` / ``designer`` / ``critic``),
+    the population is filtered to rows tagged ``metadata.slot == slot``
+    and the result rows are filtered + rewritten to attribute by the
+    slot's bare ID. The other slots' rows pass through unchanged so
+    we never lose them on save.
+
+    ``min_samples`` is the minimum number of scored experiments a
+    variant needs before GEPA is allowed to mutate it. Variants below
+    the threshold are preserved as-is so they accumulate trials —
+    crucial when LLM/task noise is large enough that 1-2 samples per
+    variant can't distinguish signal from variance.
+    """
     pop = _ensure_seed(prompts_dir)
+
+    other_pop: list[Prompt] = []
+    if slot:
+        slot_pop = [p for p in pop if (p.metadata or {}).get("slot") == slot]
+        other_pop = [p for p in pop if (p.metadata or {}).get("slot") != slot]
+        if not slot_pop:
+            logger.warning(
+                "no prompts tagged slot=%s — nothing to optimize", slot,
+            )
+            return len(pop)
+        pop = slot_pop
+
     results = _experiments_to_rows(store, task=task)
+    if slot:
+        slot_ids = {p.id for p in pop}
+        results = _filter_results_for_slot(results, slot, slot_ids)
+
+    # Gate mutation on minimum-samples-per-variant. Undersampled rows
+    # bypass the optimizer this pass and survive unchanged so they keep
+    # accumulating trials.
+    tested_pop, undersampled_pop = _partition_by_min_samples(
+        pop, results, min_samples,
+    )
+    if min_samples > 1:
+        logger.info(
+            "min_samples=%d → %d variant(s) ready for mutation, "
+            "%d below threshold (held over)",
+            min_samples, len(tested_pop), len(undersampled_pop),
+        )
+    if not tested_pop:
+        logger.warning(
+            "no variants meet min_samples=%d — skipping mutation, "
+            "keeping population as-is",
+            min_samples,
+        )
+        return len(pop) + len(other_pop)
+    pop = tested_pop
+
     logger.info(
-        "running %s: %d scored row(s), population=%d, target=%d",
+        "running %s: %d scored row(s), population=%d, target=%d%s",
         optimizer, len(results), len(pop), population,
+        f" (slot={slot})" if slot else "",
     )
 
     if optimizer == "gepa":
@@ -138,16 +249,19 @@ def _run_once(store: LocalStore, prompts_dir: Path, *, optimizer: str,
     )
     if not new_pop:
         logger.warning("optimizer returned empty population; keeping current")
-        return len(pop)
+        return len(pop) + len(undersampled_pop) + len(other_pop)
 
-    next_gen = max(p.generation for p in new_pop)
+    # When slot-filtered, splice the optimized slot back alongside the
+    # untouched other-slot rows so the on-disk population stays whole.
+    final_pop = list(new_pop) + list(undersampled_pop) + list(other_pop)
+    next_gen = max(p.generation for p in final_pop)
     prompts_mod.archive_current(next_gen, prompts_dir)
-    prompts_mod.save_active(new_pop, prompts_dir)
+    prompts_mod.save_active(final_pop, prompts_dir)
     logger.info(
         "wrote generation %d (%d prompt(s)) → %s",
-        next_gen, len(new_pop), prompts_dir / "active.json",
+        next_gen, len(final_pop), prompts_dir / "active.json",
     )
-    return len(new_pop)
+    return len(final_pop)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -169,6 +283,18 @@ def main(argv: list[str] | None = None) -> int:
                              "rate-limited provider like Chutes.")
     parser.add_argument("--task", default="synth_regression")
     parser.add_argument("--score_key", default="raw_score")
+    parser.add_argument("--slot", default="",
+                        choices=("", "researcher", "designer", "critic"),
+                        help="When set, restrict optimization to one "
+                             "subagent slot of a multi-slot population "
+                             "(claude_v2_gepa-style agents). Other slots' "
+                             "rows are preserved as-is.")
+    parser.add_argument("--min_samples", type=int, default=1,
+                        help="Minimum scored experiments per variant before "
+                             "GEPA is allowed to mutate it. Higher values "
+                             "(3-5) cut variance noise at the cost of slower "
+                             "iteration. Undersampled variants are held over "
+                             "unchanged so they accumulate trials.")
     parser.add_argument("--watch", action="store_true",
                         help="Re-run whenever a new experiment row appears.")
     parser.add_argument("--poll_seconds", type=float, default=5.0)
@@ -180,6 +306,20 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [optimize] %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # Default ``--agent_dir`` to the GEPA-tuned variant when the user
+    # runs gepa without specifying an agent. Its ``prompts/active.json``
+    # ships pre-populated with slot-tagged seeds so the optimizer has
+    # something meaningful to mutate from generation 0.
+    if args.optimizer == "gepa" and not args.agent_dir and not args.prompts_dir:
+        default_agent = (
+            Path(__file__).resolve().parent.parent
+            / "miners" / "claude_style_v2_gepa"
+        )
+        if default_agent.is_dir():
+            args.agent_dir = str(default_agent)
+            logger.info("defaulting --agent_dir to %s (GEPA-tuned variant)",
+                        args.agent_dir)
 
     if args.prompts_dir:
         prompts_dir = Path(args.prompts_dir).resolve()
@@ -196,7 +336,8 @@ def main(argv: list[str] | None = None) -> int:
         _run_once(store, prompts_dir, optimizer=args.optimizer,
                   population=args.population, budget=args.budget,
                   task=args.task, score_key=args.score_key,
-                  num_threads=args.num_threads)
+                  num_threads=args.num_threads, slot=args.slot,
+                  min_samples=args.min_samples)
         if not args.watch:
             return 0
 
@@ -213,7 +354,9 @@ def main(argv: list[str] | None = None) -> int:
             last_total = total
             _run_once(store, prompts_dir, optimizer=args.optimizer,
                       population=args.population, budget=args.budget,
-                      task=args.task, score_key=args.score_key)
+                      task=args.task, score_key=args.score_key,
+                      num_threads=args.num_threads, slot=args.slot,
+                  min_samples=args.min_samples)
     except KeyboardInterrupt:
         logger.info("interrupted; bye")
     finally:
