@@ -27,6 +27,7 @@ from __future__ import annotations
 import difflib
 from typing import Optional
 
+from local.continuation import continuation_frontier
 from local.scoring import compute_pareto
 from local.store import LocalStore
 
@@ -39,7 +40,116 @@ def _filter_task(exps: list[dict], task: Optional[str]) -> list[dict]:
 
 def frontier(store: LocalStore, task: Optional[str] = None) -> dict:
     exps = _filter_task(store.recent_experiments(n=10_000), task)
-    return {"frontier": compute_pareto(exps)}
+    return {
+        "frontier": compute_pareto(exps),
+        "continuation": continuation_frontier(exps),
+    }
+
+
+def _parent_summary(exp: dict) -> dict:
+    """Compact, weights-free view of a continuation-eligible parent."""
+    objs = exp.get("objectives", {}) or {}
+    curve = exp.get("loss_curve") or []
+    return {
+        "id": exp["id"],
+        "name": exp.get("name"),
+        "task": exp.get("task"),
+        "metric": exp.get("metric"),
+        "n_rounds": exp.get("n_rounds", 1),
+        "cumulative_compute": exp.get("cumulative_compute", 0.0),
+        "best_val_loss": objs.get("best_val_loss"),
+        "checkpoint_available": exp.get("checkpoint_ref") is not None,
+        "loss_curve_tail": [float(x) for x in curve[-8:]],
+        "num_params": objs.get("num_params"),
+        "flops_equivalent_size": objs.get("flops_equivalent_size"),
+    }
+
+
+def parents(
+    store: LocalStore,
+    *,
+    task: Optional[str] = None,
+    min_flops: Optional[int] = None,
+    max_flops: Optional[int] = None,
+) -> dict:
+    """Continuation-eligible parents for a bucket.
+
+    When ``min_flops`` / ``max_flops`` are omitted they're taken from the
+    active challenge so an agent can just call ``GET /parents``.
+    """
+    if min_flops is None or max_flops is None:
+        ch = store.open_challenge()
+        payload = (ch or {}).get("payload", {}) if ch else {}
+        if min_flops is None:
+            min_flops = int(payload.get("min_flops_equivalent", 0) or 0)
+        if max_flops is None:
+            max_flops = int(payload.get("max_flops_equivalent", 0) or 0)
+        if task is None:
+            task = (payload.get("task", {}) or {}).get("name")
+    rows = store.eligible_parents(
+        task=task, min_flops=int(min_flops), max_flops=int(max_flops),
+    )
+    return {"parents": [_parent_summary(e) for e in rows]}
+
+
+def signature(store: LocalStore, idx: int) -> dict:
+    """Tensor names + shapes of an experiment's checkpoint (no weights).
+
+    Lets a continuation miner author code whose ``build_model`` produces a
+    state_dict that loads cleanly over the parent (warm-start is strict).
+    """
+    exp = store.get_experiment(idx)
+    if exp is None:
+        return {"error": "not found"}
+    sig = (exp.get("objectives", {}) or {}).get("param_signature")
+    return {
+        "id": idx,
+        "checkpoint_available": exp.get("checkpoint_ref") is not None,
+        "signature": sig or {},
+    }
+
+
+def trajectory(store: LocalStore, idx: int) -> dict:
+    """Stitch a lineage's loss curve + GIFT-eval points, root → idx.
+
+    Per-segment loss samples are concatenated and tagged with their source
+    experiment so a miner can see where each continuation began (and
+    whether it actually bent the curve). The GIFT-eval series carries one
+    ``(cumulative_compute, metric)`` point per lineage member — the real
+    objective trajectory whose deltas are the continuation-frontier Δ's.
+    """
+    chain = store.lineage(idx)
+    loss_curve: list[dict] = []
+    gift_eval: list[dict] = []
+    boundaries: list[dict] = []
+    for exp in chain:
+        objs = exp.get("objectives", {}) or {}
+        boundaries.append({
+            "experiment_id": exp["id"],
+            "n_rounds": exp.get("n_rounds", 1),
+            "start_index": len(loss_curve),
+        })
+        for v in (exp.get("loss_curve") or []):
+            loss_curve.append({
+                "i": len(loss_curve),
+                "loss": float(v),
+                "experiment_id": exp["id"],
+                "n_rounds": exp.get("n_rounds", 1),
+            })
+        gift_eval.append({
+            "experiment_id": exp["id"],
+            "n_rounds": exp.get("n_rounds", 1),
+            "cumulative_compute": exp.get("cumulative_compute", 0.0),
+            "metric": exp.get("metric"),
+            "best_val_loss": objs.get("best_val_loss"),
+        })
+    return {
+        "id": idx,
+        "lineage": [e["id"] for e in chain],
+        "loss_curve": loss_curve,
+        "gift_eval": gift_eval,
+        "boundaries": boundaries,
+    }
 
 
 def pareto(store: LocalStore, task: Optional[str] = None) -> dict:

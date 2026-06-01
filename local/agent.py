@@ -71,6 +71,61 @@ def _pick_shape(min_flops: int, max_flops: int) -> tuple[list[int], str, float, 
     return best
 
 
+def _tail_descending(tail: list[float], min_points: int = 4) -> bool:
+    """Heuristic: is a loss curve still meaningfully descending at the end?
+
+    Compares the average over the last third of the tail against the first
+    third. Still-descending ⇒ the model is under-trained ⇒ a good
+    continuation candidate. A flat/rising tail ⇒ prefer a fresh design.
+    """
+    pts = [float(x) for x in tail if x is not None]
+    if len(pts) < min_points:
+        return False
+    k = max(1, len(pts) // 3)
+    early = sum(pts[:k]) / k
+    late = sum(pts[-k:]) / k
+    if early <= 0:
+        return False
+    # Require >2% relative improvement across the window to count as descending.
+    return (early - late) / abs(early) > 0.02
+
+
+def _choose_continuation(challenge: dict, client=None) -> tuple[str, "Optional[int]"]:
+    """Pick a warm-start parent when the validator declares a continuation
+    round.
+
+    The *validator* owns whether this is a continuation round
+    (``challenge['round_type']``); the miner only chooses *which* parent.
+    On a continuation round we prefer parents whose loss is still
+    descending, but since the validator has mandated continuation we fall
+    back to the best-metric eligible parent even if none look under-trained.
+    Returns ``("new", None)`` on fresh rounds or when no parent is usable
+    (always the case for the numpy task — no checkpoints).
+    """
+    if challenge.get("round_type") != "continuation":
+        return "new", None
+    parents = challenge.get("eligible_parents") or []
+    if not parents and client is not None and challenge.get("db_url"):
+        try:
+            resp = client.get_json(
+                f"{challenge['db_url']}/parents", timeout=5,
+            )
+            parents = (resp or {}).get("parents", [])
+        except Exception:  # noqa: BLE001
+            parents = []
+    parents = [p for p in parents if p.get("checkpoint_available")
+               and p.get("metric") is not None]
+    if not parents:
+        return "new", None
+    # Prefer still-descending parents; among them (or all, if none qualify)
+    # take the best metric.
+    descending = [p for p in parents
+                  if _tail_descending(p.get("loss_curve_tail", []))]
+    pick_from = descending or parents
+    best = min(pick_from, key=lambda p: p["metric"])
+    return "continue", int(best["id"])
+
+
 def _emit_code(hidden_sizes: list[int], activation: str,
                learning_rate: float, epochs: int) -> str:
     return f"""# Numpy MLP submission for the local radar stack.
@@ -145,11 +200,22 @@ def design_architecture(challenge: dict, client=None) -> dict:
     code = _emit_code(hidden, activation, lr, epochs)
     name = f"mlp_{'x'.join(str(h) for h in hidden)}_{activation}"
 
+    # Decide whether to warm-start from a still-improving parent. For the
+    # numpy task there are never eligible parents, so this is a no-op there;
+    # it's the reference path real ts_forecasting miners build on.
+    mode, parent_index = _choose_continuation(challenge, client)
+    if mode == "continue":
+        reasoning_lines.append(
+            f"Continuing from parent #{parent_index} (loss still descending)."
+        )
+
     return {
         "code": code,
         "name": name,
         "motivation": motivation,
         "reasoning": "\n".join(reasoning_lines),
+        "mode": mode,
+        "parent_index": parent_index,
         "tool_calls": [
             {
                 "tool": "internal",

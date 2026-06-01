@@ -28,6 +28,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from local.artifacts import ArtifactSink, cleanup_workdir, sweep_orphan_workdirs
 from local.backup import from_env as backup_from_env
+from local.checkpoints import CheckpointStore
+from local.continuation import (
+    continuation_frontier,
+    continuation_rate,
+    is_continuation_round,
+    prepare_continuation,
+)
+from local.experiments_api import _parent_summary
 from local.scoring import compute_pareto, passes_size_gate, score_round
 from local.services import ServicesServer
 from local.store import LocalStore
@@ -75,7 +83,9 @@ def _task_dict(task) -> dict:
 
 
 def _build_challenge(round_id: int, store: LocalStore, task,
-                     services_url: str, agent_seconds: int = 180) -> dict:
+                     services_url: str, agent_seconds: int = 180,
+                     continuation_enabled: bool = False,
+                     scheduled_continuation: bool = False) -> dict:
     name, lo, hi = _pick_bucket(round_id, task=task)
     all_exps = store.recent_experiments(n=10_000)
     pareto = compute_pareto(all_exps)
@@ -89,6 +99,24 @@ def _build_challenge(round_id: int, store: LocalStore, task,
         for e in pareto
         if passes_size_gate(e["objectives"], lo, hi)
     ]
+    # The validator owns the round type: a scheduled continuation round only
+    # becomes one if eligible (fully-eval'd, checkpoint-bearing, in-bucket)
+    # parents actually exist — otherwise it degrades to a fresh round. This
+    # is why continuation pressure ramps in slowly: early rounds have no
+    # parents to continue from regardless of the schedule.
+    eligible_parents = []
+    if continuation_enabled:
+        eligible_parents = [
+            _parent_summary(e)
+            for e in store.eligible_parents(
+                task=task.name, min_flops=lo, max_flops=hi,
+            )
+        ]
+    round_type = (
+        "continuation"
+        if (scheduled_continuation and eligible_parents) else "new"
+    )
+    continuation_allowed = round_type == "continuation"
     # ``allowed_urls`` is what the miner-side GatedClient enforces. Every
     # endpoint the agent can reach lives under ``services_url`` so a
     # single prefix is enough.
@@ -101,6 +129,9 @@ def _build_challenge(round_id: int, store: LocalStore, task,
         "bucket": name,
         "task": _task_dict(task),
         "feasible_frontier": feasible,
+        "round_type": round_type,
+        "continuation_allowed": bool(continuation_allowed),
+        "eligible_parents": eligible_parents if continuation_allowed else [],
         "agent_seconds": int(agent_seconds),
         # Dummy agent_token — local services.py doesn't enforce auth, but
         # the real agents' startup checks require a non-empty value.
@@ -213,19 +244,99 @@ def _next_round_id(store: LocalStore) -> int:
     return int(rows["r"]) + 1
 
 
+def _pretrain_pool() -> list[str]:
+    """Sorted parquet shard paths in the pretrain cache (empty if absent)."""
+    import os
+    pdir = Path(os.environ.get("RADAR_PRETRAIN_CACHE", "/tmp/radar_pretrain"))
+    if not pdir.is_dir():
+        return []
+    return sorted(str(p) for p in pdir.glob("*.parquet"))
+
+
+def _train_proposal(payload: dict, task, round_id: int,
+                    challenge: dict, prep: dict) -> dict:
+    """Run one proposal, retrying as a fresh run if a continuation
+    warm-start turns out to be architecture-incompatible (strict load)."""
+    def _run() -> dict:
+        return run_training(
+            payload.get("code", ""),
+            seed=round_id,
+            task=task,
+            min_flops=challenge["min_flops_equivalent"],
+            max_flops=challenge["max_flops_equivalent"],
+            parent_checkpoint_path=prep["parent_checkpoint_path"],
+            compute_offset=prep["compute_offset"],
+            step_offset=prep["step_offset"],
+            shard_paths=prep["shard_paths"],
+            shard_reuse=prep["shard_reuse"],
+        )
+
+    result = _run()
+    if (not result.get("success")
+            and result.get("harness_status") == "checkpoint_incompatible"
+            and prep["mode"] == "continue"):
+        logger.warning("    warm-start incompatible; retrying as a fresh run")
+        prefix = (prep["note"] + "; ") if prep["note"] else ""
+        prep["note"] = prefix + "continuation incompatible: retried fresh"
+        prep.update(
+            mode="new", parent_index=None, parent_metric=None,
+            parent_checkpoint_path=None, compute_offset=0.0,
+            step_offset=0, n_rounds=1,
+        )
+        result = _run()
+    return result
+
+
+def _gc_checkpoints(store: LocalStore, ckpt_store: CheckpointStore,
+                    round_id: int, keep_rounds: int = 5) -> None:
+    """Drop checkpoints that aren't on a frontier or a recent parent."""
+    all_exps = store.recent_experiments(n=10_000)
+    keep = {e["id"] for e in compute_pareto(all_exps)}
+    keep |= {e["id"] for e in continuation_frontier(all_exps)}
+    keep |= {e["id"] for e in all_exps if e["round_id"] > round_id - keep_rounds}
+    removed = ckpt_store.gc(keep)
+    if removed:
+        logger.info("  gc: removed %d stale checkpoint(s)", removed)
+
+
 def run_round(store: LocalStore, task, round_id: int,
               phase_a_seconds: float, services_url: str,
               agent_seconds: int = 180,
-              sink: ArtifactSink | None = None) -> None:
+              sink: ArtifactSink | None = None,
+              ckpt_store: CheckpointStore | None = None,
+              continuation_enabled: bool = False,
+              continuation_equilibrium: float = 0.7,
+              continuation_ramp_rounds: int = 50,
+              continuation_rate_start: float = 0.0,
+              shards_per_round: int = 0) -> None:
+    # The validator owns the cadence: a scheduled coin flip (rate ramps
+    # linearly to the equilibrium) decides whether this is a continuation
+    # round; _build_challenge downgrades to "new" when no eligible parents
+    # exist yet.
+    scheduled = continuation_enabled and is_continuation_round(
+        round_id,
+        equilibrium=continuation_equilibrium,
+        ramp_rounds=continuation_ramp_rounds,
+        start=continuation_rate_start,
+    )
     challenge = _build_challenge(
         round_id, store, task, services_url, agent_seconds=agent_seconds,
+        continuation_enabled=continuation_enabled,
+        scheduled_continuation=scheduled,
     )
     challenge_id = challenge["challenge_id"]
     bucket = challenge["bucket"]
+    continuation_allowed = challenge["continuation_allowed"]
+    rate = continuation_rate(
+        round_id, equilibrium=continuation_equilibrium,
+        ramp_rounds=continuation_ramp_rounds, start=continuation_rate_start,
+    ) if continuation_enabled else 0.0
     logger.info(
-        "round=%d bucket=%s flops=[%d, %d] frontier=%d",
+        "round=%d bucket=%s flops=[%d, %d] frontier=%d type=%s "
+        "(cont_rate=%.2f parents=%d)",
         round_id, bucket, challenge["min_flops_equivalent"],
         challenge["max_flops_equivalent"], len(challenge["feasible_frontier"]),
+        challenge["round_type"], rate, len(challenge["eligible_parents"]),
     )
 
     if sink is not None:
@@ -253,6 +364,10 @@ def run_round(store: LocalStore, task, round_id: int,
         store.mark_challenge(challenge_id, "done")
         return
 
+    # Pretrain shard pool (ts_forecasting only) — assigned per-run so
+    # continuations can avoid lineage-seen shards.
+    pool = _pretrain_pool() if continuation_allowed else []
+
     # ── Phase B + Phase C: train and evaluate every proposal ──
     results: list[dict] = []
     for p in proposals:
@@ -261,14 +376,34 @@ def run_round(store: LocalStore, task, round_id: int,
         name = payload.get("name", "unnamed")
         if sink is not None:
             sink.record_proposal(task.name, round_id, miner_id, payload)
-        logger.info("  phase B/C: training '%s' from miner=%s", name, miner_id)
-        result = run_training(
-            payload.get("code", ""),
-            seed=round_id,
-            task=task,
+
+        prep = prepare_continuation(
+            store, ckpt_store,
+            payload=payload, task_name=task.name,
             min_flops=challenge["min_flops_equivalent"],
             max_flops=challenge["max_flops_equivalent"],
+            pool=pool, shards_per_round=shards_per_round, seed=round_id,
+        ) if continuation_allowed else {
+            # Continuation disabled — still preserve any payload parent_index
+            # so the existing lineage/diff tracking keeps working.
+            "mode": "new",
+            "parent_index": (
+                payload.get("parent_index")
+                if isinstance(payload.get("parent_index"), int) else None
+            ),
+            "parent_metric": None,
+            "parent_checkpoint_path": None, "compute_offset": 0.0,
+            "step_offset": 0, "n_rounds": 1, "shard_paths": None,
+            "shard_reuse": False, "note": "",
+        }
+        if prep["note"]:
+            logger.info("    %s", prep["note"])
+        logger.info(
+            "  phase B/C: training '%s' from miner=%s mode=%s",
+            name, miner_id, prep["mode"],
         )
+        result = _train_proposal(payload, task, round_id, challenge, prep)
+
         result["miner_id"] = miner_id
         result["name"] = name
         result["code"] = payload.get("code", "")
@@ -276,6 +411,11 @@ def run_round(store: LocalStore, task, round_id: int,
         result["reasoning"] = payload.get("reasoning", "")
         result["tool_calls"] = payload.get("tool_calls", [])
         result["prompt_id"] = payload.get("prompt_id", "")
+        result["mode"] = prep["mode"]
+        result["parent_index"] = prep["parent_index"]
+        result["parent_metric"] = prep["parent_metric"]
+        result["n_rounds"] = prep["n_rounds"]
+        result["continuation_note"] = prep["note"]
         if result["success"]:
             objs = result["objectives"]
             extra = ""
@@ -291,16 +431,17 @@ def run_round(store: LocalStore, task, round_id: int,
         results.append(result)
 
     # ── Scoring ─────────────────────────────────────────────
+    cont_frontier = continuation_frontier(store.recent_experiments(n=10_000))
     score_round(
         results,
         min_flops=challenge["min_flops_equivalent"],
         max_flops=challenge["max_flops_equivalent"],
         frontier=challenge["feasible_frontier"],
+        continuation_frontier=cont_frontier,
     )
 
-    # Write experiments + mirror artifacts to object storage
+    # Write experiments + persist checkpoints + mirror artifacts
     for p, r in zip(proposals, results):
-        parent = p["payload"].get("parent_index")
         # On failure, fold the trainer's error trace into analysis so
         # /experiments/failures returns something actionable to other
         # miners (the analysis label alone is just "training crashed").
@@ -309,7 +450,10 @@ def run_round(store: LocalStore, task, round_id: int,
             err = (r.get("error") or "").strip()
             if err and err not in analysis:
                 analysis = f"{analysis}\n{err}" if analysis else err
-        store.add_experiment(
+        note = r.get("continuation_note") or ""
+        if note:
+            analysis = f"{analysis} [{note}]"
+        exp_id = store.add_experiment(
             round_id=round_id,
             miner_id=r["miner_id"],
             name=r["name"],
@@ -324,12 +468,24 @@ def run_round(store: LocalStore, task, round_id: int,
             loss_curve=r["loss_curve"],
             val_curve=r.get("val_curve") or [],
             analysis=analysis,
-            parent_index=int(parent) if isinstance(parent, int) else None,
+            parent_index=r.get("parent_index"),
             prompt_id=r["prompt_id"],
             task=task.name,
+            n_rounds=int(r.get("n_rounds", 1) or 1),
+            cumulative_compute=float(
+                r["objectives"].get("cumulative_compute", 0.0)
+            ),
+            mode=r.get("mode", "new"),
         )
         workdir_str = r.get("workdir") or ""
         workdir = Path(workdir_str) if workdir_str else None
+        # Persist the trained checkpoint so this experiment can later be a
+        # warm-start parent, BEFORE the workdir is cleaned up.
+        if r["success"] and ckpt_store is not None and workdir is not None:
+            ckpt_src = workdir / "checkpoints" / "model.safetensors"
+            ref = ckpt_store.save(exp_id, ckpt_src)
+            if ref is not None:
+                store.set_checkpoint_ref(exp_id, ref)
         try:
             if sink is not None:
                 sink.record_result(task.name, round_id, r["miner_id"], r, workdir)
@@ -337,6 +493,11 @@ def run_round(store: LocalStore, task, round_id: int,
             # Always reclaim the trainer workdir, even if mirroring raised —
             # otherwise the /tmp/radar_ts_* dir leaks for the run's lifetime.
             cleanup_workdir(workdir)
+
+    # Keep only checkpoints worth warm-starting from (frontier + recent
+    # lineage parents); drop the rest to bound disk use.
+    if ckpt_store is not None:
+        _gc_checkpoints(store, ckpt_store, round_id)
 
     store.mark_challenge(challenge_id, "done")
 
@@ -418,6 +579,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--task", default="synth_regression",
                         choices=["synth_regression", "ts_forecasting"],
                         help="Which task this validator drives.")
+    parser.add_argument("--continuation", default="auto",
+                        choices=["auto", "on", "off"],
+                        help="Allow continuation (warm-start) proposals. "
+                             "'auto' = on for ts_forecasting, off for "
+                             "synth_regression (no checkpoints there).")
+    parser.add_argument("--shards_per_round", type=int, default=0,
+                        help="Pretrain shards assigned per run. 0 = all "
+                             "(legacy; continuations then reuse shards). "
+                             "Set >0 to leave disjoint headroom so "
+                             "continuations train on unseen shards.")
+    parser.add_argument("--checkpoint_dir", default="",
+                        help="Durable checkpoint store dir for continuation "
+                             "warm-starts. Empty = $RADAR_CHECKPOINT_DIR or "
+                             "local/checkpoints.")
+    parser.add_argument("--continuation_equilibrium", type=float, default=0.7,
+                        help="Steady-state fraction of rounds the validator "
+                             "schedules as continuations (default 0.70).")
+    parser.add_argument("--continuation_ramp_rounds", type=int, default=50,
+                        help="Rounds over which the continuation rate climbs "
+                             "linearly from --continuation_rate_start to "
+                             "--continuation_equilibrium (default 50).")
+    parser.add_argument("--continuation_rate_start", type=float, default=0.0,
+                        help="Continuation rate at round 0 (default 0.0).")
     parser.add_argument("--log_level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -450,13 +634,27 @@ def main(argv: list[str] | None = None) -> int:
         if not _ensure_ts_caches():
             logger.error("ts_forecasting caches not ready — aborting.")
             return 2
+
+    if args.continuation == "on":
+        continuation_enabled = True
+    elif args.continuation == "off":
+        continuation_enabled = False
+    else:  # auto
+        continuation_enabled = isinstance(task, TSForecastingSpec)
+
     logger.info(
-        "starting; db=%s task=%s agent_seconds=%d training_seconds=%s",
+        "starting; db=%s task=%s agent_seconds=%d training_seconds=%s "
+        "continuation=%s (eq=%.2f ramp=%d) shards_per_round=%d",
         args.db, task.name, args.agent_seconds,
         getattr(task, "time_budget_seconds", "n/a"),
+        continuation_enabled, args.continuation_equilibrium,
+        args.continuation_ramp_rounds, args.shards_per_round,
     )
 
     sink = ArtifactSink.from_env(store)
+    ckpt_store = CheckpointStore(
+        base_dir=args.checkpoint_dir or None, sink=sink,
+    ) if continuation_enabled else None
 
     wiki_dir = args.wiki_dir or None
     if not wiki_dir:
@@ -492,7 +690,13 @@ def main(argv: list[str] | None = None) -> int:
                       phase_a_seconds=args.phase_a_seconds,
                       services_url=services_url,
                       agent_seconds=args.agent_seconds,
-                      sink=sink)
+                      sink=sink,
+                      ckpt_store=ckpt_store,
+                      continuation_enabled=continuation_enabled,
+                      continuation_equilibrium=args.continuation_equilibrium,
+                      continuation_ramp_rounds=args.continuation_ramp_rounds,
+                      continuation_rate_start=args.continuation_rate_start,
+                      shards_per_round=args.shards_per_round)
             round_id += 1
             completed += 1
             if args.rounds == 0 or completed < args.rounds:
