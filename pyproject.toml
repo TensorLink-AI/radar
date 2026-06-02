@@ -34,3 +34,15 @@ miners = ["torch>=2.1", "openai>=1.30", "httpx>=0.27"]
 
 [tool.setuptools.packages.find]
 include = ["local*", "shared*", "miner_template*", "miners*", "runner*"]
+
+# Pull torch from the CUDA 12.8 wheel index so the GPU build matches the
+# NVIDIA driver. Without this, uv pulls torch from PyPI, which ships a
+# build for a newer CUDA than driver 570.x supports and falls back to CPU
+# with a "driver too old" warning.
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
