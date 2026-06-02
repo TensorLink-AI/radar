@@ -319,12 +319,48 @@ def build_designer_system_prompt(
     return "\n\n".join(parts)
 
 
+def _continuation_preamble(context: dict) -> str:
+    """Hard architecture-freeze instruction for a continuation round.
+
+    The parent checkpoint is loaded strictly, so the submission must be
+    architecturally identical. We hand the designer the parent's own
+    architecture source to copy verbatim and confine it to the training
+    recipe — which it writes every round anyway.
+    """
+    parent = context.get("parent", {})
+    return (
+        f"## CONTINUATION ROUND — architecture is FROZEN\n\n"
+        f"You are continuing parent experiment #{context['parent_id']} "
+        f"(metric={parent.get('metric')!r}, "
+        f"n_rounds={parent.get('n_rounds')!r}). Its checkpoint is loaded "
+        "into your model with `strict=True`, so your module MUST be "
+        "architecturally identical. Copy the following top-level "
+        "definitions into your submission **verbatim** — do not rename, "
+        "reshape, reorder, or otherwise alter them:\n\n"
+        "```python\n" + context["frozen_arch"] + "\n```\n\n"
+        "Your ONLY job is to improve the **training recipe** so the "
+        "warm-started weights train further/better. You may add or "
+        "rewrite: `build_optimizer` (required), `build_scheduler`, "
+        "`training_config`, `compute_loss`, `configure_amp`, "
+        "`transform_batch`, `on_step_begin`/`on_step_end`. Because the "
+        "weights are already trained, favour a lower / decaying learning "
+        "rate that extends the parent's curve rather than restarting it. "
+        "Do NOT change `build_model` / `init_weights` / `COMPILE` or any "
+        "tensor shape — if you do, the warm-start load fails and the run "
+        "is scored as a fresh design instead.\n\n"
+        "`validate_code`, then `submit`."
+    )
+
+
 def build_designer_user_prompt(challenge: dict, brief: dict) -> str:
     """Kickoff message for the designer — embeds the researcher brief."""
     task = challenge.get("task", {}) or {}
     task_name = task.get("name", "unknown")
 
     parts: list[str] = []
+    cont_ctx = challenge.get("_continuation_context")
+    if cont_ctx:
+        parts.append(_continuation_preamble(cont_ctx))
     parts.append(
         f"You are designing for task `{task_name}`. The researcher "
         "produced this brief — read it, then implement one of the "

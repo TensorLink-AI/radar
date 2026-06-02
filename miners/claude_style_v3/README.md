@@ -124,3 +124,12 @@ round-seed reproduces identical primitives across reruns.
   operator-prompt hooks. They're hardcoded — if you want to evolve
   them, fork to `claude_style_v2_gepa` and add `metadata.slot:
   "analyst"` rows to its `active.json`.
+- **Continuation rounds** (`core/continuation.py`, shared verbatim with
+  v2): on `challenge["round_type"] == "continuation"` the orchestrator
+  lifts the chosen parent's `build_model` / `init_weights` / `COMPILE`
+  source verbatim and **skips the analyst, Phase A, and the researcher**
+  — there's no new architecture to invent. The designer gets a
+  frozen-architecture preamble and retunes only the training recipe; the
+  proposal ships `mode="continue"` + `parent_index` only when the code
+  reproduces the frozen architecture exactly (AST-checked), else it's a
+  fresh design. See `claude_style_v2/README.md` for the full rationale.
