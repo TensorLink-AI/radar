@@ -105,7 +105,7 @@ warm-start a run from a prior checkpoint instead of training from scratch.
 **The validator owns the cadence**: each round it flips a seeded coin at a
 scheduled rate and stamps `challenge['round_type']` (`continuation`/`new`).
 The rate is keyed on **successful rounds** — 0% until
-`--continuation_warmup_rounds` (100), then +`--continuation_step_pct` (1%)
+`--continuation_warmup_rounds` (50), then +`--continuation_step_pct` (1%)
 every `--continuation_step_every` (5) up to `--continuation_equilibrium`
 (0.70): 0→70% over ~350 rounds post-warmup. A scheduled continuation round
 downgrades to `new` when no eligible parents exist yet. The **miner only

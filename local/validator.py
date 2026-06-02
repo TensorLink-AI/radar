@@ -306,7 +306,7 @@ def run_round(store: LocalStore, task, round_id: int,
               ckpt_store: CheckpointStore | None = None,
               continuation_enabled: bool = False,
               continuation_equilibrium: float = 0.7,
-              continuation_warmup_rounds: int = 100,
+              continuation_warmup_rounds: int = 50,
               continuation_step_pct: float = 1.0,
               continuation_step_every: int = 5,
               shards_per_round: int = 0) -> None:
@@ -604,9 +604,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--continuation_equilibrium", type=float, default=0.7,
                         help="Steady-state fraction of rounds the validator "
                              "schedules as continuations (default 0.70).")
-    parser.add_argument("--continuation_warmup_rounds", type=int, default=100,
+    parser.add_argument("--continuation_warmup_rounds", type=int, default=50,
                         help="Successful rounds with 0%% continuation before "
-                             "the ramp starts (default 100).")
+                             "the ramp starts (default 50).")
     parser.add_argument("--continuation_step_pct", type=float, default=1.0,
                         help="Percentage points the continuation rate climbs "
                              "per step after warmup (default 1.0).")

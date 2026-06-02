@@ -328,14 +328,14 @@ def test_continuation_rate_warmup_then_staircase():
     from local.continuation import continuation_rate
     # 0% through the whole warmup window.
     assert continuation_rate(0) == 0.0
-    assert continuation_rate(99) == 0.0
-    assert continuation_rate(100) == pytest.approx(0.0)   # ramp starts here
+    assert continuation_rate(49) == 0.0
+    assert continuation_rate(50) == pytest.approx(0.0)   # ramp starts here
     # +1% per 5 successful rounds after warmup.
-    assert continuation_rate(105) == pytest.approx(0.01)
-    assert continuation_rate(150) == pytest.approx(0.10)
+    assert continuation_rate(55) == pytest.approx(0.01)
+    assert continuation_rate(100) == pytest.approx(0.10)
     # Reaches the 0.70 equilibrium ~350 rounds after warmup, then holds.
-    assert continuation_rate(100 + 350) == pytest.approx(0.70)
-    assert continuation_rate(100 + 999) == pytest.approx(0.70)
+    assert continuation_rate(50 + 350) == pytest.approx(0.70)
+    assert continuation_rate(50 + 999) == pytest.approx(0.70)
 
 
 def test_is_continuation_round_warmup_and_tracking():

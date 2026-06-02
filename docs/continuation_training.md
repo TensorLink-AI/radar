@@ -33,14 +33,14 @@ The rate is driven by the count of **successful rounds** (rounds that
 produced ≥1 successful experiment — failing early rounds don't count):
 
 * **Warmup** — stays at **0%** until `--continuation_warmup_rounds`
-  (default **100**) successful rounds, so the initial frontier
+  (default **50**) successful rounds, so the initial frontier
   establishes first.
 * **Staircase** — then climbs `--continuation_step_pct` (default **1%**)
   every `--continuation_step_every` (default **5**) successful rounds, up
   to `--continuation_equilibrium` (default **0.70**), then holds.
 
 With the defaults that's **0 → 70% over ~350 successful rounds after the
-100-round warmup**, leaving ~30% fresh exploration at steady state. The
+50-round warmup**, leaving ~30% fresh exploration at steady state. The
 realized round-type frequency tracks the rate via a per-round Bernoulli
 flip seeded by `round_id` (reproducible, independent of the training
 seed). See `local/continuation.py::continuation_rate` /

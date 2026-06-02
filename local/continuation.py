@@ -29,7 +29,7 @@ def continuation_rate(
     successful_rounds: int,
     *,
     equilibrium: float = 0.7,
-    warmup_rounds: int = 100,
+    warmup_rounds: int = 50,
     step_pct: float = 1.0,
     step_every: int = 5,
 ) -> float:
@@ -38,7 +38,7 @@ def continuation_rate(
     Stays at **0** until ``warmup_rounds`` successful rounds have completed
     (let the frontier establish first), then climbs as a staircase —
     ``step_pct`` percentage points every ``step_every`` rounds — up to
-    ``equilibrium``. With the defaults (warmup 100, +1%/5 rounds, eq 0.70)
+    ``equilibrium``. With the defaults (warmup 50, +1%/5 rounds, eq 0.70)
     it reaches 70% about 350 successful rounds after the warmup.
     """
     eq = max(0.0, min(1.0, equilibrium))
@@ -55,7 +55,7 @@ def is_continuation_round(
     successful_rounds: int,
     *,
     equilibrium: float = 0.7,
-    warmup_rounds: int = 100,
+    warmup_rounds: int = 50,
     step_pct: float = 1.0,
     step_every: int = 5,
 ) -> bool:
