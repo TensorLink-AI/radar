@@ -14,7 +14,11 @@ Two responsibilities:
 Configuration is env-driven so the numpy-only path stays a no-op:
 
 * ``RADAR_BACKUP_BUCKET``    — required; empty disables backups.
-* ``RADAR_BACKUP_PREFIX``    — key prefix (default ``radar-backups``).
+* ``RADAR_BACKUP_PREFIX``    — key prefix (default ``radar-backups``,
+  or ``radar-backups/<RADAR_INSTANCE_ID>`` when that is set).
+* ``RADAR_INSTANCE_ID``      — optional shared instance name used to
+  namespace R2 writes (backup + agent-events). Lets multiple
+  validators share one bucket without colliding.
 * ``RADAR_BACKUP_INTERVAL_SEC`` — seconds between snapshots
   (default ``3600``).
 
@@ -239,7 +243,12 @@ def from_env(db_path: str | Path) -> Optional[R2Backup]:
         if not _has_s3_creds():
             return None
         bucket = DEFAULT_BUCKET
-    prefix = os.getenv("RADAR_BACKUP_PREFIX", DEFAULT_PREFIX).strip()
+    explicit_prefix = os.getenv("RADAR_BACKUP_PREFIX", "").strip()
+    if explicit_prefix:
+        prefix = explicit_prefix
+    else:
+        instance = os.getenv("RADAR_INSTANCE_ID", "").strip()
+        prefix = f"{DEFAULT_PREFIX}/{instance}" if instance else DEFAULT_PREFIX
     try:
         interval = float(os.getenv("RADAR_BACKUP_INTERVAL_SEC", "3600"))
     except ValueError:
