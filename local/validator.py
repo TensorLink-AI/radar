@@ -370,7 +370,12 @@ def run_round(store: LocalStore, task, round_id: int,
     if bucket:
         try:
             from local.export_events import flush_round_to_r2
-            prefix = os.getenv("RADAR_EVENT_LOG_R2_PREFIX", "agent-events")
+            explicit_prefix = os.getenv("RADAR_EVENT_LOG_R2_PREFIX", "").strip()
+            if explicit_prefix:
+                prefix = explicit_prefix
+            else:
+                instance = os.getenv("RADAR_INSTANCE_ID", "").strip()
+                prefix = f"agent-events/{instance}" if instance else "agent-events"
             flush_round_to_r2(store, round_id, bucket, prefix=prefix)
         except Exception as e:  # noqa: BLE001
             logger.warning("agent-events flush failed for round=%d: %s",
