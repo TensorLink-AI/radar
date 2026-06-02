@@ -30,15 +30,28 @@ def cont():
     return _load(_V2)
 
 
+# Deliberately uses a top-level helper class + imports that build_model
+# depends on — the case a naive "extract build_model only" approach drops.
 PARENT_CODE = '''
 import torch
 import torch.nn as nn
 
 COMPILE = True
 
+HIDDEN = 64
+
+
+class Block(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.lin = nn.Linear(d, d)
+
+    def forward(self, x):
+        return self.lin(x)
+
 
 def build_model(context_len, prediction_len, num_variates, quantiles):
-    return nn.Linear(context_len, prediction_len)
+    return nn.Sequential(Block(HIDDEN), nn.Linear(HIDDEN, prediction_len))
 
 
 def init_weights(model):
@@ -113,6 +126,10 @@ def test_extract_arch_source(cont):
     assert "def build_model" in arch
     assert "def init_weights" in arch
     assert "COMPILE = True" in arch
+    # helper class + imports + constants build_model depends on come along
+    assert "class Block" in arch
+    assert "import torch.nn as nn" in arch
+    assert "HIDDEN = 64" in arch
     # recipe hooks are NOT frozen
     assert "build_optimizer" not in arch
     assert "training_config" not in arch
@@ -136,9 +153,10 @@ def test_arch_matches_recipe_only_change(cont):
 def test_arch_matches_rejects_reshape(cont):
     arch = cont.extract_arch_source(PARENT_CODE)
     changed = PARENT_CODE.replace(
-        "nn.Linear(context_len, prediction_len)",
-        "nn.Linear(context_len, prediction_len * 2)",
+        "nn.Linear(HIDDEN, prediction_len)",
+        "nn.Linear(HIDDEN, prediction_len * 2)",
     )
+    assert changed != PARENT_CODE  # guard against a stale substring
     assert not cont.arch_matches(changed, arch)
 
 
@@ -149,8 +167,31 @@ def test_arch_matches_rejects_missing_symbol(cont):
         "    import torch.nn as nn\n"
         "    return nn.Linear(context_len, prediction_len)\n"
     )
-    # missing init_weights + COMPILE → symbol set differs
+    # missing helper class / imports / init_weights → frozen node unmatched
     assert not cont.arch_matches(only_build, arch)
+
+
+def test_arch_matches_rejects_modified_helper(cont):
+    """Changing a helper class build_model depends on must be caught even
+    though build_model itself is untouched."""
+    arch = cont.extract_arch_source(PARENT_CODE)
+    changed = PARENT_CODE.replace("self.lin = nn.Linear(d, d)",
+                                  "self.lin = nn.Linear(d, d * 2)")
+    assert not cont.arch_matches(changed, arch)
+
+
+def test_arch_matches_allows_extra_additions(cont):
+    """The designer may add extra imports/helpers for its recipe without
+    breaking the match — only the frozen nodes must be reproduced."""
+    arch = cont.extract_arch_source(PARENT_CODE)
+    submission = (
+        "import math\n\n"  # extra import the recipe might use
+        + arch
+        + "\n\ndef build_optimizer(model):\n"
+        "    import torch\n"
+        "    return torch.optim.AdamW(model.parameters(), lr=math.exp(-7))\n"
+    )
+    assert cont.arch_matches(submission, arch)
 
 
 def test_arch_matches_ignores_formatting(cont):
@@ -161,10 +202,7 @@ def test_arch_matches_ignores_formatting(cont):
 
 
 def test_build_context_happy_path(cont):
-    client = FakeClient({
-        "/experiments/42/signature": {"signature": {"w": [4, 8]}},
-        "/experiments/42": {"code": PARENT_CODE},
-    })
+    client = FakeClient({"/experiments/42": {"code": PARENT_CODE}})
     challenge = {
         "round_type": "continuation",
         "eligible_parents": [
@@ -175,7 +213,9 @@ def test_build_context_happy_path(cont):
     assert ctx is not None
     assert ctx["parent_id"] == 42
     assert "def build_model" in ctx["frozen_arch"]
-    assert ctx["signature"] == {"w": [4, 8]}
+    assert "class Block" in ctx["frozen_arch"]
+    # only the one experiment fetch — no extra /signature round-trip
+    assert client.calls == ["http://db/experiments/42"]
 
 
 def test_build_context_new_round_is_none(cont):

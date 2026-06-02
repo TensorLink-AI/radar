@@ -10,16 +10,17 @@ weights-free parent summaries). To actually warm-start, a proposal must
      checkpoint exactly — the validator loads it strictly.
 
 We make (2) trivial and safe instead of asking the LLM to regenerate a
-shape-identical architecture from a signature. The harness already splits
-the submission into an *architecture* surface (``build_model`` /
-``init_weights`` / ``COMPILE``) and a *training-recipe* surface
-(``build_optimizer`` / ``build_scheduler`` / ``training_config`` /
+shape-identical architecture from a signature. The harness splits the
+submission into a *training-recipe* surface — the hooks it picks up by
+name (``build_optimizer`` / ``build_scheduler`` / ``training_config`` /
 ``compute_loss`` / ``configure_amp`` / ``transform_batch`` /
-``on_step_*``). On a continuation round we lift the parent's architecture
-definitions verbatim, pin them into the prompt, and let the designer
-rewrite only the recipe. Shapes are then identical by construction, so
-the strict load can't fail — and recipe-tuning is something the designer
-already does every round.
+``on_step_*``) — and everything else (imports, helper classes,
+``build_model``, ``init_weights``, ``COMPILE``, module constants), which
+is the *architecture*. On a continuation round we lift the parent's whole
+architecture (everything but the recipe hooks) verbatim, pin it into the
+prompt, and let the designer rewrite only the recipe. Shapes are then
+identical by construction, so the strict load can't fail — and
+recipe-tuning is something the designer already does every round.
 
 This module is duplicated byte-for-byte into each standalone agent's
 ``core/`` (the miners don't share an importable package).
@@ -33,15 +34,18 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Top-level symbols that define the architecture. These must be reproduced
-# verbatim on a continuation so the parent checkpoint loads strictly. The
-# recipe hooks (build_optimizer, build_scheduler, training_config,
-# compute_loss, configure_amp, transform_batch, on_step_*) are free to
-# change — that's the whole point of a continuation.
-ARCH_FUNCS = ("build_model", "init_weights")
-ARCH_GLOBALS = ("COMPILE",)
-
-_HTTP_TIMEOUT = 15.0
+# The training-recipe hooks the harness picks up by name. These — and ONLY
+# these — are what a continuation is allowed to change. Everything else at
+# module level (imports, helper classes/functions, build_model,
+# init_weights, COMPILE, module constants) is the "architecture" and is
+# frozen verbatim so the parent checkpoint loads strictly. We blacklist the
+# recipe rather than whitelist build_model, because build_model routinely
+# depends on top-level helper classes / imports that must come along too.
+RECIPE_FUNCS = frozenset({
+    "build_optimizer", "build_scheduler", "training_config",
+    "compute_loss", "configure_amp", "transform_batch",
+    "on_step_begin", "on_step_end",
+})
 
 
 def is_continuation_round(challenge: dict) -> bool:
@@ -98,57 +102,51 @@ def fetch_parent_code(client, db_url: str, parent_id: int) -> Optional[str]:
     return code if isinstance(code, str) and code.strip() else None
 
 
-def fetch_parent_signature(client, db_url: str, parent_id: int) -> dict:
-    """``{tensor_name: [shape]}`` of the parent checkpoint (no weights)."""
-    body = _get_json(client, db_url, f"/experiments/{parent_id}/signature")
-    if not body:
-        return {}
-    sig = body.get("signature")
-    return sig if isinstance(sig, dict) else {}
+def _node_name(node: ast.AST) -> Optional[str]:
+    """Name of a top-level def/class, else ``None``."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return node.name
+    return None
 
 
-def _arch_nodes(code: str) -> dict[str, ast.AST]:
-    """Map architecture symbol → its top-level AST node.
+def _is_recipe(node: ast.AST) -> bool:
+    return _node_name(node) in RECIPE_FUNCS
 
-    Captures ``def build_model`` / ``def init_weights`` and any module-level
-    assignment to ``COMPILE``. Returns ``{}`` if the code doesn't parse.
-    """
+
+def _parse_body(code: str) -> Optional[list[ast.stmt]]:
+    """Top-level statements of ``code``, or ``None`` if it doesn't parse."""
     try:
-        tree = ast.parse(code)
+        return ast.parse(code).body
     except SyntaxError as exc:
-        logger.debug("continuation: parent code did not parse: %s", exc)
-        return {}
-    out: dict[str, ast.AST] = {}
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name in ARCH_FUNCS:
-                out[node.name] = node
-        elif isinstance(node, ast.Assign):
-            for tgt in node.targets:
-                if isinstance(tgt, ast.Name) and tgt.id in ARCH_GLOBALS:
-                    out[tgt.id] = node
-        elif isinstance(node, ast.AnnAssign):
-            tgt = node.target
-            if isinstance(tgt, ast.Name) and tgt.id in ARCH_GLOBALS:
-                out[tgt.id] = node
-    return out
+        logger.debug("continuation: code did not parse: %s", exc)
+        return None
+
+
+def _has_build_model(body: list[ast.stmt]) -> bool:
+    return any(
+        isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and n.name == "build_model"
+        for n in body
+    )
 
 
 def extract_arch_source(code: str) -> Optional[str]:
-    """Verbatim source of the parent's architecture definitions.
+    """Verbatim source of the parent's architecture — everything at module
+    level *except* the recipe hooks.
 
-    Returns the concatenated ``build_model`` (required), ``init_weights``,
-    and ``COMPILE`` segments — exactly what the designer must copy. ``None``
-    when the code doesn't parse or has no ``build_model``.
+    This deliberately keeps imports, helper classes/functions, module
+    constants, ``build_model``, ``init_weights`` and ``COMPILE`` so the
+    designer can paste a self-contained, loadable architecture. Returns
+    ``None`` when the code doesn't parse or has no ``build_model``.
     """
-    nodes = _arch_nodes(code)
-    if "build_model" not in nodes:
+    body = _parse_body(code)
+    # build_model is never a recipe hook, so its presence in the full body
+    # guarantees it survives the filter below.
+    if body is None or not _has_build_model(body):
         return None
     segments: list[str] = []
-    # Stable, readable order: COMPILE flag, then build_model, then init.
-    for name in ("COMPILE", "build_model", "init_weights"):
-        node = nodes.get(name)
-        if node is None:
+    for node in body:
+        if _is_recipe(node):
             continue
         seg = ast.get_source_segment(code, node)
         if seg:
@@ -159,19 +157,30 @@ def extract_arch_source(code: str) -> Optional[str]:
 def arch_matches(submitted_code: str, frozen_arch: str) -> bool:
     """True iff the submission reproduces the frozen architecture exactly.
 
-    Compares the structural AST of each architecture symbol (ignoring
-    formatting/comments). A continuation only stays ``mode="continue"``
-    when this passes; otherwise the proposal is shipped as a fresh design
-    so the validator scores it cleanly instead of failing the strict load.
+    Every frozen top-level node (imports, helper classes, ``build_model``,
+    …) must appear structurally identical (AST-equal, ignoring formatting /
+    comments) among the submission's non-recipe top-level nodes. The
+    submission may add extra nodes and freely write the recipe hooks —
+    those don't affect tensor shapes. Any change to a frozen node fails the
+    check, so the proposal ships as a fresh design rather than risking a
+    strict warm-start load failure.
     """
     if not submitted_code or not frozen_arch:
         return False
-    want = _arch_nodes(frozen_arch)
-    got = _arch_nodes(submitted_code)
-    if not want or set(want) != set(got):
+    frozen_body = _parse_body(frozen_arch)
+    sub_body = _parse_body(submitted_code)
+    if not frozen_body or sub_body is None:
         return False
-    for name, node in want.items():
-        if ast.dump(node) != ast.dump(got[name]):
+    if not _has_build_model(frozen_body):
+        return False
+    # Multiset of the submission's non-recipe nodes; each frozen node must
+    # be matched (and consumed) exactly once.
+    pool = [ast.dump(n) for n in sub_body if not _is_recipe(n)]
+    for node in frozen_body:
+        dump = ast.dump(node)
+        if dump in pool:
+            pool.remove(dump)
+        else:
             return False
     return True
 
@@ -204,7 +213,6 @@ def build_context(challenge: dict, client, db_url: str) -> Optional[dict]:
         "parent_id": parent_id,
         "parent": parent,
         "frozen_arch": frozen,
-        "signature": fetch_parent_signature(client, db_url, parent_id),
     }
 
 
