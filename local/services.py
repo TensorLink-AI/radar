@@ -31,6 +31,8 @@ without a real network. Endpoints (handlers in ``experiments_api``):
   POST /desearch/search
   GET  /wiki                          JSON listing of available files
   GET  /wiki/<path>                   raw markdown content
+  POST /memory/remember               opt-in; 404 unless RADAR_MEMORY_ENABLED
+  POST /memory/recall                 opt-in; 404 unless RADAR_MEMORY_ENABLED
 
 Provider behavior lives in ``local/providers.py``; experiment-query
 logic in ``local/experiments_api.py``.
@@ -49,6 +51,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Optional
 
 from local import experiments_api as exp_api
+from local.memory import Memory
 from local.providers import (
     WikiStore, desearch, llm_available_models, llm_dispatch,
     llm_openai_dispatch,
@@ -85,6 +88,7 @@ class _Handler(BaseHTTPRequestHandler):
     store: LocalStore = None  # type: ignore[assignment]
     wiki: WikiStore = None    # type: ignore[assignment]
     sink: object = None       # ArtifactSink | None — set by ServicesServer.start
+    memory: Optional[Memory] = None  # set by ServicesServer.start; may be disabled
 
     def log_message(self, format, *args):  # noqa: A002
         logger.debug("svc %s - %s", self.address_string(), format % args)
@@ -389,6 +393,37 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return self._json(status, body)
 
+        if path in ("/memory/remember", "/memory/recall"):
+            mem = self.memory
+            if mem is None or not mem.enabled:
+                return self._json(404, {"error": f"unknown path {path}"})
+            if path == "/memory/remember":
+                status, body = self._logged(
+                    "memory_remember", path, payload,
+                    lambda: {"node_id": mem.remember(
+                        payload.get("text", ""),
+                        actor=payload.get("actor") or self._miner_id(),
+                        ts=payload.get("ts"),
+                        props=payload.get("props"),
+                        kind=payload.get("kind", "memory"),
+                    )},
+                )
+                return self._json(status, body)
+            status, body = self._logged(
+                "memory_recall", path, payload,
+                lambda: {"hits": [
+                    {"node_id": h.node_id, "kind": h.kind, "text": h.text,
+                     "score": h.score, "props": h.props, "edges": h.edges}
+                    for h in mem.recall(
+                        payload.get("query", ""),
+                        k=int(payload.get("k", 5) or 5),
+                        as_of=payload.get("as_of"),
+                        hops=int(payload.get("hops", 1) or 1),
+                    )
+                ]},
+            )
+            return self._json(status, body)
+
         self._json(404, {"error": f"unknown path {path}"})
 
 
@@ -416,10 +451,14 @@ class ServicesServer:
     """
 
     def __init__(self, store: LocalStore, wiki_dir: Optional[str],
-                 port: int = 0, sink: object = None):
+                 port: int = 0, sink: object = None,
+                 memory: Optional[Memory] = None):
         self.store = store
         self.wiki = WikiStore(wiki_dir)
         self.sink = sink
+        # Default off: callers that don't pass a Memory get the env-driven
+        # one, which is disabled unless RADAR_MEMORY_ENABLED is set.
+        self.memory = memory if memory is not None else Memory.from_env()
         self._port = port
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -434,6 +473,7 @@ class ServicesServer:
         store = self.store
         wiki = self.wiki
         sink = self.sink
+        memory = self.memory
 
         class BoundHandler(_Handler):
             pass
@@ -441,6 +481,7 @@ class ServicesServer:
         BoundHandler.store = store
         BoundHandler.wiki = wiki
         BoundHandler.sink = sink
+        BoundHandler.memory = memory
 
         self._httpd = _Services(("127.0.0.1", port), BoundHandler)
         self._url = f"http://127.0.0.1:{port}"
