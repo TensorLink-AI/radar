@@ -78,12 +78,29 @@ class TSForecastingSpec:
     time_budget_seconds: int = 3600
 
 
+@dataclass
+class TSDataPipelineSpec:
+    """Complementary task to ts_forecasting: miners design synthetic data
+    generators / augmentors instead of architectures. Each round pairs the
+    miner's pipeline with the current frozen architecture (see
+    ``local/frozen_arch.py``) and scores on AULC × GIFT-Eval.
+    """
+    name: str = "ts_data_pipeline"
+    context_len: int = TS_CONTEXT_LEN
+    prediction_len: int = TS_PREDICTION_LEN
+    num_variates: int = TS_NUM_VARIATES
+    quantiles: tuple[float, ...] = TS_QUANTILES
+    time_budget_seconds: int = 1800
+
+
 def make_spec(name: str):
-    """Return a TaskSpec or TSForecastingSpec by short name."""
+    """Return a TaskSpec / TSForecastingSpec / TSDataPipelineSpec by short name."""
     if name in (None, "", "synth_regression"):
         return TaskSpec()
     if name == "ts_forecasting":
         return TSForecastingSpec()
+    if name == "ts_data_pipeline":
+        return TSDataPipelineSpec()
     raise ValueError(f"unknown task: {name!r}")
 
 
@@ -113,7 +130,7 @@ TS_SIZE_BUCKETS: dict[str, tuple[int, int]] = {
 
 def buckets_for(task) -> dict[str, tuple[int, int]]:
     """Return the bucket dict appropriate for ``task``."""
-    if isinstance(task, TSForecastingSpec):
+    if isinstance(task, (TSForecastingSpec, TSDataPipelineSpec)):
         return TS_SIZE_BUCKETS
     return SIZE_BUCKETS
 

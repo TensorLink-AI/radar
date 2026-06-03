@@ -13,19 +13,33 @@ from core.output_shape import infer_output_shape, verify_output_shape
 
 FORBIDDEN_IMPORTS = {"subprocess", "socket", "ftplib"}
 
+DATA_PIPELINE_TASK = "ts_data_pipeline"
+
+
+def _task_name(challenge: dict | None) -> str:
+    if not challenge:
+        return ""
+    return (challenge.get("task") or {}).get("name") or ""
+
+
 def _required_functions(challenge: dict | None) -> dict[str, list[str]]:
     """Derive required function signatures from the challenge task_params.
 
-    Reads build_model params from challenge['task']['task_params'] keys
-    instead of hardcoding them — the CLAUDE.md spec requires this.
+    Reads required-function signatures from challenge['task']['task_params']
+    keys instead of hardcoding them — the CLAUDE.md spec requires this.
+
+    For ``ts_data_pipeline`` the contract is a ``build_pipeline(...)``
+    iterator factory; there is no ``build_optimizer`` because the harness
+    uses the frozen architecture's hooks.
     """
+    task_params: dict = {}
     if challenge:
-        task_params = challenge.get("task", {}).get("task_params", {})
-        build_model_params = list(task_params.keys()) if task_params else []
-    else:
-        build_model_params = []
+        task_params = challenge.get("task", {}).get("task_params", {}) or {}
+    param_names = list(task_params.keys())
+    if _task_name(challenge) == DATA_PIPELINE_TASK:
+        return {"build_pipeline": param_names}
     return {
-        "build_model": build_model_params,
+        "build_model": param_names,
         "build_optimizer": ["model"],
     }
 
@@ -88,6 +102,12 @@ def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[
                 root = node.module.split(".")[0]
                 if root in FORBIDDEN_IMPORTS:
                     errors.append(f"Forbidden import: {node.module}")
+
+    # ts_data_pipeline ships a data generator, not a model. FLOPs/output-
+    # shape checks would try to forward-pass something that isn't there.
+    # Stop after structural + import checks.
+    if _task_name(challenge) == DATA_PIPELINE_TASK:
+        return len(errors) == 0, errors
 
     # 8. FLOPs bounds + 9. output shape check — only if no structural errors.
     #    Both share a single forward pass: the estimator captures the

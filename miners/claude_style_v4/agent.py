@@ -70,11 +70,14 @@ try:
     from .prompts import (
         build_critic_prompt,
         build_designer_system_prompt, build_designer_user_prompt,
+        build_pipeline_designer_system_prompt,
+        build_pipeline_designer_user_prompt,
         build_researcher_system_prompt, build_researcher_user_prompt,
     )
     from .subagents.analyst import (
         default_digest, format_digest_for_researcher, run_analyst,
     )
+    from .subagents.base import Subagent
     from .subagents.critic import run_critic
     from .subagents.designer import run_designer
     from .subagents.researcher import default_brief, run_researcher
@@ -85,11 +88,14 @@ except ImportError:
     from prompts import (
         build_critic_prompt,
         build_designer_system_prompt, build_designer_user_prompt,
+        build_pipeline_designer_system_prompt,
+        build_pipeline_designer_user_prompt,
         build_researcher_system_prompt, build_researcher_user_prompt,
     )
     from subagents.analyst import (
         default_digest, format_digest_for_researcher, run_analyst,
     )
+    from subagents.base import Subagent
     from subagents.critic import run_critic
     from subagents.designer import run_designer
     from subagents.researcher import default_brief, run_researcher
@@ -360,13 +366,201 @@ def _run_recipe_tuner_pass(
     return pass2_sig
 
 
+PIPELINE_DESIGNER_MAX_ROUNDS = 30
+
+
+def _design_data_pipeline(challenge: dict, gated_client=None) -> dict:
+    """ts_data_pipeline flow: single designer pass against the frozen arch.
+
+    No analyst, no researcher, no recipe-tuner. The design space is
+    well-scoped (procedural / augmentor / hybrid / mixer) and described
+    in the pipeline-designer system prompt; the analyst's "axes of
+    variation" framing doesn't apply because the architecture is fixed
+    externally. The scratchpad still threads cross-round memory through
+    the same handlers the other v4 subagents use.
+    """
+    from core.fallback_templates import fallback_name_for, generate_fallback
+    from core import history
+
+    t_start = time.monotonic()
+    budget = _agent_budget(challenge)
+    deadline = t_start + budget - FALLBACK_RESERVE_SECONDS
+    _log(
+        f"[orchestrator] ts_data_pipeline start budget={budget}s "
+        f"deadline_in={budget - FALLBACK_RESERVE_SECONDS}s"
+    )
+
+    round_id = int(challenge.get("round_id", 0) or 0)
+    active_prompt = _load_active_prompt(round_id)
+    if active_prompt["id"]:
+        challenge["_operator_prompt"] = active_prompt["template"]
+        challenge["_operator_prompt_id"] = active_prompt["id"]
+
+    fa = challenge.get("frozen_arch") or {}
+    _log(
+        f"[orchestrator] frozen_arch v{fa.get('version')} "
+        f"(source exp #{fa.get('source_experiment_id')}, "
+        f"metric={fa.get('source_metric')!r})"
+    )
+
+    scratch_dir: Optional[str] = None
+    try:
+        scratch_dir = load_scratchpad(challenge)  # noqa: F821 — injected
+    except NameError:
+        _log("[orchestrator] load_scratchpad not injected — no scratchpad")
+    except Exception as exc:
+        _log(f"[orchestrator] scratchpad load failed: {exc}")
+
+    state = history.load_state(scratch_dir) if scratch_dir else {}
+    prev_results = challenge.get("previous_results") or []
+    if prev_results:
+        history.merge_results_into_state(state, prev_results)
+
+    handlers = build_handlers(
+        challenge,
+        client=gated_client,
+        scratch_dir=scratch_dir,
+        deadline=deadline,
+        state=state,
+    )
+    llm_kwargs = _llm_kwargs(challenge)
+
+    config_broken = False
+    config_error: Optional[str] = None
+    try:
+        get_client(
+            llm_kwargs["llm_url"],
+            llm_kwargs["agent_token"],
+            llm_kwargs["miner_uid"],
+        )
+    except RuntimeError as exc:
+        _log(f"[orchestrator] startup config check failed: {exc}")
+        config_broken = True
+        config_error = f"config error: {exc}"
+
+    submit_sig: Optional[SubmitSignal] = None
+    last_validated_code: Optional[str] = None
+    if not config_broken:
+        tools = build_tools(challenge, role="pipeline_designer")
+        designer_sys = build_pipeline_designer_system_prompt(challenge)
+        op_directive = challenge.get("_operator_prompt") or ""
+        op_id = challenge.get("_operator_prompt_id") or ""
+        if op_directive:
+            designer_sys = (
+                f"{designer_sys}\n\n"
+                f"## Operator Directive (prompt variant {op_id[:8]})\n"
+                f"{op_directive}"
+            )
+        # No researcher brief on this task — the design space is fully
+        # described by the system prompt. Pass an empty dict so the user
+        # prompt skips the brief section.
+        sub = Subagent(
+            name="pipeline_designer",
+            system_prompt=designer_sys,
+            user_prompt=build_pipeline_designer_user_prompt(challenge, None),
+            tools=tools,
+            handlers=handlers,
+            deadline=deadline,
+            hooks=default_designer_hooks(),
+            state=state,
+            max_rounds=PIPELINE_DESIGNER_MAX_ROUNDS,
+            llm_kwargs=llm_kwargs,
+        )
+        try:
+            result = sub.run()
+            submit_sig = result.submit_sig
+            if submit_sig is not None:
+                _log(
+                    f"[pipeline_designer] shipped via submit "
+                    f"(rounds={result.rounds}, name={submit_sig.name})"
+                )
+            else:
+                _log(
+                    f"[pipeline_designer] no submit "
+                    f"(rounds={result.rounds}, failure={result.failure})"
+                )
+        except Exception as exc:
+            _log(f"[orchestrator] pipeline_designer crashed: {exc}")
+        last_validated_code = getattr(
+            handlers.get("submit", None), "_last_validated_code", "",
+        ) or None
+
+    try:
+        state_holder = getattr(
+            handlers.get("submit", None), "_state_holder", None,
+        )
+        if state_holder is not None:
+            scratch_dir = scratch_dir or tempfile.mkdtemp()
+            history.save_state(scratch_dir, state_holder["state"])
+            try:
+                save_scratchpad(challenge, scratch_dir)  # noqa: F821 — injected
+            except NameError:
+                pass
+            except Exception as exc:
+                _log(f"[orchestrator] scratchpad save failed: {exc}")
+    except Exception as exc:
+        _log(f"[orchestrator] scratchpad finalize crashed: {exc}")
+
+    elapsed = time.monotonic() - t_start
+    _log(f"[orchestrator] ts_data_pipeline elapsed={elapsed:.0f}s")
+
+    if submit_sig is not None:
+        return _package(
+            submit_sig.code, submit_sig.name, submit_sig.motivation,
+            prompt_id=active_prompt["id"],
+        )
+
+    state_holder = getattr(handlers.get("submit", None), "_state_holder", None)
+    best = (
+        (state_holder or {}).get("state", {}).get("best_so_far")
+        if state_holder else None
+    )
+    if best and best.get("code"):
+        _log(
+            f"[orchestrator] shipping stashed best-so-far "
+            f"(name={best.get('name')!r})"
+        )
+        return _package(
+            best["code"],
+            best.get("name") or f"pipeline_best_v{fa.get('version')}",
+            best.get("motivation") or "Auto-shipped best-so-far candidate.",
+            prompt_id=active_prompt["id"],
+        )
+
+    if last_validated_code:
+        return _package(
+            last_validated_code,
+            f"pipeline_auto_v{fa.get('version')}",
+            "Auto-submitted validated code — designer did not call submit.",
+            prompt_id=active_prompt["id"],
+        )
+
+    fb_code = generate_fallback(challenge)
+    fb_name = fallback_name_for(challenge)
+    motivation = (
+        f"FALLBACK: {config_error}"
+        if config_error
+        else "FALLBACK: pipeline designer did not produce validated code"
+    )
+    return _package(fb_code, fb_name, motivation, prompt_id=active_prompt["id"])
+
+
 def design_architecture(challenge: dict, gated_client=None) -> dict:
     """Entry point required by the harness.
 
     Drives researcher → designer → fallback in sequence under one
     monotonic deadline. Persists state to scratchpad so candidate
     history, hypotheses, and submissions survive across rounds.
+
+    ``ts_data_pipeline`` rounds short-circuit to a focused single-designer
+    flow (``_design_data_pipeline``) — the analyst/researcher/recipe
+    machinery doesn't apply to a data-generator task and the prompt
+    surface is entirely different.
     """
+    task_name = (challenge.get("task") or {}).get("name") or ""
+    if task_name == "ts_data_pipeline":
+        return _design_data_pipeline(challenge, gated_client)
+
     t_start = time.monotonic()
     budget = _agent_budget(challenge)
     deadline = t_start + budget - FALLBACK_RESERVE_SECONDS

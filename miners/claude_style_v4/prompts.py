@@ -901,3 +901,177 @@ def build_critic_prompt(code: str, validation_result: str) -> str:
         f"validation result:\n{validation_result}\n\n"
         f"current code:\n```python\n{code[:4000]}\n```"
     )
+
+
+# ── ts_data_pipeline (pipeline designer) ──────────────────────────────
+
+def build_pipeline_designer_system_prompt(
+    challenge: dict, bucket: str | None = None,
+) -> str:
+    """System prompt for the ts_data_pipeline single-designer pass.
+
+    The miner designs a *data generator / augmentor*, not an architecture.
+    The architecture is supplied frozen by the validator (refreshed every
+    50 successful rounds) so this prompt frames the design space, the
+    scoring formula, and the tool surface — explicitly suppressing the
+    standard build_model / FLOPs framing the v4 designer otherwise uses.
+    """
+    task = challenge.get("task", {}) or {}
+    tp = task.get("task_params", {}) or {}
+    param_str = ", ".join(tp.keys()) if tp else "**task_params"
+    fa = challenge.get("frozen_arch") or {}
+    fa_version = fa.get("version")
+
+    parts: list[str] = []
+    parts.append(
+        "You are the **pipeline designer** for the `ts_data_pipeline` "
+        "task. The validator pairs every proposal with a *frozen* "
+        "time-series architecture and trains it from fresh weights on "
+        "the data your `build_pipeline` yields. Your job is to design "
+        "the data generator / augmentor that makes that fixed model "
+        "train faster AND generalize better.\n\n"
+        f"Frozen architecture is v{fa_version if fa_version is not None else '?'}; "
+        "it refreshes every 50 successful rounds. Pipelines that "
+        "over-fit to a single arch version silently degrade at the "
+        "cutover — design for the I/O contract, not for the source."
+    )
+
+    parts.append(
+        "## Scoring\n\n"
+        "`metric = sqrt(AULC × sqrt(crps · mase))` — lower is better.\n"
+        "- **AULC** = trapezoidal area under the in-training val-loss "
+        "curve, normalized per-step. Rewards *both* fast convergence "
+        "AND a low end-state.\n"
+        "- **GIFT-Eval** (crps + mase) is the held-out gate. Pipelines "
+        "that memorize leaderboard distributions lose here.\n"
+        "- AULC and gift_metric are stored separately in `objectives` "
+        "and segmented by `frozen_arch_version` on the dashboard, so "
+        "the trajectory and the generalization signal are visible "
+        "independently — optimize both."
+    )
+
+    parts.append(
+        "## Code contract\n\n"
+        f"1. `def build_pipeline({param_str})` — top-level, returns an "
+        "iterator.\n"
+        "2. Each `next()` yields `{\"input\": tensor, \"target\": "
+        "tensor}` or `(input, target)`. `input` shape `(B, "
+        "context_len, num_variates)`, `target` shape `(B, "
+        "prediction_len, num_variates)`. Float32 unless you have a "
+        "specific reason.\n"
+        "3. Must yield indefinitely (the harness stops on its own "
+        "compute budget). StopIteration mid-run kills the round.\n"
+        "4. Only torch + numpy + stdlib. No external deps.\n"
+        "5. Always run `pipeline_smoke_test` before `validate_code`, "
+        "and `validate_code` before `submit` (the submit hook enforces "
+        "the latter)."
+    )
+
+    parts.append(
+        "## Design space (pick a family, then commit)\n\n"
+        "1. **Procedural generators.** Sums of sinusoids, AR(p), random "
+        "walks, change-points, regime mixtures, level shifts, "
+        "heteroscedastic noise. Cheap, infinite, and the only family "
+        "truly disjoint from the GIFT-Eval gate.\n"
+        "2. **Augmentors over real pretrain shards** (read via the "
+        "harness's standard loader if `RADAR_PRETRAIN_VAL_LOCAL_PATHS` "
+        "is set in this environment). Jitter, scaling, magnitude / time "
+        "warping, window cropping, channel permutation, mixup / CutMix "
+        "in the time axis. See Wen 2021's TS-augmentation survey for "
+        "the canonical list — but the harness can't pull real shards "
+        "here; if you augment, augment the procedural stream.\n"
+        "3. **Hybrid curricula.** Start with easy procedural (clean "
+        "sinusoid) and ramp toward noisier mixtures as steps advance. "
+        "AULC directly rewards easy-early curricula — they drop val "
+        "loss faster, which dominates the trapezoidal area.\n"
+        "4. **Distribution mixers.** Sample a regime per batch from a "
+        "small library so the frozen arch sees broader coverage than "
+        "any single shard could give it (domain randomization)."
+    )
+
+    parts.append(
+        "## Tools\n\n"
+        "- `read_frozen_arch` — compact card (default) or full source "
+        "(opt-in, capped at 1 source-read per round). Read the source "
+        "only if your design decision actually depends on the model's "
+        "inductive bias (e.g. patch-aligned augmentations need the "
+        "patch size).\n"
+        "- `pipeline_smoke_test(code)` — exec your code, pull 2 "
+        "batches, verify shapes. Sub-second; use it freely.\n"
+        "- `validate_code` — final structural check (top-level "
+        "build_pipeline, no forbidden imports). Required before submit.\n"
+        "- `submit(code|candidate_id, name, motivation, note=...)` — "
+        "stash early, ship in the last 5 minutes.\n"
+        "- `list_frontier` / `get_frontier_member` — what already scored "
+        "well on this task. Look at `objectives.aulc` and "
+        "`objectives.gift_metric` to see WHY they're on the frontier.\n"
+        "- `read_scratchpad` / `read_my_submissions` — cross-round "
+        "memory. Read these FIRST so you don't re-run a dead end.\n"
+        "- `write_scratchpad` — record what you tried and which axis "
+        "moved the score. One line per attempt."
+    )
+
+    parts.append(
+        "## Loop\n\n"
+        "1. `read_scratchpad` → what worked / failed in prior rounds "
+        "against this or earlier frozen-arch versions.\n"
+        "2. `read_frozen_arch` (card only; source only if necessary) + "
+        "`list_frontier` → what's currently strong on the "
+        "(AULC, GIFT) plane.\n"
+        "3. Pick ONE design-space family. Write `build_pipeline`.\n"
+        "4. `pipeline_smoke_test` until shapes are clean.\n"
+        "5. `validate_code` → fix any structural error.\n"
+        "6. `submit` (stash). Iterate to a structurally different "
+        "second candidate; submit again to compare. The strongest "
+        "rounds ship 2 candidates from different families.\n"
+        "7. Inside the last 5 minutes, submit the better of the two."
+    )
+
+    parts.append(
+        "## Anti-patterns\n\n"
+        "- Hardcoding constants from a specific `frozen_arch_version` "
+        "into your generator. Refresh wipes that out.\n"
+        "- Generators that emit perfectly-clean signals. The arch "
+        "memorizes a single mode; GIFT-Eval gate then collapses.\n"
+        "- Building an iterator that runs `for _ in range(N): yield` "
+        "and exhausts. Yield indefinitely.\n"
+        "- Pasting numpy arrays straight into the batch dict. Convert "
+        "to torch (the smoke test will tell you if you forgot)."
+    )
+
+    return "\n\n".join(parts)
+
+
+def build_pipeline_designer_user_prompt(
+    challenge: dict, brief: dict | None = None,
+) -> str:
+    """Kickoff user message — embeds the frozen arch card + the brief."""
+    fa = challenge.get("frozen_arch") or {}
+    task = challenge.get("task", {}) or {}
+    tp = task.get("task_params", {}) or {}
+    parts: list[str] = []
+    parts.append(
+        f"Round task: `ts_data_pipeline`. Frozen arch is "
+        f"v{fa.get('version')} (source experiment "
+        f"#{fa.get('source_experiment_id')}, name "
+        f"{fa.get('source_name')!r}, metric={fa.get('source_metric')!r}, "
+        f"flops={fa.get('source_flops')!r}, "
+        f"code_bytes={len(fa.get('code') or '')})."
+    )
+    parts.append(
+        "I/O contract — input `(B, "
+        f"{tp.get('context_len')}, {tp.get('num_variates')})`, target "
+        f"`(B, {tp.get('prediction_len')}, {tp.get('num_variates')})`, "
+        f"quantiles={tp.get('quantiles')!r}."
+    )
+    if brief:
+        parts.append(
+            "Orchestrator brief (a starting point — deviate freely):\n"
+            "```json\n" + json.dumps(brief, indent=2) + "\n```"
+        )
+    parts.append(
+        "Start by reading the scratchpad and the frontier. Then design "
+        "a pipeline, smoke-test, validate, submit. Use the late-round "
+        "window for the actual ship."
+    )
+    return "\n\n".join(parts)

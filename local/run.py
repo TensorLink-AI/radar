@@ -60,10 +60,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--wiki_dir", default="",
                         help="Local markdown directory exposed to the "
                              "agent at GET /wiki.")
-    parser.add_argument("--task", default="synth_regression",
-                        choices=["synth_regression", "ts_forecasting"],
-                        help="Task spec (synthetic regression or "
-                             "ts_forecasting with torch + GIFT-Eval data).")
+    parser.add_argument(
+        "--task", default="synth_regression",
+        choices=["synth_regression", "ts_forecasting", "ts_data_pipeline"],
+        help="Task spec (synthetic regression, ts_forecasting with torch + "
+             "GIFT-Eval data, or ts_data_pipeline — data generators paired "
+             "with a frozen architecture).",
+    )
     parser.add_argument("--agent_seconds", type=int, default=1800,
                         help="LLM agent budget (default 30 min).")
     parser.add_argument("--training_seconds", type=int, default=3600,

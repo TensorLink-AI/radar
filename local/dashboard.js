@@ -14,11 +14,20 @@ const esc = s => String(s == null ? '' : s).replace(/[&<>]/g,
 
 async function get(p) { const r = await fetch(p); return r.json(); }
 
+const TAB_KEY = 'radar.activeTab';
+const VALID_TABS = ['architecture', 'data_pipeline'];
+
 const state = {
   selectedId: null,
   detailOpen: false,
   lossLogScale: false,
   lastData: null,  // last refresh payload, used by modal/redraw
+  activeTab: (() => {
+    try {
+      const stored = localStorage.getItem(TAB_KEY);
+      return VALID_TABS.includes(stored) ? stored : 'architecture';
+    } catch (_e) { return 'architecture'; }
+  })(),
 };
 
 const charts = {};  // id -> { canvas, points, draw, lastArgs }
@@ -62,6 +71,11 @@ function expTooltip(e) {
   } else {
     rows.push(['kind', `<b style="color:#7ec97e">novel</b>`]);
   }
+  if (obj(e, 'aulc') !== null) rows.push(['aulc', fmt(obj(e, 'aulc'))]);
+  if (obj(e, 'gift_metric') !== null)
+    rows.push(['gift', fmt(obj(e, 'gift_metric'))]);
+  if (obj(e, 'frozen_arch_version') !== null)
+    rows.push(['arch v', `v${obj(e, 'frozen_arch_version')}`]);
   if (obj(e, 'crps') !== null) rows.push(['crps', fmt(obj(e, 'crps'))]);
   if (obj(e, 'mase') !== null) rows.push(['mase', fmt(obj(e, 'mase'))]);
   if (obj(e, 'flops_equivalent_size') !== null)
@@ -145,6 +159,59 @@ function frontRowCM(e) {
     + `<td class="num">${fmt(obj(e, 'crps'))}</td>`
     + `<td class="num">${fmt(obj(e, 'mase'))}</td>`
     + `<td class="num">${fmtInt(obj(e, 'flops_equivalent_size'))}</td>`;
+  return tr;
+}
+
+function dpRow(e) {
+  const tr = document.createElement('tr');
+  tr.className = 'row' + (e.id === state.selectedId ? ' selected' : '');
+  tr.dataset.expId = e.id;
+  tr.onclick = () => showDetail(e.id);
+  tr.innerHTML = `<td>${e.id}</td><td>${e.round_id}</td>`
+    + `<td>${esc(e.miner_id)}</td><td>${esc(e.name)}</td>`
+    + `<td class="num">${fmtInt(obj(e, 'frozen_arch_version'))}</td>`
+    + `<td class="num">${fmt(obj(e, 'aulc'))}</td>`
+    + `<td class="num">${fmt(obj(e, 'gift_metric'))}</td>`
+    + `<td class="num">${fmt(obj(e, 'crps'))}</td>`
+    + `<td class="num">${fmt(obj(e, 'mase'))}</td>`
+    + `<td class="metric">${fmt(e.metric)}</td>`
+    + `<td class="score">${fmt(e.score, 3)}</td>`;
+  return tr;
+}
+
+function recentDPRow(e) {
+  const tr = document.createElement('tr');
+  tr.className = 'row' + (e.id === state.selectedId ? ' selected' : '');
+  tr.dataset.expId = e.id;
+  tr.onclick = () => showDetail(e.id);
+  tr.innerHTML = `<td>${e.id}</td><td>${e.round_id}</td>`
+    + `<td>${esc(e.miner_id)}</td><td>${esc(e.name)}</td>`
+    + `<td class="num">${fmtInt(obj(e, 'frozen_arch_version'))}</td>`
+    + `<td class="num">${fmt(obj(e, 'aulc'))}</td>`
+    + `<td class="num">${fmt(obj(e, 'gift_metric'))}</td>`
+    + `<td class="metric">${fmt(e.metric)}</td>`
+    + (e.success ? `<td class="ok">ok</td>` : `<td class="fail">fail</td>`);
+  return tr;
+}
+
+function frozenArchRow(e) {
+  const tr = document.createElement('tr');
+  tr.className = 'row';
+  const ts = e.created_at
+    ? new Date(e.created_at * 1000).toLocaleString() : '—';
+  tr.innerHTML = `<td>v${e.version}</td>`
+    + `<td>${fmtInt(e.source_experiment_id)}</td>`
+    + `<td>${esc(e.source_name)}</td>`
+    + `<td class="num">${fmt(e.source_metric)}</td>`
+    + `<td class="num">${fmt(e.source_crps)}</td>`
+    + `<td class="num">${fmt(e.source_mase)}</td>`
+    + `<td class="num">${fmtInt(e.source_flops)}</td>`
+    + `<td>${esc(ts)}</td>`;
+  // Make source experiment clickable so it opens its detail panel.
+  if (e.source_experiment_id) {
+    tr.style.cursor = 'pointer';
+    tr.onclick = () => showDetail(e.source_experiment_id);
+  }
   return tr;
 }
 
@@ -328,6 +395,76 @@ function drawParetoCM(canvas, front, all) {
     drawMarker(ctx, x, y, 4, !!e.is_continuation);
   }
   drawAxesLabels(ctx, c, 'crps (lower=better) →', 'mase (lower=better) →');
+  drawYTicks(ctx, c, pad, yMin, yMax, 4);
+  return { points: hits };
+}
+
+// ── Pareto: aulc × gift (data-pipeline only) ───────────────
+// Both axes lower=better. Points color-coded by frozen_arch_version so
+// cross-version comparisons are visible at a glance.
+const ARCH_PALETTE = [
+  '#6ba4ff', '#f0a040', '#7ec97e', '#a07cc7',
+  '#e87e9d', '#7ecbe8', '#c97e7e', '#c9c97e',
+];
+function archColor(v) {
+  if (!v) return '#3a4050';
+  return ARCH_PALETTE[(Number(v) - 1) % ARCH_PALETTE.length];
+}
+function drawParetoDP(canvas, front, all) {
+  const c = canvas, ctx = c.getContext('2d');
+  ctx.fillStyle = '#161820'; ctx.fillRect(0, 0, c.width, c.height);
+  const points = (all || []).filter(e =>
+    e.success && obj(e, 'aulc') !== null && obj(e, 'gift_metric') !== null);
+  const hits = [];
+  if (points.length === 0) {
+    drawEmpty(ctx, c, 'no ts_data_pipeline runs with aulc + gift_metric yet');
+    return { points: hits };
+  }
+  const xs = points.map(e => obj(e, 'aulc'));
+  const ys = points.map(e => obj(e, 'gift_metric'));
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const yMin = Math.min(...ys), yMax = Math.max(...ys);
+  const pad = 40;
+  const xRange = Math.max(1e-9, xMax - xMin);
+  const yRange = Math.max(1e-9, yMax - yMin);
+  const px = x => pad + (x - xMin) / xRange * (c.width - 2 * pad);
+  const py = y => c.height - pad - (y - yMin) / yRange * (c.height - 2 * pad);
+  drawGrid(ctx, c, pad);
+  // Off-frontier points, colored by frozen_arch_version.
+  for (const e of points) {
+    const x = px(obj(e, 'aulc')), y = py(obj(e, 'gift_metric'));
+    const selected = e.id === state.selectedId;
+    ctx.fillStyle = selected ? '#f0a040'
+      : archColor(obj(e, 'frozen_arch_version'));
+    drawMarker(ctx, x, y, selected ? 5 : 3, false);
+    hits.push({ sx: x, sy: y, exp: e });
+  }
+  // Frontier line + markers.
+  ctx.strokeStyle = '#7ec97e'; ctx.fillStyle = '#7ec97e'; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  (front || []).forEach((e, i) => {
+    const x = px(obj(e, 'aulc')), y = py(obj(e, 'gift_metric'));
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  for (const e of (front || [])) {
+    const x = px(obj(e, 'aulc')), y = py(obj(e, 'gift_metric'));
+    drawMarker(ctx, x, y, 4, false);
+  }
+  // Per-version legend so the colour code is readable.
+  const versions = [...new Set(points
+    .map(e => obj(e, 'frozen_arch_version'))
+    .filter(v => v))].sort((a, b) => Number(a) - Number(b));
+  ctx.font = '11px ui-monospace, monospace';
+  versions.slice(0, 6).forEach((v, i) => {
+    ctx.fillStyle = archColor(v);
+    ctx.fillText(`■ v${v}`, c.width - 70 - i * 60, 16);
+  });
+  drawAxesLabels(
+    ctx, c,
+    'aulc (lower=better) →',
+    'sqrt(crps·mase) (lower=better) →',
+  );
   drawYTicks(ctx, c, pad, yMin, yMax, 4);
   return { points: hits };
 }
@@ -785,12 +922,15 @@ function openLossModal(e) {
 // ── Refresh loop ───────────────────────────────────────────
 async function refresh() {
   try {
-    const [stats, lb, fr, frCM, cont, recent] = await Promise.all([
+    const [stats, lb, fr, frCM, cont, dp, archs, recent] = await Promise.all([
       get('/api/stats'), get('/api/leaderboard?n=20'),
       get('/api/frontier'), get('/api/frontier_crps_mase'),
-      get('/api/continuation_frontier'), get('/api/recent?n=30'),
+      get('/api/continuation_frontier'),
+      get('/api/data_pipeline_frontier'),
+      get('/api/frozen_archs'),
+      get('/api/recent?n=30'),
     ]);
-    state.lastData = { stats, lb, fr, frCM, cont, recent };
+    state.lastData = { stats, lb, fr, frCM, cont, dp, archs, recent };
     redraw(state.lastData);
     document.getElementById('refresh').textContent =
       'refreshed ' + new Date().toLocaleTimeString();
@@ -798,7 +938,7 @@ async function refresh() {
     document.getElementById('refresh').textContent = 'error: ' + e;
   }
 }
-function redraw({ stats, lb, fr, frCM, cont, recent }) {
+function redraw({ stats, lb, fr, frCM, cont, dp, archs, recent }) {
   // novel/cont split surfaces continuation activity at a glance —
   // raw count + how many of them actually succeeded.
   const novelLine = `${fmtInt(stats.n_novel_successful)} / ${fmtInt(stats.n_novel)}`;
@@ -820,36 +960,56 @@ function redraw({ stats, lb, fr, frCM, cont, recent }) {
   tableRaw.frontier     = fr;
   tableRaw.frontierCM   = frCM;
   tableRaw.continuation = (cont && cont.all) || [];
+  tableRaw.dataPipeline = (dp && dp.all) || [];
+  tableRaw.frozenArchs  = archs || [];
   tableRaw.recent       = recent;
+  // Recent rows filtered to ts_data_pipeline for the data-pipeline tab.
+  tableRaw.recentDP     = (recent || []).filter(
+    e => e.task === 'ts_data_pipeline',
+  );
   renderTable('leaderboard');
   renderTable('frontier');
   renderTable('frontierCM');
   renderTable('continuation');
+  renderTable('dataPipeline');
+  renderTable('frozenArchs');
   renderTable('recent');
+  renderTable('recentDP');
   document.getElementById('lb-count').textContent = ` (${lb.length})`;
   document.getElementById('cm-count').textContent = ` (${frCM.length})`;
   const cAll = (cont && cont.all) || [];
   const cFront = (cont && cont.frontier) || [];
   document.getElementById('cont-count').textContent =
     ` (${cFront.length} on front / ${cAll.length} total)`;
+  const dpAll = (dp && dp.all) || [];
+  const dpFront = (dp && dp.frontier) || [];
+  document.getElementById('dp-count').textContent =
+    ` (${dpFront.length} on front / ${dpAll.length} total)`;
+  document.getElementById('fa-count').textContent =
+    ` (${(archs || []).length})`;
 
   // Charts share the combined point set so off-frontier points are
   // still hover/click-able.
   charts.pareto.getArgs = () => [fr, lb.concat(recent)];
   charts.paretoCM.getArgs = () => [frCM, lb.concat(recent)];
   charts.paretoCont.getArgs = () => [cFront, cAll];
+  charts.paretoDP.getArgs = () => [dpFront, dpAll];
   renderChart('pareto');
   renderChart('paretoCM');
   renderChart('paretoCont');
+  renderChart('paretoDP');
 }
 
 // ── Boot ───────────────────────────────────────────────────
 for (const [id, m] of Object.entries({
-  leaderboard:  { rowFn: row,         rank: true  },
-  frontier:     { rowFn: frontRow,    rank: false },
-  frontierCM:   { rowFn: frontRowCM,  rank: false },
-  continuation: { rowFn: contRow,     rank: false },
-  recent:       { rowFn: recentRow,   rank: false },
+  leaderboard:  { rowFn: row,             rank: true  },
+  frontier:     { rowFn: frontRow,        rank: false },
+  frontierCM:   { rowFn: frontRowCM,      rank: false },
+  continuation: { rowFn: contRow,         rank: false },
+  dataPipeline: { rowFn: dpRow,           rank: false },
+  frozenArchs:  { rowFn: frozenArchRow,   rank: false },
+  recent:       { rowFn: recentRow,       rank: false },
+  recentDP:     { rowFn: recentDPRow,     rank: false },
 })) {
   tableMeta[id] = m;
   tableState[id] = { sortKey: null, sortDir: 'asc', filter: '' };
@@ -860,6 +1020,7 @@ setupTables();
 registerChart('pareto', drawPareto, () => null);
 registerChart('paretoCM', drawParetoCM, () => null);
 registerChart('paretoCont', drawParetoCont, () => null);
+registerChart('paretoDP', drawParetoDP, () => null);
 
 // Expand buttons on the main charts.
 document.querySelectorAll('.chart-expand').forEach(btn => {
@@ -877,6 +1038,28 @@ document.addEventListener('keydown', ev => {
     if (state.detailOpen) return closeDetail();
   }
 });
+
+// ── Tabs ───────────────────────────────────────────────────
+function setActiveTab(name) {
+  if (!VALID_TABS.includes(name)) return;
+  state.activeTab = name;
+  document.body.dataset.activeTab = name;
+  document.querySelectorAll('.tab').forEach(btn => {
+    btn.setAttribute('aria-selected',
+      btn.dataset.tab === name ? 'true' : 'false');
+  });
+  try { localStorage.setItem(TAB_KEY, name); } catch (_e) { /* ignore */ }
+  // Canvas dimensions aren't measured while a section is display:none.
+  // Re-render the now-visible charts using the last fetched data so
+  // they paint correctly on first reveal.
+  if (state.lastData) redraw(state.lastData);
+}
+
+document.querySelectorAll('.tab').forEach(btn => {
+  btn.addEventListener('click', () => setActiveTab(btn.dataset.tab));
+});
+// Apply persisted tab choice before the first refresh paints.
+setActiveTab(state.activeTab);
 
 const autoEl = document.getElementById('autoRefresh');
 let timer = null;

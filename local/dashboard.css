@@ -58,6 +58,33 @@ body {
   100% { box-shadow: 0 0 0 0 rgba(126, 201, 126, 0); }
 }
 .topbar-right { display: flex; align-items: center; gap: 14px; }
+
+/* ─── Tabs ─────────────────────────────────────────────── */
+.tabs {
+  display: flex; gap: 4px; flex: 1; justify-content: center;
+  margin: 0 24px;
+}
+.tab {
+  appearance: none; -webkit-appearance: none;
+  background: transparent; color: var(--fg-2);
+  border: 1px solid transparent; border-bottom-color: var(--border);
+  padding: 7px 16px; cursor: pointer; user-select: none;
+  font: 12px/1.2 var(--font-ui); letter-spacing: 0.02em;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
+}
+.tab:hover { color: var(--fg-1); background: var(--bg-2); }
+.tab[aria-selected="true"] {
+  color: var(--fg-0); background: var(--bg-2);
+  border-color: var(--border) var(--border) transparent var(--border);
+  font-weight: 600;
+}
+/* Section visibility — driven by body[data-active-tab]. */
+section[data-tab] { display: none; }
+body[data-active-tab="architecture"] section[data-tab="architecture"],
+body[data-active-tab="data_pipeline"] section[data-tab="data_pipeline"] {
+  display: block;
+}
 .refresh {
   color: var(--fg-3); font: 11px/1 var(--font-mono); letter-spacing: 0.02em;
 }

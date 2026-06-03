@@ -145,9 +145,102 @@ def fallback_name_for(challenge: dict) -> str:
     e.g. ``fallback_large_v2``. Makes it possible to distinguish fallback
     submissions across rounds and size buckets in the experiment DB.
     """
+    task_name = (challenge.get("task") or {}).get("name") or ""
+    if task_name == "ts_data_pipeline":
+        fa_version = (challenge.get("frozen_arch") or {}).get("version", "?")
+        return f"pipeline_fallback_v{fa_version}_{FALLBACK_VERSION}"
     flops_min, flops_max = extract_flops_budget(challenge)
     bucket = identify_bucket(flops_min, flops_max)
     return f"fallback_{bucket}_{FALLBACK_VERSION}"
+
+
+PIPELINE_FALLBACK_TEMPLATE = '''"""Fallback pipeline for ts_data_pipeline.
+
+Mixture of a few procedural time-series families (sinusoid sums, random
+walks, AR(1)) with light noise. Designed to be a non-degenerate prior:
+trains the frozen arch on a diverse-enough distribution that AULC drops
+and the GIFT-Eval gate holds, without depending on any external data.
+Yields indefinitely.
+"""
+
+import math
+import torch
+
+BATCH_SIZE = {batch_size}
+SEED = {seed}
+
+
+def _sinusoid_batch(rng, B, ctx, pred, V):
+    n = ctx + pred
+    t = torch.arange(n, dtype=torch.float32).view(1, n, 1)
+    freqs = rng.uniform(0.02, 0.4, size=(B, 1, V))
+    phases = rng.uniform(0.0, 2 * math.pi, size=(B, 1, V))
+    amps = rng.uniform(0.5, 2.0, size=(B, 1, V))
+    f = torch.from_numpy(freqs.astype("float32"))
+    p = torch.from_numpy(phases.astype("float32"))
+    a = torch.from_numpy(amps.astype("float32"))
+    series = a * torch.sin(2 * math.pi * f * t + p)
+    noise = torch.from_numpy(
+        rng.normal(0.0, 0.1, size=(B, n, V)).astype("float32"),
+    )
+    return series + noise
+
+
+def _walk_batch(rng, B, ctx, pred, V):
+    n = ctx + pred
+    steps = torch.from_numpy(
+        rng.normal(0.0, 0.2, size=(B, n, V)).astype("float32"),
+    )
+    return steps.cumsum(dim=1)
+
+
+def _ar1_batch(rng, B, ctx, pred, V):
+    n = ctx + pred
+    phi = rng.uniform(0.6, 0.95, size=(B, 1, V)).astype("float32")
+    phi_t = torch.from_numpy(phi)
+    noise = torch.from_numpy(
+        rng.normal(0.0, 0.3, size=(B, n, V)).astype("float32"),
+    )
+    out = torch.zeros(B, n, V)
+    out[:, 0] = noise[:, 0]
+    for i in range(1, n):
+        out[:, i] = phi_t.squeeze(1) * out[:, i - 1] + noise[:, i]
+    return out
+
+
+def build_pipeline(context_len, prediction_len, num_variates, quantiles):
+    import numpy as np
+    rng = np.random.default_rng(SEED)
+    families = (_sinusoid_batch, _walk_batch, _ar1_batch)
+
+    def _iter():
+        i = 0
+        while True:
+            family = families[i % len(families)]
+            i += 1
+            series = family(
+                rng, BATCH_SIZE, context_len, prediction_len, num_variates,
+            )
+            yield {{
+                "input": series[:, :context_len].contiguous(),
+                "target": series[:, context_len:].contiguous(),
+            }}
+
+    return _iter()
+'''
+
+
+def _generate_pipeline_fallback(challenge: dict, jitter: int) -> str:
+    """Emit a procedural mixture pipeline that satisfies the contract
+    without any data dependency. Seed jittered per miner so two miners
+    on the same round produce different generators (hash-distinct
+    submissions, same shape contract)."""
+    # Batch size in 16-48 range — a real generator can override.
+    batch_size = 32 + (jitter % 16)
+    seed = (jitter * 2654435761) & 0xFFFFFFFF
+    return PIPELINE_FALLBACK_TEMPLATE.format(
+        batch_size=batch_size, seed=seed,
+    )
 
 
 def _has_recognized_continuous_keys(tp: dict) -> bool:
@@ -188,6 +281,11 @@ def generate_fallback(challenge: dict) -> str:
     sig = ", ".join(param_names) if param_names else "**kwargs"
 
     jitter = _miner_jitter(challenge)
+
+    # 0. ts_data_pipeline — different contract (build_pipeline, not
+    # build_model). Procedural mixture generator, no data dependency.
+    if (challenge.get("task") or {}).get("name") == "ts_data_pipeline":
+        return _generate_pipeline_fallback(challenge, jitter)
 
     # 1. Token-ID task
     if _looks_like_token_task(tp):
