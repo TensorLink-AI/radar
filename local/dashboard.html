@@ -18,35 +18,61 @@
 </div>
 <div class="stats" id="stats"></div>
 
-<h2>Leaderboard <span class="muted" id="lb-count"></span></h2>
-<div class="table-wrap"><table><thead><tr>
-  <th class="rank">#</th><th>id</th><th>round</th><th>miner</th><th>name</th>
-  <th class="num">metric</th><th class="num">crps</th><th class="num">mase</th>
-  <th class="num">flops</th><th class="num">score</th>
+<h2>Leaderboard <span class="muted" id="lb-count"></span>
+  <input class="tbl-search" data-table="leaderboard" placeholder="filter…">
+</h2>
+<div class="table-wrap"><table data-table="leaderboard"><thead><tr>
+  <th class="rank">#</th>
+  <th data-key="id" data-type="num">id</th>
+  <th data-key="round_id" data-type="num">round</th>
+  <th data-key="miner_id">miner</th>
+  <th data-key="name">name</th>
+  <th class="num" data-key="metric" data-type="num">metric</th>
+  <th class="num" data-key="objectives.crps" data-type="num">crps</th>
+  <th class="num" data-key="objectives.mase" data-type="num">mase</th>
+  <th class="num" data-key="objectives.flops_equivalent_size" data-type="num">flops</th>
+  <th class="num" data-key="score" data-type="num">score</th>
 </tr></thead><tbody id="leaderboard"></tbody></table></div>
 
 <h2>Pareto frontier (metric × flops)
   <button class="chart-expand" data-chart="pareto" title="enlarge">⤢</button>
+  <input class="tbl-search" data-table="frontier" placeholder="filter…">
 </h2>
 <div class="chart-host"><canvas id="pareto" width="900" height="320"></canvas></div>
-<div class="table-wrap"><table><thead><tr>
-  <th>id</th><th>miner</th><th class="num">flops</th>
-  <th class="num">metric</th><th class="num">crps</th><th class="num">mase</th>
+<div class="table-wrap"><table data-table="frontier"><thead><tr>
+  <th data-key="id" data-type="num">id</th>
+  <th data-key="miner_id">miner</th>
+  <th class="num" data-key="objectives.flops_equivalent_size" data-type="num">flops</th>
+  <th class="num" data-key="metric" data-type="num">metric</th>
+  <th class="num" data-key="objectives.crps" data-type="num">crps</th>
+  <th class="num" data-key="objectives.mase" data-type="num">mase</th>
 </tr></thead><tbody id="frontier"></tbody></table></div>
 
 <h2>Pareto frontier (crps × mase) <span class="muted" id="cm-count"></span>
   <button class="chart-expand" data-chart="paretoCM" title="enlarge">⤢</button>
+  <input class="tbl-search" data-table="frontierCM" placeholder="filter…">
 </h2>
 <div class="chart-host"><canvas id="paretoCM" width="900" height="320"></canvas></div>
-<div class="table-wrap"><table><thead><tr>
-  <th>id</th><th>miner</th><th>name</th>
-  <th class="num">crps</th><th class="num">mase</th><th class="num">flops</th>
+<div class="table-wrap"><table data-table="frontierCM"><thead><tr>
+  <th data-key="id" data-type="num">id</th>
+  <th data-key="miner_id">miner</th>
+  <th data-key="name">name</th>
+  <th class="num" data-key="objectives.crps" data-type="num">crps</th>
+  <th class="num" data-key="objectives.mase" data-type="num">mase</th>
+  <th class="num" data-key="objectives.flops_equivalent_size" data-type="num">flops</th>
 </tr></thead><tbody id="frontierCM"></tbody></table></div>
 
-<h2>Recent</h2>
-<div class="table-wrap"><table><thead><tr>
-  <th>id</th><th>round</th><th>miner</th><th>name</th>
-  <th class="num">metric</th><th class="num">score</th><th>ok</th>
+<h2>Recent
+  <input class="tbl-search" data-table="recent" placeholder="filter…">
+</h2>
+<div class="table-wrap"><table data-table="recent"><thead><tr>
+  <th data-key="id" data-type="num">id</th>
+  <th data-key="round_id" data-type="num">round</th>
+  <th data-key="miner_id">miner</th>
+  <th data-key="name">name</th>
+  <th class="num" data-key="metric" data-type="num">metric</th>
+  <th class="num" data-key="score" data-type="num">score</th>
+  <th data-key="success">ok</th>
 </tr></thead><tbody id="recent"></tbody></table></div>
 
 <div id="tooltip" class="tooltip"></div>
