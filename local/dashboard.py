@@ -17,6 +17,9 @@ Endpoints:
   GET /api/frontier_crps_mase      Pareto front on (crps, mase) — ts_forecasting only
   GET /api/continuation_frontier   Pareto front on (cumulative_compute, Δ) for
                                    warm-started runs only
+  GET /api/data_pipeline_frontier  Pareto front on (aulc, gift_metric) —
+                                   ts_data_pipeline runs only
+  GET /api/frozen_archs            Frozen-arch version list (ts_data_pipeline)
   GET /api/experiment/<id>         full row (incl. code, loss_curve)
 """
 
@@ -271,6 +274,56 @@ def _continuation_frontier(conn: sqlite3.Connection) -> dict[str, Any]:
     return {"frontier": front, "all": enriched}
 
 
+def _data_pipeline_frontier(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Non-dominated set on (aulc, gift_metric) for ts_data_pipeline runs.
+
+    Both lower=better. Returns ``{frontier, all, versions}`` so the chart can
+    render off-frontier dots and segment per frozen-arch version (since each
+    version anchors its own comparison).
+    """
+    rows = conn.execute(
+        "SELECT * FROM experiments WHERE success=1 AND metric IS NOT NULL "
+        "AND task='ts_data_pipeline'"
+    ).fetchall()
+    points = [_row(r) for r in rows]
+    points = [
+        p for p in points
+        if p["objectives"].get("aulc") is not None
+        and p["objectives"].get("gift_metric") is not None
+    ]
+    front: list[dict[str, Any]] = []
+    for p in points:
+        pa = p["objectives"]["aulc"]
+        pg = p["objectives"]["gift_metric"]
+        dominated = False
+        for o in points:
+            if o is p:
+                continue
+            oa = o["objectives"]["aulc"]
+            og = o["objectives"]["gift_metric"]
+            if oa <= pa and og <= pg and (oa < pa or og < pg):
+                dominated = True
+                break
+        if not dominated:
+            front.append(p)
+    front.sort(key=lambda e: e["objectives"]["aulc"])
+    versions = sorted({
+        int(p["objectives"].get("frozen_arch_version") or 0)
+        for p in points
+    })
+    return {"frontier": front, "all": points, "versions": versions}
+
+
+def _frozen_archs(base_dir: str) -> list[dict[str, Any]]:
+    """List persisted frozen-arch snapshots (metadata only, no code)."""
+    try:
+        from local.frozen_arch import FrozenArchStore
+        return FrozenArchStore(base_dir or None).all_versions()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("frozen_archs read failed: %s", e)
+        return []
+
+
 def _experiment(conn: sqlite3.Connection, exp_id: int) -> dict[str, Any] | None:
     r = conn.execute(
         "SELECT * FROM experiments WHERE id=?", (exp_id,)
@@ -280,6 +333,7 @@ def _experiment(conn: sqlite3.Connection, exp_id: int) -> dict[str, Any] | None:
 
 class _Handler(BaseHTTPRequestHandler):
     db_path: str = ""
+    frozen_arch_dir: str = ""
     html: bytes = b""
     css: bytes = b""
     js: bytes = b""
@@ -328,6 +382,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, _frontier_crps_mase(conn))
             if path == "/api/continuation_frontier":
                 return self._json(200, _continuation_frontier(conn))
+            if path == "/api/data_pipeline_frontier":
+                return self._json(200, _data_pipeline_frontier(conn))
+            if path == "/api/frozen_archs":
+                return self._json(200, _frozen_archs(self.frozen_arch_dir))
             if path.startswith("/api/experiment/"):
                 try:
                     exp_id = int(path.rsplit("/", 1)[1])
@@ -342,8 +400,10 @@ class _Handler(BaseHTTPRequestHandler):
             conn.close()
 
 
-def serve(db_path: str, host: str, port: int) -> None:
+def serve(db_path: str, host: str, port: int,
+          frozen_arch_dir: str = "") -> None:
     _Handler.db_path = db_path
+    _Handler.frozen_arch_dir = frozen_arch_dir
     _Handler.html = _HTML_PATH.read_bytes()
     _Handler.css = _CSS_PATH.read_bytes() if _CSS_PATH.exists() else b""
     _Handler.js = _JS_PATH.read_bytes() if _JS_PATH.exists() else b""
@@ -363,11 +423,16 @@ def main() -> None:
     parser.add_argument("--db", default="local/radar_local.db")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--frozen_arch_dir", default="",
+        help="Frozen-arch snapshot dir for the ts_data_pipeline task. "
+             "Empty = $RADAR_FROZEN_ARCH_DIR or local/frozen_archs.",
+    )
     args = parser.parse_args()
     if not Path(args.db).exists():
         raise SystemExit(f"db not found: {args.db}")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    serve(args.db, args.host, args.port)
+    serve(args.db, args.host, args.port, frozen_arch_dir=args.frozen_arch_dir)
 
 
 if __name__ == "__main__":

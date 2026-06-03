@@ -82,6 +82,40 @@
   <th class="num" data-key="score" data-type="num">score</th>
 </tr></thead><tbody id="continuation"></tbody></table></div>
 
+<h2>Data-pipeline frontier (aulc × gift) <span class="muted" id="dp-count"></span>
+  <span class="muted">ts_data_pipeline · synthetic data generators</span>
+  <button class="chart-expand" data-chart="paretoDP" title="enlarge">⤢</button>
+  <input class="tbl-search" data-table="dataPipeline" placeholder="filter…">
+</h2>
+<div class="chart-host"><canvas id="paretoDP" width="900" height="320"></canvas></div>
+<div class="table-wrap"><table data-table="dataPipeline"><thead><tr>
+  <th data-key="id" data-type="num">id</th>
+  <th data-key="round_id" data-type="num">round</th>
+  <th data-key="miner_id">miner</th>
+  <th data-key="name">name</th>
+  <th class="num" data-key="objectives.frozen_arch_version" data-type="num">arch v</th>
+  <th class="num" data-key="objectives.aulc" data-type="num">aulc</th>
+  <th class="num" data-key="objectives.gift_metric" data-type="num">gift</th>
+  <th class="num" data-key="objectives.crps" data-type="num">crps</th>
+  <th class="num" data-key="objectives.mase" data-type="num">mase</th>
+  <th class="num" data-key="metric" data-type="num">metric</th>
+  <th class="num" data-key="score" data-type="num">score</th>
+</tr></thead><tbody id="dataPipeline"></tbody></table></div>
+
+<h2>Frozen architectures <span class="muted" id="fa-count"></span>
+  <span class="muted">snapshots that anchor data-pipeline scoring</span>
+</h2>
+<div class="table-wrap"><table data-table="frozenArchs"><thead><tr>
+  <th data-key="version" data-type="num">v</th>
+  <th data-key="source_experiment_id" data-type="num">source exp</th>
+  <th data-key="source_name">source name</th>
+  <th class="num" data-key="source_metric" data-type="num">metric</th>
+  <th class="num" data-key="source_crps" data-type="num">crps</th>
+  <th class="num" data-key="source_mase" data-type="num">mase</th>
+  <th class="num" data-key="source_flops" data-type="num">flops</th>
+  <th data-key="created_at" data-type="num">created</th>
+</tr></thead><tbody id="frozenArchs"></tbody></table></div>
+
 <h2>Recent
   <input class="tbl-search" data-table="recent" placeholder="filter…">
 </h2>

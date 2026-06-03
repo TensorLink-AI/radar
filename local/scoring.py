@@ -17,6 +17,10 @@ SIZE_GATE_TOLERANCE = 0.1   # 10%, matches Config.SIZE_GATE_TOLERANCE
 
 
 def passes_size_gate(objectives: dict, min_flops: int, max_flops: int) -> bool:
+    # Both bounds 0 = gate disabled (e.g. the ts_data_pipeline task where
+    # the architecture is frozen and every miner reports identical flops).
+    if min_flops <= 0 and max_flops <= 0:
+        return True
     flops = objectives.get("flops_equivalent_size", 0)
     lo = int(min_flops * (1 - SIZE_GATE_TOLERANCE))
     hi = int(max_flops * (1 + SIZE_GATE_TOLERANCE))

@@ -36,10 +36,14 @@ from local.continuation import (
     prepare_continuation,
 )
 from local.experiments_api import _parent_summary
+from local.frozen_arch import FrozenArchStore, maybe_refresh as maybe_refresh_frozen
 from local.scoring import compute_pareto, passes_size_gate, score_round
 from local.services import ServicesServer
 from local.store import LocalStore
-from local.task import SIZE_BUCKETS, TaskSpec, TSForecastingSpec, buckets_for, make_spec
+from local.task import (
+    SIZE_BUCKETS, TaskSpec, TSDataPipelineSpec, TSForecastingSpec,
+    buckets_for, make_spec,
+)
 from local.trainer import run_training
 
 
@@ -60,6 +64,27 @@ def _task_dict(task) -> dict:
     Miners read this verbatim — see ``miners/*/agent.py`` and the
     ``challenge['task']`` description in radar-miner-examples/README.md.
     """
+    if isinstance(task, TSDataPipelineSpec):
+        return {
+            "name": task.name,
+            "task_params": {
+                "context_len": task.context_len,
+                "prediction_len": task.prediction_len,
+                "num_variates": task.num_variates,
+                "quantiles": list(task.quantiles),
+            },
+            "constraints": [
+                "torch + stdlib only",
+                "build_pipeline(context_len, prediction_len, num_variates, "
+                "quantiles) returns an iterator of {'input', 'target'} batches",
+            ],
+            "objectives": [
+                {"name": "aulc", "primary": False, "minimize": True},
+                {"name": "gift_metric", "primary": False, "minimize": True},
+            ],
+            "time_budget": task.time_budget_seconds,
+            "runner_dir": "ts_data_pipeline",
+        }
     if isinstance(task, TSForecastingSpec):
         return {
             "name": task.name,
@@ -85,10 +110,20 @@ def _task_dict(task) -> dict:
 def _build_challenge(round_id: int, store: LocalStore, task,
                      services_url: str, agent_seconds: int = 180,
                      continuation_enabled: bool = False,
-                     scheduled_continuation: bool = False) -> dict:
+                     scheduled_continuation: bool = False,
+                     frozen_arch=None) -> dict:
     name, lo, hi = _pick_bucket(round_id, task=task)
+    # The data-pipeline task uses a fixed frozen architecture, so its
+    # FLOPs are identical across miners in a round — size buckets are
+    # meaningless here. Zero the bounds so the harness skips the gate.
+    if isinstance(task, TSDataPipelineSpec):
+        name, lo, hi = "frozen", 0, 0
     all_exps = store.recent_experiments(n=10_000)
-    pareto = compute_pareto(all_exps)
+    # Mixed-task DBs (e.g. ts_forecasting + ts_data_pipeline against the
+    # same SQLite file) mean we can't compare metrics across tasks — filter
+    # to this task before computing the per-round feasible frontier.
+    same_task = [e for e in all_exps if e.get("task") == task.name]
+    pareto = compute_pareto(same_task)
     feasible = [
         {
             "code": e["code"],
@@ -120,7 +155,7 @@ def _build_challenge(round_id: int, store: LocalStore, task,
     # ``allowed_urls`` is what the miner-side GatedClient enforces. Every
     # endpoint the agent can reach lives under ``services_url`` so a
     # single prefix is enough.
-    return {
+    payload = {
         "challenge_id": f"r{round_id:06d}-{uuid.uuid4().hex[:8]}",
         "round_id": round_id,
         "seed": round_id * 31 + 7,
@@ -143,6 +178,18 @@ def _build_challenge(round_id: int, store: LocalStore, task,
         "cognition_wiki_url": f"{services_url}/wiki",
         "allowed_urls": services_url,
     }
+    if frozen_arch is not None:
+        payload["frozen_arch"] = {
+            "version": frozen_arch.version,
+            "source_experiment_id": frozen_arch.source_experiment_id,
+            "source_metric": frozen_arch.source_metric,
+            "source_crps": frozen_arch.source_crps,
+            "source_mase": frozen_arch.source_mase,
+            "source_flops": frozen_arch.source_flops,
+            "source_name": frozen_arch.source_name,
+            "code": frozen_arch.code,
+        }
+    return payload
 
 
 def _ensure_ts_caches() -> bool:
@@ -254,7 +301,7 @@ def _pretrain_pool() -> list[str]:
 
 
 def _train_proposal(payload: dict, task, round_id: int,
-                    challenge: dict, prep: dict) -> dict:
+                    challenge: dict, prep: dict, frozen_arch=None) -> dict:
     """Run one proposal, retrying as a fresh run if a continuation
     warm-start turns out to be architecture-incompatible (strict load)."""
     def _run() -> dict:
@@ -269,6 +316,7 @@ def _train_proposal(payload: dict, task, round_id: int,
             step_offset=prep["step_offset"],
             shard_paths=prep["shard_paths"],
             shard_reuse=prep["shard_reuse"],
+            frozen_arch=frozen_arch,
         )
 
     result = _run()
@@ -309,7 +357,9 @@ def run_round(store: LocalStore, task, round_id: int,
               continuation_warmup_rounds: int = 50,
               continuation_step_pct: float = 1.0,
               continuation_step_every: int = 5,
-              shards_per_round: int = 0) -> None:
+              shards_per_round: int = 0,
+              frozen_arch_store: FrozenArchStore | None = None,
+              frozen_arch_refresh_every: int = 50) -> None:
     # The validator owns the cadence: a scheduled coin flip decides whether
     # this is a continuation round. The rate stays at 0 until
     # ``warmup_rounds`` successful rounds, then climbs as a staircase to the
@@ -330,10 +380,27 @@ def run_round(store: LocalStore, task, round_id: int,
         step_pct=continuation_step_pct,
         step_every=continuation_step_every,
     )
+    # Frozen-arch refresh (ts_data_pipeline only). Snapshots at every_n
+    # successful data-pipeline rounds; the first one bootstraps from the
+    # ts_forecasting frontier.
+    frozen_arch = None
+    if isinstance(task, TSDataPipelineSpec) and frozen_arch_store is not None:
+        maybe_refresh_frozen(
+            frozen_arch_store, store, every_n=frozen_arch_refresh_every,
+        )
+        frozen_arch = frozen_arch_store.current()
+        if frozen_arch is None:
+            logger.warning(
+                "  no frozen architecture available yet — round drops. "
+                "Run ts_forecasting first so there's a frontier to snapshot.",
+            )
+            return
+
     challenge = _build_challenge(
         round_id, store, task, services_url, agent_seconds=agent_seconds,
         continuation_enabled=continuation_enabled,
         scheduled_continuation=scheduled,
+        frozen_arch=frozen_arch,
     )
     challenge_id = challenge["challenge_id"]
     bucket = challenge["bucket"]
@@ -410,7 +477,9 @@ def run_round(store: LocalStore, task, round_id: int,
             "  phase B/C: training '%s' from miner=%s mode=%s",
             name, miner_id, prep["mode"],
         )
-        result = _train_proposal(payload, task, round_id, challenge, prep)
+        result = _train_proposal(
+            payload, task, round_id, challenge, prep, frozen_arch=frozen_arch,
+        )
 
         result["miner_id"] = miner_id
         result["name"] = name
@@ -584,9 +653,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--wiki_dir", default="",
                         help="Local directory of markdown files exposed to "
                              "the agent at GET /wiki. Empty = no wiki.")
-    parser.add_argument("--task", default="synth_regression",
-                        choices=["synth_regression", "ts_forecasting"],
-                        help="Which task this validator drives.")
+    parser.add_argument(
+        "--task", default="synth_regression",
+        choices=["synth_regression", "ts_forecasting", "ts_data_pipeline"],
+        help="Which task this validator drives.",
+    )
+    parser.add_argument(
+        "--frozen_arch_refresh_every", type=int, default=50,
+        help="ts_data_pipeline only: refresh the frozen architecture every "
+             "N successful data-pipeline rounds (default 50).",
+    )
+    parser.add_argument(
+        "--frozen_arch_dir", default="",
+        help="ts_data_pipeline only: where versioned frozen archs live. "
+             "Empty = $RADAR_FROZEN_ARCH_DIR or local/frozen_archs.",
+    )
     parser.add_argument("--continuation", default="auto",
                         choices=["auto", "on", "off"],
                         help="Allow continuation (warm-start) proposals. "
@@ -637,20 +718,46 @@ def main(argv: list[str] | None = None) -> int:
     if backup is not None:
         backup.start()
     task = make_spec(args.task)
-    if isinstance(task, TSForecastingSpec):
+    if isinstance(task, (TSForecastingSpec, TSDataPipelineSpec)):
         task.time_budget_seconds = args.training_seconds
         # GIFT-Eval is non-negotiable: Phase C always runs the full 97-task
         # leaderboard, so there's no point starting rounds without it. No
         # skip flag — fix creds / disk and rerun.
         if not _ensure_ts_caches():
-            logger.error("ts_forecasting caches not ready — aborting.")
+            logger.error("%s caches not ready — aborting.", task.name)
             return 2
+
+    frozen_arch_store: FrozenArchStore | None = None
+    if isinstance(task, TSDataPipelineSpec):
+        frozen_arch_store = FrozenArchStore(
+            base_dir=args.frozen_arch_dir or None,
+        )
+        # Best-effort bootstrap so the very first round has a snapshot.
+        maybe_refresh_frozen(
+            frozen_arch_store, store, every_n=args.frozen_arch_refresh_every,
+        )
+        current = frozen_arch_store.current()
+        if current is None:
+            logger.warning(
+                "ts_data_pipeline: no frozen arch available yet — "
+                "early rounds will drop until a ts_forecasting experiment "
+                "with both crps + mase lands in the same db.",
+            )
+        else:
+            logger.info(
+                "ts_data_pipeline: frozen arch v%d (exp=%d metric=%.6f)",
+                current.version, current.source_experiment_id,
+                current.source_metric,
+            )
 
     if args.continuation == "on":
         continuation_enabled = True
     elif args.continuation == "off":
         continuation_enabled = False
     else:  # auto
+        # Continuation is a ts_forecasting-specific lineage feature; the
+        # data-pipeline task doesn't persist checkpoints as warm-start
+        # parents (frozen arch fills that role instead).
         continuation_enabled = isinstance(task, TSForecastingSpec)
 
     logger.info(
@@ -709,7 +816,9 @@ def main(argv: list[str] | None = None) -> int:
                       continuation_warmup_rounds=args.continuation_warmup_rounds,
                       continuation_step_pct=args.continuation_step_pct,
                       continuation_step_every=args.continuation_step_every,
-                      shards_per_round=args.shards_per_round)
+                      shards_per_round=args.shards_per_round,
+                      frozen_arch_store=frozen_arch_store,
+                      frozen_arch_refresh_every=args.frozen_arch_refresh_every)
             round_id += 1
             completed += 1
             if args.rounds == 0 or completed < args.rounds:

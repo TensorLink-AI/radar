@@ -42,7 +42,7 @@ import numpy as np
 from local.task import (
     MAX_EPOCHS, MAX_HIDDEN_LAYERS, MAX_HIDDEN_WIDTH,
     INPUT_DIM, OUTPUT_DIM, estimate_flops_equivalent, make_dataset,
-    TSForecastingSpec,
+    TSForecastingSpec, TSDataPipelineSpec,
 )
 
 logger = logging.getLogger(__name__)
@@ -156,6 +156,7 @@ def run_training(
     step_offset: int = 0,
     shard_paths: list[str] | None = None,
     shard_reuse: bool = False,
+    frozen_arch: Any = None,
 ) -> dict:
     """Phase B + Phase C, in one function. Returns the experiment record.
 
@@ -170,6 +171,24 @@ def run_training(
       one entry per logged epoch), ``analysis`` (str), ``error`` (str
       on failure).
     """
+    if isinstance(task, TSDataPipelineSpec):
+        from local.data_pipeline import run_data_pipeline_training
+        if frozen_arch is None:
+            return {
+                "success": False,
+                "metric": None,
+                "objectives": {"flops_equivalent_size": 0, "num_params": 0,
+                               "train_seconds": 0.0},
+                "loss_curve": [],
+                "analysis": "ts_data_pipeline: no frozen arch available",
+                "error": "frozen_arch is required for ts_data_pipeline",
+                "workdir": "",
+            }
+        return run_data_pipeline_training(
+            code, seed=seed, task=task,
+            min_flops=min_flops, max_flops=max_flops,
+            frozen_arch=frozen_arch,
+        )
     if isinstance(task, TSForecastingSpec):
         return _run_ts_forecasting(
             code, seed=seed, task=task,
