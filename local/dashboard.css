@@ -272,3 +272,19 @@ canvas { background: var(--bg-2); border-radius: var(--radius-sm); display: bloc
 .modal-head .close:hover { color: var(--fg-0); background: var(--bg-3); }
 
 .spark { vertical-align: middle; margin-left: 6px; }
+
+/* ─── Kind badge (novel / continuation) ───────────────── */
+.badge {
+  display: inline-block; padding: 1px 7px;
+  font: 500 10px/1.5 var(--font-ui);
+  text-transform: uppercase; letter-spacing: 0.06em;
+  border-radius: 999px; border: 1px solid transparent;
+}
+.badge-novel {
+  color: var(--green); background: var(--green-2);
+  border-color: rgba(126, 201, 126, 0.3);
+}
+.badge-cont {
+  color: #c9a8e8; background: rgba(160, 124, 199, 0.16);
+  border-color: rgba(160, 124, 199, 0.36);
+}

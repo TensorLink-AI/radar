@@ -52,11 +52,27 @@ function expTooltip(e) {
     ['name', esc(e.name)], ['metric', fmt(e.metric)],
     ['score', fmt(e.score, 3)],
   ];
+  if (e.is_continuation) {
+    rows.push(['kind', `<b style="color:#f0a040">continuation</b>`]);
+    if (e.parent_index !== null && e.parent_index !== undefined)
+      rows.push(['parent', e.parent_index]);
+    if (e.n_rounds)              rows.push(['rounds', e.n_rounds]);
+    if (e.cumulative_compute)    rows.push(['Σ compute', fmt(e.cumulative_compute, 2)]);
+    if (e.delta !== undefined)   rows.push(['Δ', fmt(e.delta)]);
+  } else {
+    rows.push(['kind', `<b style="color:#7ec97e">novel</b>`]);
+  }
   if (obj(e, 'crps') !== null) rows.push(['crps', fmt(obj(e, 'crps'))]);
   if (obj(e, 'mase') !== null) rows.push(['mase', fmt(obj(e, 'mase'))]);
   if (obj(e, 'flops_equivalent_size') !== null)
     rows.push(['flops', fmtInt(obj(e, 'flops_equivalent_size'))]);
   return rows.map(([k, v]) => `<span class="k">${k}</span> <b>${v}</b>`).join('<br>');
+}
+
+function kindBadge(e) {
+  return e.is_continuation
+    ? `<span class="badge badge-cont" title="warm-started from a parent checkpoint">cont</span>`
+    : `<span class="badge badge-novel" title="trained from scratch">novel</span>`;
 }
 
 // ── Tables ─────────────────────────────────────────────────
@@ -68,6 +84,7 @@ function row(e, rank) {
   tr.innerHTML = (rank !== undefined ? `<td class="rank">${rank}</td>` : '')
     + `<td>${e.id}</td><td>${e.round_id}</td>`
     + `<td>${esc(e.miner_id)}</td><td>${esc(e.name)}</td>`
+    + `<td>${kindBadge(e)}</td>`
     + `<td class="metric">${fmt(e.metric)}</td>`
     + `<td class="num">${fmt(obj(e, 'crps'))}</td>`
     + `<td class="num">${fmt(obj(e, 'mase'))}</td>`
@@ -83,9 +100,26 @@ function recentRow(e) {
   tr.onclick = () => showDetail(e.id);
   tr.innerHTML = `<td>${e.id}</td><td>${e.round_id}</td>`
     + `<td>${esc(e.miner_id)}</td><td>${esc(e.name)}</td>`
+    + `<td>${kindBadge(e)}</td>`
     + `<td class="metric">${fmt(e.metric)}</td>`
     + `<td class="score">${fmt(e.score, 3)}</td>`
     + (e.success ? `<td class="ok">ok</td>` : `<td class="fail">fail</td>`);
+  return tr;
+}
+
+function contRow(e) {
+  const tr = document.createElement('tr');
+  tr.className = 'row' + (e.id === state.selectedId ? ' selected' : '');
+  tr.dataset.expId = e.id;
+  tr.onclick = () => showDetail(e.id);
+  tr.innerHTML = `<td>${e.id}</td><td>${e.round_id}</td>`
+    + `<td>${esc(e.miner_id)}</td>`
+    + `<td>${e.parent_index ?? '—'}</td>`
+    + `<td class="num">${fmtInt(e.n_rounds)}</td>`
+    + `<td class="num">${fmt(e.cumulative_compute, 2)}</td>`
+    + `<td class="num">${fmt(e.delta)}</td>`
+    + `<td class="num">${fmt(e.metric)}</td>`
+    + `<td class="score">${fmt(e.score, 3)}</td>`;
   return tr;
 }
 
@@ -193,6 +227,21 @@ function setupTables() {
   });
 }
 
+// Marker helpers — keep continuation runs visually separate from
+// novel ones across every chart. Circle = novel, triangle = continuation.
+function drawMarker(ctx, x, y, r, isCont) {
+  ctx.beginPath();
+  if (isCont) {
+    ctx.moveTo(x, y - r);
+    ctx.lineTo(x + r * 0.95, y + r * 0.75);
+    ctx.lineTo(x - r * 0.95, y + r * 0.75);
+    ctx.closePath();
+  } else {
+    ctx.arc(x, y, r, 0, 2*Math.PI);
+  }
+  ctx.fill();
+}
+
 // ── Pareto: metric × flops (log x) ─────────────────────────
 function drawPareto(canvas, front, all) {
   const c = canvas, ctx = c.getContext('2d');
@@ -217,10 +266,9 @@ function drawPareto(canvas, front, all) {
   for (const e of points) {
     const x = px(obj(e, 'flops_equivalent_size') || 1), y = py(e.metric);
     const selected = e.id === state.selectedId;
-    ctx.fillStyle = selected ? '#f0a040' : '#3a4050';
-    ctx.beginPath();
-    ctx.arc(x, y, selected ? 5 : 3, 0, 2*Math.PI);
-    ctx.fill();
+    const cont = !!e.is_continuation;
+    ctx.fillStyle = selected ? '#f0a040' : (cont ? '#a07cc7' : '#3a4050');
+    drawMarker(ctx, x, y, selected ? 5 : (cont ? 4 : 3), cont);
     hits.push({ sx: x, sy: y, exp: e });
   }
   // frontier line + points
@@ -233,9 +281,7 @@ function drawPareto(canvas, front, all) {
   ctx.stroke();
   for (const e of front) {
     const x = px(obj(e, 'flops_equivalent_size') || 1), y = py(e.metric);
-    ctx.beginPath();
-    ctx.arc(x, y, 4, 0, 2*Math.PI);
-    ctx.fill();
+    drawMarker(ctx, x, y, 4, !!e.is_continuation);
   }
   drawAxesLabels(ctx, c, 'log10(flops) →', 'metric (lower=better) →');
   drawYTicks(ctx, c, pad, yMin, yMax, 4);
@@ -265,10 +311,9 @@ function drawParetoCM(canvas, front, all) {
   for (const e of points) {
     const x = px(obj(e, 'crps')), y = py(obj(e, 'mase'));
     const selected = e.id === state.selectedId;
-    ctx.fillStyle = selected ? '#f0a040' : '#3a4050';
-    ctx.beginPath();
-    ctx.arc(x, y, selected ? 5 : 3, 0, 2*Math.PI);
-    ctx.fill();
+    const cont = !!e.is_continuation;
+    ctx.fillStyle = selected ? '#f0a040' : (cont ? '#a07cc7' : '#3a4050');
+    drawMarker(ctx, x, y, selected ? 5 : (cont ? 4 : 3), cont);
     hits.push({ sx: x, sy: y, exp: e });
   }
   ctx.strokeStyle = '#7ec97e'; ctx.fillStyle = '#7ec97e'; ctx.lineWidth = 1.5;
@@ -280,11 +325,72 @@ function drawParetoCM(canvas, front, all) {
   ctx.stroke();
   for (const e of front) {
     const x = px(obj(e, 'crps')), y = py(obj(e, 'mase'));
-    ctx.beginPath();
-    ctx.arc(x, y, 4, 0, 2*Math.PI);
-    ctx.fill();
+    drawMarker(ctx, x, y, 4, !!e.is_continuation);
   }
   drawAxesLabels(ctx, c, 'crps (lower=better) →', 'mase (lower=better) →');
+  drawYTicks(ctx, c, pad, yMin, yMax, 4);
+  return { points: hits };
+}
+
+// ── Pareto: cumulative_compute × Δ (continuation only) ────
+// X is cumulative compute (lower=better → left), Y is Δ (higher=better →
+// up), so the frontier hugs the top-left and the line slopes downward.
+function drawParetoCont(canvas, front, all) {
+  const c = canvas, ctx = c.getContext('2d');
+  ctx.fillStyle = '#161820'; ctx.fillRect(0, 0, c.width, c.height);
+  const hits = [];
+  if (!all || all.length === 0) {
+    drawEmpty(ctx, c, 'no continuation runs yet');
+    return { points: hits };
+  }
+  const xs = all.map(e => Math.max(1e-9, e.cumulative_compute || 1e-9));
+  const ys = all.map(e => e.delta);
+  const useLogX = Math.max(...xs) / Math.min(...xs) > 50;
+  const xT = v => useLogX ? Math.log10(Math.max(1e-9, v)) : v;
+  const xMin = Math.min(...xs.map(xT));
+  const xMax = Math.max(...xs.map(xT));
+  const yMin = Math.min(...ys, 0);  // anchor at 0 so the "no progress" line shows
+  const yMax = Math.max(...ys, 0);
+  const pad = 40;
+  const xRange = Math.max(1e-6, xMax - xMin), yRange = Math.max(1e-6, yMax - yMin);
+  const px = x => pad + (xT(x) - xMin) / xRange * (c.width - 2 * pad);
+  const py = y => c.height - pad - (y - yMin) / yRange * (c.height - 2 * pad);
+  drawGrid(ctx, c, pad);
+  // zero-Δ reference line: above it = improved on parent.
+  if (yMin < 0 && yMax > 0) {
+    ctx.strokeStyle = '#3a4050'; ctx.setLineDash([4, 4]); ctx.lineWidth = 1;
+    ctx.beginPath();
+    const yz = py(0);
+    ctx.moveTo(pad, yz); ctx.lineTo(c.width - pad/2, yz);
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+  // all continuation points — color-code by Δ sign so regressions read red.
+  for (const e of all) {
+    const x = px(e.cumulative_compute), y = py(e.delta);
+    const selected = e.id === state.selectedId;
+    ctx.fillStyle = selected
+      ? '#f0a040'
+      : (e.delta > 0 ? '#a07cc7' : '#6b4040');
+    drawMarker(ctx, x, y, selected ? 5 : 4, true);
+    hits.push({ sx: x, sy: y, exp: e });
+  }
+  // frontier line + markers
+  ctx.strokeStyle = '#7ec97e'; ctx.fillStyle = '#7ec97e'; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  front.forEach((e, i) => {
+    const x = px(e.cumulative_compute), y = py(e.delta);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  for (const e of front) {
+    const x = px(e.cumulative_compute), y = py(e.delta);
+    drawMarker(ctx, x, y, 5, true);
+  }
+  drawAxesLabels(
+    ctx, c,
+    (useLogX ? 'log10(Σ compute) →' : 'Σ compute →'),
+    'Δ = parent.metric − this.metric (↑ = better) →',
+  );
   drawYTicks(ctx, c, pad, yMin, yMax, 4);
   return { points: hits };
 }
@@ -385,6 +491,15 @@ async function showDetail(id) {
   const ts = e.timestamp ? new Date(e.timestamp * 1000).toLocaleString() : '—';
   const hasLoss = Array.isArray(e.loss_curve) && e.loss_curve.length > 0;
   const spikes = obj(e, 'num_spikes_skipped');
+  const contLine = e.is_continuation
+    ? `<p><b>kind</b> <span style="color:#a07cc7">continuation</span>`
+      + (e.parent_index != null ? ` <b>parent</b> `
+          + `<a href="#" data-parent="${e.parent_index}" id="parentLink">${e.parent_index}</a>`
+        : '')
+      + ` <b>rounds</b> ${e.n_rounds || 1}`
+      + ` <b>Σ compute</b> ${fmt(e.cumulative_compute, 2)}`
+      + ` <b>mode</b> ${esc(e.mode || 'continue')}</p>`
+    : `<p><b>kind</b> <span style="color:#7ec97e">novel</span></p>`;
   d.innerHTML = `<span class="close" id="detailClose">×</span>`
     + `<h2>experiment ${e.id}</h2>`
     + `<div class="muted">round ${e.round_id} · miner ${esc(e.miner_id)} · `
@@ -395,6 +510,7 @@ async function showDetail(id) {
         ? ` · <span style="color:#e8b87e">spikes skipped: ${spikes}</span>`
         : '')
     + `</p>`
+    + contLine
     + `<h2>objectives</h2><pre>${objJson}</pre>`
     + `<h2>analysis</h2><pre>${esc(e.analysis)}</pre>`
     + (e.motivation ? `<h2>motivation</h2><pre>${esc(e.motivation)}</pre>` : '')
@@ -412,6 +528,11 @@ async function showDetail(id) {
     + `<h2>code <button class="copy-btn" id="copyCode">copy</button></h2>`
     + `<pre id="codePre">${esc(e.code)}</pre>`;
   document.getElementById('detailClose').onclick = closeDetail;
+  const pl = document.getElementById('parentLink');
+  if (pl) pl.onclick = (ev) => {
+    ev.preventDefault();
+    showDetail(Number(pl.dataset.parent));
+  };
   const copy = document.getElementById('copyCode');
   if (copy) copy.onclick = () => {
     navigator.clipboard.writeText(e.code).then(
@@ -664,12 +785,12 @@ function openLossModal(e) {
 // ── Refresh loop ───────────────────────────────────────────
 async function refresh() {
   try {
-    const [stats, lb, fr, frCM, recent] = await Promise.all([
+    const [stats, lb, fr, frCM, cont, recent] = await Promise.all([
       get('/api/stats'), get('/api/leaderboard?n=20'),
       get('/api/frontier'), get('/api/frontier_crps_mase'),
-      get('/api/recent?n=30'),
+      get('/api/continuation_frontier'), get('/api/recent?n=30'),
     ]);
-    state.lastData = { stats, lb, fr, frCM, recent };
+    state.lastData = { stats, lb, fr, frCM, cont, recent };
     redraw(state.lastData);
     document.getElementById('refresh').textContent =
       'refreshed ' + new Date().toLocaleTimeString();
@@ -677,11 +798,17 @@ async function refresh() {
     document.getElementById('refresh').textContent = 'error: ' + e;
   }
 }
-function redraw({ stats, lb, fr, frCM, recent }) {
+function redraw({ stats, lb, fr, frCM, cont, recent }) {
+  // novel/cont split surfaces continuation activity at a glance —
+  // raw count + how many of them actually succeeded.
+  const novelLine = `${fmtInt(stats.n_novel_successful)} / ${fmtInt(stats.n_novel)}`;
+  const contLine  = `${fmtInt(stats.n_continuation_successful)} / ${fmtInt(stats.n_continuation)}`;
   const cells = [
     ['total', fmtInt(stats.total)], ['successful', fmtInt(stats.successful)],
     ['failed', fmtInt(stats.failed)], ['miners', fmtInt(stats.n_miners)],
     ['last round', fmtInt(stats.last_round)],
+    ['novel (ok/total)', novelLine],
+    ['continuation (ok/total)', contLine],
     ['best metric', fmt(stats.best_metric)],
     ['mean metric', fmt(stats.mean_metric)],
   ];
@@ -689,31 +816,40 @@ function redraw({ stats, lb, fr, frCM, recent }) {
     `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`
   ).join('');
 
-  tableRaw.leaderboard = lb;
-  tableRaw.frontier    = fr;
-  tableRaw.frontierCM  = frCM;
-  tableRaw.recent      = recent;
+  tableRaw.leaderboard  = lb;
+  tableRaw.frontier     = fr;
+  tableRaw.frontierCM   = frCM;
+  tableRaw.continuation = (cont && cont.all) || [];
+  tableRaw.recent       = recent;
   renderTable('leaderboard');
   renderTable('frontier');
   renderTable('frontierCM');
+  renderTable('continuation');
   renderTable('recent');
   document.getElementById('lb-count').textContent = ` (${lb.length})`;
   document.getElementById('cm-count').textContent = ` (${frCM.length})`;
+  const cAll = (cont && cont.all) || [];
+  const cFront = (cont && cont.frontier) || [];
+  document.getElementById('cont-count').textContent =
+    ` (${cFront.length} on front / ${cAll.length} total)`;
 
   // Charts share the combined point set so off-frontier points are
   // still hover/click-able.
   charts.pareto.getArgs = () => [fr, lb.concat(recent)];
   charts.paretoCM.getArgs = () => [frCM, lb.concat(recent)];
+  charts.paretoCont.getArgs = () => [cFront, cAll];
   renderChart('pareto');
   renderChart('paretoCM');
+  renderChart('paretoCont');
 }
 
 // ── Boot ───────────────────────────────────────────────────
 for (const [id, m] of Object.entries({
-  leaderboard: { rowFn: row,         rank: true  },
-  frontier:    { rowFn: frontRow,    rank: false },
-  frontierCM:  { rowFn: frontRowCM,  rank: false },
-  recent:      { rowFn: recentRow,   rank: false },
+  leaderboard:  { rowFn: row,         rank: true  },
+  frontier:     { rowFn: frontRow,    rank: false },
+  frontierCM:   { rowFn: frontRowCM,  rank: false },
+  continuation: { rowFn: contRow,     rank: false },
+  recent:       { rowFn: recentRow,   rank: false },
 })) {
   tableMeta[id] = m;
   tableState[id] = { sortKey: null, sortDir: 'asc', filter: '' };
@@ -723,6 +859,7 @@ setupTables();
 
 registerChart('pareto', drawPareto, () => null);
 registerChart('paretoCM', drawParetoCM, () => null);
+registerChart('paretoCont', drawParetoCont, () => null);
 
 // Expand buttons on the main charts.
 document.querySelectorAll('.chart-expand').forEach(btn => {
