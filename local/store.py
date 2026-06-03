@@ -16,12 +16,24 @@ only need what one round of A → B → C needs.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Iterator, Optional
+
+
+# Per-side cap for ``agent_events.request_json`` / ``response_json``.
+# Multi-turn tool loops + reasoning traces routinely cross the old 256KB
+# default, which clipped messages and the model's chain-of-thought. 4MB
+# gives a typical Kimi/R1 round (system prompt + ~10 turns + a few KB of
+# reasoning) headroom without letting a single pathological response
+# bloat the DB. Override with ``RADAR_AGENT_EVENT_MAX_BYTES`` (bytes).
+DEFAULT_AGENT_EVENT_MAX_BYTES = int(
+    os.environ.get("RADAR_AGENT_EVENT_MAX_BYTES", str(4 * 1024 * 1024))
+)
 
 
 SCHEMA = """
@@ -440,7 +452,8 @@ class LocalStore:
         endpoint: str = "", status: Optional[int] = None,
         latency_ms: Optional[float] = None,
         request: object = None, response: object = None,
-        error: Optional[str] = None, max_bytes: int = 262_144,
+        error: Optional[str] = None,
+        max_bytes: int = DEFAULT_AGENT_EVENT_MAX_BYTES,
     ) -> int:
         """Insert one structured event row. ``request``/``response`` are
         JSON-serialised; anything not JSON-encodable is stringified.

@@ -47,9 +47,21 @@ def _openai_compat_chat(base_url: str, api_key: str, payload: dict,
         "temperature": float(payload.get("temperature", 0.7)),
         "max_tokens": int(payload.get("max_tokens", 1024)),
     }
-    # Pass tool-calling fields through when present — the OpenAI SDK
-    # miners rely on this to drive multi-round tool loops.
-    for key in ("tools", "tool_choice", "response_format"):
+    # Pass tool-calling + reasoning fields through when present. Tool
+    # fields drive multi-round tool loops; the reasoning fields tell
+    # OpenAI-compatible upstreams to emit a thinking trace, which lands
+    # in choices[0].message.reasoning_content (or reasoning, depending
+    # on the family) and gets logged to agent_events alongside the
+    # final content. Names vary by provider, so we forward every
+    # variant a miner might use rather than picking one.
+    for key in (
+        "tools", "tool_choice", "response_format",
+        "reasoning_effort",     # OpenAI o-series / GPT-5
+        "reasoning",            # OpenRouter / generic { effort, exclude, ... }
+        "thinking",             # Anthropic-style { type, budget_tokens }
+        "include_reasoning",    # OpenRouter boolean
+        "extra_body",           # SDK escape hatch — nested provider dict
+    ):
         if key in payload and payload[key] is not None:
             forwarded[key] = payload[key]
     req = urllib.request.Request(
