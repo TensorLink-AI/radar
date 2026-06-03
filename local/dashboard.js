@@ -23,6 +23,12 @@ const state = {
 
 const charts = {};  // id -> { canvas, points, draw, lastArgs }
 
+// Sort/filter state per table. Tables share data with the charts (raw
+// rows are stashed here so re-sorting doesn't need a fetch).
+const tableMeta = {};   // id -> { rowFn, rank }
+const tableState = {};  // id -> { sortKey, sortDir, filter }
+const tableRaw = {};    // id -> rows[]
+
 // ── Tooltip ────────────────────────────────────────────────
 const tip = () => document.getElementById('tooltip');
 function showTip(html, ev) {
@@ -106,6 +112,85 @@ function frontRowCM(e) {
     + `<td class="num">${fmt(obj(e, 'mase'))}</td>`
     + `<td class="num">${fmtInt(obj(e, 'flops_equivalent_size'))}</td>`;
   return tr;
+}
+
+// ── Sort + filter ──────────────────────────────────────────
+function getField(e, key) {
+  if (!key) return null;
+  if (key.startsWith('objectives.')) return obj(e, key.slice(11));
+  return e[key];
+}
+function cmpVals(a, b, type) {
+  const aNull = a === null || a === undefined || (typeof a === 'number' && !Number.isFinite(a));
+  const bNull = b === null || b === undefined || (typeof b === 'number' && !Number.isFinite(b));
+  if (aNull && bNull) return 0;
+  if (aNull) return 1;   // nulls sink to the bottom regardless of dir
+  if (bNull) return -1;
+  if (type === 'num') return Number(a) - Number(b);
+  return String(a).localeCompare(String(b));
+}
+function matchesFilter(e, q) {
+  if (!q) return true;
+  q = q.toLowerCase();
+  const hay = [e.id, e.round_id, e.miner_id, e.name, e.task, e.metric, e.score];
+  if (hay.some(v => v !== null && v !== undefined
+      && String(v).toLowerCase().includes(q))) return true;
+  if (e.objectives) {
+    for (const v of Object.values(e.objectives)) {
+      if (v !== null && v !== undefined
+          && String(v).toLowerCase().includes(q)) return true;
+    }
+  }
+  return false;
+}
+function renderTable(tableId) {
+  const meta = tableMeta[tableId];
+  const st = tableState[tableId];
+  const data = tableRaw[tableId] || [];
+  let rows = data.filter(e => matchesFilter(e, st.filter));
+  if (st.sortKey) {
+    const th = document.querySelector(
+      `table[data-table="${tableId}"] th[data-key="${st.sortKey}"]`);
+    const type = th ? (th.dataset.type || '') : '';
+    const sign = st.sortDir === 'asc' ? 1 : -1;
+    rows = rows.slice().sort((a, b) => sign *
+      cmpVals(getField(a, st.sortKey), getField(b, st.sortKey), type));
+  }
+  const el = document.getElementById(tableId);
+  el.innerHTML = '';
+  rows.forEach((e, i) =>
+    el.appendChild(meta.rank ? meta.rowFn(e, i + 1) : meta.rowFn(e)));
+  document.querySelectorAll(
+      `table[data-table="${tableId}"] th[data-key]`).forEach(th => {
+    th.classList.remove('sort-asc', 'sort-desc');
+    if (th.dataset.key === st.sortKey)
+      th.classList.add(st.sortDir === 'asc' ? 'sort-asc' : 'sort-desc');
+  });
+}
+function setupTables() {
+  document.querySelectorAll('table[data-table]').forEach(t => {
+    const tableId = t.dataset.table;
+    t.querySelectorAll('th[data-key]').forEach(th => {
+      th.classList.add('sortable');
+      th.addEventListener('click', () => {
+        const st = tableState[tableId];
+        if (st.sortKey === th.dataset.key) {
+          st.sortDir = st.sortDir === 'asc' ? 'desc' : 'asc';
+        } else {
+          st.sortKey = th.dataset.key;
+          st.sortDir = 'asc';
+        }
+        renderTable(tableId);
+      });
+    });
+  });
+  document.querySelectorAll('.tbl-search').forEach(inp => {
+    const tableId = inp.dataset.table;
+    inp.addEventListener('input', () => {
+      tableState[tableId].filter = inp.value;
+      renderTable(tableId);
+    });
+  });
 }
 
 // ── Pareto: metric × flops (log x) ─────────────────────────
@@ -604,23 +689,16 @@ function redraw({ stats, lb, fr, frCM, recent }) {
     `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`
   ).join('');
 
-  const lbEl = document.getElementById('leaderboard');
-  lbEl.innerHTML = '';
-  lb.forEach((e, i) => lbEl.appendChild(row(e, i + 1)));
+  tableRaw.leaderboard = lb;
+  tableRaw.frontier    = fr;
+  tableRaw.frontierCM  = frCM;
+  tableRaw.recent      = recent;
+  renderTable('leaderboard');
+  renderTable('frontier');
+  renderTable('frontierCM');
+  renderTable('recent');
   document.getElementById('lb-count').textContent = ` (${lb.length})`;
-
-  const frEl = document.getElementById('frontier');
-  frEl.innerHTML = '';
-  fr.forEach(e => frEl.appendChild(frontRow(e)));
-
-  const frCMEl = document.getElementById('frontierCM');
-  frCMEl.innerHTML = '';
-  frCM.forEach(e => frCMEl.appendChild(frontRowCM(e)));
   document.getElementById('cm-count').textContent = ` (${frCM.length})`;
-
-  const rEl = document.getElementById('recent');
-  rEl.innerHTML = '';
-  recent.forEach(e => rEl.appendChild(recentRow(e)));
 
   // Charts share the combined point set so off-frontier points are
   // still hover/click-able.
@@ -631,6 +709,18 @@ function redraw({ stats, lb, fr, frCM, recent }) {
 }
 
 // ── Boot ───────────────────────────────────────────────────
+for (const [id, m] of Object.entries({
+  leaderboard: { rowFn: row,         rank: true  },
+  frontier:    { rowFn: frontRow,    rank: false },
+  frontierCM:  { rowFn: frontRowCM,  rank: false },
+  recent:      { rowFn: recentRow,   rank: false },
+})) {
+  tableMeta[id] = m;
+  tableState[id] = { sortKey: null, sortDir: 'asc', filter: '' };
+  tableRaw[id] = [];
+}
+setupTables();
+
 registerChart('pareto', drawPareto, () => null);
 registerChart('paretoCM', drawParetoCM, () => null);
 
