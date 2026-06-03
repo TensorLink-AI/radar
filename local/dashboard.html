@@ -27,6 +27,7 @@
   <th data-key="round_id" data-type="num">round</th>
   <th data-key="miner_id">miner</th>
   <th data-key="name">name</th>
+  <th data-key="is_continuation">kind</th>
   <th class="num" data-key="metric" data-type="num">metric</th>
   <th class="num" data-key="objectives.crps" data-type="num">crps</th>
   <th class="num" data-key="objectives.mase" data-type="num">mase</th>
@@ -34,7 +35,7 @@
   <th class="num" data-key="score" data-type="num">score</th>
 </tr></thead><tbody id="leaderboard"></tbody></table></div>
 
-<h2>Pareto frontier (metric × flops)
+<h2>Pareto frontier (metric × flops) <span class="muted">novel ● · continuation ▲</span>
   <button class="chart-expand" data-chart="pareto" title="enlarge">⤢</button>
   <input class="tbl-search" data-table="frontier" placeholder="filter…">
 </h2>
@@ -49,6 +50,7 @@
 </tr></thead><tbody id="frontier"></tbody></table></div>
 
 <h2>Pareto frontier (crps × mase) <span class="muted" id="cm-count"></span>
+  <span class="muted">novel ● · continuation ▲</span>
   <button class="chart-expand" data-chart="paretoCM" title="enlarge">⤢</button>
   <input class="tbl-search" data-table="frontierCM" placeholder="filter…">
 </h2>
@@ -62,6 +64,24 @@
   <th class="num" data-key="objectives.flops_equivalent_size" data-type="num">flops</th>
 </tr></thead><tbody id="frontierCM"></tbody></table></div>
 
+<h2>Continuation frontier (compute × Δ) <span class="muted" id="cont-count"></span>
+  <span class="muted">warm-started only · Δ = parent.metric − this.metric</span>
+  <button class="chart-expand" data-chart="paretoCont" title="enlarge">⤢</button>
+  <input class="tbl-search" data-table="continuation" placeholder="filter…">
+</h2>
+<div class="chart-host"><canvas id="paretoCont" width="900" height="320"></canvas></div>
+<div class="table-wrap"><table data-table="continuation"><thead><tr>
+  <th data-key="id" data-type="num">id</th>
+  <th data-key="round_id" data-type="num">round</th>
+  <th data-key="miner_id">miner</th>
+  <th data-key="parent_index" data-type="num">parent</th>
+  <th class="num" data-key="n_rounds" data-type="num">rounds</th>
+  <th class="num" data-key="cumulative_compute" data-type="num">Σ compute</th>
+  <th class="num" data-key="delta" data-type="num">Δ</th>
+  <th class="num" data-key="metric" data-type="num">metric</th>
+  <th class="num" data-key="score" data-type="num">score</th>
+</tr></thead><tbody id="continuation"></tbody></table></div>
+
 <h2>Recent
   <input class="tbl-search" data-table="recent" placeholder="filter…">
 </h2>
@@ -70,6 +90,7 @@
   <th data-key="round_id" data-type="num">round</th>
   <th data-key="miner_id">miner</th>
   <th data-key="name">name</th>
+  <th data-key="is_continuation">kind</th>
   <th class="num" data-key="metric" data-type="num">metric</th>
   <th class="num" data-key="score" data-type="num">score</th>
   <th data-key="success">ok</th>

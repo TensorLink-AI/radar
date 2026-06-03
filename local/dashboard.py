@@ -9,13 +9,15 @@ process is writing. Stdlib only, no JS deps. The UI shell lives in
   # then open http://127.0.0.1:8765/
 
 Endpoints:
-  GET /                       HTML page
-  GET /api/stats              {total, successful, best_metric, ...}
-  GET /api/leaderboard?n=N    top-N by metric ASC (lower=better)
-  GET /api/recent?n=N         latest N by id
-  GET /api/frontier           Pareto front on (metric, flops)
-  GET /api/frontier_crps_mase Pareto front on (crps, mase) — ts_forecasting only
-  GET /api/experiment/<id>    full row (incl. code, loss_curve)
+  GET /                            HTML page
+  GET /api/stats                   {total, successful, best_metric, ...}
+  GET /api/leaderboard?n=N         top-N by metric ASC (lower=better)
+  GET /api/recent?n=N              latest N by id
+  GET /api/frontier                Pareto front on (metric, flops)
+  GET /api/frontier_crps_mase      Pareto front on (crps, mase) — ts_forecasting only
+  GET /api/continuation_frontier   Pareto front on (cumulative_compute, Δ) for
+                                   warm-started runs only
+  GET /api/experiment/<id>         full row (incl. code, loss_curve)
 """
 
 from __future__ import annotations
@@ -23,7 +25,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sqlite3
+
+math_isfinite = math.isfinite
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -45,6 +50,21 @@ def _connect_ro(db_path: str) -> sqlite3.Connection:
 
 
 def _row(r: sqlite3.Row, *, with_code: bool = False) -> dict[str, Any]:
+    # ``mode``/``n_rounds``/``parent_index``/``cumulative_compute`` were
+    # added when continuation training landed; older rows may pre-date
+    # the schema migration so fall back to the "fresh run" defaults.
+    def _opt(key: str, default: Any) -> Any:
+        try:
+            v = r[key]
+        except (IndexError, KeyError):
+            return default
+        return default if v is None else v
+
+    mode = _opt("mode", "new")
+    n_rounds = int(_opt("n_rounds", 1))
+    parent_index = r["parent_index"] if "parent_index" in r.keys() else None
+    cumulative_compute = float(_opt("cumulative_compute", 0.0))
+    is_cont = mode == "continue" or (n_rounds >= 2 and parent_index is not None)
     out = {
         "id": r["id"],
         "round_id": r["round_id"],
@@ -59,6 +79,11 @@ def _row(r: sqlite3.Row, *, with_code: bool = False) -> dict[str, Any]:
         "generation": r["generation"],
         "prompt_id": r["prompt_id"],
         "timestamp": r["timestamp"],
+        "mode": mode,
+        "n_rounds": n_rounds,
+        "parent_index": parent_index,
+        "cumulative_compute": cumulative_compute,
+        "is_continuation": is_cont,
     }
     if with_code:
         out["code"] = r["code"]
@@ -87,6 +112,24 @@ def _stats(conn: sqlite3.Connection) -> dict[str, Any]:
     n_miners = conn.execute(
         "SELECT COUNT(DISTINCT miner_id) AS n FROM experiments"
     ).fetchone()["n"] or 0
+    # Pre-continuation DBs lack mode/n_rounds; the validator's
+    # schema-migration usually fills them in, but tolerate absence so a
+    # standalone dashboard against an old snapshot doesn't 500.
+    try:
+        cont_row = conn.execute(
+            "SELECT "
+            " SUM(CASE WHEN mode='continue' OR (n_rounds>=2 AND parent_index IS NOT NULL) "
+            "          THEN 1 ELSE 0 END) AS n_cont, "
+            " SUM(CASE WHEN success=1 AND "
+            "          (mode='continue' OR (n_rounds>=2 AND parent_index IS NOT NULL)) "
+            "          THEN 1 ELSE 0 END) AS n_cont_ok "
+            "FROM experiments"
+        ).fetchone()
+        n_continuation = cont_row["n_cont"] or 0
+        n_continuation_ok = cont_row["n_cont_ok"] or 0
+    except sqlite3.OperationalError:
+        n_continuation = 0
+        n_continuation_ok = 0
     return {
         "total": total,
         "successful": successful,
@@ -96,6 +139,10 @@ def _stats(conn: sqlite3.Connection) -> dict[str, Any]:
         "mean_metric": row["mean"],
         "last_round": row["last_round"],
         "n_miners": n_miners,
+        "n_continuation": n_continuation,
+        "n_continuation_successful": n_continuation_ok,
+        "n_novel": total - n_continuation,
+        "n_novel_successful": successful - n_continuation_ok,
     }
 
 
@@ -173,6 +220,57 @@ def _frontier_crps_mase(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return front
 
 
+def _continuation_frontier(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Continuation-only Pareto front on (cumulative_compute ↓, Δ ↑).
+
+    Δ is computed as ``parent.metric − this.metric`` so a positive Δ means
+    the warm-start outperformed its parent. Points with non-positive or
+    non-finite Δ are excluded from the frontier but still returned in
+    ``all`` so the chart can render them as off-frontier dots.
+    """
+    rows = conn.execute(
+        "SELECT * FROM experiments WHERE success=1 AND metric IS NOT NULL"
+    ).fetchall()
+    by_id: dict[int, dict[str, Any]] = {}
+    points: list[dict[str, Any]] = []
+    for r in rows:
+        p = _row(r)
+        by_id[p["id"]] = p
+        if p["is_continuation"]:
+            points.append(p)
+    enriched: list[dict[str, Any]] = []
+    for p in points:
+        parent = by_id.get(p.get("parent_index"))
+        pm = parent["metric"] if parent else None
+        if pm is None or p["metric"] is None:
+            continue
+        delta = float(pm) - float(p["metric"])
+        compute = float(p.get("cumulative_compute") or 0.0)
+        if not (math_isfinite(delta) and math_isfinite(compute)):
+            continue
+        p = dict(p)
+        p["delta"] = delta
+        p["parent_metric"] = float(pm)
+        enriched.append(p)
+    front: list[dict[str, Any]] = []
+    for p in enriched:
+        if p["delta"] <= 0:
+            continue
+        pd_, pc_ = p["delta"], p["cumulative_compute"]
+        dominated = False
+        for o in enriched:
+            if o is p or o["delta"] <= 0:
+                continue
+            od_, oc_ = o["delta"], o["cumulative_compute"]
+            if oc_ <= pc_ and od_ >= pd_ and (oc_ < pc_ or od_ > pd_):
+                dominated = True
+                break
+        if not dominated:
+            front.append(p)
+    front.sort(key=lambda e: e["cumulative_compute"])
+    return {"frontier": front, "all": enriched}
+
+
 def _experiment(conn: sqlite3.Connection, exp_id: int) -> dict[str, Any] | None:
     r = conn.execute(
         "SELECT * FROM experiments WHERE id=?", (exp_id,)
@@ -228,6 +326,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, _frontier(conn))
             if path == "/api/frontier_crps_mase":
                 return self._json(200, _frontier_crps_mase(conn))
+            if path == "/api/continuation_frontier":
+                return self._json(200, _continuation_frontier(conn))
             if path.startswith("/api/experiment/"):
                 try:
                     exp_id = int(path.rsplit("/", 1)[1])
