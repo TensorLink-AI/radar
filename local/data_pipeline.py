@@ -226,9 +226,18 @@ def run_data_pipeline_training(
     min_flops: int,
     max_flops: int,
     frozen_arch: FrozenArch,
+    parent_checkpoint_path: str | None = None,
+    compute_offset: float = 0.0,
+    step_offset: int = 0,
 ) -> dict:
-    """Train the frozen arch from fresh weights on the miner's pipeline,
-    then run GIFT-Eval on the saved checkpoint.
+    """Train the frozen arch on the miner's pipeline, then run GIFT-Eval.
+
+    For continuation rounds, ``parent_checkpoint_path`` warm-starts the
+    frozen arch from a parent's saved weights instead of fresh init, and
+    ``compute_offset`` / ``step_offset`` shift the recorded curve
+    coordinates into lineage-absolute space (mirrors ts_forecasting). The
+    epoch (``frozen_arch_version``) must match across parent and child —
+    the validator enforces that gate before we get here.
 
     Returns the same dict shape ``local/validator.py`` already consumes for
     ts_forecasting, plus a ``frozen_arch_version`` key in ``objectives`` so
@@ -292,16 +301,15 @@ def run_data_pipeline_training(
         "RADAR_PRETRAIN_VAL_LOCAL_PATHS": (
             json.dumps(val_paths) if val_paths else ""
         ),
-        "RADAR_STEP_OFFSET": "0",
-        "RADAR_FLOPS_OFFSET": "0",
+        "RADAR_STEP_OFFSET": str(int(step_offset)),
+        "RADAR_FLOPS_OFFSET": str(int(compute_offset)),
+        # Empty string disables warm-start (harness checks ``if env:``).
+        "PARENT_CHECKPOINT_PATH": (
+            str(parent_checkpoint_path) if parent_checkpoint_path else ""
+        ),
     }
-    # Strip any continuation env left over from prior in-process calls.
-    overrides["PARENT_CHECKPOINT_PATH"] = ""
     saved = {k: os.environ.get(k) for k in overrides}
     os.environ.update(overrides)
-    # Remove rather than set-to-empty for the keys the harness checks via
-    # ``getenv() == ""`` -> falsey semantics. PARENT_CHECKPOINT_PATH is
-    # specifically tested with ``if env:`` so empty disables warm-start.
 
     train_log_path = logs_dir / "train.log"
     file_handler = logging.FileHandler(
@@ -387,12 +395,17 @@ def run_data_pipeline_training(
     )
 
     this_compute = float(result.get("this_run_flops") or 0.0)
+    cumulative_compute = float(
+        result.get("cumulative_flops")
+        if result.get("cumulative_flops") is not None
+        else float(compute_offset) + this_compute
+    )
     objectives = {
         "flops_equivalent_size": flops_equiv,
         "num_params": num_params,
         "train_seconds": train_seconds,
         "this_compute": this_compute,
-        "cumulative_compute": this_compute,
+        "cumulative_compute": cumulative_compute,
         "frozen_arch_version": int(frozen_arch.version),
         "frozen_arch_source_id": int(frozen_arch.source_experiment_id),
     }
@@ -452,6 +465,16 @@ def run_data_pipeline_training(
     objectives["mase"] = float(mase)
     if "n_tasks" in eval_metrics:
         objectives["n_tasks"] = int(eval_metrics["n_tasks"])
+
+    # Capture the frozen arch's tensor signature so /signature can serve it
+    # to a continuation miner picking a parent.
+    try:
+        from local.checkpoints import read_signature
+        sig = read_signature(checkpoint_path)
+        if sig:
+            objectives["param_signature"] = sig
+    except Exception as e:  # noqa: BLE001
+        logger.debug("could not capture param signature: %s", e)
 
     gift = math.sqrt(max(crps, 0.0) * max(mase, 0.0))
     # Composite trajectory + leaderboard score: geomean(AULC, GIFT). Both

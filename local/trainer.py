@@ -188,6 +188,9 @@ def run_training(
             code, seed=seed, task=task,
             min_flops=min_flops, max_flops=max_flops,
             frozen_arch=frozen_arch,
+            parent_checkpoint_path=parent_checkpoint_path,
+            compute_offset=compute_offset,
+            step_offset=step_offset,
         )
     if isinstance(task, TSForecastingSpec):
         return _run_ts_forecasting(

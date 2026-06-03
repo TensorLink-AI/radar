@@ -223,3 +223,95 @@ def test_challenge_dict_for_data_pipeline_advertises_pipeline_contract():
     obj_names = {o["name"] for o in d["objectives"]}
     assert "aulc" in obj_names
     assert "gift_metric" in obj_names
+
+
+# ── continuation epoch pinning ──────────────────────────────────────
+
+
+def _add_dp_exp(store, *, frozen_arch_version: int, metric: float = 0.5,
+                cumc: float = 0.0, success: bool = True,
+                ckpt: bool = True) -> int:
+    objs = {
+        "flops_equivalent_size": 0,
+        "num_params": 0,
+        "frozen_arch_version": frozen_arch_version,
+        "frozen_arch_source_id": 1,
+        "cumulative_compute": cumc,
+    }
+    eid = store.add_experiment(
+        round_id=0, miner_id="m", name="x", code="c", motivation="",
+        reasoning="", tool_calls=[], metric=metric, success=success,
+        objectives=objs, score=0.0, loss_curve=[],
+        task="ts_data_pipeline", cumulative_compute=cumc, mode="new",
+    )
+    if ckpt and success:
+        store.set_checkpoint_ref(eid, f"ckpt:{eid}")
+    return eid
+
+
+def test_prepare_continuation_rejects_cross_epoch_parent(tmp_path):
+    from local.checkpoints import CheckpointStore
+    from local.continuation import prepare_continuation
+
+    store = LocalStore(tmp_path / "t.db")
+    cs = CheckpointStore(base_dir=tmp_path / "ck")
+    src = tmp_path / "m.safetensors"
+    src.write_bytes(b"w")
+
+    parent_id = _add_dp_exp(store, frozen_arch_version=1)
+    cs.save(parent_id, src)
+    store.set_checkpoint_ref(parent_id, f"ckpt:{parent_id}")
+
+    # Same-epoch continuation: accepted.
+    prep = prepare_continuation(
+        store, cs,
+        payload={"mode": "continue", "parent_index": parent_id},
+        task_name="ts_data_pipeline", min_flops=0, max_flops=0,
+        pool=[], shards_per_round=0, seed=1,
+        current_epoch={"frozen_arch_version": 1},
+    )
+    assert prep["mode"] == "continue"
+    assert prep["parent_metric"] == 0.5
+
+    # Cross-epoch (parent v1, round v2): rejected, falls back to fresh.
+    prep2 = prepare_continuation(
+        store, cs,
+        payload={"mode": "continue", "parent_index": parent_id},
+        task_name="ts_data_pipeline", min_flops=0, max_flops=0,
+        pool=[], shards_per_round=0, seed=1,
+        current_epoch={"frozen_arch_version": 2},
+    )
+    assert prep2["mode"] == "new"
+    assert "different epoch" in prep2["note"]
+    store.close()
+
+
+def test_current_epoch_for_data_pipeline():
+    from local.frozen_arch import FrozenArch
+    from local.validator import _current_epoch
+
+    dp = make_spec("ts_data_pipeline")
+    ts = make_spec("ts_forecasting")
+    arch = FrozenArch(
+        version=7, code="x", source_experiment_id=1, source_metric=0.5,
+        source_crps=0.3, source_mase=0.7, source_flops=1_000_000,
+        source_name="v7", created_at=0.0,
+    )
+    assert _current_epoch(dp, arch) == {"frozen_arch_version": 7}
+    # ts_forecasting has no epoch axis (yet); empty dict = pin is a no-op.
+    assert _current_epoch(ts, None) == {}
+    assert _current_epoch(dp, None) == {}
+
+
+def test_parent_in_epoch_filters_eligible():
+    from local.validator import _parent_in_epoch
+
+    p1 = {"objectives": {"frozen_arch_version": 3}}
+    p2 = {"objectives": {"frozen_arch_version": 4}}
+    p3 = {"objectives": {}}
+    assert _parent_in_epoch(p1, {"frozen_arch_version": 3})
+    assert not _parent_in_epoch(p2, {"frozen_arch_version": 3})
+    assert not _parent_in_epoch(p3, {"frozen_arch_version": 3})
+    # Empty epoch is a no-op gate.
+    assert _parent_in_epoch(p1, {})
+    assert _parent_in_epoch(p3, {})

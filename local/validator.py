@@ -107,6 +107,28 @@ def _task_dict(task) -> dict:
     }
 
 
+def _current_epoch(task, frozen_arch) -> dict:
+    """Continuation-pinning context for this round.
+
+    A parent's saved checkpoint is only a valid warm-start when it was
+    trained in the same context as this round. For ts_data_pipeline that
+    means the frozen architecture version — the metric isn't comparable
+    across arch refreshes. ts_forecasting has no epoch axis yet (returns
+    empty dict — gate is a no-op).
+    """
+    epoch: dict = {}
+    if isinstance(task, TSDataPipelineSpec) and frozen_arch is not None:
+        epoch["frozen_arch_version"] = int(frozen_arch.version)
+    return epoch
+
+
+def _parent_in_epoch(parent: dict, epoch: dict) -> bool:
+    if not epoch:
+        return True
+    objs = parent.get("objectives", {}) or {}
+    return all(objs.get(k) == v for k, v in epoch.items())
+
+
 def _build_challenge(round_id: int, store: LocalStore, task,
                      services_url: str, agent_seconds: int = 180,
                      continuation_enabled: bool = False,
@@ -140,12 +162,14 @@ def _build_challenge(round_id: int, store: LocalStore, task,
     # is why continuation pressure ramps in slowly: early rounds have no
     # parents to continue from regardless of the schedule.
     eligible_parents = []
+    epoch = _current_epoch(task, frozen_arch)
     if continuation_enabled:
         eligible_parents = [
             _parent_summary(e)
             for e in store.eligible_parents(
                 task=task.name, min_flops=lo, max_flops=hi,
             )
+            if _parent_in_epoch(e, epoch)
         ]
     round_type = (
         "continuation"
@@ -440,8 +464,13 @@ def run_round(store: LocalStore, task, round_id: int,
         return
 
     # Pretrain shard pool (ts_forecasting only) — assigned per-run so
-    # continuations can avoid lineage-seen shards.
-    pool = _pretrain_pool() if continuation_allowed else []
+    # continuations can avoid lineage-seen shards. ts_data_pipeline's
+    # data source is the miner's pipeline; shard assignment is N/A.
+    pool = (
+        _pretrain_pool()
+        if continuation_allowed and isinstance(task, TSForecastingSpec)
+        else []
+    )
 
     # ── Phase B + Phase C: train and evaluate every proposal ──
     results: list[dict] = []
@@ -458,6 +487,7 @@ def run_round(store: LocalStore, task, round_id: int,
             min_flops=challenge["min_flops_equivalent"],
             max_flops=challenge["max_flops_equivalent"],
             pool=pool, shards_per_round=shards_per_round, seed=round_id,
+            current_epoch=_current_epoch(task, frozen_arch),
         ) if continuation_allowed else {
             # Continuation disabled — still preserve any payload parent_index
             # so the existing lineage/diff tracking keeps working.
@@ -755,10 +785,13 @@ def main(argv: list[str] | None = None) -> int:
     elif args.continuation == "off":
         continuation_enabled = False
     else:  # auto
-        # Continuation is a ts_forecasting-specific lineage feature; the
-        # data-pipeline task doesn't persist checkpoints as warm-start
-        # parents (frozen arch fills that role instead).
-        continuation_enabled = isinstance(task, TSForecastingSpec)
+        # Continuation is on by default for both ts_forecasting and
+        # ts_data_pipeline (the latter gates parents on
+        # frozen_arch_version so Δ is honest across epochs). Synthetic
+        # regression has no checkpoints, so it stays off.
+        continuation_enabled = isinstance(
+            task, (TSForecastingSpec, TSDataPipelineSpec),
+        )
 
     logger.info(
         "starting; db=%s task=%s agent_seconds=%d training_seconds=%s "
