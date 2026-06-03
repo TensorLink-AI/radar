@@ -14,11 +14,20 @@ const esc = s => String(s == null ? '' : s).replace(/[&<>]/g,
 
 async function get(p) { const r = await fetch(p); return r.json(); }
 
+const TAB_KEY = 'radar.activeTab';
+const VALID_TABS = ['architecture', 'data_pipeline'];
+
 const state = {
   selectedId: null,
   detailOpen: false,
   lossLogScale: false,
   lastData: null,  // last refresh payload, used by modal/redraw
+  activeTab: (() => {
+    try {
+      const stored = localStorage.getItem(TAB_KEY);
+      return VALID_TABS.includes(stored) ? stored : 'architecture';
+    } catch (_e) { return 'architecture'; }
+  })(),
 };
 
 const charts = {};  // id -> { canvas, points, draw, lastArgs }
@@ -167,6 +176,21 @@ function dpRow(e) {
     + `<td class="num">${fmt(obj(e, 'mase'))}</td>`
     + `<td class="metric">${fmt(e.metric)}</td>`
     + `<td class="score">${fmt(e.score, 3)}</td>`;
+  return tr;
+}
+
+function recentDPRow(e) {
+  const tr = document.createElement('tr');
+  tr.className = 'row' + (e.id === state.selectedId ? ' selected' : '');
+  tr.dataset.expId = e.id;
+  tr.onclick = () => showDetail(e.id);
+  tr.innerHTML = `<td>${e.id}</td><td>${e.round_id}</td>`
+    + `<td>${esc(e.miner_id)}</td><td>${esc(e.name)}</td>`
+    + `<td class="num">${fmtInt(obj(e, 'frozen_arch_version'))}</td>`
+    + `<td class="num">${fmt(obj(e, 'aulc'))}</td>`
+    + `<td class="num">${fmt(obj(e, 'gift_metric'))}</td>`
+    + `<td class="metric">${fmt(e.metric)}</td>`
+    + (e.success ? `<td class="ok">ok</td>` : `<td class="fail">fail</td>`);
   return tr;
 }
 
@@ -939,6 +963,10 @@ function redraw({ stats, lb, fr, frCM, cont, dp, archs, recent }) {
   tableRaw.dataPipeline = (dp && dp.all) || [];
   tableRaw.frozenArchs  = archs || [];
   tableRaw.recent       = recent;
+  // Recent rows filtered to ts_data_pipeline for the data-pipeline tab.
+  tableRaw.recentDP     = (recent || []).filter(
+    e => e.task === 'ts_data_pipeline',
+  );
   renderTable('leaderboard');
   renderTable('frontier');
   renderTable('frontierCM');
@@ -946,6 +974,7 @@ function redraw({ stats, lb, fr, frCM, cont, dp, archs, recent }) {
   renderTable('dataPipeline');
   renderTable('frozenArchs');
   renderTable('recent');
+  renderTable('recentDP');
   document.getElementById('lb-count').textContent = ` (${lb.length})`;
   document.getElementById('cm-count').textContent = ` (${frCM.length})`;
   const cAll = (cont && cont.all) || [];
@@ -980,6 +1009,7 @@ for (const [id, m] of Object.entries({
   dataPipeline: { rowFn: dpRow,           rank: false },
   frozenArchs:  { rowFn: frozenArchRow,   rank: false },
   recent:       { rowFn: recentRow,       rank: false },
+  recentDP:     { rowFn: recentDPRow,     rank: false },
 })) {
   tableMeta[id] = m;
   tableState[id] = { sortKey: null, sortDir: 'asc', filter: '' };
@@ -1008,6 +1038,28 @@ document.addEventListener('keydown', ev => {
     if (state.detailOpen) return closeDetail();
   }
 });
+
+// ── Tabs ───────────────────────────────────────────────────
+function setActiveTab(name) {
+  if (!VALID_TABS.includes(name)) return;
+  state.activeTab = name;
+  document.body.dataset.activeTab = name;
+  document.querySelectorAll('.tab').forEach(btn => {
+    btn.setAttribute('aria-selected',
+      btn.dataset.tab === name ? 'true' : 'false');
+  });
+  try { localStorage.setItem(TAB_KEY, name); } catch (_e) { /* ignore */ }
+  // Canvas dimensions aren't measured while a section is display:none.
+  // Re-render the now-visible charts using the last fetched data so
+  // they paint correctly on first reveal.
+  if (state.lastData) redraw(state.lastData);
+}
+
+document.querySelectorAll('.tab').forEach(btn => {
+  btn.addEventListener('click', () => setActiveTab(btn.dataset.tab));
+});
+// Apply persisted tab choice before the first refresh paints.
+setActiveTab(state.activeTab);
 
 const autoEl = document.getElementById('autoRefresh');
 let timer = null;
