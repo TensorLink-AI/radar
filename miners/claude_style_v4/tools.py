@@ -45,6 +45,7 @@ from core.input_shape import infer_input
 from core.output_shape import infer_output_shape, verify_output_shape
 from core.sizing import MAX_PROBES, sweep_sizes
 from core.trace import format_trace, trace_architecture
+from core.pipeline_probe import smoke_test_pipeline
 from core.validation import validate_code
 
 TOOL_HTTP_TIMEOUT = 15       # seconds per research/DB request
@@ -898,6 +899,61 @@ TOOLS: list[dict] = [
             },
         },
     },
+    # ── Data-pipeline task only ──────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "read_frozen_arch",
+            "description": (
+                "ts_data_pipeline only: return the FROZEN architecture's "
+                "compact card (version + I/O contract + flops + bytes). "
+                "Pass include_source=true to also get the full Python "
+                "source — do this at most once per round; the source is "
+                "several KB and copying it into context bloats the loop."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "include_source": {
+                        "type": "boolean",
+                        "description": (
+                            "When true, the response also contains the "
+                            "frozen arch's Python source under `code`. "
+                            "Default false."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pipeline_smoke_test",
+            "description": (
+                "ts_data_pipeline only: exec the code locally, call "
+                "build_pipeline(**task_params), and pull up to 2 batches "
+                "to verify shape (B, ctx, V) + (B, pred, V) and batch-dim "
+                "agreement. Cheap sub-second check — run it BEFORE "
+                "validate_code so syntax/contract issues surface fast."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": (
+                            "Python source defining "
+                            "build_pipeline(context_len, prediction_len, "
+                            "num_variates, quantiles)."
+                        ),
+                    },
+                },
+                "required": ["code"],
+            },
+        },
+    },
 ]
 
 
@@ -1170,6 +1226,71 @@ def build_handlers(
             return entry.read_text(encoding="utf-8")
         except OSError as exc:
             return f"cognition wiki read failed: {exc}"
+
+    # ── Data-pipeline task helpers ───────────────────────────────
+
+    def _read_frozen_arch(include_source: bool = False, **_kwargs) -> str:
+        """ts_data_pipeline: return the frozen architecture card
+        (always) and optionally its source code (opt-in).
+
+        Tracks reads in ``state_holder["frozen_arch_reads"]`` so a
+        repeat ``include_source=True`` returns a "you already read it"
+        nudge instead of dumping the source twice into context.
+        """
+        frozen = challenge.get("frozen_arch") or {}
+        if not frozen:
+            return (
+                "error: no frozen_arch on challenge — not a ts_data_pipeline "
+                "round?"
+            )
+        task = challenge.get("task", {}) or {}
+        tp = task.get("task_params") or {}
+        card = {
+            "version": frozen.get("version"),
+            "source_experiment_id": frozen.get("source_experiment_id"),
+            "source_name": frozen.get("source_name"),
+            "source_metric": frozen.get("source_metric"),
+            "source_flops": frozen.get("source_flops"),
+            "code_bytes": len(frozen.get("code") or ""),
+            "io_contract": {
+                "input_shape": [
+                    "B", tp.get("context_len"), tp.get("num_variates"),
+                ],
+                "target_shape": [
+                    "B", tp.get("prediction_len"), tp.get("num_variates"),
+                ],
+                "quantiles": tp.get("quantiles"),
+            },
+        }
+        if not include_source:
+            return json.dumps({"card": card, "source_included": False},
+                              indent=2, default=str)
+        # Source path: cap reads to keep transcripts bounded.
+        already = state_holder.get("frozen_arch_reads", 0)
+        state_holder["frozen_arch_reads"] = already + 1
+        if already >= 1:
+            return (
+                "frozen arch source already returned earlier this round — "
+                "scroll back rather than re-reading (saves transcript bytes). "
+                f"version=v{card['version']}, bytes={card['code_bytes']}"
+            )
+        return json.dumps(
+            {"card": card, "source_included": True,
+             "code": frozen.get("code") or ""},
+            indent=2, default=str,
+        )
+
+    def _pipeline_smoke_test(code: str = "", **_kwargs) -> str:
+        """ts_data_pipeline: exec + probe the miner's build_pipeline."""
+        if not code or not code.strip():
+            return "error: empty code"
+        if (challenge.get("task") or {}).get("name") != "ts_data_pipeline":
+            return (
+                "error: pipeline_smoke_test is only valid on a "
+                "ts_data_pipeline round"
+            )
+        result = smoke_test_pipeline(code, challenge)
+        return json.dumps(result, indent=2, default=str)
 
     # ── Analysis ─────────────────────────────────────────────────
 
@@ -2176,6 +2297,8 @@ def build_handlers(
         "query_db": _query_db,
         "cognition_wiki_index": _cognition_wiki_index,
         "cognition_wiki_read": _cognition_wiki_read,
+        "read_frozen_arch": _read_frozen_arch,
+        "pipeline_smoke_test": _pipeline_smoke_test,
         "analyze_task": _analyze_task,
         "estimate_layer_flops": _estimate_layer_flops,
         "sketch_architecture": _sketch_architecture,
@@ -2274,6 +2397,16 @@ ROLE_TOOLS: dict[str, frozenset[str]] = {
     "designer": frozenset({
         "sketch_architecture", "estimate_layer_flops", "validate_code",
         "submit", "time_remaining",
+    }),
+    # ts_data_pipeline: smaller, task-specific surface. No FLOPs sizing
+    # (architecture is frozen externally), no sketch_architecture
+    # (there's no build_model to probe). The designer reads the frozen
+    # arch on demand and smoke-tests its pipeline locally before submit.
+    "pipeline_designer": frozenset({
+        "read_frozen_arch", "pipeline_smoke_test", "validate_code",
+        "submit", "time_remaining",
+        "read_scratchpad", "write_scratchpad", "read_my_submissions",
+        "list_frontier", "get_frontier_member",
     }),
 }
 
