@@ -143,6 +143,14 @@ class _Handler(BaseHTTPRequestHandler):
         self._log_event(kind, endpoint, request, body, 200, latency)
         return 200, body
 
+    def _serve_logged(self, kind: str, endpoint: str, request: object,
+                      fn: Callable[[], dict]) -> None:
+        """``_logged`` + JSON response in one call. Used by every GET
+        route a miner can hit, so behavior reads (frontier, experiments,
+        artifacts, …) land in agent_events alongside LLM/desearch calls."""
+        status, body = self._logged(kind, endpoint, request, fn)
+        self._json(status, body)
+
     def _json(self, status: int, body) -> None:
         data = json.dumps(body).encode()
         try:
@@ -157,8 +165,19 @@ class _Handler(BaseHTTPRequestHandler):
             logger.debug("svc client disconnected before response sent")
 
     def _serve_artifact_body(self, artifact_id: int) -> None:
+        t0 = time.perf_counter()
+        endpoint = f"/artifacts/{artifact_id}/download"
+        req = {"artifact_id": artifact_id}
+
+        def _log(status: int, resp_meta: object, error: Optional[str] = None) -> None:
+            self._log_event(
+                "artifact_download", endpoint, req, resp_meta,
+                status, (time.perf_counter() - t0) * 1000.0, error=error,
+            )
+
         art = self.store.get_artifact(artifact_id)
         if art is None:
+            _log(404, None, error="not found")
             return self._json(404, {"error": "not found"})
         # Inline text path — return immediately, no R2 round-trip needed.
         if art.get("content_text") is not None:
@@ -167,6 +186,13 @@ class _Handler(BaseHTTPRequestHandler):
             ctype = "application/json" if rel.endswith(".json") else (
                 "text/x-python" if rel.endswith(".py") else "text/plain; charset=utf-8"
             )
+            # Inline text is small enough to log verbatim — useful when
+            # the artifact is a submission .py or a result .json.
+            _log(200, {
+                "kind": art.get("kind"), "rel_path": rel,
+                "bytes": len(data), "content_type": ctype,
+                "text": art["content_text"],
+            })
             self.send_response(200)
             self.send_header("content-type", ctype)
             self.send_header("content-length", str(len(data)))
@@ -175,10 +201,19 @@ class _Handler(BaseHTTPRequestHandler):
             return
         # Binary path — proxy from object storage via the sink.
         if self.sink is None or not getattr(self.sink, "r2_enabled", False):
+            _log(503, None, error="binary artifact requires R2 backend")
             return self._json(503, {"error": "binary artifact requires R2 backend"})
         body = self.sink.fetch_bytes(art["s3_key"])  # type: ignore[attr-defined]
         if body is None:
+            _log(502, None, error="object storage fetch failed")
             return self._json(502, {"error": "object storage fetch failed"})
+        # Binary bodies are checkpoints / weights — log metadata only,
+        # the bytes themselves don't belong in the event log.
+        _log(200, {
+            "kind": art.get("kind"), "rel_path": art.get("rel_path"),
+            "bytes": len(body), "s3_key": art.get("s3_key"),
+            "content_type": "application/octet-stream",
+        })
         self.send_response(200)
         self.send_header("content-type", "application/octet-stream")
         self.send_header("content-length", str(len(body)))
@@ -200,14 +235,21 @@ class _Handler(BaseHTTPRequestHandler):
         q = urllib.parse.parse_qs(parsed.query)
 
         if path == "/health":
+            # Cheap probe; not worth a log row even when a miner pings it.
             return self._json(200, {"status": "ok"})
 
         if path == "/frontier":
             task = q.get("task", [None])[0]
-            return self._json(200, exp_api.frontier(self.store, task=task))
+            return self._serve_logged(
+                "frontier", path, {"task": task},
+                lambda: exp_api.frontier(self.store, task=task),
+            )
 
         if path == "/challenge":
-            return self._json(200, exp_api.active_challenge(self.store))
+            return self._serve_logged(
+                "challenge", path, {},
+                lambda: exp_api.active_challenge(self.store),
+            )
 
         if path == "/parents":
             def _opt(name):
@@ -216,39 +258,60 @@ class _Handler(BaseHTTPRequestHandler):
                     return int(v) if v is not None else None
                 except ValueError:
                     return None
-            return self._json(200, exp_api.parents(
-                self.store,
-                task=q.get("task", [None])[0],
-                min_flops=_opt("min_flops"),
-                max_flops=_opt("max_flops"),
-            ))
+            req = {
+                "task": q.get("task", [None])[0],
+                "min_flops": _opt("min_flops"),
+                "max_flops": _opt("max_flops"),
+            }
+            return self._serve_logged(
+                "parents", path, req,
+                lambda: exp_api.parents(self.store, **req),
+            )
 
         # /experiments/* — list/aggregate endpoints first, then the
         # multi-segment paths, then the bare /experiments/{idx}.
         if path == "/experiments/recent":
             n = int(q.get("n", q.get("limit", ["10"]))[0])
             task = q.get("task", [None])[0]
-            return self._json(200, exp_api.recent(self.store, n=n, task=task))
+            return self._serve_logged(
+                "experiments_recent", path, {"n": n, "task": task},
+                lambda: exp_api.recent(self.store, n=n, task=task),
+            )
 
         if path == "/experiments/pareto":
             task = q.get("task", [None])[0]
-            return self._json(200, exp_api.pareto(self.store, task=task))
+            return self._serve_logged(
+                "experiments_pareto", path, {"task": task},
+                lambda: exp_api.pareto(self.store, task=task),
+            )
 
         if path == "/experiments/failures":
             n = int(q.get("n", ["5"])[0])
             task = q.get("task", [None])[0]
-            return self._json(200, exp_api.failures(self.store, n=n, task=task))
+            return self._serve_logged(
+                "experiments_failures", path, {"n": n, "task": task},
+                lambda: exp_api.failures(self.store, n=n, task=task),
+            )
 
         if path == "/experiments/families":
             task = q.get("task", [None])[0]
-            return self._json(200, exp_api.families(self.store, task=task))
+            return self._serve_logged(
+                "experiments_families", path, {"task": task},
+                lambda: exp_api.families(self.store, task=task),
+            )
 
         if path == "/experiments/stats":
             task = q.get("task", [None])[0]
-            return self._json(200, exp_api.stats(self.store, task=task))
+            return self._serve_logged(
+                "experiments_stats", path, {"task": task},
+                lambda: exp_api.stats(self.store, task=task),
+            )
 
         if path == "/experiments/tasks":
-            return self._json(200, exp_api.tasks(self.store))
+            return self._serve_logged(
+                "experiments_tasks", path, {},
+                lambda: exp_api.tasks(self.store),
+            )
 
         if path == "/artifacts":
             def _opt_int(name: str) -> Optional[int]:
@@ -257,14 +320,17 @@ class _Handler(BaseHTTPRequestHandler):
                     return int(v) if v is not None else None
                 except ValueError:
                     return None
-            return self._json(200, exp_api.list_artifacts(
-                self.store,
-                round_id=_opt_int("round_id"),
-                miner_id=q.get("miner_id", [None])[0],
-                task=q.get("task", [None])[0],
-                kind=q.get("kind", [None])[0],
-                limit=int(q.get("limit", ["200"])[0] or "200"),
-            ))
+            req = {
+                "round_id": _opt_int("round_id"),
+                "miner_id": q.get("miner_id", [None])[0],
+                "task": q.get("task", [None])[0],
+                "kind": q.get("kind", [None])[0],
+                "limit": int(q.get("limit", ["200"])[0] or "200"),
+            }
+            return self._serve_logged(
+                "artifacts_list", path, req,
+                lambda: exp_api.list_artifacts(self.store, **req),
+            )
 
         if path.startswith("/artifacts/") and path.endswith("/download"):
             try:
@@ -278,17 +344,27 @@ class _Handler(BaseHTTPRequestHandler):
                 aid = int(path.rsplit("/", 1)[1])
             except ValueError:
                 return self._json(400, {"error": "bad id"})
-            art = self.store.get_artifact(aid)
-            if art is None:
+            def _get_art():
+                art = self.store.get_artifact(aid)
+                if art is None:
+                    raise KeyError(f"artifact {aid} not found")
+                return art
+            status, body = self._logged(
+                "artifact_get", path, {"artifact_id": aid}, _get_art,
+            )
+            if status == 502 and "not found" in str(body.get("error", "")):
                 return self._json(404, {"error": "not found"})
-            return self._json(200, art)
+            return self._json(status, body)
 
         if path.startswith("/experiments/") and path.endswith("/artifacts"):
             try:
                 idx = int(path.split("/")[2])
             except (IndexError, ValueError):
                 return self._json(400, {"error": "bad id"})
-            return self._json(200, exp_api.artifacts_for_experiment(self.store, idx))
+            return self._serve_logged(
+                "experiment_artifacts", path, {"experiment_id": idx},
+                lambda: exp_api.artifacts_for_experiment(self.store, idx),
+            )
 
         if path.startswith("/experiments/diff/"):
             parts = path.split("/")
@@ -296,69 +372,103 @@ class _Handler(BaseHTTPRequestHandler):
                 a, b = int(parts[3]), int(parts[4])
             except (IndexError, ValueError):
                 return self._json(400, {"error": "bad ids"})
-            return self._json(200, exp_api.pair_diff(self.store, a, b))
+            return self._serve_logged(
+                "experiments_pair_diff", path, {"a": a, "b": b},
+                lambda: exp_api.pair_diff(self.store, a, b),
+            )
 
         if path.startswith("/experiments/lineage/"):
             try:
                 idx = int(path.rsplit("/", 1)[1])
             except ValueError:
                 return self._json(400, {"error": "bad id"})
-            return self._json(200, exp_api.lineage(self.store, idx))
+            return self._serve_logged(
+                "experiment_lineage", path, {"experiment_id": idx},
+                lambda: exp_api.lineage(self.store, idx),
+            )
 
         if path.startswith("/experiments/") and path.endswith("/diff"):
             try:
                 idx = int(path.split("/")[2])
             except (IndexError, ValueError):
                 return self._json(400, {"error": "bad id"})
-            return self._json(200, exp_api.parent_diff(self.store, idx))
+            return self._serve_logged(
+                "experiment_parent_diff", path, {"experiment_id": idx},
+                lambda: exp_api.parent_diff(self.store, idx),
+            )
 
         if path.startswith("/experiments/") and path.endswith("/lineage_diffs"):
             try:
                 idx = int(path.split("/")[2])
             except (IndexError, ValueError):
                 return self._json(400, {"error": "bad id"})
-            return self._json(200, exp_api.lineage_diffs(self.store, idx))
+            return self._serve_logged(
+                "experiment_lineage_diffs", path, {"experiment_id": idx},
+                lambda: exp_api.lineage_diffs(self.store, idx),
+            )
 
         if path.startswith("/experiments/") and path.endswith("/trajectory"):
             try:
                 idx = int(path.split("/")[2])
             except (IndexError, ValueError):
                 return self._json(400, {"error": "bad id"})
-            return self._json(200, exp_api.trajectory(self.store, idx))
+            return self._serve_logged(
+                "experiment_trajectory", path, {"experiment_id": idx},
+                lambda: exp_api.trajectory(self.store, idx),
+            )
 
         if path.startswith("/experiments/") and path.endswith("/signature"):
             try:
                 idx = int(path.split("/")[2])
             except (IndexError, ValueError):
                 return self._json(400, {"error": "bad id"})
-            return self._json(200, exp_api.signature(self.store, idx))
+            return self._serve_logged(
+                "experiment_signature", path, {"experiment_id": idx},
+                lambda: exp_api.signature(self.store, idx),
+            )
 
         if path.startswith("/experiments/"):
             try:
                 idx = int(path.rsplit("/", 1)[1])
             except ValueError:
                 return self._json(400, {"error": "bad id"})
-            exp = self.store.get_experiment(idx)
-            if exp is None:
+            def _get_exp():
+                exp = self.store.get_experiment(idx)
+                if exp is None:
+                    raise KeyError(f"experiment {idx} not found")
+                return exp
+            status, body = self._logged(
+                "experiment_get", path, {"experiment_id": idx}, _get_exp,
+            )
+            if status == 502 and "not found" in str(body.get("error", "")):
                 return self._json(404, {"error": "not found"})
-            return self._json(200, exp)
+            return self._json(status, body)
 
         if path == "/llm/models":
-            return self._json(200, {"models": llm_available_models()})
+            return self._serve_logged(
+                "llm_models", path, {},
+                lambda: {"models": llm_available_models()},
+            )
 
         if path == "/llm/v1/models":
             now = 0
-            return self._json(200, {
-                "object": "list",
-                "data": [
-                    {"id": m, "object": "model", "created": now,
-                     "owned_by": "local"}
-                    for m in llm_available_models()
-                ],
-            })
+            return self._serve_logged(
+                "llm_models_openai", path, {},
+                lambda: {
+                    "object": "list",
+                    "data": [
+                        {"id": m, "object": "model", "created": now,
+                         "owned_by": "local"}
+                        for m in llm_available_models()
+                    ],
+                },
+            )
 
         if path == "/wiki":
-            return self._json(200, {"files": self.wiki.list()})
+            return self._serve_logged(
+                "wiki_list", path, {},
+                lambda: {"files": self.wiki.list()},
+            )
 
         if path.startswith("/wiki/"):
             rel = path[len("/wiki/"):]
@@ -394,8 +504,9 @@ class _Handler(BaseHTTPRequestHandler):
         payload = self._read_body()
 
         if path == "/experiments/search":
-            return self._json(
-                200, exp_api.search(self.store, payload.get("query", "")),
+            return self._serve_logged(
+                "experiments_search", path, payload,
+                lambda: exp_api.search(self.store, payload.get("query", "")),
             )
 
         if path == "/llm/chat":
