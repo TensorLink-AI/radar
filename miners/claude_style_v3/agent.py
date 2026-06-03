@@ -37,6 +37,7 @@ import tempfile
 import time
 from typing import Optional
 
+from core import continuation
 from core import history
 from core.fallback_templates import (
     fallback_name_for, generate_fallback,
@@ -122,10 +123,18 @@ def _agent_budget(challenge: dict) -> int:
 
 def _package(
     code: str, name: str, motivation: str, prompt_id: str = "",
+    mode: Optional[str] = None, parent_index: Optional[int] = None,
 ) -> dict:
     out = {"code": code, "name": name, "motivation": motivation}
     if prompt_id:
         out["prompt_id"] = prompt_id
+    # Continuation: the validator reads payload["mode"]/["parent_index"]
+    # and warm-starts from the parent checkpoint. Only set when the
+    # submitted code actually reproduced the parent's frozen architecture.
+    if mode:
+        out["mode"] = mode
+    if parent_index is not None:
+        out["parent_index"] = parent_index
     return out
 
 
@@ -205,6 +214,24 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
         challenge["_operator_prompt"] = active_prompt["template"]
         challenge["_operator_prompt_id"] = active_prompt["id"]
 
+    # ── Continuation context ────────────────────────────────────
+    # On a scheduled continuation round, lift the chosen parent's frozen
+    # architecture so the designer reproduces it verbatim and tunes only
+    # the training recipe. Any failure → cont_ctx is None → design fresh.
+    db_url = (challenge.get("db_url") or "").rstrip("/")
+    try:
+        cont_ctx = continuation.build_context(challenge, gated_client, db_url)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"[orchestrator] continuation context failed: {exc}")
+        cont_ctx = None
+    if cont_ctx:
+        challenge["_continuation_context"] = cont_ctx
+        _log(
+            f"[orchestrator] CONTINUATION round — parent "
+            f"#{cont_ctx['parent_id']}, architecture frozen, skipping "
+            "analyst + researcher"
+        )
+
     # ── Scratchpad load ─────────────────────────────────────────
     scratch_dir: Optional[str] = None
     try:
@@ -265,54 +292,61 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     )
 
     if not config_broken:
-        # ── Phase 1: analyst (technique #1) ─────────────────────
-        analyst_deadline = min(
-            deadline,
-            t_start + min(
-                ANALYST_BUDGET_CAP,
-                int(budget * ANALYST_BUDGET_FRACTION),
-            ),
-        )
-        try:
-            digest = run_analyst(
-                challenge=challenge,
-                handlers=handlers,
-                deadline=analyst_deadline,
-                llm_kwargs=llm_kwargs,
-                bucket=bucket,
-                primitives=primitives,
+        if cont_ctx:
+            # Continuation: the architecture is frozen, so the analyst
+            # (axes of variation) and the brainstorm researcher have
+            # nothing to explore — hand the designer a recipe-focused
+            # brief and let it use the whole budget on the recipe.
+            brief = continuation.recipe_brief(cont_ctx)
+        else:
+            # ── Phase 1: analyst (technique #1) ─────────────────
+            analyst_deadline = min(
+                deadline,
+                t_start + min(
+                    ANALYST_BUDGET_CAP,
+                    int(budget * ANALYST_BUDGET_FRACTION),
+                ),
             )
-        except Exception as exc:
-            _log(f"[orchestrator] analyst crashed: {exc}")
-            digest = default_digest(challenge, bucket, primitives)
-        digest_block = format_digest_for_researcher(digest)
+            try:
+                digest = run_analyst(
+                    challenge=challenge,
+                    handlers=handlers,
+                    deadline=analyst_deadline,
+                    llm_kwargs=llm_kwargs,
+                    bucket=bucket,
+                    primitives=primitives,
+                )
+            except Exception as exc:
+                _log(f"[orchestrator] analyst crashed: {exc}")
+                digest = default_digest(challenge, bucket, primitives)
+            digest_block = format_digest_for_researcher(digest)
 
-        # ── Phase 2: researcher (two-phase, technique #3) ───────
-        # Cumulative-from-t_start cap; if the analyst finished
-        # early the researcher reclaims the slack naturally.
-        researcher_deadline = min(
-            deadline,
-            t_start + min(
-                ANALYST_BUDGET_CAP + RESEARCHER_BUDGET_CAP,
-                int(budget * (
-                    ANALYST_BUDGET_FRACTION + RESEARCHER_BUDGET_FRACTION
-                )),
-            ),
-        )
-        try:
-            brief = run_researcher(
-                challenge=challenge,
-                handlers=handlers,
-                deadline=researcher_deadline,
-                llm_kwargs=llm_kwargs,
-                state=state,
-                bucket=bucket,
-                digest_block=digest_block,
-                primitives=primitives,
+            # ── Phase 2: researcher (two-phase, technique #3) ───
+            # Cumulative-from-t_start cap; if the analyst finished
+            # early the researcher reclaims the slack naturally.
+            researcher_deadline = min(
+                deadline,
+                t_start + min(
+                    ANALYST_BUDGET_CAP + RESEARCHER_BUDGET_CAP,
+                    int(budget * (
+                        ANALYST_BUDGET_FRACTION + RESEARCHER_BUDGET_FRACTION
+                    )),
+                ),
             )
-        except Exception as exc:
-            _log(f"[orchestrator] researcher crashed: {exc}")
-            brief = default_brief(challenge, bucket)
+            try:
+                brief = run_researcher(
+                    challenge=challenge,
+                    handlers=handlers,
+                    deadline=researcher_deadline,
+                    llm_kwargs=llm_kwargs,
+                    state=state,
+                    bucket=bucket,
+                    digest_block=digest_block,
+                    primitives=primitives,
+                )
+            except Exception as exc:
+                _log(f"[orchestrator] researcher crashed: {exc}")
+                brief = default_brief(challenge, bucket)
 
         # ── Phase 3: designer ───────────────────────────────────
         designer_deadline = min(
@@ -373,10 +407,25 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     elapsed = time.monotonic() - t_start
     _log(f"[orchestrator] phase=reserve elapsed={elapsed:.0f}s")
 
+    def _cont_fields(code: str):
+        """(mode, parent_index) for a candidate on a continuation round —
+        only ``continue`` when the code reproduced the frozen architecture,
+        so the validator's strict warm-start load can't fail."""
+        if not cont_ctx:
+            return None, None
+        if code and continuation.arch_matches(code, cont_ctx["frozen_arch"]):
+            return "continue", cont_ctx["parent_id"]
+        _log(
+            "[orchestrator] candidate diverged from frozen parent "
+            "architecture — shipping as a new design"
+        )
+        return None, None
+
     if submit_sig is not None:
+        mode, parent_index = _cont_fields(submit_sig.code)
         return _package(
             submit_sig.code, submit_sig.name, submit_sig.motivation,
-            prompt_id=active_prompt["id"],
+            prompt_id=active_prompt["id"], mode=mode, parent_index=parent_index,
         )
 
     # Recovery: deadline hit and no SubmitSignal raised, but the LLM
@@ -389,20 +438,24 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
                 f"[agent] shipping stashed best-so-far "
                 f"(name={best.get('name')!r}, no late-window submit)"
             )
+            mode, parent_index = _cont_fields(best["code"])
             return _package(
                 best["code"],
                 best.get("name") or f"best_so_far_{bucket}",
                 best.get("motivation") or "Auto-shipped best-so-far candidate.",
-                prompt_id=active_prompt["id"],
+                prompt_id=active_prompt["id"], mode=mode,
+                parent_index=parent_index,
             )
 
     if last_validated_code:
+        mode, parent_index = _cont_fields(last_validated_code)
         return _package(
             last_validated_code,
             f"auto_submit_{bucket}",
             "Auto-submitted validated code — designer did not call "
             "submit explicitly.",
-            prompt_id=active_prompt["id"],
+            prompt_id=active_prompt["id"], mode=mode,
+            parent_index=parent_index,
         )
 
     # Designer failed → fallback template path.

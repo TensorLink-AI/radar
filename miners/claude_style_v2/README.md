@@ -27,6 +27,18 @@ the same `llm_client.chat()` the openai_sdk agent uses.
   `submit` until a recent `validate_code` returned `ok=true`.
 - **Fallback**: when the designer fails to ship, the orchestrator
   falls through to `core/fallback_templates.generate_fallback`.
+- **Continuation rounds** (`core/continuation.py`): when the validator
+  stamps `challenge["round_type"] == "continuation"` and supplies
+  `eligible_parents`, the orchestrator picks the best checkpoint-bearing
+  parent, fetches its submission via `GET /experiments/{id}`, and lifts
+  its `build_model` / `init_weights` / `COMPILE` source verbatim. The
+  researcher is **skipped** (the architecture is fixed); the designer
+  gets a frozen-architecture preamble and retunes only the training
+  recipe (`build_optimizer`, `build_scheduler`, `training_config`,
+  `compute_loss`, …). The proposal ships `mode="continue"` +
+  `parent_index` only when the submitted code reproduces the frozen
+  architecture exactly (AST-checked) — otherwise it's shipped as a fresh
+  design so the strict warm-start load can't fail.
 
 ## File layout
 
