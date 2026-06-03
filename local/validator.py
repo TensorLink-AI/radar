@@ -38,6 +38,10 @@ from local.continuation import (
 )
 from local.experiments_api import _parent_summary
 from local.frozen_arch import FrozenArchStore, maybe_refresh as maybe_refresh_frozen
+from local.frozen_pipeline import (
+    FrozenPipelineStore,
+    maybe_refresh as maybe_refresh_pipeline,
+)
 from local.scoring import compute_pareto, passes_size_gate, score_round
 from local.services import ServicesServer
 from local.store import LocalStore
@@ -152,18 +156,25 @@ def _task_dict(task) -> dict:
     }
 
 
-def _current_epoch(task, frozen_arch) -> dict:
+def _current_epoch(task, frozen_arch=None, frozen_pipeline=None) -> dict:
     """Continuation-pinning context for this round.
 
     A parent's saved checkpoint is only a valid warm-start when it was
-    trained in the same context as this round. For ts_data_pipeline that
-    means the frozen architecture version — the metric isn't comparable
-    across arch refreshes. ts_forecasting has no epoch axis yet (returns
-    empty dict — gate is a no-op).
+    trained in the same context as this round. The epoch keys are
+    stamped on every successful experiment's ``objectives``:
+
+    * ts_data_pipeline pins ``frozen_arch_version`` — Δ isn't comparable
+      after the yardstick arch refreshes.
+    * ts_forecasting pins ``frozen_pipeline_version`` *only when one is
+      currently in use*. A pure-real run (no synthetic mixed in) leaves
+      the key out so it pairs freely with other pure-real ancestors —
+      that's the deliberate control track.
     """
     epoch: dict = {}
     if isinstance(task, TSDataPipelineSpec) and frozen_arch is not None:
         epoch["frozen_arch_version"] = int(frozen_arch.version)
+    if isinstance(task, TSForecastingSpec) and frozen_pipeline is not None:
+        epoch["frozen_pipeline_version"] = int(frozen_pipeline.version)
     return epoch
 
 
@@ -178,7 +189,7 @@ def _build_challenge(round_id: int, store: LocalStore, task,
                      services_url: str, agent_seconds: int = 180,
                      continuation_enabled: bool = False,
                      scheduled_continuation: bool = False,
-                     frozen_arch=None) -> dict:
+                     frozen_arch=None, frozen_pipeline=None) -> dict:
     name, lo, hi = _pick_bucket(round_id, task=task)
     # The data-pipeline task uses a fixed frozen architecture, so its
     # FLOPs are identical across miners in a round — size buckets are
@@ -207,7 +218,7 @@ def _build_challenge(round_id: int, store: LocalStore, task,
     # is why continuation pressure ramps in slowly: early rounds have no
     # parents to continue from regardless of the schedule.
     eligible_parents = []
-    epoch = _current_epoch(task, frozen_arch)
+    epoch = _current_epoch(task, frozen_arch, frozen_pipeline)
     if continuation_enabled:
         eligible_parents = [
             _parent_summary(e)
@@ -257,6 +268,17 @@ def _build_challenge(round_id: int, store: LocalStore, task,
             "source_flops": frozen_arch.source_flops,
             "source_name": frozen_arch.source_name,
             "code": frozen_arch.code,
+        }
+    if frozen_pipeline is not None:
+        payload["frozen_pipeline"] = {
+            "version": frozen_pipeline.version,
+            "source_experiment_id": frozen_pipeline.source_experiment_id,
+            "source_metric": frozen_pipeline.source_metric,
+            "source_crps": frozen_pipeline.source_crps,
+            "source_mase": frozen_pipeline.source_mase,
+            "source_name": frozen_pipeline.source_name,
+            "frozen_arch_version": frozen_pipeline.frozen_arch_version,
+            "num_shards": len(frozen_pipeline.shard_paths or []),
         }
     return payload
 
@@ -370,7 +392,8 @@ def _pretrain_pool() -> list[str]:
 
 
 def _train_proposal(payload: dict, task, round_id: int,
-                    challenge: dict, prep: dict, frozen_arch=None) -> dict:
+                    challenge: dict, prep: dict,
+                    frozen_arch=None, frozen_pipeline=None) -> dict:
     """Run one proposal, retrying as a fresh run if a continuation
     warm-start turns out to be architecture-incompatible (strict load)."""
     def _run() -> dict:
@@ -386,6 +409,7 @@ def _train_proposal(payload: dict, task, round_id: int,
             shard_paths=prep["shard_paths"],
             shard_reuse=prep["shard_reuse"],
             frozen_arch=frozen_arch,
+            frozen_pipeline=frozen_pipeline,
         )
 
     result = _run()
@@ -428,7 +452,11 @@ def run_round(store: LocalStore, task, round_id: int,
               continuation_step_every: int = 5,
               shards_per_round: int = 0,
               frozen_arch_store: FrozenArchStore | None = None,
-              frozen_arch_refresh_every: int = 50) -> None:
+              frozen_arch_refresh_every: int = 50,
+              frozen_pipeline_store: FrozenPipelineStore | None = None,
+              frozen_pipeline_refresh_every: int = 30,
+              frozen_pipeline_num_shards: int = 16,
+              frozen_pipeline_batches_per_shard: int = 64) -> None:
     # The validator owns the cadence: a scheduled coin flip decides whether
     # this is a continuation round. The rate stays at 0 until
     # ``warmup_rounds`` successful rounds, then climbs as a staircase to the
@@ -465,11 +493,31 @@ def run_round(store: LocalStore, task, round_id: int,
             )
             return
 
+    # Frozen-pipeline refresh (ts_forecasting only). Snapshots at every_n
+    # successful forecasting rounds — staggered from arch refresh so both
+    # yardsticks don't move at once. Absent pipeline = pure-real run, the
+    # control track that stays comparable across versions.
+    frozen_pipeline = None
+    if isinstance(task, TSForecastingSpec) and frozen_pipeline_store is not None:
+        maybe_refresh_pipeline(
+            frozen_pipeline_store, store,
+            every_n=frozen_pipeline_refresh_every,
+            num_shards=frozen_pipeline_num_shards,
+            batches_per_shard=frozen_pipeline_batches_per_shard,
+        )
+        frozen_pipeline = frozen_pipeline_store.current()
+        # Skip injection if the snapshot has no rendered shards (the
+        # promotion was lean — torch/pandas unavailable, or the miner's
+        # pipeline raised). The round still runs as pure-real.
+        if frozen_pipeline is not None and not frozen_pipeline.shard_paths:
+            frozen_pipeline = None
+
     challenge = _build_challenge(
         round_id, store, task, services_url, agent_seconds=agent_seconds,
         continuation_enabled=continuation_enabled,
         scheduled_continuation=scheduled,
         frozen_arch=frozen_arch,
+        frozen_pipeline=frozen_pipeline,
     )
     challenge_id = challenge["challenge_id"]
     bucket = challenge["bucket"]
@@ -532,7 +580,7 @@ def run_round(store: LocalStore, task, round_id: int,
             min_flops=challenge["min_flops_equivalent"],
             max_flops=challenge["max_flops_equivalent"],
             pool=pool, shards_per_round=shards_per_round, seed=round_id,
-            current_epoch=_current_epoch(task, frozen_arch),
+            current_epoch=_current_epoch(task, frozen_arch, frozen_pipeline),
         ) if continuation_allowed else {
             # Continuation disabled — still preserve any payload parent_index
             # so the existing lineage/diff tracking keeps working.
@@ -553,7 +601,8 @@ def run_round(store: LocalStore, task, round_id: int,
             name, miner_id, prep["mode"],
         )
         result = _train_proposal(
-            payload, task, round_id, challenge, prep, frozen_arch=frozen_arch,
+            payload, task, round_id, challenge, prep,
+            frozen_arch=frozen_arch, frozen_pipeline=frozen_pipeline,
         )
 
         result["miner_id"] = miner_id
@@ -751,11 +800,34 @@ def main(argv: list[str] | None = None) -> int:
         help="ts_data_pipeline only: where versioned frozen archs live. "
              "Empty = $RADAR_FROZEN_ARCH_DIR or local/frozen_archs.",
     )
+    parser.add_argument(
+        "--frozen_pipeline_refresh_every", type=int, default=30,
+        help="ts_forecasting only: refresh the frozen synthetic pipeline "
+             "every N successful forecasting rounds (default 30 — staggered "
+             "from the arch refresh so both yardsticks don't move at once). "
+             "0 disables the consumer-side feedback loop.",
+    )
+    parser.add_argument(
+        "--frozen_pipeline_dir", default="",
+        help="ts_forecasting only: where versioned frozen pipelines live. "
+             "Empty = $RADAR_FROZEN_PIPELINE_DIR or local/frozen_pipelines.",
+    )
+    parser.add_argument(
+        "--frozen_pipeline_num_shards", type=int, default=16,
+        help="ts_forecasting only: how many synthetic shards to render at "
+             "each frozen-pipeline promotion (default 16).",
+    )
+    parser.add_argument(
+        "--frozen_pipeline_batches_per_shard", type=int, default=64,
+        help="ts_forecasting only: batches drawn per rendered synthetic "
+             "shard (default 64).",
+    )
     parser.add_argument("--continuation", default="auto",
                         choices=["auto", "on", "off"],
                         help="Allow continuation (warm-start) proposals. "
-                             "'auto' = on for ts_forecasting, off for "
-                             "synth_regression (no checkpoints there).")
+                             "'auto' = on for ts_forecasting and "
+                             "ts_data_pipeline (both persist checkpoints), "
+                             "off for synth_regression.")
     parser.add_argument("--shards_per_round", type=int, default=0,
                         help="Pretrain shards assigned per run. 0 = all "
                              "(legacy; continuations then reuse shards). "
@@ -848,6 +920,32 @@ def main(argv: list[str] | None = None) -> int:
                 current.source_metric,
             )
 
+    frozen_pipeline_store: FrozenPipelineStore | None = None
+    if (any(isinstance(specs[name], TSForecastingSpec) for name, _ in mixture)
+            and args.frozen_pipeline_refresh_every > 0):
+        frozen_pipeline_store = FrozenPipelineStore(
+            base_dir=args.frozen_pipeline_dir or None,
+        )
+        maybe_refresh_pipeline(
+            frozen_pipeline_store, store,
+            every_n=args.frozen_pipeline_refresh_every,
+            num_shards=args.frozen_pipeline_num_shards,
+            batches_per_shard=args.frozen_pipeline_batches_per_shard,
+        )
+        current_p = frozen_pipeline_store.current()
+        if current_p is None:
+            logger.info(
+                "ts_forecasting: no frozen pipeline yet — early rounds "
+                "run on real shards only until a ts_data_pipeline "
+                "experiment with crps+mase lands in this db.",
+            )
+        else:
+            logger.info(
+                "ts_forecasting: frozen pipeline v%d (exp=%d shards=%d)",
+                current_p.version, current_p.source_experiment_id,
+                len(current_p.shard_paths or []),
+            )
+
     if args.continuation == "on":
         continuation_enabled = True
     elif args.continuation == "off":
@@ -926,7 +1024,11 @@ def main(argv: list[str] | None = None) -> int:
                       continuation_step_every=args.continuation_step_every,
                       shards_per_round=args.shards_per_round,
                       frozen_arch_store=frozen_arch_store,
-                      frozen_arch_refresh_every=args.frozen_arch_refresh_every)
+                      frozen_arch_refresh_every=args.frozen_arch_refresh_every,
+                      frozen_pipeline_store=frozen_pipeline_store,
+                      frozen_pipeline_refresh_every=args.frozen_pipeline_refresh_every,
+                      frozen_pipeline_num_shards=args.frozen_pipeline_num_shards,
+                      frozen_pipeline_batches_per_shard=args.frozen_pipeline_batches_per_shard)
             round_id += 1
             completed += 1
             if args.rounds == 0 or completed < args.rounds:

@@ -157,6 +157,7 @@ def run_training(
     shard_paths: list[str] | None = None,
     shard_reuse: bool = False,
     frozen_arch: Any = None,
+    frozen_pipeline: Any = None,
 ) -> dict:
     """Phase B + Phase C, in one function. Returns the experiment record.
 
@@ -199,6 +200,7 @@ def run_training(
             parent_checkpoint_path=parent_checkpoint_path,
             compute_offset=compute_offset, step_offset=step_offset,
             shard_paths=shard_paths, shard_reuse=shard_reuse,
+            frozen_pipeline=frozen_pipeline,
         )
     started = time.time()
     try:
@@ -339,6 +341,7 @@ def _run_ts_forecasting(
     step_offset: int = 0,
     shard_paths: list[str] | None = None,
     shard_reuse: bool = False,
+    frozen_pipeline: Any = None,
 ) -> dict:
     """Drive ``runner.harness.run_training`` against a ts_forecasting submission.
 
@@ -396,6 +399,17 @@ def _run_ts_forecasting(
         train_paths = sorted(shard_paths)
     elif Path(pretrain_cache).is_dir():
         train_paths = sorted(str(p) for p in Path(pretrain_cache).glob("*.parquet"))
+    # Mix in pre-rendered synthetic shards from the current frozen pipeline,
+    # if one was passed. These augment the real corpus — they don't replace
+    # it, so a pure-real run is still possible by omitting the pipeline.
+    synth_paths: list[str] = []
+    if frozen_pipeline is not None:
+        synth_paths = [
+            p for p in (getattr(frozen_pipeline, "shard_paths", []) or [])
+            if Path(p).is_file()
+        ]
+        if synth_paths:
+            train_paths = sorted({*train_paths, *synth_paths})
     val_paths: list[str] = []
     if Path(val_cache).is_dir() and os.path.realpath(val_cache) != os.path.realpath(pretrain_cache):
         val_paths = sorted(str(p) for p in Path(val_cache).glob("*.parquet"))
@@ -558,6 +572,14 @@ def _run_ts_forecasting(
         "pretrain_shards": [Path(p).name for p in train_paths],
         "shard_reuse": bool(shard_reuse),
     }
+    # Stamp the synthetic-data epoch so continuation can pin lineages to
+    # a single frozen-pipeline version (Δ across versions isn't honest).
+    # 0 means "no synthetic mixed in" — the pure-real control track stays
+    # comparable to other zero rounds.
+    objectives["frozen_pipeline_version"] = int(
+        getattr(frozen_pipeline, "version", 0) if frozen_pipeline is not None
+        else 0
+    )
     if best_val_loss is not None:
         objectives["best_val_loss"] = float(best_val_loss)
     spikes = result.get("num_spikes_skipped")
@@ -642,9 +664,13 @@ def _run_ts_forecasting(
     train_src = (
         f"local={len(train_paths)}" if train_paths else f"streamed={len(train_urls)}"
     )
+    synth_tag = (
+        f" synth=v{frozen_pipeline.version}/{len(synth_paths)}"
+        if frozen_pipeline is not None and synth_paths else ""
+    )
     analysis = (
         f"task=ts_forecasting status={status} pretrain_shards({train_src}) "
-        f"val_shards={len(val_paths)} reuse={int(bool(shard_reuse))} "
+        f"val_shards={len(val_paths)} reuse={int(bool(shard_reuse))}{synth_tag} "
         f"crps={crps:.4f} mase={mase:.4f}"
     )
 

@@ -360,3 +360,77 @@ def test_parent_in_epoch_filters_eligible():
     # Empty epoch is a no-op gate.
     assert _parent_in_epoch(p1, {})
     assert _parent_in_epoch(p3, {})
+
+
+# ── frozen pipeline store + ts_forecasting epoch ────────────────────
+
+
+def test_frozen_pipeline_store_bootstrap(tmp_path):
+    from local.frozen_pipeline import FrozenPipelineStore
+
+    s = FrozenPipelineStore(base_dir=str(tmp_path / "pipes"))
+    assert s.current_version() == 0
+    assert s.current() is None
+
+
+def test_frozen_pipeline_save_and_load(tmp_path):
+    from local.frozen_pipeline import FrozenPipelineStore
+
+    s = FrozenPipelineStore(base_dir=str(tmp_path / "pipes"))
+    pipe = s.save(
+        code="def build_pipeline(*a, **k): pass",
+        source_experiment_id=42, source_metric=0.4,
+        source_crps=0.2, source_mase=0.6, source_flops=1_000_000,
+        source_name="pipe_a", frozen_arch_version=3,
+        shard_paths=[str(tmp_path / "s.parquet")],
+    )
+    assert pipe.version == 1 and s.current_version() == 1
+    loaded = s.load(1)
+    assert loaded is not None
+    assert loaded.frozen_arch_version == 3
+    assert loaded.shard_paths == [str(tmp_path / "s.parquet")]
+    # Listing strips the code.
+    rows = s.all_versions()
+    assert len(rows) == 1
+    assert "code" not in rows[0]
+
+
+def test_frozen_pipeline_bootstraps_from_data_pipeline_frontier(tmp_path):
+    from local.frozen_pipeline import FrozenPipelineStore, maybe_refresh
+
+    store = LocalStore(tmp_path / "t.db")
+    store.add_experiment(
+        round_id=0, miner_id="m", name="p", code="code-A",
+        motivation="", reasoning="", tool_calls=[],
+        metric=0.5, success=True,
+        objectives={"flops_equivalent_size": 0, "num_params": 0,
+                    "crps": 0.4, "mase": 0.6,
+                    "frozen_arch_version": 2},
+        score=0.0, loss_curve=[], task="ts_data_pipeline",
+    )
+    pipe_store = FrozenPipelineStore(base_dir=str(tmp_path / "pipes"))
+    # num_shards=0 short-circuits the rendering path so the test stays
+    # numpy-only — we're verifying the bookkeeping, not pyarrow.
+    saved = maybe_refresh(pipe_store, store, every_n=10, num_shards=0)
+    assert saved is not None
+    assert saved.frozen_arch_version == 2
+    assert saved.source_metric == 0.5
+    store.close()
+
+
+def test_current_epoch_for_forecasting_includes_pipeline_version():
+    from local.frozen_pipeline import FrozenPipeline
+    from local.validator import _current_epoch
+
+    ts = make_spec("ts_forecasting")
+    pipe = FrozenPipeline(
+        version=4, code="x", source_experiment_id=1, source_metric=0.5,
+        source_crps=0.3, source_mase=0.7, source_flops=0,
+        source_name="p", frozen_arch_version=2, created_at=0.0,
+        shard_paths=["a.parquet"],
+    )
+    # ts_forecasting with a pipeline → pin the version.
+    assert _current_epoch(ts, frozen_pipeline=pipe) == {"frozen_pipeline_version": 4}
+    # ts_forecasting without a pipeline (the pure-real control track) →
+    # no pin: empty epoch lets it pair with any other pure-real parent.
+    assert _current_epoch(ts) == {}
