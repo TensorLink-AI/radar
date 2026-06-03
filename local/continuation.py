@@ -26,33 +26,34 @@ _DELTA_K = 5.0
 
 
 def continuation_rate(
-    successful_rounds: int,
+    attempted_rounds: int,
     *,
     equilibrium: float = 0.7,
     warmup_rounds: int = 50,
     step_pct: float = 1.0,
     step_every: int = 5,
 ) -> float:
-    """Target continuation fraction given the count of successful rounds.
+    """Target continuation fraction given the count of attempted rounds.
 
-    Stays at **0** until ``warmup_rounds`` successful rounds have completed
-    (let the frontier establish first), then climbs as a staircase —
-    ``step_pct`` percentage points every ``step_every`` rounds — up to
-    ``equilibrium``. With the defaults (warmup 50, +1%/5 rounds, eq 0.70)
-    it reaches 70% about 350 successful rounds after the warmup.
+    Stays at **0** until ``warmup_rounds`` rounds have been attempted (any
+    experiment row, success or failure — failed rounds count too), then
+    climbs as a staircase — ``step_pct`` percentage points every
+    ``step_every`` rounds — up to ``equilibrium``. With the defaults
+    (warmup 50, +1%/5 rounds, eq 0.70) it reaches 70% about 350 rounds
+    after the warmup.
     """
     eq = max(0.0, min(1.0, equilibrium))
-    if successful_rounds < warmup_rounds:
+    if attempted_rounds < warmup_rounds:
         return 0.0
     if step_every <= 0:
         return eq
-    steps = (successful_rounds - warmup_rounds) // step_every
+    steps = (attempted_rounds - warmup_rounds) // step_every
     return min(eq, max(0.0, (step_pct / 100.0) * steps))
 
 
 def is_continuation_round(
     round_id: int,
-    successful_rounds: int,
+    attempted_rounds: int,
     *,
     equilibrium: float = 0.7,
     warmup_rounds: int = 50,
@@ -62,13 +63,13 @@ def is_continuation_round(
     """Deterministic per-round coin flip at the scheduled rate.
 
     Seeded by ``round_id`` so the schedule is reproducible and independent
-    of the training seed; the *rate* is driven by ``successful_rounds``.
+    of the training seed; the *rate* is driven by ``attempted_rounds``.
     Whether a scheduled continuation round actually runs as one still
     depends on eligible parents existing (the validator downgrades to a
     fresh round when none do).
     """
     rate = continuation_rate(
-        successful_rounds, equilibrium=equilibrium, warmup_rounds=warmup_rounds,
+        attempted_rounds, equilibrium=equilibrium, warmup_rounds=warmup_rounds,
         step_pct=step_pct, step_every=step_every,
     )
     if rate <= 0.0:
