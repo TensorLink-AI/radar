@@ -303,6 +303,51 @@ def test_current_epoch_for_data_pipeline():
     assert _current_epoch(dp, None) == {}
 
 
+# ── interwoven task dispatch ────────────────────────────────────────
+
+
+def test_parse_task_mixture_round_trip():
+    from local.validator import _parse_task_mixture
+
+    assert _parse_task_mixture("ts_forecasting") == [("ts_forecasting", 1.0)]
+    assert _parse_task_mixture("ts_forecasting:0.6,ts_data_pipeline:0.4") == [
+        ("ts_forecasting", 0.6), ("ts_data_pipeline", 0.4),
+    ]
+    # Whitespace and trailing commas tolerated.
+    assert _parse_task_mixture(" a:1 , b:2 , ") == [("a", 1.0), ("b", 2.0)]
+
+
+def test_parse_task_mixture_rejects_bad_input():
+    from local.validator import _parse_task_mixture
+
+    with pytest.raises(ValueError):
+        _parse_task_mixture("")
+    with pytest.raises(ValueError):
+        _parse_task_mixture("ts_forecasting:nope")
+    with pytest.raises(ValueError):
+        _parse_task_mixture("ts_forecasting:-1")
+    with pytest.raises(ValueError):
+        _parse_task_mixture("ts_forecasting:0,ts_data_pipeline:0")
+
+
+def test_pick_task_name_distribution_matches_weights():
+    from local.validator import _pick_task_name
+
+    mixture = [("a", 0.7), ("b", 0.3)]
+    picks = [_pick_task_name(r, mixture) for r in range(5000)]
+    a_share = picks.count("a") / len(picks)
+    assert 0.65 < a_share < 0.75
+    # Deterministic for same (round_id, mixture).
+    assert _pick_task_name(42, mixture) == _pick_task_name(42, mixture)
+
+
+def test_pick_task_name_singleton_is_identity():
+    from local.validator import _pick_task_name
+
+    assert _pick_task_name(0, [("only", 1.0)]) == "only"
+    assert _pick_task_name(999, [("only", 5.0)]) == "only"
+
+
 def test_parent_in_epoch_filters_eligible():
     from local.validator import _parent_in_epoch
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import random
 import sys
 import time
 import uuid
@@ -56,6 +57,50 @@ def _pick_bucket(round_id: int, task=None) -> tuple[str, int, int]:
     name = names[round_id % len(names)]
     lo, hi = buckets[name]
     return name, lo, hi
+
+
+def _parse_task_mixture(spec: str) -> list[tuple[str, float]]:
+    """Parse ``--tasks "ts_forecasting:0.6,ts_data_pipeline:0.4"``.
+
+    Bare names default to weight 1.0 so ``--tasks ts_forecasting`` is the
+    single-task shorthand. Raises ``argparse``-style ``ValueError`` on
+    malformed entries or non-positive weight sum.
+    """
+    out: list[tuple[str, float]] = []
+    for piece in spec.split(","):
+        s = piece.strip()
+        if not s:
+            continue
+        if ":" in s:
+            name, w_str = s.split(":", 1)
+            try:
+                weight = float(w_str)
+            except ValueError as e:
+                raise ValueError(f"bad weight in --tasks: {piece!r}") from e
+        else:
+            name, weight = s, 1.0
+        if weight < 0:
+            raise ValueError(f"negative weight in --tasks: {piece!r}")
+        out.append((name.strip(), weight))
+    if not out:
+        raise ValueError("--tasks resolved to an empty mixture")
+    if sum(w for _, w in out) <= 0:
+        raise ValueError("--tasks weights must sum to a positive number")
+    return out
+
+
+def _pick_task_name(round_id: int, mixture: list[tuple[str, float]]) -> str:
+    """Seeded per-round task pick. Identity on a single-task mixture."""
+    if len(mixture) == 1:
+        return mixture[0][0]
+    total = sum(w for _, w in mixture)
+    r = random.Random(f"task-mix-{round_id}").random() * total
+    acc = 0.0
+    for name, w in mixture:
+        acc += w
+        if r < acc:
+            return name
+    return mixture[-1][0]
 
 
 def _task_dict(task) -> dict:
@@ -686,7 +731,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--task", default="synth_regression",
         choices=["synth_regression", "ts_forecasting", "ts_data_pipeline"],
-        help="Which task this validator drives.",
+        help="Which task this validator drives (single-task shorthand). "
+             "Mutually exclusive with --tasks.",
+    )
+    parser.add_argument(
+        "--tasks", default="",
+        help="Weighted mixture for interwoven dispatch, e.g. "
+             "'ts_forecasting:0.6,ts_data_pipeline:0.4'. Each round "
+             "picks one task with a seeded coin so families alternate. "
+             "Empty = fall back to --task.",
     )
     parser.add_argument(
         "--frozen_arch_refresh_every", type=int, default=50,
@@ -747,22 +800,37 @@ def main(argv: list[str] | None = None) -> int:
     store = LocalStore(args.db)
     if backup is not None:
         backup.start()
-    task = make_spec(args.task)
-    if isinstance(task, (TSForecastingSpec, TSDataPipelineSpec)):
-        task.time_budget_seconds = args.training_seconds
-        # GIFT-Eval is non-negotiable: Phase C always runs the full 97-task
-        # leaderboard, so there's no point starting rounds without it. No
-        # skip flag — fix creds / disk and rerun.
-        if not _ensure_ts_caches():
-            logger.error("%s caches not ready — aborting.", task.name)
-            return 2
+
+    # Resolve the task mixture: --tasks (weighted mix) wins; otherwise fall
+    # back to the single --task shorthand. Each mixture entry gets a
+    # cached TaskSpec; the round loop picks one per round.
+    try:
+        mixture = (
+            _parse_task_mixture(args.tasks) if args.tasks else
+            [(args.task, 1.0)]
+        )
+    except ValueError as e:
+        logger.error("invalid --tasks: %s", e)
+        return 2
+    specs: dict[str, object] = {}
+    for name, _ in mixture:
+        spec = make_spec(name)
+        if isinstance(spec, (TSForecastingSpec, TSDataPipelineSpec)):
+            spec.time_budget_seconds = args.training_seconds
+        specs[name] = spec
+    needs_ts_caches = any(
+        isinstance(specs[name], (TSForecastingSpec, TSDataPipelineSpec))
+        for name, _ in mixture
+    )
+    if needs_ts_caches and not _ensure_ts_caches():
+        logger.error("ts caches not ready — aborting.")
+        return 2
 
     frozen_arch_store: FrozenArchStore | None = None
-    if isinstance(task, TSDataPipelineSpec):
+    if any(isinstance(specs[name], TSDataPipelineSpec) for name, _ in mixture):
         frozen_arch_store = FrozenArchStore(
             base_dir=args.frozen_arch_dir or None,
         )
-        # Best-effort bootstrap so the very first round has a snapshot.
         maybe_refresh_frozen(
             frozen_arch_store, store, every_n=args.frozen_arch_refresh_every,
         )
@@ -770,8 +838,8 @@ def main(argv: list[str] | None = None) -> int:
         if current is None:
             logger.warning(
                 "ts_data_pipeline: no frozen arch available yet — "
-                "early rounds will drop until a ts_forecasting experiment "
-                "with both crps + mase lands in the same db.",
+                "early rounds of that task will drop until a ts_forecasting "
+                "experiment with both crps + mase lands in the same db.",
             )
         else:
             logger.info(
@@ -785,19 +853,18 @@ def main(argv: list[str] | None = None) -> int:
     elif args.continuation == "off":
         continuation_enabled = False
     else:  # auto
-        # Continuation is on by default for both ts_forecasting and
-        # ts_data_pipeline (the latter gates parents on
-        # frozen_arch_version so Δ is honest across epochs). Synthetic
-        # regression has no checkpoints, so it stays off.
-        continuation_enabled = isinstance(
-            task, (TSForecastingSpec, TSDataPipelineSpec),
+        # Both ts_forecasting and ts_data_pipeline persist checkpoints and
+        # support continuation; synthetic regression doesn't.
+        continuation_enabled = any(
+            isinstance(specs[name], (TSForecastingSpec, TSDataPipelineSpec))
+            for name, _ in mixture
         )
 
+    mixture_str = ", ".join(f"{n}:{w:g}" for n, w in mixture)
     logger.info(
-        "starting; db=%s task=%s agent_seconds=%d training_seconds=%s "
+        "starting; db=%s tasks=[%s] agent_seconds=%d training_seconds=%d "
         "continuation=%s (eq=%.2f warmup=%d +%.1f%%/%d) shards_per_round=%d",
-        args.db, task.name, args.agent_seconds,
-        getattr(task, "time_budget_seconds", "n/a"),
+        args.db, mixture_str, args.agent_seconds, args.training_seconds,
         continuation_enabled, args.continuation_equilibrium,
         args.continuation_warmup_rounds, args.continuation_step_pct,
         args.continuation_step_every, args.shards_per_round,
@@ -810,9 +877,13 @@ def main(argv: list[str] | None = None) -> int:
 
     wiki_dir = args.wiki_dir or None
     if not wiki_dir:
+        # Use the first mixture entry's wiki as the served snapshot. Mixed
+        # runs share the wiki dir; per-task swapping isn't worth the
+        # complexity for the laptop stack.
+        first_task_name = mixture[0][0]
         try:
             from shared.cognition_wiki import ensure_wiki_cached
-            cached = ensure_wiki_cached(task.name)
+            cached = ensure_wiki_cached(first_task_name)
         except Exception as e:
             logger.warning("cognition-wiki fetch raised %s — continuing without", e)
             cached = None
@@ -838,6 +909,10 @@ def main(argv: list[str] | None = None) -> int:
     completed = 0
     try:
         while args.rounds == 0 or completed < args.rounds:
+            picked_name = _pick_task_name(round_id, mixture)
+            task = specs[picked_name]
+            if len(mixture) > 1:
+                logger.info("round=%d task=%s (mixture pick)", round_id, picked_name)
             run_round(store, task, round_id,
                       phase_a_seconds=args.phase_a_seconds,
                       services_url=services_url,
