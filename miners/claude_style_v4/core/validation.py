@@ -7,9 +7,12 @@ when models land outside the budget.
 
 import ast
 import math
+import os
+import tempfile
 
 from core.flops_estimator import estimate_flops, suggest_resize
 from core.history import extract_flops_budget
+from core.input_shape import infer_input
 from core.output_shape import infer_output_shape, verify_output_shape
 
 FORBIDDEN_IMPORTS = {"subprocess", "socket", "ftplib"}
@@ -54,19 +57,80 @@ def _required_functions(challenge: dict | None) -> dict[str, list[str]]:
     }
 
 
-def _check_training_recipe(code: str, challenge: dict) -> list[str]:
-    """Pre-flight ``build_optimizer`` + ``build_scheduler`` to catch broken
-    LR recipes before training.
+def _build_dummy_input(tp: dict, constraints: list, torch_mod):
+    """Construct a [B=1, ...] dummy matching the harness's contract.
 
-    The training harness calls ``scheduler.step()`` and ``optimizer.step()``
-    on every optim step without exception guards, so a broken lambda
-    (e.g. ``torch.cos(torch.tensor(x))`` returning a 0-dim tensor that
-    LambdaLR then multiplies into ``param_group["lr"]``) silently kills the
-    whole training run. We instantiate model + optimizer + scheduler here
-    and step the scheduler across both the warmup and post-warmup regions,
-    asserting ``param_group["lr"]`` stays a finite Python float at every
-    probe. Returns empty list when there's nothing to check (missing
-    hooks, build_model crashed, etc.) — earlier checks catch those.
+    Returns ``(tensor, None)`` on success or ``(None, error_str)`` if the
+    shape can't be inferred. Mirrors ``flops_estimator``'s logic so this
+    smoke test sees the same tensor the FLOPs path does.
+    """
+    try:
+        input_shape, input_dtype = infer_input(tp, constraints)
+    except Exception as exc:
+        return None, f"could not infer input shape: {exc}"
+    try:
+        if input_dtype == torch_mod.long:
+            vocab = tp.get("vocab_size", tp.get("n_vocab", 1000))
+            return torch_mod.randint(0, int(vocab), input_shape), None
+        return torch_mod.randn(*input_shape), None
+    except Exception as exc:
+        return None, f"could not build dummy input: {exc}"
+
+
+def _scalar_loss(namespace: dict, predictions, torch_mod):
+    """Reduce an arbitrary model output to a scalar we can backward through.
+
+    Prefers the submission's ``compute_loss`` (with a same-shape target) so
+    bf16-unsupported ops inside the loss surface here; falls back to
+    ``predictions.mean()`` when the submission doesn't define one or the
+    custom loss rejects synthetic targets.
+    """
+    compute_loss = namespace.get("compute_loss")
+    if callable(compute_loss) and isinstance(predictions, torch_mod.Tensor):
+        try:
+            targets = torch_mod.zeros_like(predictions)
+            loss = compute_loss(predictions, targets)
+            if isinstance(loss, torch_mod.Tensor) and loss.ndim == 0:
+                return loss
+        except Exception:
+            pass
+    if isinstance(predictions, torch_mod.Tensor):
+        return predictions.float().mean()
+    # Tuple/dict outputs — sum every tensor leaf we can find.
+    leaves = []
+
+    def _walk(obj):
+        if isinstance(obj, torch_mod.Tensor):
+            leaves.append(obj.float().mean())
+        elif isinstance(obj, (list, tuple)):
+            for o in obj:
+                _walk(o)
+        elif isinstance(obj, dict):
+            for o in obj.values():
+                _walk(o)
+    _walk(predictions)
+    if not leaves:
+        return None
+    return sum(leaves)
+
+
+def _check_training_recipe(code: str, challenge: dict) -> list[str]:
+    """Full runtime smoke test before submitting.
+
+    Catches the four largest classes of mid-training failure that the
+    pure-FLOPs / AST validation can't see:
+      - forward pass that crashes only in ``model.train()`` mode (the
+        classic ``.view()`` after a non-contiguous transpose),
+      - bf16-unsupported ops triggered only inside ``torch.amp.autocast``
+        (FFT, ``view_as_complex``, custom kernels that hard-require fp32),
+      - state_dict that gets ``_orig_mod.`` prefixes when ``COMPILE = True``
+        is set but the Phase C reload uses a bare model,
+      - scheduler/lambda bugs that turn ``param_group["lr"]`` into a tensor
+        or a non-finite value.
+
+    Steps share an exec'd namespace so the cost is one model build, one
+    optimizer build, one optional compile + state_dict roundtrip, plus the
+    existing scheduler probe.
     """
     # Defer heavy imports so callers without torch (the AST-only checks
     # above) still work.
@@ -89,6 +153,7 @@ def _check_training_recipe(code: str, challenge: dict) -> list[str]:
 
     task = challenge.get("task", {}) or {}
     tp = task.get("task_params", {}) or {}
+    constraints = task.get("constraints", []) or []
     try:
         model = build_model_fn(**tp)
     except Exception:
@@ -99,6 +164,112 @@ def _check_training_recipe(code: str, challenge: dict) -> list[str]:
     except Exception as exc:
         return [f"build_optimizer() raised: {exc}"]
 
+    # ── Forward + backward smoke test (train mode) ────────────────
+    dummy, dummy_err = _build_dummy_input(tp, constraints, torch)
+    if dummy is None:
+        # Couldn't synthesize a probe input — skip runtime checks and let
+        # the existing FLOPs path's diagnostics carry. Don't fail.
+        return _scheduler_probe(namespace, model, optimizer, torch)
+
+    model.train()
+    try:
+        predictions = model(dummy)
+    except Exception as exc:
+        return [
+            f"model.forward() raised in train mode: "
+            f"{type(exc).__name__}: {exc}. The training harness runs the "
+            "forward pass in train mode on shape "
+            f"{tuple(dummy.shape)} — fix this before submitting."
+        ]
+
+    loss = _scalar_loss(namespace, predictions, torch)
+    if loss is None:
+        return _scheduler_probe(namespace, model, optimizer, torch)
+
+    try:
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+    except Exception as exc:
+        return [
+            f"backward()/optimizer.step() raised: "
+            f"{type(exc).__name__}: {exc}. This is the same path the "
+            "training harness takes — the run would crash on the first "
+            "real batch."
+        ]
+
+    # ── AMP smoke test (when configure_amp() opts in) ─────────────
+    configure_amp = namespace.get("configure_amp")
+    amp_enabled = False
+    amp_dtype_str = "bfloat16"
+    if callable(configure_amp):
+        try:
+            cfg = configure_amp() or {}
+            amp_enabled = bool(cfg.get("enabled", False))
+            amp_dtype_str = str(cfg.get("dtype", "bfloat16"))
+        except Exception as exc:
+            return [f"configure_amp() raised: {exc}"]
+    if amp_enabled:
+        dtype_map = {
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32,
+        }
+        amp_dtype = dtype_map.get(amp_dtype_str, torch.bfloat16)
+        # autocast on "cpu" rejects the same op set as cuda for bf16/fp16
+        # — view_as_complex, fft.*, and most custom kernels — which is
+        # exactly what we need to catch here.
+        try:
+            with torch.amp.autocast("cpu", dtype=amp_dtype, enabled=True):
+                predictions = model(dummy)
+                loss = _scalar_loss(namespace, predictions, torch)
+            if loss is not None:
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+        except Exception as exc:
+            return [
+                f"forward/backward under AMP ({amp_dtype_str}) raised: "
+                f"{type(exc).__name__}: {exc}. configure_amp() opts into "
+                f"{amp_dtype_str} but an op rejects it (commonly "
+                "view_as_complex, FFT, or a custom kernel). Either drop "
+                "AMP, switch dtype to float32, or wrap the offending "
+                "block in torch.amp.autocast(..., enabled=False)."
+            ]
+
+    # ── COMPILE state_dict round-trip ─────────────────────────────
+    if bool(namespace.get("COMPILE", False)):
+        try:
+            fresh = build_model_fn(**tp)
+            compiled = torch.compile(fresh)
+            state = compiled.state_dict()
+            with tempfile.TemporaryDirectory() as td:
+                from safetensors.torch import save_file, load_file
+                path = os.path.join(td, "probe.safetensors")
+                save_file(state, path)
+                reload_target = build_model_fn(**tp)
+                reload_target.load_state_dict(load_file(path), strict=True)
+        except Exception as exc:
+            return [
+                f"COMPILE=True checkpoint round-trip failed: "
+                f"{type(exc).__name__}: {exc}. torch.compile wraps the "
+                "model so saved keys gain a `_orig_mod.` prefix that the "
+                "Phase C eval loader (which builds a bare model) can't "
+                "match. Either set COMPILE=False, or save "
+                "`model._orig_mod.state_dict()` explicitly."
+            ]
+
+    # ── Existing scheduler probe ──────────────────────────────────
+    return _scheduler_probe(namespace, model, optimizer, torch)
+
+
+def _scheduler_probe(namespace: dict, model, optimizer, torch) -> list[str]:
+    """LR-schedule probe extracted from the legacy ``_check_training_recipe``.
+
+    Walks the user's scheduler across warmup + post-warmup steps and
+    asserts ``param_group['lr']`` stays a finite Python float at every
+    probe. Catches the ``torch.cos(torch.tensor(x))`` -> tensor-LR gotcha.
+    """
     build_scheduler_fn = namespace.get("build_scheduler")
     if not callable(build_scheduler_fn):
         return []
