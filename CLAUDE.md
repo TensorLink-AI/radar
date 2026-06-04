@@ -105,12 +105,18 @@ warm-start a run from a prior checkpoint instead of training from scratch.
 **The validator owns the cadence**: each round it flips a seeded coin at a
 scheduled rate and stamps `challenge['round_type']` (`continuation`/`new`).
 The rate is keyed on **attempted rounds** (any experiment row — failed
-rounds count too) — 0% until `--continuation_warmup_rounds` (50), then
-+`--continuation_step_pct` (1%) every `--continuation_step_every` (5)
-up to `--continuation_equilibrium` (0.70): 0→70% over ~350 rounds
-post-warmup. A scheduled continuation round
-downgrades to `new` when no eligible parents exist yet. The **miner only
-picks which parent** (`mode`/`parent_index`) on continuation rounds. The
+rounds count too) — 0% until `--continuation_warmup_rounds` (20), then
++`--continuation_step_pct` (2%) every `--continuation_step_every` (3)
+up to `--continuation_equilibrium` (0.70): 0→70% over ~105 rounds
+post-warmup. A scheduled continuation round downgrades to `new` when no
+eligible parents exist; on scheduled-continuation rounds the validator
+also biases the bucket pick toward buckets that *have* eligible parents
+(rather than round-robin) so the schedule actually fires instead of
+landing on empty buckets. The downgrade reason
+(`no_eligible_parents` / `no_in_bucket_parents`) is stamped onto the
+challenge payload alongside `scheduled_round_type` so the dashboard can
+distinguish "always-novel" from "downgraded continuation". The **miner
+only picks which parent** (`mode`/`parent_index`) on continuation rounds. The
 validator gates eligible parents, runs lineage-disjoint shard assignment
 (`--shards_per_round`), and scores continuations on a **second frontier**
 — `cumulative_compute` vs GIFT-eval Δ (`parent.metric − this.metric`) —

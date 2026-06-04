@@ -21,6 +21,16 @@ new); the **miner only chooses which parent** to warm-start from.
   **downgrades to `"new"`** when no eligible (fully-eval'd,
   checkpoint-bearing, in-bucket) parents exist yet — which is why
   pressure ramps in slowly: early rounds have nothing to continue.
+  The scheduled type and downgrade reason
+  (`no_eligible_parents` / `no_in_bucket_parents`) are persisted on
+  the challenge payload as `scheduled_round_type` and
+  `downgrade_reason` so the dashboard can show downgrades separately
+  from always-novel rounds.
+* **Bucket bias** — on scheduled-continuation rounds the validator
+  also rotates the bucket pick (normally round-robin on `round_id`)
+  forward to a bucket that *has* eligible parents. Without this, a
+  5-bucket rotation wastes ~80% of scheduled continuations on buckets
+  with no parents and silently downgrades them.
 * **Miner** reads `round_type`; on a continuation round it sets
   `mode="continue"` + `parent_index`, else `mode="new"`. An architecture
   that doesn't match the parent checkpoint (strict load) **degrades to a
@@ -34,14 +44,14 @@ produced ≥1 experiment row, success or failure — failed rounds count too,
 so a stalled stretch still advances the clock):
 
 * **Warmup** — stays at **0%** until `--continuation_warmup_rounds`
-  (default **50**) attempted rounds, so the initial frontier
+  (default **20**) attempted rounds, so the initial frontier
   establishes first.
-* **Staircase** — then climbs `--continuation_step_pct` (default **1%**)
-  every `--continuation_step_every` (default **5**) attempted rounds, up
+* **Staircase** — then climbs `--continuation_step_pct` (default **2%**)
+  every `--continuation_step_every` (default **3**) attempted rounds, up
   to `--continuation_equilibrium` (default **0.70**), then holds.
 
-With the defaults that's **0 → 70% over ~350 rounds after the
-50-round warmup**, leaving ~30% fresh exploration at steady state. The
+With the defaults that's **0 → 70% over ~105 rounds after the
+20-round warmup**, leaving ~30% fresh exploration at steady state. The
 realized round-type frequency tracks the rate via a per-round Bernoulli
 flip seeded by `round_id` (reproducible, independent of the training
 seed). See `local/continuation.py::continuation_rate` /

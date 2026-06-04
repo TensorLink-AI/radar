@@ -133,6 +133,28 @@ def _stats(conn: sqlite3.Connection) -> dict[str, Any]:
     except sqlite3.OperationalError:
         n_continuation = 0
         n_continuation_ok = 0
+    # Scheduled-vs-actual continuation counts come from the challenges table:
+    # the validator stamps scheduled_round_type + downgrade_reason on the
+    # payload before persisting. n_scheduled distinguishes "always-novel"
+    # rounds from "scheduled continuation, downgraded because no parents",
+    # which the experiments table alone can't tell apart.
+    n_cont_scheduled = 0
+    n_cont_downgraded = 0
+    try:
+        sched_row = conn.execute(
+            "SELECT "
+            " SUM(CASE WHEN json_extract(payload_json,'$.scheduled_round_type')"
+            "          = 'continuation' THEN 1 ELSE 0 END) AS n_sched, "
+            " SUM(CASE WHEN json_extract(payload_json,'$.scheduled_round_type')"
+            "          = 'continuation' AND "
+            "          json_extract(payload_json,'$.round_type') = 'new' "
+            "          THEN 1 ELSE 0 END) AS n_downgraded "
+            "FROM challenges"
+        ).fetchone()
+        n_cont_scheduled = sched_row["n_sched"] or 0
+        n_cont_downgraded = sched_row["n_downgraded"] or 0
+    except sqlite3.OperationalError:
+        pass
     return {
         "total": total,
         "successful": successful,
@@ -144,6 +166,8 @@ def _stats(conn: sqlite3.Connection) -> dict[str, Any]:
         "n_miners": n_miners,
         "n_continuation": n_continuation,
         "n_continuation_successful": n_continuation_ok,
+        "n_continuation_scheduled": n_cont_scheduled,
+        "n_continuation_downgraded": n_cont_downgraded,
         "n_novel": total - n_continuation,
         "n_novel_successful": successful - n_continuation_ok,
     }

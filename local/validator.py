@@ -55,10 +55,25 @@ from local.trainer import run_training
 logger = logging.getLogger("local.validator")
 
 
-def _pick_bucket(round_id: int, task=None) -> tuple[str, int, int]:
+def _pick_bucket(round_id: int, task=None,
+                 prefer_buckets: set[str] | None = None) -> tuple[str, int, int]:
+    """Pick the bucket for this round.
+
+    Default is round-robin keyed on ``round_id``. When ``prefer_buckets`` is
+    non-empty, rotate forward from the round-robin pick until we land on a
+    preferred bucket — used on scheduled-continuation rounds to bias toward
+    buckets that actually have eligible parents.
+    """
     buckets = buckets_for(task) if task is not None else SIZE_BUCKETS
     names = list(buckets.keys())
-    name = names[round_id % len(names)]
+    start = round_id % len(names)
+    name = names[start]
+    if prefer_buckets and name not in prefer_buckets:
+        for i in range(1, len(names)):
+            cand = names[(start + i) % len(names)]
+            if cand in prefer_buckets:
+                name = cand
+                break
     lo, hi = buckets[name]
     return name, lo, hi
 
@@ -190,7 +205,26 @@ def _build_challenge(round_id: int, store: LocalStore, task,
                      continuation_enabled: bool = False,
                      scheduled_continuation: bool = False,
                      frozen_arch=None, frozen_pipeline=None) -> dict:
-    name, lo, hi = _pick_bucket(round_id, task=task)
+    # On scheduled-continuation rounds, bias the bucket pick toward buckets
+    # that actually have eligible parents — otherwise round-robin wastes
+    # most scheduled continuations on empty buckets and they all downgrade.
+    prefer_buckets: set[str] | None = None
+    parents_any: list[dict] = []
+    if (continuation_enabled and scheduled_continuation
+            and not isinstance(task, TSDataPipelineSpec)):
+        parents_any = store.eligible_parents(
+            task=task.name, min_flops=0, max_flops=10**18,
+        )
+        if parents_any:
+            bucket_defs = buckets_for(task)
+            prefer_buckets = set()
+            for e in parents_any:
+                f = (e.get("objectives", {}) or {}).get("flops_equivalent_size", 0)
+                for bname, (blo, bhi) in bucket_defs.items():
+                    if int(blo * 0.9) <= int(f) <= int(bhi * 1.1):
+                        prefer_buckets.add(bname)
+                        break
+    name, lo, hi = _pick_bucket(round_id, task=task, prefer_buckets=prefer_buckets)
     # The data-pipeline task uses a fixed frozen architecture, so its
     # FLOPs are identical across miners in a round — size buckets are
     # meaningless here. Zero the bounds so the harness skips the gate.
@@ -214,9 +248,7 @@ def _build_challenge(round_id: int, store: LocalStore, task,
     ]
     # The validator owns the round type: a scheduled continuation round only
     # becomes one if eligible (fully-eval'd, checkpoint-bearing, in-bucket)
-    # parents actually exist — otherwise it degrades to a fresh round. This
-    # is why continuation pressure ramps in slowly: early rounds have no
-    # parents to continue from regardless of the schedule.
+    # parents actually exist — otherwise it degrades to a fresh round.
     eligible_parents = []
     epoch = _current_epoch(task, frozen_arch, frozen_pipeline)
     if continuation_enabled:
@@ -232,6 +264,16 @@ def _build_challenge(round_id: int, store: LocalStore, task,
         if (scheduled_continuation and eligible_parents) else "new"
     )
     continuation_allowed = round_type == "continuation"
+    # Persist scheduled-vs-actual so the dashboard can show "scheduled
+    # continuation downgraded because no parents" instead of silently
+    # bucketing it as a novel round.
+    scheduled_round_type = "continuation" if scheduled_continuation else "new"
+    downgrade_reason = ""
+    if scheduled_continuation and round_type == "new":
+        downgrade_reason = (
+            "no_eligible_parents" if not parents_any
+            else "no_in_bucket_parents"
+        )
     # ``allowed_urls`` is what the miner-side GatedClient enforces. Every
     # endpoint the agent can reach lives under ``services_url`` so a
     # single prefix is enough.
@@ -245,6 +287,8 @@ def _build_challenge(round_id: int, store: LocalStore, task,
         "task": _task_dict(task),
         "feasible_frontier": feasible,
         "round_type": round_type,
+        "scheduled_round_type": scheduled_round_type,
+        "downgrade_reason": downgrade_reason,
         "continuation_allowed": bool(continuation_allowed),
         "eligible_parents": eligible_parents if continuation_allowed else [],
         "agent_seconds": int(agent_seconds),
@@ -447,9 +491,9 @@ def run_round(store: LocalStore, task, round_id: int,
               ckpt_store: CheckpointStore | None = None,
               continuation_enabled: bool = False,
               continuation_equilibrium: float = 0.7,
-              continuation_warmup_rounds: int = 50,
-              continuation_step_pct: float = 1.0,
-              continuation_step_every: int = 5,
+              continuation_warmup_rounds: int = 20,
+              continuation_step_pct: float = 2.0,
+              continuation_step_every: int = 3,
               shards_per_round: int = 0,
               frozen_arch_store: FrozenArchStore | None = None,
               frozen_arch_refresh_every: int = 50,
@@ -522,12 +566,15 @@ def run_round(store: LocalStore, task, round_id: int,
     challenge_id = challenge["challenge_id"]
     bucket = challenge["bucket"]
     continuation_allowed = challenge["continuation_allowed"]
+    type_field = challenge["round_type"]
+    if challenge.get("downgrade_reason"):
+        type_field = f"new<-continuation({challenge['downgrade_reason']})"
     logger.info(
         "round=%d bucket=%s flops=[%d, %d] frontier=%d type=%s "
         "(cont_rate=%.2f attempted=%d parents=%d)",
         round_id, bucket, challenge["min_flops_equivalent"],
         challenge["max_flops_equivalent"], len(challenge["feasible_frontier"]),
-        challenge["round_type"], rate, attempted_rounds,
+        type_field, rate, attempted_rounds,
         len(challenge["eligible_parents"]),
     )
 
@@ -840,15 +887,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--continuation_equilibrium", type=float, default=0.7,
                         help="Steady-state fraction of rounds the validator "
                              "schedules as continuations (default 0.70).")
-    parser.add_argument("--continuation_warmup_rounds", type=int, default=50,
-                        help="Successful rounds with 0%% continuation before "
-                             "the ramp starts (default 50).")
-    parser.add_argument("--continuation_step_pct", type=float, default=1.0,
+    parser.add_argument("--continuation_warmup_rounds", type=int, default=20,
+                        help="Attempted rounds with 0%% continuation before "
+                             "the ramp starts (default 20).")
+    parser.add_argument("--continuation_step_pct", type=float, default=2.0,
                         help="Percentage points the continuation rate climbs "
-                             "per step after warmup (default 1.0).")
-    parser.add_argument("--continuation_step_every", type=int, default=5,
-                        help="Successful rounds per ramp step (default 5). "
-                             "Defaults give 0→70%% over ~350 rounds post-warmup.")
+                             "per step after warmup (default 2.0).")
+    parser.add_argument("--continuation_step_every", type=int, default=3,
+                        help="Attempted rounds per ramp step (default 3). "
+                             "Defaults give 0→70%% over ~105 rounds post-warmup.")
     parser.add_argument("--log_level", default="INFO")
     args = parser.parse_args(argv)
 
