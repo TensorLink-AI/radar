@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import random
 import sys
 import time
 import uuid
@@ -37,6 +38,10 @@ from local.continuation import (
 )
 from local.experiments_api import _parent_summary
 from local.frozen_arch import FrozenArchStore, maybe_refresh as maybe_refresh_frozen
+from local.frozen_pipeline import (
+    FrozenPipelineStore,
+    maybe_refresh as maybe_refresh_pipeline,
+)
 from local.scoring import compute_pareto, passes_size_gate, score_round
 from local.services import ServicesServer
 from local.store import LocalStore
@@ -56,6 +61,50 @@ def _pick_bucket(round_id: int, task=None) -> tuple[str, int, int]:
     name = names[round_id % len(names)]
     lo, hi = buckets[name]
     return name, lo, hi
+
+
+def _parse_task_mixture(spec: str) -> list[tuple[str, float]]:
+    """Parse ``--tasks "ts_forecasting:0.6,ts_data_pipeline:0.4"``.
+
+    Bare names default to weight 1.0 so ``--tasks ts_forecasting`` is the
+    single-task shorthand. Raises ``argparse``-style ``ValueError`` on
+    malformed entries or non-positive weight sum.
+    """
+    out: list[tuple[str, float]] = []
+    for piece in spec.split(","):
+        s = piece.strip()
+        if not s:
+            continue
+        if ":" in s:
+            name, w_str = s.split(":", 1)
+            try:
+                weight = float(w_str)
+            except ValueError as e:
+                raise ValueError(f"bad weight in --tasks: {piece!r}") from e
+        else:
+            name, weight = s, 1.0
+        if weight < 0:
+            raise ValueError(f"negative weight in --tasks: {piece!r}")
+        out.append((name.strip(), weight))
+    if not out:
+        raise ValueError("--tasks resolved to an empty mixture")
+    if sum(w for _, w in out) <= 0:
+        raise ValueError("--tasks weights must sum to a positive number")
+    return out
+
+
+def _pick_task_name(round_id: int, mixture: list[tuple[str, float]]) -> str:
+    """Seeded per-round task pick. Identity on a single-task mixture."""
+    if len(mixture) == 1:
+        return mixture[0][0]
+    total = sum(w for _, w in mixture)
+    r = random.Random(f"task-mix-{round_id}").random() * total
+    acc = 0.0
+    for name, w in mixture:
+        acc += w
+        if r < acc:
+            return name
+    return mixture[-1][0]
 
 
 def _task_dict(task) -> dict:
@@ -107,11 +156,40 @@ def _task_dict(task) -> dict:
     }
 
 
+def _current_epoch(task, frozen_arch=None, frozen_pipeline=None) -> dict:
+    """Continuation-pinning context for this round.
+
+    A parent's saved checkpoint is only a valid warm-start when it was
+    trained in the same context as this round. The epoch keys are
+    stamped on every successful experiment's ``objectives``:
+
+    * ts_data_pipeline pins ``frozen_arch_version`` — Δ isn't comparable
+      after the yardstick arch refreshes.
+    * ts_forecasting pins ``frozen_pipeline_version`` *only when one is
+      currently in use*. A pure-real run (no synthetic mixed in) leaves
+      the key out so it pairs freely with other pure-real ancestors —
+      that's the deliberate control track.
+    """
+    epoch: dict = {}
+    if isinstance(task, TSDataPipelineSpec) and frozen_arch is not None:
+        epoch["frozen_arch_version"] = int(frozen_arch.version)
+    if isinstance(task, TSForecastingSpec) and frozen_pipeline is not None:
+        epoch["frozen_pipeline_version"] = int(frozen_pipeline.version)
+    return epoch
+
+
+def _parent_in_epoch(parent: dict, epoch: dict) -> bool:
+    if not epoch:
+        return True
+    objs = parent.get("objectives", {}) or {}
+    return all(objs.get(k) == v for k, v in epoch.items())
+
+
 def _build_challenge(round_id: int, store: LocalStore, task,
                      services_url: str, agent_seconds: int = 180,
                      continuation_enabled: bool = False,
                      scheduled_continuation: bool = False,
-                     frozen_arch=None) -> dict:
+                     frozen_arch=None, frozen_pipeline=None) -> dict:
     name, lo, hi = _pick_bucket(round_id, task=task)
     # The data-pipeline task uses a fixed frozen architecture, so its
     # FLOPs are identical across miners in a round — size buckets are
@@ -140,12 +218,14 @@ def _build_challenge(round_id: int, store: LocalStore, task,
     # is why continuation pressure ramps in slowly: early rounds have no
     # parents to continue from regardless of the schedule.
     eligible_parents = []
+    epoch = _current_epoch(task, frozen_arch, frozen_pipeline)
     if continuation_enabled:
         eligible_parents = [
             _parent_summary(e)
             for e in store.eligible_parents(
                 task=task.name, min_flops=lo, max_flops=hi,
             )
+            if _parent_in_epoch(e, epoch)
         ]
     round_type = (
         "continuation"
@@ -188,6 +268,17 @@ def _build_challenge(round_id: int, store: LocalStore, task,
             "source_flops": frozen_arch.source_flops,
             "source_name": frozen_arch.source_name,
             "code": frozen_arch.code,
+        }
+    if frozen_pipeline is not None:
+        payload["frozen_pipeline"] = {
+            "version": frozen_pipeline.version,
+            "source_experiment_id": frozen_pipeline.source_experiment_id,
+            "source_metric": frozen_pipeline.source_metric,
+            "source_crps": frozen_pipeline.source_crps,
+            "source_mase": frozen_pipeline.source_mase,
+            "source_name": frozen_pipeline.source_name,
+            "frozen_arch_version": frozen_pipeline.frozen_arch_version,
+            "num_shards": len(frozen_pipeline.shard_paths or []),
         }
     return payload
 
@@ -301,7 +392,8 @@ def _pretrain_pool() -> list[str]:
 
 
 def _train_proposal(payload: dict, task, round_id: int,
-                    challenge: dict, prep: dict, frozen_arch=None) -> dict:
+                    challenge: dict, prep: dict,
+                    frozen_arch=None, frozen_pipeline=None) -> dict:
     """Run one proposal, retrying as a fresh run if a continuation
     warm-start turns out to be architecture-incompatible (strict load)."""
     def _run() -> dict:
@@ -317,6 +409,7 @@ def _train_proposal(payload: dict, task, round_id: int,
             shard_paths=prep["shard_paths"],
             shard_reuse=prep["shard_reuse"],
             frozen_arch=frozen_arch,
+            frozen_pipeline=frozen_pipeline,
         )
 
     result = _run()
@@ -359,7 +452,11 @@ def run_round(store: LocalStore, task, round_id: int,
               continuation_step_every: int = 5,
               shards_per_round: int = 0,
               frozen_arch_store: FrozenArchStore | None = None,
-              frozen_arch_refresh_every: int = 50) -> None:
+              frozen_arch_refresh_every: int = 50,
+              frozen_pipeline_store: FrozenPipelineStore | None = None,
+              frozen_pipeline_refresh_every: int = 30,
+              frozen_pipeline_num_shards: int = 16,
+              frozen_pipeline_batches_per_shard: int = 64) -> None:
     # The validator owns the cadence: a scheduled coin flip decides whether
     # this is a continuation round. The rate stays at 0 until
     # ``warmup_rounds`` attempted rounds, then climbs as a staircase to the
@@ -396,11 +493,31 @@ def run_round(store: LocalStore, task, round_id: int,
             )
             return
 
+    # Frozen-pipeline refresh (ts_forecasting only). Snapshots at every_n
+    # successful forecasting rounds — staggered from arch refresh so both
+    # yardsticks don't move at once. Absent pipeline = pure-real run, the
+    # control track that stays comparable across versions.
+    frozen_pipeline = None
+    if isinstance(task, TSForecastingSpec) and frozen_pipeline_store is not None:
+        maybe_refresh_pipeline(
+            frozen_pipeline_store, store,
+            every_n=frozen_pipeline_refresh_every,
+            num_shards=frozen_pipeline_num_shards,
+            batches_per_shard=frozen_pipeline_batches_per_shard,
+        )
+        frozen_pipeline = frozen_pipeline_store.current()
+        # Skip injection if the snapshot has no rendered shards (the
+        # promotion was lean — torch/pandas unavailable, or the miner's
+        # pipeline raised). The round still runs as pure-real.
+        if frozen_pipeline is not None and not frozen_pipeline.shard_paths:
+            frozen_pipeline = None
+
     challenge = _build_challenge(
         round_id, store, task, services_url, agent_seconds=agent_seconds,
         continuation_enabled=continuation_enabled,
         scheduled_continuation=scheduled,
         frozen_arch=frozen_arch,
+        frozen_pipeline=frozen_pipeline,
     )
     challenge_id = challenge["challenge_id"]
     bucket = challenge["bucket"]
@@ -440,8 +557,13 @@ def run_round(store: LocalStore, task, round_id: int,
         return
 
     # Pretrain shard pool (ts_forecasting only) — assigned per-run so
-    # continuations can avoid lineage-seen shards.
-    pool = _pretrain_pool() if continuation_allowed else []
+    # continuations can avoid lineage-seen shards. ts_data_pipeline's
+    # data source is the miner's pipeline; shard assignment is N/A.
+    pool = (
+        _pretrain_pool()
+        if continuation_allowed and isinstance(task, TSForecastingSpec)
+        else []
+    )
 
     # ── Phase B + Phase C: train and evaluate every proposal ──
     results: list[dict] = []
@@ -458,6 +580,7 @@ def run_round(store: LocalStore, task, round_id: int,
             min_flops=challenge["min_flops_equivalent"],
             max_flops=challenge["max_flops_equivalent"],
             pool=pool, shards_per_round=shards_per_round, seed=round_id,
+            current_epoch=_current_epoch(task, frozen_arch, frozen_pipeline),
         ) if continuation_allowed else {
             # Continuation disabled — still preserve any payload parent_index
             # so the existing lineage/diff tracking keeps working.
@@ -478,7 +601,8 @@ def run_round(store: LocalStore, task, round_id: int,
             name, miner_id, prep["mode"],
         )
         result = _train_proposal(
-            payload, task, round_id, challenge, prep, frozen_arch=frozen_arch,
+            payload, task, round_id, challenge, prep,
+            frozen_arch=frozen_arch, frozen_pipeline=frozen_pipeline,
         )
 
         result["miner_id"] = miner_id
@@ -656,7 +780,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--task", default="synth_regression",
         choices=["synth_regression", "ts_forecasting", "ts_data_pipeline"],
-        help="Which task this validator drives.",
+        help="Which task this validator drives (single-task shorthand). "
+             "Mutually exclusive with --tasks.",
+    )
+    parser.add_argument(
+        "--tasks", default="",
+        help="Weighted mixture for interwoven dispatch, e.g. "
+             "'ts_forecasting:0.6,ts_data_pipeline:0.4'. Each round "
+             "picks one task with a seeded coin so families alternate. "
+             "Empty = fall back to --task.",
     )
     parser.add_argument(
         "--frozen_arch_refresh_every", type=int, default=50,
@@ -668,11 +800,34 @@ def main(argv: list[str] | None = None) -> int:
         help="ts_data_pipeline only: where versioned frozen archs live. "
              "Empty = $RADAR_FROZEN_ARCH_DIR or local/frozen_archs.",
     )
+    parser.add_argument(
+        "--frozen_pipeline_refresh_every", type=int, default=30,
+        help="ts_forecasting only: refresh the frozen synthetic pipeline "
+             "every N successful forecasting rounds (default 30 — staggered "
+             "from the arch refresh so both yardsticks don't move at once). "
+             "0 disables the consumer-side feedback loop.",
+    )
+    parser.add_argument(
+        "--frozen_pipeline_dir", default="",
+        help="ts_forecasting only: where versioned frozen pipelines live. "
+             "Empty = $RADAR_FROZEN_PIPELINE_DIR or local/frozen_pipelines.",
+    )
+    parser.add_argument(
+        "--frozen_pipeline_num_shards", type=int, default=16,
+        help="ts_forecasting only: how many synthetic shards to render at "
+             "each frozen-pipeline promotion (default 16).",
+    )
+    parser.add_argument(
+        "--frozen_pipeline_batches_per_shard", type=int, default=64,
+        help="ts_forecasting only: batches drawn per rendered synthetic "
+             "shard (default 64).",
+    )
     parser.add_argument("--continuation", default="auto",
                         choices=["auto", "on", "off"],
                         help="Allow continuation (warm-start) proposals. "
-                             "'auto' = on for ts_forecasting, off for "
-                             "synth_regression (no checkpoints there).")
+                             "'auto' = on for ts_forecasting and "
+                             "ts_data_pipeline (both persist checkpoints), "
+                             "off for synth_regression.")
     parser.add_argument("--shards_per_round", type=int, default=0,
                         help="Pretrain shards assigned per run. 0 = all "
                              "(legacy; continuations then reuse shards). "
@@ -717,22 +872,37 @@ def main(argv: list[str] | None = None) -> int:
     store = LocalStore(args.db)
     if backup is not None:
         backup.start()
-    task = make_spec(args.task)
-    if isinstance(task, (TSForecastingSpec, TSDataPipelineSpec)):
-        task.time_budget_seconds = args.training_seconds
-        # GIFT-Eval is non-negotiable: Phase C always runs the full 97-task
-        # leaderboard, so there's no point starting rounds without it. No
-        # skip flag — fix creds / disk and rerun.
-        if not _ensure_ts_caches():
-            logger.error("%s caches not ready — aborting.", task.name)
-            return 2
+
+    # Resolve the task mixture: --tasks (weighted mix) wins; otherwise fall
+    # back to the single --task shorthand. Each mixture entry gets a
+    # cached TaskSpec; the round loop picks one per round.
+    try:
+        mixture = (
+            _parse_task_mixture(args.tasks) if args.tasks else
+            [(args.task, 1.0)]
+        )
+    except ValueError as e:
+        logger.error("invalid --tasks: %s", e)
+        return 2
+    specs: dict[str, object] = {}
+    for name, _ in mixture:
+        spec = make_spec(name)
+        if isinstance(spec, (TSForecastingSpec, TSDataPipelineSpec)):
+            spec.time_budget_seconds = args.training_seconds
+        specs[name] = spec
+    needs_ts_caches = any(
+        isinstance(specs[name], (TSForecastingSpec, TSDataPipelineSpec))
+        for name, _ in mixture
+    )
+    if needs_ts_caches and not _ensure_ts_caches():
+        logger.error("ts caches not ready — aborting.")
+        return 2
 
     frozen_arch_store: FrozenArchStore | None = None
-    if isinstance(task, TSDataPipelineSpec):
+    if any(isinstance(specs[name], TSDataPipelineSpec) for name, _ in mixture):
         frozen_arch_store = FrozenArchStore(
             base_dir=args.frozen_arch_dir or None,
         )
-        # Best-effort bootstrap so the very first round has a snapshot.
         maybe_refresh_frozen(
             frozen_arch_store, store, every_n=args.frozen_arch_refresh_every,
         )
@@ -740,8 +910,8 @@ def main(argv: list[str] | None = None) -> int:
         if current is None:
             logger.warning(
                 "ts_data_pipeline: no frozen arch available yet — "
-                "early rounds will drop until a ts_forecasting experiment "
-                "with both crps + mase lands in the same db.",
+                "early rounds of that task will drop until a ts_forecasting "
+                "experiment with both crps + mase lands in the same db.",
             )
         else:
             logger.info(
@@ -750,21 +920,49 @@ def main(argv: list[str] | None = None) -> int:
                 current.source_metric,
             )
 
+    frozen_pipeline_store: FrozenPipelineStore | None = None
+    if (any(isinstance(specs[name], TSForecastingSpec) for name, _ in mixture)
+            and args.frozen_pipeline_refresh_every > 0):
+        frozen_pipeline_store = FrozenPipelineStore(
+            base_dir=args.frozen_pipeline_dir or None,
+        )
+        maybe_refresh_pipeline(
+            frozen_pipeline_store, store,
+            every_n=args.frozen_pipeline_refresh_every,
+            num_shards=args.frozen_pipeline_num_shards,
+            batches_per_shard=args.frozen_pipeline_batches_per_shard,
+        )
+        current_p = frozen_pipeline_store.current()
+        if current_p is None:
+            logger.info(
+                "ts_forecasting: no frozen pipeline yet — early rounds "
+                "run on real shards only until a ts_data_pipeline "
+                "experiment with crps+mase lands in this db.",
+            )
+        else:
+            logger.info(
+                "ts_forecasting: frozen pipeline v%d (exp=%d shards=%d)",
+                current_p.version, current_p.source_experiment_id,
+                len(current_p.shard_paths or []),
+            )
+
     if args.continuation == "on":
         continuation_enabled = True
     elif args.continuation == "off":
         continuation_enabled = False
     else:  # auto
-        # Continuation is a ts_forecasting-specific lineage feature; the
-        # data-pipeline task doesn't persist checkpoints as warm-start
-        # parents (frozen arch fills that role instead).
-        continuation_enabled = isinstance(task, TSForecastingSpec)
+        # Both ts_forecasting and ts_data_pipeline persist checkpoints and
+        # support continuation; synthetic regression doesn't.
+        continuation_enabled = any(
+            isinstance(specs[name], (TSForecastingSpec, TSDataPipelineSpec))
+            for name, _ in mixture
+        )
 
+    mixture_str = ", ".join(f"{n}:{w:g}" for n, w in mixture)
     logger.info(
-        "starting; db=%s task=%s agent_seconds=%d training_seconds=%s "
+        "starting; db=%s tasks=[%s] agent_seconds=%d training_seconds=%d "
         "continuation=%s (eq=%.2f warmup=%d +%.1f%%/%d) shards_per_round=%d",
-        args.db, task.name, args.agent_seconds,
-        getattr(task, "time_budget_seconds", "n/a"),
+        args.db, mixture_str, args.agent_seconds, args.training_seconds,
         continuation_enabled, args.continuation_equilibrium,
         args.continuation_warmup_rounds, args.continuation_step_pct,
         args.continuation_step_every, args.shards_per_round,
@@ -777,9 +975,13 @@ def main(argv: list[str] | None = None) -> int:
 
     wiki_dir = args.wiki_dir or None
     if not wiki_dir:
+        # Use the first mixture entry's wiki as the served snapshot. Mixed
+        # runs share the wiki dir; per-task swapping isn't worth the
+        # complexity for the laptop stack.
+        first_task_name = mixture[0][0]
         try:
             from shared.cognition_wiki import ensure_wiki_cached
-            cached = ensure_wiki_cached(task.name)
+            cached = ensure_wiki_cached(first_task_name)
         except Exception as e:
             logger.warning("cognition-wiki fetch raised %s — continuing without", e)
             cached = None
@@ -805,6 +1007,10 @@ def main(argv: list[str] | None = None) -> int:
     completed = 0
     try:
         while args.rounds == 0 or completed < args.rounds:
+            picked_name = _pick_task_name(round_id, mixture)
+            task = specs[picked_name]
+            if len(mixture) > 1:
+                logger.info("round=%d task=%s (mixture pick)", round_id, picked_name)
             run_round(store, task, round_id,
                       phase_a_seconds=args.phase_a_seconds,
                       services_url=services_url,
@@ -818,7 +1024,11 @@ def main(argv: list[str] | None = None) -> int:
                       continuation_step_every=args.continuation_step_every,
                       shards_per_round=args.shards_per_round,
                       frozen_arch_store=frozen_arch_store,
-                      frozen_arch_refresh_every=args.frozen_arch_refresh_every)
+                      frozen_arch_refresh_every=args.frozen_arch_refresh_every,
+                      frozen_pipeline_store=frozen_pipeline_store,
+                      frozen_pipeline_refresh_every=args.frozen_pipeline_refresh_every,
+                      frozen_pipeline_num_shards=args.frozen_pipeline_num_shards,
+                      frozen_pipeline_batches_per_shard=args.frozen_pipeline_batches_per_shard)
             round_id += 1
             completed += 1
             if args.rounds == 0 or completed < args.rounds:

@@ -65,7 +65,12 @@ def main(argv: list[str] | None = None) -> int:
         choices=["synth_regression", "ts_forecasting", "ts_data_pipeline"],
         help="Task spec (synthetic regression, ts_forecasting with torch + "
              "GIFT-Eval data, or ts_data_pipeline — data generators paired "
-             "with a frozen architecture).",
+             "with a frozen architecture). Mutually exclusive with --tasks.",
+    )
+    parser.add_argument(
+        "--tasks", default="",
+        help="Weighted task mixture for interwoven dispatch, e.g. "
+             "'ts_forecasting:0.6,ts_data_pipeline:0.4'. Empty = use --task.",
     )
     parser.add_argument("--agent_seconds", type=int, default=1800,
                         help="LLM agent budget (default 30 min).")
@@ -88,11 +93,14 @@ def main(argv: list[str] | None = None) -> int:
         "--rounds", str(args.rounds),
         "--phase_a_seconds", str(args.phase_a_seconds),
         "--gap_seconds", str(args.gap_seconds),
-        "--task", args.task,
         "--agent_seconds", str(args.agent_seconds),
         "--training_seconds", str(args.training_seconds),
         "--log_level", args.log_level,
     ]
+    if args.tasks:
+        validator_cmd += ["--tasks", args.tasks]
+    else:
+        validator_cmd += ["--task", args.task]
     if args.wiki_dir:
         validator_cmd += ["--wiki_dir", args.wiki_dir]
 

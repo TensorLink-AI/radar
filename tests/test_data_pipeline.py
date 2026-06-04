@@ -223,3 +223,240 @@ def test_challenge_dict_for_data_pipeline_advertises_pipeline_contract():
     obj_names = {o["name"] for o in d["objectives"]}
     assert "aulc" in obj_names
     assert "gift_metric" in obj_names
+
+
+# ── continuation epoch pinning ──────────────────────────────────────
+
+
+def _add_dp_exp(store, *, frozen_arch_version: int, metric: float = 0.5,
+                cumc: float = 0.0, success: bool = True,
+                ckpt: bool = True) -> int:
+    objs = {
+        "flops_equivalent_size": 0,
+        "num_params": 0,
+        "frozen_arch_version": frozen_arch_version,
+        "frozen_arch_source_id": 1,
+        "cumulative_compute": cumc,
+    }
+    eid = store.add_experiment(
+        round_id=0, miner_id="m", name="x", code="c", motivation="",
+        reasoning="", tool_calls=[], metric=metric, success=success,
+        objectives=objs, score=0.0, loss_curve=[],
+        task="ts_data_pipeline", cumulative_compute=cumc, mode="new",
+    )
+    if ckpt and success:
+        store.set_checkpoint_ref(eid, f"ckpt:{eid}")
+    return eid
+
+
+def test_eligible_parents_ignores_size_gate_when_disabled(tmp_path):
+    """ts_data_pipeline rounds run with min/max flops both 0 (frozen-arch
+    FLOPs are fixed and not comparable across miners). The eligible-parent
+    query must treat that as 'gate disabled' rather than 'flops must be 0',
+    or every scheduled continuation round silently downgrades to 'new'.
+    """
+    store = LocalStore(tmp_path / "t.db")
+    parent_id = _add_dp_exp(store, frozen_arch_version=1)
+    # Frozen arch's actual training FLOPs are non-zero.
+    store._conn.execute(
+        "UPDATE experiments SET objectives_json = ? WHERE id = ?",
+        (json.dumps({
+            "flops_equivalent_size": 5_000_000,
+            "num_params": 0,
+            "frozen_arch_version": 1,
+            "frozen_arch_source_id": 1,
+            "cumulative_compute": 0,
+        }), parent_id),
+    )
+    elig = store.eligible_parents(
+        task="ts_data_pipeline", min_flops=0, max_flops=0,
+    )
+    assert {e["id"] for e in elig} == {parent_id}
+    store.close()
+
+
+def test_prepare_continuation_rejects_cross_epoch_parent(tmp_path):
+    from local.checkpoints import CheckpointStore
+    from local.continuation import prepare_continuation
+
+    store = LocalStore(tmp_path / "t.db")
+    cs = CheckpointStore(base_dir=tmp_path / "ck")
+    src = tmp_path / "m.safetensors"
+    src.write_bytes(b"w")
+
+    parent_id = _add_dp_exp(store, frozen_arch_version=1)
+    cs.save(parent_id, src)
+    store.set_checkpoint_ref(parent_id, f"ckpt:{parent_id}")
+
+    # Same-epoch continuation: accepted.
+    prep = prepare_continuation(
+        store, cs,
+        payload={"mode": "continue", "parent_index": parent_id},
+        task_name="ts_data_pipeline", min_flops=0, max_flops=0,
+        pool=[], shards_per_round=0, seed=1,
+        current_epoch={"frozen_arch_version": 1},
+    )
+    assert prep["mode"] == "continue"
+    assert prep["parent_metric"] == 0.5
+
+    # Cross-epoch (parent v1, round v2): rejected, falls back to fresh.
+    prep2 = prepare_continuation(
+        store, cs,
+        payload={"mode": "continue", "parent_index": parent_id},
+        task_name="ts_data_pipeline", min_flops=0, max_flops=0,
+        pool=[], shards_per_round=0, seed=1,
+        current_epoch={"frozen_arch_version": 2},
+    )
+    assert prep2["mode"] == "new"
+    assert "different epoch" in prep2["note"]
+    store.close()
+
+
+def test_current_epoch_for_data_pipeline():
+    from local.frozen_arch import FrozenArch
+    from local.validator import _current_epoch
+
+    dp = make_spec("ts_data_pipeline")
+    ts = make_spec("ts_forecasting")
+    arch = FrozenArch(
+        version=7, code="x", source_experiment_id=1, source_metric=0.5,
+        source_crps=0.3, source_mase=0.7, source_flops=1_000_000,
+        source_name="v7", created_at=0.0,
+    )
+    assert _current_epoch(dp, arch) == {"frozen_arch_version": 7}
+    # ts_forecasting has no epoch axis (yet); empty dict = pin is a no-op.
+    assert _current_epoch(ts, None) == {}
+    assert _current_epoch(dp, None) == {}
+
+
+# ── interwoven task dispatch ────────────────────────────────────────
+
+
+def test_parse_task_mixture_round_trip():
+    from local.validator import _parse_task_mixture
+
+    assert _parse_task_mixture("ts_forecasting") == [("ts_forecasting", 1.0)]
+    assert _parse_task_mixture("ts_forecasting:0.6,ts_data_pipeline:0.4") == [
+        ("ts_forecasting", 0.6), ("ts_data_pipeline", 0.4),
+    ]
+    # Whitespace and trailing commas tolerated.
+    assert _parse_task_mixture(" a:1 , b:2 , ") == [("a", 1.0), ("b", 2.0)]
+
+
+def test_parse_task_mixture_rejects_bad_input():
+    from local.validator import _parse_task_mixture
+
+    with pytest.raises(ValueError):
+        _parse_task_mixture("")
+    with pytest.raises(ValueError):
+        _parse_task_mixture("ts_forecasting:nope")
+    with pytest.raises(ValueError):
+        _parse_task_mixture("ts_forecasting:-1")
+    with pytest.raises(ValueError):
+        _parse_task_mixture("ts_forecasting:0,ts_data_pipeline:0")
+
+
+def test_pick_task_name_distribution_matches_weights():
+    from local.validator import _pick_task_name
+
+    mixture = [("a", 0.7), ("b", 0.3)]
+    picks = [_pick_task_name(r, mixture) for r in range(5000)]
+    a_share = picks.count("a") / len(picks)
+    assert 0.65 < a_share < 0.75
+    # Deterministic for same (round_id, mixture).
+    assert _pick_task_name(42, mixture) == _pick_task_name(42, mixture)
+
+
+def test_pick_task_name_singleton_is_identity():
+    from local.validator import _pick_task_name
+
+    assert _pick_task_name(0, [("only", 1.0)]) == "only"
+    assert _pick_task_name(999, [("only", 5.0)]) == "only"
+
+
+def test_parent_in_epoch_filters_eligible():
+    from local.validator import _parent_in_epoch
+
+    p1 = {"objectives": {"frozen_arch_version": 3}}
+    p2 = {"objectives": {"frozen_arch_version": 4}}
+    p3 = {"objectives": {}}
+    assert _parent_in_epoch(p1, {"frozen_arch_version": 3})
+    assert not _parent_in_epoch(p2, {"frozen_arch_version": 3})
+    assert not _parent_in_epoch(p3, {"frozen_arch_version": 3})
+    # Empty epoch is a no-op gate.
+    assert _parent_in_epoch(p1, {})
+    assert _parent_in_epoch(p3, {})
+
+
+# ── frozen pipeline store + ts_forecasting epoch ────────────────────
+
+
+def test_frozen_pipeline_store_bootstrap(tmp_path):
+    from local.frozen_pipeline import FrozenPipelineStore
+
+    s = FrozenPipelineStore(base_dir=str(tmp_path / "pipes"))
+    assert s.current_version() == 0
+    assert s.current() is None
+
+
+def test_frozen_pipeline_save_and_load(tmp_path):
+    from local.frozen_pipeline import FrozenPipelineStore
+
+    s = FrozenPipelineStore(base_dir=str(tmp_path / "pipes"))
+    pipe = s.save(
+        code="def build_pipeline(*a, **k): pass",
+        source_experiment_id=42, source_metric=0.4,
+        source_crps=0.2, source_mase=0.6, source_flops=1_000_000,
+        source_name="pipe_a", frozen_arch_version=3,
+        shard_paths=[str(tmp_path / "s.parquet")],
+    )
+    assert pipe.version == 1 and s.current_version() == 1
+    loaded = s.load(1)
+    assert loaded is not None
+    assert loaded.frozen_arch_version == 3
+    assert loaded.shard_paths == [str(tmp_path / "s.parquet")]
+    # Listing strips the code.
+    rows = s.all_versions()
+    assert len(rows) == 1
+    assert "code" not in rows[0]
+
+
+def test_frozen_pipeline_bootstraps_from_data_pipeline_frontier(tmp_path):
+    from local.frozen_pipeline import FrozenPipelineStore, maybe_refresh
+
+    store = LocalStore(tmp_path / "t.db")
+    store.add_experiment(
+        round_id=0, miner_id="m", name="p", code="code-A",
+        motivation="", reasoning="", tool_calls=[],
+        metric=0.5, success=True,
+        objectives={"flops_equivalent_size": 0, "num_params": 0,
+                    "crps": 0.4, "mase": 0.6,
+                    "frozen_arch_version": 2},
+        score=0.0, loss_curve=[], task="ts_data_pipeline",
+    )
+    pipe_store = FrozenPipelineStore(base_dir=str(tmp_path / "pipes"))
+    # num_shards=0 short-circuits the rendering path so the test stays
+    # numpy-only — we're verifying the bookkeeping, not pyarrow.
+    saved = maybe_refresh(pipe_store, store, every_n=10, num_shards=0)
+    assert saved is not None
+    assert saved.frozen_arch_version == 2
+    assert saved.source_metric == 0.5
+    store.close()
+
+
+def test_current_epoch_for_forecasting_includes_pipeline_version():
+    from local.frozen_pipeline import FrozenPipeline
+    from local.validator import _current_epoch
+
+    ts = make_spec("ts_forecasting")
+    pipe = FrozenPipeline(
+        version=4, code="x", source_experiment_id=1, source_metric=0.5,
+        source_crps=0.3, source_mase=0.7, source_flops=0,
+        source_name="p", frozen_arch_version=2, created_at=0.0,
+        shard_paths=["a.parquet"],
+    )
+    # ts_forecasting with a pipeline → pin the version.
+    assert _current_epoch(ts, frozen_pipeline=pipe) == {"frozen_pipeline_version": 4}
+    # ts_forecasting without a pipeline (the pure-real control track) →
+    # no pin: empty epoch lets it pair with any other pure-real parent.
+    assert _current_epoch(ts) == {}

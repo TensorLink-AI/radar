@@ -160,6 +160,7 @@ def prepare_continuation(
     pool: list[str],
     shards_per_round: int,
     seed: int,
+    current_epoch: dict | None = None,
 ) -> dict:
     """Resolve a proposal's continuation request into ``run_training`` kwargs.
 
@@ -168,6 +169,11 @@ def prepare_continuation(
     reason is reported in ``note`` so the validator can record
     ``continuation_status``. Also computes the lineage-disjoint shard
     assignment.
+
+    ``current_epoch`` is a dict of ``objectives``-keys → required values
+    (e.g. ``{"frozen_arch_version": 3}`` for ts_data_pipeline). A parent
+    whose objectives don't match is rejected, because Δ is only honest
+    inside a fixed context epoch.
     """
     from local.shards import assign_shards, lineage_shards
 
@@ -189,7 +195,9 @@ def prepare_continuation(
 
     if mode == "continue" and isinstance(parent_index, int):
         parent = store.get_experiment(parent_index)
-        reason = _parent_reject_reason(parent, min_flops, max_flops)
+        reason = _parent_reject_reason(
+            parent, min_flops, max_flops, current_epoch=current_epoch,
+        )
         ckpt_path = (
             ckpt_store.resolve(parent.get("checkpoint_ref"))
             if parent is not None and reason is None else None
@@ -217,7 +225,10 @@ def prepare_continuation(
     return prep
 
 
-def _parent_reject_reason(parent, min_flops: int, max_flops: int):
+def _parent_reject_reason(
+    parent, min_flops: int, max_flops: int,
+    *, current_epoch: dict | None = None,
+):
     """Return a human reason a parent can't be continued, or None if OK."""
     if parent is None:
         return "parent not found"
@@ -225,9 +236,19 @@ def _parent_reject_reason(parent, min_flops: int, max_flops: int):
         return "parent not fully evaluated"
     if parent.get("checkpoint_ref") is None:
         return "parent has no saved checkpoint"
-    flops = (parent.get("objectives", {}) or {}).get("flops_equivalent_size", 0)
-    if not (int(min_flops * 0.9) <= flops <= int(max_flops * 1.1)):
-        return "parent outside size bucket"
+    objs = parent.get("objectives", {}) or {}
+    # Size-gate check is meaningful only when bounds are set (e.g. the
+    # ts_data_pipeline task disables the gate via 0/0 because the frozen
+    # arch fixes FLOPs for every miner in a round).
+    if min_flops > 0 or max_flops > 0:
+        flops = objs.get("flops_equivalent_size", 0)
+        if not (int(min_flops * 0.9) <= flops <= int(max_flops * 1.1)):
+            return "parent outside size bucket"
+    if current_epoch:
+        for k, v in current_epoch.items():
+            pv = objs.get(k)
+            if pv != v:
+                return f"parent in different epoch ({k}={pv} vs {v})"
     return None
 
 
