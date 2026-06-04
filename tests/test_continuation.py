@@ -198,6 +198,15 @@ def test_successful_round_count(store):
     assert store.successful_round_count(task="ts_forecasting") == 2
 
 
+def test_attempted_round_count_includes_failures(store):
+    _add(store, metric=1.0)                                   # round 1 success
+    _add(store, metric=0.9, success=False, ckpt=False, n_rounds=2)  # round 2 failure
+    _add(store, metric=None, success=False, ckpt=False, n_rounds=3) # round 3 failure
+    # Failures advance the cadence clock; successes don't double-count.
+    assert store.attempted_round_count(task="ts_forecasting") == 3
+    assert store.successful_round_count(task="ts_forecasting") == 1
+
+
 def test_store_lineage_and_eligible(store):
     e1 = _add(store, metric=1.0, shards=["s1.parquet"])
     e2 = _add(store, metric=0.8, mode="continue", parent=e1, n_rounds=2,
@@ -330,7 +339,7 @@ def test_continuation_rate_warmup_then_staircase():
     assert continuation_rate(0) == 0.0
     assert continuation_rate(49) == 0.0
     assert continuation_rate(50) == pytest.approx(0.0)   # ramp starts here
-    # +1% per 5 successful rounds after warmup.
+    # +1% per 5 attempted rounds after warmup.
     assert continuation_rate(55) == pytest.approx(0.01)
     assert continuation_rate(100) == pytest.approx(0.10)
     # Reaches the 0.70 equilibrium ~350 rounds after warmup, then holds.
@@ -342,7 +351,7 @@ def test_is_continuation_round_warmup_and_tracking():
     from local.continuation import is_continuation_round
     # Inside warmup: never a continuation regardless of round_id.
     assert not any(is_continuation_round(r, 50) for r in range(200))
-    # Deterministic per (round_id, successful_rounds).
+    # Deterministic per (round_id, attempted_rounds).
     a = is_continuation_round(7, 100 + 350)
     b = is_continuation_round(7, 100 + 350)
     assert a == b

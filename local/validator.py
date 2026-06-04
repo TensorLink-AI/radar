@@ -362,19 +362,19 @@ def run_round(store: LocalStore, task, round_id: int,
               frozen_arch_refresh_every: int = 50) -> None:
     # The validator owns the cadence: a scheduled coin flip decides whether
     # this is a continuation round. The rate stays at 0 until
-    # ``warmup_rounds`` successful rounds, then climbs as a staircase to the
+    # ``warmup_rounds`` attempted rounds, then climbs as a staircase to the
     # equilibrium; _build_challenge further downgrades to "new" when no
     # eligible parents exist yet.
-    successful_rounds = store.successful_round_count(task=task.name)
+    attempted_rounds = store.attempted_round_count(task=task.name)
     rate = continuation_rate(
-        successful_rounds,
+        attempted_rounds,
         equilibrium=continuation_equilibrium,
         warmup_rounds=continuation_warmup_rounds,
         step_pct=continuation_step_pct,
         step_every=continuation_step_every,
     ) if continuation_enabled else 0.0
     scheduled = continuation_enabled and is_continuation_round(
-        round_id, successful_rounds,
+        round_id, attempted_rounds,
         equilibrium=continuation_equilibrium,
         warmup_rounds=continuation_warmup_rounds,
         step_pct=continuation_step_pct,
@@ -407,10 +407,10 @@ def run_round(store: LocalStore, task, round_id: int,
     continuation_allowed = challenge["continuation_allowed"]
     logger.info(
         "round=%d bucket=%s flops=[%d, %d] frontier=%d type=%s "
-        "(cont_rate=%.2f ok_rounds=%d parents=%d)",
+        "(cont_rate=%.2f attempted=%d parents=%d)",
         round_id, bucket, challenge["min_flops_equivalent"],
         challenge["max_flops_equivalent"], len(challenge["feasible_frontier"]),
-        challenge["round_type"], rate, successful_rounds,
+        challenge["round_type"], rate, attempted_rounds,
         len(challenge["eligible_parents"]),
     )
 
