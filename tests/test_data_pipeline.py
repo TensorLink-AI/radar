@@ -249,6 +249,32 @@ def _add_dp_exp(store, *, frozen_arch_version: int, metric: float = 0.5,
     return eid
 
 
+def test_eligible_parents_ignores_size_gate_when_disabled(tmp_path):
+    """ts_data_pipeline rounds run with min/max flops both 0 (frozen-arch
+    FLOPs are fixed and not comparable across miners). The eligible-parent
+    query must treat that as 'gate disabled' rather than 'flops must be 0',
+    or every scheduled continuation round silently downgrades to 'new'.
+    """
+    store = LocalStore(tmp_path / "t.db")
+    parent_id = _add_dp_exp(store, frozen_arch_version=1)
+    # Frozen arch's actual training FLOPs are non-zero.
+    store._conn.execute(
+        "UPDATE experiments SET objectives_json = ? WHERE id = ?",
+        (json.dumps({
+            "flops_equivalent_size": 5_000_000,
+            "num_params": 0,
+            "frozen_arch_version": 1,
+            "frozen_arch_source_id": 1,
+            "cumulative_compute": 0,
+        }), parent_id),
+    )
+    elig = store.eligible_parents(
+        task="ts_data_pipeline", min_flops=0, max_flops=0,
+    )
+    assert {e["id"] for e in elig} == {parent_id}
+    store.close()
+
+
 def test_prepare_continuation_rejects_cross_epoch_parent(tmp_path):
     from local.checkpoints import CheckpointStore
     from local.continuation import prepare_continuation

@@ -247,7 +247,7 @@ def _render_shards(
         from local.task import (
             TS_CONTEXT_LEN, TS_NUM_VARIATES, TS_PREDICTION_LEN, TS_QUANTILES,
         )
-        import pandas as pd  # noqa: F401  (proves the dep is present)
+        import pandas as pd
         import torch  # noqa: F401
     except Exception as e:  # noqa: BLE001
         logger.warning(
@@ -257,31 +257,34 @@ def _render_shards(
 
     try:
         build_pipeline = _exec_pipeline_submission(code)
+        iterator = iter(build_pipeline(
+            TS_CONTEXT_LEN, TS_PREDICTION_LEN, TS_NUM_VARIATES,
+            list(TS_QUANTILES),
+        ))
     except Exception as e:  # noqa: BLE001
         logger.warning("frozen pipeline render: build_pipeline failed: %s", e)
         return []
 
+    # Drain ``num_shards`` worth of rows from a single iterator. Calling
+    # build_pipeline once per shard would produce identical shards for a
+    # deterministic pipeline; consuming from one iterator lets within-stream
+    # variation (or RNG advance) carry across shards.
     saved: list[str] = []
     for shard_idx in range(num_shards):
         try:
-            it = build_pipeline(
-                TS_CONTEXT_LEN, TS_PREDICTION_LEN, TS_NUM_VARIATES,
-                list(TS_QUANTILES),
-            )
-            rows = _drain_to_rows(it, batches_per_shard)
+            rows = _drain_to_rows(iterator, batches_per_shard)
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "frozen pipeline render: shard %d aborted (%s)", shard_idx, e,
             )
-            continue
+            break
         if not rows:
-            continue
+            break  # iterator exhausted — stop rather than write empty shards
         out_path = out_dir / f"synth-{shard_idx:05d}.parquet"
         try:
-            import pandas as pd
-            pd.DataFrame({"target": rows, "freq": ["synthetic"] * len(rows)}).to_parquet(
-                out_path, index=False,
-            )
+            pd.DataFrame(
+                {"target": rows, "freq": ["synthetic"] * len(rows)},
+            ).to_parquet(out_path, index=False)
             saved.append(str(out_path))
         except Exception as e:  # noqa: BLE001
             logger.warning(

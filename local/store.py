@@ -341,11 +341,14 @@ class LocalStore:
         A parent must have succeeded, carry a finite metric and a saved
         ``checkpoint_ref``, and fall inside the round's size bucket
         (warm-start can't change architecture across the gate cleanly).
+        ``min_flops == max_flops == 0`` disables the gate — used by
+        ts_data_pipeline where the frozen arch fixes FLOPs.
         """
         rows = self._conn.execute(
             "SELECT * FROM experiments WHERE success = 1 "
             "AND metric IS NOT NULL AND checkpoint_ref IS NOT NULL"
         ).fetchall()
+        gate_disabled = min_flops <= 0 and max_flops <= 0
         lo = int(min_flops * 0.9)
         hi = int(max_flops * 1.1)
         out: list[dict] = []
@@ -353,9 +356,11 @@ class LocalStore:
             exp = _row_to_experiment(r)
             if task is not None and exp.get("task") != task:
                 continue
-            flops = exp["objectives"].get("flops_equivalent_size", 0)
-            if lo <= flops <= hi:
-                out.append(exp)
+            if not gate_disabled:
+                flops = exp["objectives"].get("flops_equivalent_size", 0)
+                if not (lo <= flops <= hi):
+                    continue
+            out.append(exp)
         return out
 
     def get_experiment(self, exp_id: int) -> Optional[dict]:
