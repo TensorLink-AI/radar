@@ -104,10 +104,11 @@ pandas, httpx) so the synthetic stack stays numpy-only.
 warm-start a run from a prior checkpoint instead of training from scratch.
 **The validator owns the cadence**: each round it flips a seeded coin at a
 scheduled rate and stamps `challenge['round_type']` (`continuation`/`new`).
-The rate is keyed on **successful rounds** — 0% until
-`--continuation_warmup_rounds` (50), then +`--continuation_step_pct` (1%)
-every `--continuation_step_every` (5) up to `--continuation_equilibrium`
-(0.70): 0→70% over ~350 rounds post-warmup. A scheduled continuation round
+The rate is keyed on **attempted rounds** (any experiment row — failed
+rounds count too) — 0% until `--continuation_warmup_rounds` (50), then
++`--continuation_step_pct` (1%) every `--continuation_step_every` (5)
+up to `--continuation_equilibrium` (0.70): 0→70% over ~350 rounds
+post-warmup. A scheduled continuation round
 downgrades to `new` when no eligible parents exist yet. The **miner only
 picks which parent** (`mode`/`parent_index`) on continuation rounds. The
 validator gates eligible parents, runs lineage-disjoint shard assignment
@@ -136,7 +137,7 @@ and a `continuation` block on `/frontier`. Full write-up in
 | `local/task.py` | Synthetic 8-dim regression + FLOPs-equivalent size buckets. |
 | `local/optimize.py` | Prompt-population CLI (`gepa` / `random_mutate`). |
 | `local/run.py` | Launches validator + N miners as subprocesses. |
-| `local/backup.py` | R2/Hippius backup of `radar_local.db`. Restores `<prefix>/latest.db.gz` at validator start if the local DB is missing, then a daemon thread snapshots (sqlite online backup → gzip) every `RADAR_BACKUP_INTERVAL_SEC` to `<prefix>/snapshots/<UTC>.db.gz` + overwrites `latest.db.gz`. **Default-on whenever `HIPPIUS_*`/`R2_*` creds are set** — defaults bucket=`radar-backups`, prefix=`radar-backups` (or `radar-backups/<RADAR_INSTANCE_ID>` when set, which also namespaces `agent-events`), interval=3600s. Override with `RADAR_BACKUP_BUCKET`/`RADAR_BACKUP_PREFIX`; set `RADAR_BACKUP_DISABLE=1` to opt out. |
+| `local/backup.py` | R2/Hippius backup of `radar_local.db`. Restores `<prefix>/latest.db.gz` at validator start if the local DB is missing, then a daemon thread snapshots (sqlite online backup → gzip) every `RADAR_BACKUP_INTERVAL_SEC` to `<prefix>/snapshots/<UTC>.db.gz` + overwrites `latest.db.gz`. **Default-on whenever `HIPPIUS_*`/`R2_*` creds are set** — defaults bucket=`radar-backups`, prefix=`radar-backups` (or `radar-backups/<RADAR_INSTANCE_ID>` when set, which also namespaces `agent-events` and the checkpoint prefix), interval=3600s. Override with `RADAR_BACKUP_BUCKET`/`RADAR_BACKUP_PREFIX`; set `RADAR_BACKUP_DISABLE=1` to opt out. |
 | `local/dashboard.py` + `local/dashboard.html` | Read-only stdlib HTTP dashboard over `radar_local.db`. `python -m local.dashboard --db ... --port 8765`, open in Chrome. |
 | `miner_template/prompts.py` | `active.json` + `history/gen_NNN.json` atomic-write population store. |
 | `miner_template/optimizers/` | Pluggable optimizer registry (`gepa`, `random_mutate`, `pkg.mod:func`). |

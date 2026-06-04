@@ -316,11 +316,7 @@ class LocalStore:
         return chain
 
     def successful_round_count(self, task: Optional[str] = None) -> int:
-        """Distinct rounds that produced at least one successful experiment.
-
-        Drives the continuation cadence warmup/ramp — failing early rounds
-        don't count toward the schedule.
-        """
+        """Distinct rounds that produced at least one successful experiment."""
         if task is None:
             row = self._conn.execute(
                 "SELECT COUNT(DISTINCT round_id) AS n FROM experiments "
@@ -330,6 +326,24 @@ class LocalStore:
             row = self._conn.execute(
                 "SELECT COUNT(DISTINCT round_id) AS n FROM experiments "
                 "WHERE success = 1 AND task = ?", (task,)
+            ).fetchone()
+        return int(row["n"] or 0)
+
+    def attempted_round_count(self, task: Optional[str] = None) -> int:
+        """Distinct rounds that produced at least one experiment row.
+
+        Drives the continuation cadence warmup/ramp — both successful and
+        failed experiments count, so rounds where training crashed or the
+        eval failed still advance the clock.
+        """
+        if task is None:
+            row = self._conn.execute(
+                "SELECT COUNT(DISTINCT round_id) AS n FROM experiments"
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT COUNT(DISTINCT round_id) AS n FROM experiments "
+                "WHERE task = ?", (task,)
             ).fetchone()
         return int(row["n"] or 0)
 
