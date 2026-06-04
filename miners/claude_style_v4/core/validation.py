@@ -6,6 +6,7 @@ when models land outside the budget.
 """
 
 import ast
+import math
 
 from core.flops_estimator import estimate_flops, suggest_resize
 from core.history import extract_flops_budget
@@ -14,6 +15,15 @@ from core.output_shape import infer_output_shape, verify_output_shape
 FORBIDDEN_IMPORTS = {"subprocess", "socket", "ftplib"}
 
 DATA_PIPELINE_TASK = "ts_data_pipeline"
+
+# Pre-flight stepping points — chosen so warmup (5% of total = step 5)
+# is exercised in the first sample and the post-warmup cosine branch is
+# exercised in the rest. The harness's actual ``scheduler.step()`` calls
+# every optim step, so any pattern that produces a tensor lr after warmup
+# (the classic ``torch.cos(torch.tensor(x))`` gotcha) is caught here
+# before training starts.
+_RECIPE_TOTAL_STEPS = 100
+_RECIPE_STEP_PROBES = (1, 6, 30, 60, 99)
 
 
 def _task_name(challenge: dict | None) -> str:
@@ -44,6 +54,105 @@ def _required_functions(challenge: dict | None) -> dict[str, list[str]]:
     }
 
 
+def _check_training_recipe(code: str, challenge: dict) -> list[str]:
+    """Pre-flight ``build_optimizer`` + ``build_scheduler`` to catch broken
+    LR recipes before training.
+
+    The training harness calls ``scheduler.step()`` and ``optimizer.step()``
+    on every optim step without exception guards, so a broken lambda
+    (e.g. ``torch.cos(torch.tensor(x))`` returning a 0-dim tensor that
+    LambdaLR then multiplies into ``param_group["lr"]``) silently kills the
+    whole training run. We instantiate model + optimizer + scheduler here
+    and step the scheduler across both the warmup and post-warmup regions,
+    asserting ``param_group["lr"]`` stays a finite Python float at every
+    probe. Returns empty list when there's nothing to check (missing
+    hooks, build_model crashed, etc.) — earlier checks catch those.
+    """
+    # Defer heavy imports so callers without torch (the AST-only checks
+    # above) still work.
+    try:
+        import torch
+    except ImportError:
+        return []
+
+    namespace: dict = {}
+    try:
+        exec(compile(code, "<generated>", "exec"), namespace)
+    except Exception:
+        # FLOPs estimator already reported this — don't duplicate.
+        return []
+
+    build_model_fn = namespace.get("build_model")
+    build_optimizer_fn = namespace.get("build_optimizer")
+    if not callable(build_model_fn) or not callable(build_optimizer_fn):
+        return []
+
+    task = challenge.get("task", {}) or {}
+    tp = task.get("task_params", {}) or {}
+    try:
+        model = build_model_fn(**tp)
+    except Exception:
+        return []
+
+    try:
+        optimizer = build_optimizer_fn(model)
+    except Exception as exc:
+        return [f"build_optimizer() raised: {exc}"]
+
+    build_scheduler_fn = namespace.get("build_scheduler")
+    if not callable(build_scheduler_fn):
+        return []
+
+    try:
+        scheduler = build_scheduler_fn(optimizer, _RECIPE_TOTAL_STEPS)
+    except Exception as exc:
+        return [f"build_scheduler() raised: {exc}"]
+    if scheduler is None:
+        return []
+
+    import warnings
+    last_step = 0
+    for probe in _RECIPE_STEP_PROBES:
+        for _ in range(probe - last_step):
+            try:
+                with warnings.catch_warnings():
+                    # We're stepping the scheduler without a paired
+                    # optimizer.step() — that's intentional for the probe
+                    # but PyTorch warns about it.
+                    warnings.simplefilter("ignore", category=UserWarning)
+                    scheduler.step()
+            except Exception as exc:
+                return [
+                    f"scheduler.step() raised at step {probe}: "
+                    f"{type(exc).__name__}: {exc}. Make sure lambdas "
+                    "return Python floats — use `math.cos(math.pi * x)`, "
+                    "NOT `torch.cos(torch.tensor(x))`."
+                ]
+        last_step = probe
+        for pg in optimizer.param_groups:
+            lr = pg.get("lr")
+            if torch.is_tensor(lr):
+                return [
+                    f"scheduler made param_group['lr'] a tensor at step "
+                    f"{probe} (lr={lr!r}). Lambdas must return Python "
+                    "floats — use `math.cos(math.pi * x)`, NOT "
+                    "`torch.cos(torch.tensor(x))`. The training loop "
+                    "calls optimizer.step() with the resulting lr and "
+                    "would crash mid-run."
+                ]
+            if not isinstance(lr, (int, float)):
+                return [
+                    f"param_group['lr'] is {type(lr).__name__} at step "
+                    f"{probe} (expected int or float)."
+                ]
+            if not math.isfinite(float(lr)):
+                return [
+                    f"param_group['lr'] is {lr!r} at step {probe} "
+                    "(non-finite)."
+                ]
+    return []
+
+
 def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[str]]:
     """Validate generated code against the validator's requirements.
 
@@ -60,6 +169,11 @@ def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[
       9. Output shape matches the expected shape parsed from the task
          ``constraints`` (when such a constraint is present). Handles any
          tensor rank — the comparison is driven by the constraint string.
+     10. Training-recipe pre-flight — instantiates optimizer + scheduler
+         and steps the scheduler across warmup + post-warmup, asserting
+         ``param_group['lr']`` stays a finite Python float. Catches the
+         classic ``torch.cos(torch.tensor(x))`` -> tensor-LR gotcha at
+         submit time so the round isn't wasted on a guaranteed crash.
     """
     errors: list[str] = []
 
@@ -173,5 +287,11 @@ def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[
                     shape_err = verify_output_shape(out_shape_sink[0], expected)
                     if shape_err:
                         errors.append(shape_err)
+
+    # 10. Training-recipe pre-flight. Only when structural + shape checks
+    # pass — recipe errors are confusing when the model itself doesn't
+    # instantiate. Skipped for ts_data_pipeline above.
+    if not errors and challenge is not None:
+        errors.extend(_check_training_recipe(code, challenge))
 
     return len(errors) == 0, errors
