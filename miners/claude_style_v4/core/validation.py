@@ -57,6 +57,14 @@ def _required_functions(challenge: dict | None) -> dict[str, list[str]]:
     }
 
 
+class _NullCtx:
+    """No-op context manager — used to run the forced-cast AMP probe
+    without an autocast wrapper so the dtype the user sees is whatever the
+    op produces, not what autocast decides to cast back to fp32."""
+    def __enter__(self): return self
+    def __exit__(self, *_): return False
+
+
 def _build_dummy_input(tp: dict, constraints: list, torch_mod):
     """Construct a [B=1, ...] dummy matching the harness's contract.
 
@@ -216,32 +224,62 @@ def _check_training_recipe(code: str, challenge: dict) -> list[str]:
             "float32": torch.float32,
         }
         amp_dtype = dtype_map.get(amp_dtype_str, torch.bfloat16)
-        # autocast on "cpu" rejects the same op set as cuda for bf16/fp16
-        # — view_as_complex, fft.*, and most custom kernels — which is
-        # exactly what we need to catch here.
-        try:
-            with torch.amp.autocast("cpu", dtype=amp_dtype, enabled=True):
-                predictions = model(dummy)
-                loss = _scalar_loss(namespace, predictions, torch)
-            if loss is not None:
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-        except Exception as exc:
-            return [
-                f"forward/backward under AMP ({amp_dtype_str}) raised: "
-                f"{type(exc).__name__}: {exc}. configure_amp() opts into "
-                f"{amp_dtype_str} but an op rejects it (commonly "
-                "view_as_complex, FFT, or a custom kernel). Either drop "
-                "AMP, switch dtype to float32, or wrap the offending "
-                "block in torch.amp.autocast(..., enabled=False)."
-            ]
+        # CPU autocast's "cast to low precision" op list is narrower than
+        # CUDA's — SiLU/GELU/etc. may stay fp32 here and the bf16 only
+        # surfaces in the validator's CUDA run. Belt and braces:
+        #   (a) autocast pass to catch normally-cast ops,
+        #   (b) explicit dummy.to(amp_dtype) pass to force every op in the
+        #       graph to see the low-precision input, reliably exposing
+        #       FFT / view_as_complex / custom-kernel rejections regardless
+        #       of which autocast list the activation lives in.
+        for label, ctx, probe_input in (
+            ("autocast", torch.amp.autocast("cpu", dtype=amp_dtype, enabled=True), dummy),
+            ("forced-cast", _NullCtx(), dummy.to(amp_dtype)),
+        ):
+            try:
+                with ctx:
+                    predictions = model(probe_input)
+                    loss = _scalar_loss(namespace, predictions, torch)
+                if loss is not None:
+                    loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+            except Exception as exc:
+                return [
+                    f"forward/backward under AMP ({amp_dtype_str}, "
+                    f"{label}) raised: "
+                    f"{type(exc).__name__}: {exc}. configure_amp() opts into "
+                    f"{amp_dtype_str} but an op rejects it (commonly "
+                    "view_as_complex, FFT, or a custom kernel). Either drop "
+                    "AMP, switch dtype to float32, or wrap the offending "
+                    "block in torch.amp.autocast(..., enabled=False)."
+                ]
 
-    # ── COMPILE state_dict round-trip ─────────────────────────────
+    # ── COMPILE: dynamo trace + state_dict round-trip ─────────────
+    # Two failure modes to catch:
+    #   (a) dynamo's trace itself raises (e.g. a bf16 tensor flowing into
+    #       fft.rfft surfaces as FakeTensor(..., bfloat16) → "Unsupported
+    #       dtype BFloat16" during the compile pass, not at runtime).
+    #       Requires actually invoking the compiled model — state_dict()
+    #       alone won't trigger tracing.
+    #   (b) saved state_dict gains `_orig_mod.` prefixes that the Phase C
+    #       eval loader (bare model) can't match.
     if bool(namespace.get("COMPILE", False)):
         try:
             fresh = build_model_fn(**tp)
             compiled = torch.compile(fresh)
+            try:
+                compiled(dummy)
+            except Exception as exc:
+                return [
+                    f"torch.compile() trace failed on dummy input: "
+                    f"{type(exc).__name__}: {exc}. Dynamo died during "
+                    "compile-time tracing (no eager fallback). Common "
+                    "causes: bf16/fp16 flowing into an op without a "
+                    "low-precision kernel (fft.*, view_as_complex), or "
+                    "dynamic control flow Dynamo can't handle. Set "
+                    "COMPILE=False, or fix the offending op."
+                ]
             state = compiled.state_dict()
             with tempfile.TemporaryDirectory() as td:
                 from safetensors.torch import save_file, load_file
