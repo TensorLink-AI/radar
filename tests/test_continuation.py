@@ -337,20 +337,20 @@ def test_continuation_rate_warmup_then_staircase():
     from local.continuation import continuation_rate
     # 0% through the whole warmup window.
     assert continuation_rate(0) == 0.0
-    assert continuation_rate(49) == 0.0
-    assert continuation_rate(50) == pytest.approx(0.0)   # ramp starts here
-    # +1% per 5 attempted rounds after warmup.
-    assert continuation_rate(55) == pytest.approx(0.01)
-    assert continuation_rate(100) == pytest.approx(0.10)
-    # Reaches the 0.70 equilibrium ~350 rounds after warmup, then holds.
-    assert continuation_rate(50 + 350) == pytest.approx(0.70)
-    assert continuation_rate(50 + 999) == pytest.approx(0.70)
+    assert continuation_rate(19) == 0.0
+    assert continuation_rate(20) == pytest.approx(0.0)   # ramp starts here
+    # +2% per 3 attempted rounds after warmup.
+    assert continuation_rate(23) == pytest.approx(0.02)
+    assert continuation_rate(50) == pytest.approx(0.20)
+    # Reaches the 0.70 equilibrium ~105 rounds after warmup, then holds.
+    assert continuation_rate(20 + 105) == pytest.approx(0.70)
+    assert continuation_rate(20 + 999) == pytest.approx(0.70)
 
 
 def test_is_continuation_round_warmup_and_tracking():
     from local.continuation import is_continuation_round
     # Inside warmup: never a continuation regardless of round_id.
-    assert not any(is_continuation_round(r, 50) for r in range(200))
+    assert not any(is_continuation_round(r, 19) for r in range(200))
     # Deterministic per (round_id, attempted_rounds).
     a = is_continuation_round(7, 100 + 350)
     b = is_continuation_round(7, 100 + 350)

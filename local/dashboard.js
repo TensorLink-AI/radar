@@ -943,12 +943,20 @@ function redraw({ stats, lb, fr, frCM, cont, dp, archs, recent }) {
   // raw count + how many of them actually succeeded.
   const novelLine = `${fmtInt(stats.n_novel_successful)} / ${fmtInt(stats.n_novel)}`;
   const contLine  = `${fmtInt(stats.n_continuation_successful)} / ${fmtInt(stats.n_continuation)}`;
+  // scheduled-but-downgraded continuations look like novel rounds in the
+  // experiments table; the challenges table lets us count them separately.
+  const sched = stats.n_continuation_scheduled || 0;
+  const downg = stats.n_continuation_downgraded || 0;
+  const schedLine = sched
+    ? `${fmtInt(sched - downg)} ran · ${fmtInt(downg)} downgraded`
+    : '—';
   const cells = [
     ['total', fmtInt(stats.total)], ['successful', fmtInt(stats.successful)],
     ['failed', fmtInt(stats.failed)], ['miners', fmtInt(stats.n_miners)],
     ['last round', fmtInt(stats.last_round)],
     ['novel (ok/total)', novelLine],
     ['continuation (ok/total)', contLine],
+    ['scheduled continuations', schedLine],
     ['best metric', fmt(stats.best_metric)],
     ['mean metric', fmt(stats.mean_metric)],
   ];

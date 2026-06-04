@@ -29,9 +29,9 @@ def continuation_rate(
     attempted_rounds: int,
     *,
     equilibrium: float = 0.7,
-    warmup_rounds: int = 50,
-    step_pct: float = 1.0,
-    step_every: int = 5,
+    warmup_rounds: int = 20,
+    step_pct: float = 2.0,
+    step_every: int = 3,
 ) -> float:
     """Target continuation fraction given the count of attempted rounds.
 
@@ -39,7 +39,7 @@ def continuation_rate(
     experiment row, success or failure — failed rounds count too), then
     climbs as a staircase — ``step_pct`` percentage points every
     ``step_every`` rounds — up to ``equilibrium``. With the defaults
-    (warmup 50, +1%/5 rounds, eq 0.70) it reaches 70% about 350 rounds
+    (warmup 20, +2%/3 rounds, eq 0.70) it reaches 70% about 105 rounds
     after the warmup.
     """
     eq = max(0.0, min(1.0, equilibrium))
@@ -56,9 +56,9 @@ def is_continuation_round(
     attempted_rounds: int,
     *,
     equilibrium: float = 0.7,
-    warmup_rounds: int = 50,
-    step_pct: float = 1.0,
-    step_every: int = 5,
+    warmup_rounds: int = 20,
+    step_pct: float = 2.0,
+    step_every: int = 3,
 ) -> bool:
     """Deterministic per-round coin flip at the scheduled rate.
 
