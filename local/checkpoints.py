@@ -32,21 +32,47 @@ def _default_dir() -> Path:
     return Path(os.environ.get("RADAR_CHECKPOINT_DIR", _DEFAULT_DIR))
 
 
+def _default_r2_prefix() -> str:
+    """Default R2 key prefix, namespaced by ``RADAR_INSTANCE_ID`` if set.
+
+    Mirrors the backup/agent-events convention so co-tenant instances on a
+    shared bucket don't trample each other's checkpoint files.
+    """
+    explicit = os.getenv("RADAR_CHECKPOINT_R2_PREFIX", "").strip()
+    if explicit:
+        return explicit.strip("/")
+    instance = os.getenv("RADAR_INSTANCE_ID", "").strip()
+    return f"checkpoints/{instance}" if instance else "checkpoints"
+
+
 class CheckpointStore:
     """File-backed checkpoint store, optionally mirrored to R2.
 
     ``base_dir`` holds ``{exp_id}.safetensors`` files. When ``sink`` is an
     R2-enabled ``ArtifactSink`` the checkpoint is also uploaded so it
     survives container recycling; ``resolve`` re-downloads on a local miss.
+    ``r2_prefix`` defaults to ``checkpoints`` (or ``checkpoints/<RADAR_INSTANCE_ID>``
+    when set) so multiple instances sharing a bucket stay isolated.
     """
 
-    def __init__(self, base_dir: str | Path | None = None, sink: object = None):
+    def __init__(
+        self,
+        base_dir: str | Path | None = None,
+        sink: object = None,
+        r2_prefix: str | None = None,
+    ):
         self.base_dir = Path(base_dir) if base_dir else _default_dir()
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.sink = sink
+        self.r2_prefix = (
+            r2_prefix.strip("/") if r2_prefix is not None else _default_r2_prefix()
+        )
 
     def _local_path(self, exp_id: int) -> Path:
         return self.base_dir / f"{int(exp_id)}.safetensors"
+
+    def _r2_key(self, exp_id: int) -> str:
+        return f"{self.r2_prefix}/{int(exp_id)}.safetensors"
 
     def save(self, exp_id: int, src_path: str | Path) -> Optional[str]:
         """Copy ``src_path`` into the store keyed by ``exp_id``.
@@ -67,7 +93,7 @@ class CheckpointStore:
         ref = f"ckpt:{int(exp_id)}"
         if self.sink is not None and getattr(self.sink, "r2_enabled", False):
             try:
-                key = f"checkpoints/{int(exp_id)}.safetensors"
+                key = self._r2_key(exp_id)
                 self.sink._client.upload_file_from_disk(str(dst), key)  # type: ignore[attr-defined]
             except Exception as e:  # noqa: BLE001
                 logger.debug("checkpoint R2 mirror failed: %s", e)
@@ -87,7 +113,7 @@ class CheckpointStore:
         # Local miss — try pulling from R2 if available.
         if self.sink is not None and getattr(self.sink, "r2_enabled", False):
             try:
-                key = f"checkpoints/{exp_id}.safetensors"
+                key = self._r2_key(exp_id)
                 body = self.sink.fetch_bytes(key)  # type: ignore[attr-defined]
                 if body:
                     local.write_bytes(body)
