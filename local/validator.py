@@ -628,6 +628,12 @@ def run_round(store: LocalStore, task, round_id: int,
             max_flops=challenge["max_flops_equivalent"],
             pool=pool, shards_per_round=shards_per_round, seed=round_id,
             current_epoch=_current_epoch(task, frozen_arch, frozen_pipeline),
+            force_continuation=True,
+            eligible_parent_ids=[
+                int(p["id"]) for p in challenge.get("eligible_parents", [])
+                if isinstance(p.get("id"), int)
+            ],
+            miner_id=miner_id,
         ) if continuation_allowed else {
             # Continuation disabled — still preserve any payload parent_index
             # so the existing lineage/diff tracking keeps working.
