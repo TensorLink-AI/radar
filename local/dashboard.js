@@ -15,7 +15,7 @@ const esc = s => String(s == null ? '' : s).replace(/[&<>]/g,
 async function get(p) { const r = await fetch(p); return r.json(); }
 
 const TAB_KEY = 'radar.activeTab';
-const VALID_TABS = ['architecture', 'data_pipeline'];
+const VALID_TABS = ['architecture', 'data_pipeline', 'service_log', 'checkpoints'];
 
 const state = {
   selectedId: null,
@@ -215,10 +215,267 @@ function frozenArchRow(e) {
   return tr;
 }
 
+// ── Service-log + checkpoints ──────────────────────────────
+function fmtBytes(n) {
+  if (n === null || n === undefined) return '—';
+  n = Number(n);
+  if (!Number.isFinite(n)) return '—';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 ** 3) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  return (n / 1024 ** 3).toFixed(2) + ' GB';
+}
+function fmtTs(ts) {
+  if (!ts) return '—';
+  const d = new Date(Number(ts) * 1000);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleString();
+}
+function fmtRelTs(ts) {
+  if (!ts) return '—';
+  const dt = Date.now() / 1000 - Number(ts);
+  if (dt < 0) return fmtTs(ts);
+  if (dt < 60) return Math.round(dt) + 's ago';
+  if (dt < 3600) return Math.round(dt / 60) + 'm ago';
+  if (dt < 86400) return (dt / 3600).toFixed(1) + 'h ago';
+  return (dt / 86400).toFixed(1) + 'd ago';
+}
+
+// Map event kinds to a small accent palette. Falls back to neutral grey.
+const KIND_COLORS = {
+  llm: '#6ba4ff', desearch: '#7ecbe8', wiki: '#c9c97e',
+  arxiv: '#e87e9d', frontier: '#7ec97e', experiments: '#a07cc7',
+  artifacts: '#f0a040', logs: '#9aa0aa',
+};
+function kindChipHtml(kind, n, active) {
+  const c = KIND_COLORS[kind] || '#6c7280';
+  return `<button class="chip" data-kind="${esc(kind)}"`
+    + (active ? ` data-active="true"` : '')
+    + ` style="--chip-accent:${c}">`
+    + `<span class="chip-dot"></span>`
+    + `<span class="chip-label">${esc(kind || '(blank)')}</span>`
+    + `<span class="chip-count">${fmtInt(n)}</span></button>`;
+}
+
+const evState = {
+  kind: '',
+  round_id: '',
+  miner_id: '',
+  endpoint: '',
+  errors: false,
+  limit: 100,
+  stats: null,
+};
+const ckState = { dir: '', items: [] };
+
+function eventRow(e) {
+  const tr = document.createElement('tr');
+  tr.className = 'row';
+  tr.dataset.eventId = e.id;
+  tr.onclick = () => showEventDetail(e.id);
+  const isErr = e.error || (e.status !== null && Number(e.status) >= 400);
+  const statusCell = e.status === null || e.status === undefined
+    ? `<td class="num muted">—</td>`
+    : `<td class="num ${isErr ? 'fail' : 'ok'}">${e.status}</td>`;
+  const kindColor = KIND_COLORS[e.kind] || '#6c7280';
+  const preview = e.error
+    ? `<span style="color:var(--red)">${esc(e.error)}</span>`
+    : `<span class="muted">${esc(e.response_preview || e.request_preview || '')}</span>`;
+  tr.innerHTML = `<td>${e.id}</td>`
+    + `<td title="${esc(fmtTs(e.ts))}">${esc(fmtRelTs(e.ts))}</td>`
+    + `<td>${e.round_id ?? '—'}</td>`
+    + `<td>${esc(e.miner_id || '—')}</td>`
+    + `<td><span class="kind-pill" style="--chip-accent:${kindColor}">`
+    + `${esc(e.kind || '?')}</span></td>`
+    + `<td class="ep" title="${esc(e.endpoint)}">${esc(e.endpoint)}</td>`
+    + statusCell
+    + `<td class="num">${fmt(e.latency_ms, 1)}</td>`
+    + `<td class="num">${fmtBytes(e.response_bytes)}</td>`
+    + `<td class="ep">${preview}</td>`;
+  return tr;
+}
+
+function ckRow(c) {
+  const tr = document.createElement('tr');
+  tr.className = 'row';
+  tr.dataset.expId = c.exp_id;
+  tr.onclick = () => showCheckpointDetail(c.exp_id);
+  const m = c.meta || {};
+  tr.innerHTML = `<td>${c.exp_id}</td>`
+    + `<td>${m.round_id ?? '—'}</td>`
+    + `<td>${esc(m.miner_id || '—')}</td>`
+    + `<td>${esc(m.name || '—')}</td>`
+    + `<td>${esc(m.task || '—')}</td>`
+    + `<td class="num">${fmtBytes(c.size_bytes)}</td>`
+    + `<td class="num">${fmt(m.metric)}</td>`
+    + `<td class="num">${fmtInt(m.n_rounds)}</td>`
+    + `<td class="num">${m.parent_index ?? '—'}</td>`
+    + `<td class="num">${fmt(m.cumulative_compute, 2)}</td>`
+    + `<td title="${esc(fmtTs(c.mtime))}">${esc(fmtRelTs(c.mtime))}</td>`;
+  return tr;
+}
+
+function getCkField(c, key) {
+  if (!key) return null;
+  if (key.startsWith('meta.')) {
+    return c.meta ? (c.meta[key.slice(5)] ?? null) : null;
+  }
+  return c[key];
+}
+
+async function loadEvents() {
+  const params = new URLSearchParams();
+  if (evState.kind) params.set('kind', evState.kind);
+  if (evState.round_id !== '') params.set('round_id', evState.round_id);
+  if (evState.miner_id) params.set('miner_id', evState.miner_id);
+  if (evState.endpoint) params.set('endpoint', evState.endpoint);
+  if (evState.errors) params.set('errors', '1');
+  params.set('limit', String(evState.limit));
+  const events = await get('/api/events?' + params.toString());
+  tableRaw.events = events;
+  renderTable('events');
+  document.getElementById('ev-shown').textContent =
+    ` · showing ${events.length}`;
+}
+
+async function loadEventStats() {
+  const stats = await get('/api/event_stats');
+  evState.stats = stats;
+  const cells = [
+    ['total events', fmtInt(stats.total)],
+    ['errors', fmtInt(stats.errors)],
+    ['first', fmtRelTs(stats.first_ts)],
+    ['last', fmtRelTs(stats.last_ts)],
+  ];
+  document.getElementById('evStats').innerHTML = cells.map(([k, v]) =>
+    `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`
+  ).join('');
+  // Kind chips with counts. The empty-kind row is rare but possible.
+  const chipsHost = document.getElementById('evKindChips');
+  const chips = [
+    `<button class="chip" data-kind=""`
+      + (evState.kind === '' ? ` data-active="true"` : '')
+      + ` style="--chip-accent:#9aa0aa">`
+      + `<span class="chip-dot"></span>`
+      + `<span class="chip-label">all</span>`
+      + `<span class="chip-count">${fmtInt(stats.total)}</span></button>`,
+  ];
+  for (const k of (stats.by_kind || [])) {
+    chips.push(kindChipHtml(k.kind, k.n, evState.kind === k.kind));
+  }
+  chipsHost.innerHTML = chips.join('');
+  chipsHost.querySelectorAll('.chip').forEach(btn => {
+    btn.onclick = () => {
+      evState.kind = btn.dataset.kind || '';
+      loadEventStats();
+      loadEvents();
+    };
+  });
+  // Miner datalist for the input.
+  const ml = document.getElementById('evMinerList');
+  ml.innerHTML = (stats.by_miner || []).map(m =>
+    `<option value="${esc(m.miner_id || '')}">`).join('');
+  document.getElementById('ev-count').textContent =
+    ` (${fmtInt(stats.total)})`;
+}
+
+async function showEventDetail(id) {
+  const e = await get(`/api/event/${id}`);
+  if (!e || e.error === 'not found') return;
+  const isErr = e.error || (e.status !== null && Number(e.status) >= 400);
+  const reqStr = e.request === null || e.request === undefined ? ''
+    : typeof e.request === 'string' ? e.request
+    : JSON.stringify(e.request, null, 2);
+  const resStr = e.response === null || e.response === undefined ? ''
+    : typeof e.response === 'string' ? e.response
+    : JSON.stringify(e.response, null, 2);
+  openModal(`event ${e.id} · ${e.kind || '?'} ${e.endpoint || ''}`, body => {
+    body.innerHTML = `<div class="event-meta">`
+      + `<span><b>when</b> ${esc(fmtTs(e.ts))}</span>`
+      + `<span><b>round</b> ${e.round_id ?? '—'}</span>`
+      + `<span><b>miner</b> ${esc(e.miner_id || '—')}</span>`
+      + `<span><b>status</b> <span class="${isErr ? 'fail' : 'ok'}">`
+      + `${e.status ?? '—'}</span></span>`
+      + `<span><b>latency</b> ${fmt(e.latency_ms, 1)} ms</span>`
+      + `<span><b>req</b> ${fmtBytes(e.request_bytes)}</span>`
+      + `<span><b>res</b> ${fmtBytes(e.response_bytes)}</span>`
+      + `</div>`
+      + (e.error
+          ? `<h3>error</h3><pre class="err">${esc(e.error)}</pre>` : '')
+      + `<div class="json-grid">`
+      + `<div><h3>request <button class="copy-btn" data-copy="req">copy</button></h3>`
+      + `<pre class="json-pre" id="evReq">${esc(reqStr) || '<span class="muted">(empty)</span>'}</pre></div>`
+      + `<div><h3>response <button class="copy-btn" data-copy="res">copy</button></h3>`
+      + `<pre class="json-pre" id="evRes">${esc(resStr) || '<span class="muted">(empty)</span>'}</pre></div>`
+      + `</div>`;
+    body.querySelectorAll('button[data-copy]').forEach(btn => {
+      btn.onclick = () => {
+        const s = btn.dataset.copy === 'req' ? reqStr : resStr;
+        navigator.clipboard.writeText(s).then(() => {
+          btn.textContent = 'copied';
+          setTimeout(() => btn.textContent = 'copy', 1200);
+        });
+      };
+    });
+  });
+}
+
+async function loadCheckpoints() {
+  const data = await get('/api/checkpoints');
+  ckState.dir = data.dir || '';
+  ckState.items = data.items || [];
+  const dirLine = data.exists
+    ? `${esc(data.dir)} · ${ckState.items.length} file(s)`
+    : `<span class="fail">checkpoint dir missing</span>: ${esc(data.dir)}`;
+  document.getElementById('ckDir').innerHTML = dirLine;
+  document.getElementById('ck-count').textContent =
+    ` (${ckState.items.length})`;
+  tableRaw.checkpoints = ckState.items;
+  renderTable('checkpoints');
+}
+
+async function showCheckpointDetail(expId) {
+  const sig = await get(`/api/checkpoint/${expId}/signature`);
+  if (!sig || sig.error) return;
+  const top = sig.tensors.slice(0, 200);
+  openModal(`checkpoint ${sig.exp_id} · signature`, body => {
+    body.innerHTML = `<div class="event-meta">`
+      + `<span><b>path</b> <code>${esc(sig.path)}</code></span>`
+      + `<span><b>size</b> ${fmtBytes(sig.size_bytes)}</span>`
+      + `<span><b>tensors</b> ${fmtInt(sig.tensors.length)}</span>`
+      + `<span><b>parameters</b> ${fmtInt(sig.total_params)}</span>`
+      + `<span><a href="#" id="ckOpenExp">→ open experiment ${sig.exp_id}</a></span>`
+      + `</div>`
+      + `<h3>tensors <span class="muted">(top by parameter count)</span></h3>`
+      + `<div class="table-wrap" style="max-height:70vh">`
+      + `<table><thead><tr>`
+      + `<th>name</th><th class="num">shape</th><th class="num">params</th>`
+      + `</tr></thead><tbody>`
+      + top.map(t =>
+          `<tr><td><code>${esc(t.name)}</code></td>`
+          + `<td class="num">${esc(t.shape.join(' × '))}</td>`
+          + `<td class="num">${fmtInt(t.n_params)}</td></tr>`
+        ).join('')
+      + `</tbody></table></div>`
+      + (sig.tensors.length > top.length
+          ? `<div class="muted">… ${sig.tensors.length - top.length} more not shown</div>`
+          : '');
+    const link = body.querySelector('#ckOpenExp');
+    if (link) link.onclick = (ev) => {
+      ev.preventDefault();
+      closeModal();
+      showDetail(sig.exp_id);
+    };
+  });
+}
+
 // ── Sort + filter ──────────────────────────────────────────
 function getField(e, key) {
   if (!key) return null;
   if (key.startsWith('objectives.')) return obj(e, key.slice(11));
+  if (key.startsWith('meta.')) {
+    return e.meta ? (e.meta[key.slice(5)] ?? null) : null;
+  }
   return e[key];
 }
 function cmpVals(a, b, type) {
@@ -1018,12 +1275,53 @@ for (const [id, m] of Object.entries({
   frozenArchs:  { rowFn: frozenArchRow,   rank: false },
   recent:       { rowFn: recentRow,       rank: false },
   recentDP:     { rowFn: recentDPRow,     rank: false },
+  events:       { rowFn: eventRow,        rank: false },
+  checkpoints:  { rowFn: ckRow,           rank: false },
 })) {
   tableMeta[id] = m;
   tableState[id] = { sortKey: null, sortDir: 'asc', filter: '' };
   tableRaw[id] = [];
 }
+// Default sort: newest first for both new tables.
+tableState.events.sortKey = 'id'; tableState.events.sortDir = 'desc';
+tableState.checkpoints.sortKey = 'mtime'; tableState.checkpoints.sortDir = 'desc';
 setupTables();
+
+// ── Service-log filter bar ────────────────────────────────
+function applyEventFilters() {
+  evState.round_id = document.getElementById('evRound').value.trim();
+  evState.miner_id = document.getElementById('evMiner').value.trim();
+  evState.endpoint = document.getElementById('evEndpoint').value.trim();
+  evState.errors = document.getElementById('evErrors').checked;
+  const lim = Number(document.getElementById('evLimit').value);
+  if (Number.isFinite(lim) && lim > 0) evState.limit = Math.min(500, Math.round(lim));
+  loadEvents();
+}
+function resetEventFilters() {
+  evState.kind = '';
+  evState.round_id = '';
+  evState.miner_id = '';
+  evState.endpoint = '';
+  evState.errors = false;
+  evState.limit = 100;
+  document.getElementById('evRound').value = '';
+  document.getElementById('evMiner').value = '';
+  document.getElementById('evEndpoint').value = '';
+  document.getElementById('evErrors').checked = false;
+  document.getElementById('evLimit').value = '100';
+  loadEventStats(); loadEvents();
+}
+document.getElementById('evApply').onclick = applyEventFilters;
+document.getElementById('evReset').onclick = resetEventFilters;
+document.getElementById('evRefresh').onclick = () => {
+  loadEventStats(); loadEvents();
+};
+// Enter inside any filter input applies. Saves a click.
+['evRound', 'evMiner', 'evEndpoint', 'evLimit'].forEach(id => {
+  document.getElementById(id).addEventListener('keydown', ev => {
+    if (ev.key === 'Enter') applyEventFilters();
+  });
+});
 
 registerChart('pareto', drawPareto, () => null);
 registerChart('paretoCM', drawParetoCM, () => null);
@@ -1061,6 +1359,13 @@ function setActiveTab(name) {
   // Re-render the now-visible charts using the last fetched data so
   // they paint correctly on first reveal.
   if (state.lastData) redraw(state.lastData);
+  // Lazy-load the heavier tabs on first reveal — and refresh on
+  // subsequent reveals so a tab switch picks up new activity.
+  if (name === 'service_log') {
+    loadEventStats(); loadEvents();
+  } else if (name === 'checkpoints') {
+    loadCheckpoints();
+  }
 }
 
 document.querySelectorAll('.tab').forEach(btn => {
@@ -1076,7 +1381,14 @@ function startTimer() {
   timer = setInterval(() => {
     // Pause while detail panel is open so the page doesn't reshuffle
     // under the user's reading. We do still refresh on close.
-    if (!state.detailOpen && autoEl.checked) refresh();
+    if (state.detailOpen || !autoEl.checked) return;
+    refresh();
+    // The heavier tabs are lazy — only ping them while visible.
+    if (state.activeTab === 'service_log') {
+      loadEventStats(); loadEvents();
+    } else if (state.activeTab === 'checkpoints') {
+      loadCheckpoints();
+    }
   }, 5000);
 }
 autoEl.addEventListener('change', () => {

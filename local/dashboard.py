@@ -21,6 +21,14 @@ Endpoints:
                                    ts_data_pipeline runs only
   GET /api/frozen_archs            Frozen-arch version list (ts_data_pipeline)
   GET /api/experiment/<id>         full row (incl. code, loss_curve)
+  GET /api/events                  agent_events list (round_id, miner_id,
+                                   kind, endpoint, only_errors, before_id,
+                                   since_id, limit filters)
+  GET /api/event/<id>              full event (request/response bodies)
+  GET /api/event_stats             aggregated counts for filter chips
+  GET /api/checkpoints             local safetensors checkpoints + meta
+  GET /api/checkpoint/<exp_id>/signature
+                                   tensor name → shape from header
 """
 
 from __future__ import annotations
@@ -37,11 +45,28 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from local import dashboard_logs
+
 logger = logging.getLogger(__name__)
 
 _HTML_PATH = Path(__file__).with_name("dashboard.html")
 _CSS_PATH = Path(__file__).with_name("dashboard.css")
 _JS_PATH = Path(__file__).with_name("dashboard.js")
+
+
+def _qstr(q: dict[str, list[str]], key: str) -> str | None:
+    v = q.get(key, [""])[0]
+    return v or None
+
+
+def _qint(q: dict[str, list[str]], key: str) -> int | None:
+    v = q.get(key, [""])[0]
+    if not v:
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        return None
 
 
 def _connect_ro(db_path: str) -> sqlite3.Connection:
@@ -358,6 +383,7 @@ def _experiment(conn: sqlite3.Connection, exp_id: int) -> dict[str, Any] | None:
 class _Handler(BaseHTTPRequestHandler):
     db_path: str = ""
     frozen_arch_dir: str = ""
+    checkpoint_dir: str = ""
     html: bytes = b""
     css: bytes = b""
     js: bytes = b""
@@ -419,15 +445,55 @@ class _Handler(BaseHTTPRequestHandler):
                 if exp is None:
                     return self._json(404, {"error": "not found"})
                 return self._json(200, exp)
+            if path == "/api/events":
+                return self._json(200, dashboard_logs.list_events(
+                    conn,
+                    round_id=_qint(q, "round_id"),
+                    miner_id=_qstr(q, "miner_id"),
+                    kind=_qstr(q, "kind"),
+                    endpoint_q=_qstr(q, "endpoint"),
+                    only_errors=_qstr(q, "errors") in {"1", "true"},
+                    before_id=_qint(q, "before_id"),
+                    since_id=_qint(q, "since_id"),
+                    limit=_qint(q, "limit") or 100,
+                ))
+            if path == "/api/event_stats":
+                return self._json(200, dashboard_logs.event_stats(conn))
+            if path.startswith("/api/event/"):
+                try:
+                    eid = int(path.rsplit("/", 1)[1])
+                except ValueError:
+                    return self._json(400, {"error": "bad id"})
+                ev = dashboard_logs.get_event(conn, eid)
+                if ev is None:
+                    return self._json(404, {"error": "not found"})
+                return self._json(200, ev)
+            if path == "/api/checkpoints":
+                return self._json(200, dashboard_logs.list_checkpoints(
+                    conn, self.checkpoint_dir,
+                ))
+            if path.startswith("/api/checkpoint/") and path.endswith("/signature"):
+                try:
+                    exp_id = int(path.split("/")[3])
+                except (ValueError, IndexError):
+                    return self._json(400, {"error": "bad id"})
+                sig = dashboard_logs.checkpoint_signature(
+                    exp_id, self.checkpoint_dir,
+                )
+                if sig is None:
+                    return self._json(404, {"error": "no checkpoint"})
+                return self._json(200, sig)
             self._json(404, {"error": f"unknown path {path}"})
         finally:
             conn.close()
 
 
 def serve(db_path: str, host: str, port: int,
-          frozen_arch_dir: str = "") -> None:
+          frozen_arch_dir: str = "",
+          checkpoint_dir: str = "") -> None:
     _Handler.db_path = db_path
     _Handler.frozen_arch_dir = frozen_arch_dir
+    _Handler.checkpoint_dir = checkpoint_dir
     _Handler.html = _HTML_PATH.read_bytes()
     _Handler.css = _CSS_PATH.read_bytes() if _CSS_PATH.exists() else b""
     _Handler.js = _JS_PATH.read_bytes() if _JS_PATH.exists() else b""
@@ -452,11 +518,20 @@ def main() -> None:
         help="Frozen-arch snapshot dir for the ts_data_pipeline task. "
              "Empty = $RADAR_FROZEN_ARCH_DIR or local/frozen_archs.",
     )
+    parser.add_argument(
+        "--checkpoint_dir", default="",
+        help="Checkpoint dir for the Checkpoints tab. "
+             "Empty = $RADAR_CHECKPOINT_DIR or local/checkpoints.",
+    )
     args = parser.parse_args()
     if not Path(args.db).exists():
         raise SystemExit(f"db not found: {args.db}")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    serve(args.db, args.host, args.port, frozen_arch_dir=args.frozen_arch_dir)
+    serve(
+        args.db, args.host, args.port,
+        frozen_arch_dir=args.frozen_arch_dir,
+        checkpoint_dir=args.checkpoint_dir,
+    )
 
 
 if __name__ == "__main__":

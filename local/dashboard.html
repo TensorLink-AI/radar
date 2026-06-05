@@ -15,6 +15,12 @@
     <button class="tab" role="tab" data-tab="data_pipeline" aria-selected="false">
       Data pipeline
     </button>
+    <button class="tab" role="tab" data-tab="service_log" aria-selected="false">
+      Service log
+    </button>
+    <button class="tab" role="tab" data-tab="checkpoints" aria-selected="false">
+      Checkpoints
+    </button>
   </nav>
   <div class="topbar-right">
     <label class="toggle">
@@ -160,6 +166,88 @@
   <th class="num" data-key="metric" data-type="num">metric</th>
   <th data-key="success">ok</th>
 </tr></thead><tbody id="recentDP"></tbody></table></div>
+
+</section>
+
+<!-- ─── Service-log tab ────────────────────────────────────────── -->
+<section data-tab="service_log">
+
+<h2>Activity <span class="muted" id="ev-count"></span>
+  <span class="muted">agent → broker calls · LLM, desearch, wiki, experiments…</span>
+</h2>
+<div class="stats" id="evStats"></div>
+
+<h2>Filter
+  <span class="muted">kind, miner, round, endpoint substring</span>
+</h2>
+<div class="filter-bar">
+  <div class="chip-row" id="evKindChips"></div>
+  <div class="filter-controls">
+    <label class="filter-field">
+      <span>round</span>
+      <input id="evRound" type="number" placeholder="any" min="0">
+    </label>
+    <label class="filter-field">
+      <span>miner</span>
+      <input id="evMiner" type="text" placeholder="any" list="evMinerList">
+      <datalist id="evMinerList"></datalist>
+    </label>
+    <label class="filter-field">
+      <span>endpoint</span>
+      <input id="evEndpoint" type="text" placeholder="substring">
+    </label>
+    <label class="filter-field">
+      <span>limit</span>
+      <input id="evLimit" type="number" value="100" min="10" max="500">
+    </label>
+    <label class="toggle" id="evErrorsToggle">
+      <input id="evErrors" type="checkbox">
+      <span>errors only</span>
+    </label>
+    <button class="copy-btn" id="evApply">apply</button>
+    <button class="copy-btn" id="evReset">reset</button>
+  </div>
+</div>
+
+<h2>Events
+  <span class="muted" id="ev-shown"></span>
+  <button class="copy-btn" id="evRefresh" style="margin-left:auto">refresh</button>
+</h2>
+<div class="table-wrap log-wrap"><table data-table="events"><thead><tr>
+  <th data-key="id" data-type="num">id</th>
+  <th data-key="ts" data-type="num">when</th>
+  <th data-key="round_id" data-type="num">round</th>
+  <th data-key="miner_id">miner</th>
+  <th data-key="kind">kind</th>
+  <th data-key="endpoint">endpoint</th>
+  <th class="num" data-key="status" data-type="num">status</th>
+  <th class="num" data-key="latency_ms" data-type="num">ms</th>
+  <th class="num" data-key="response_bytes" data-type="num">bytes</th>
+  <th data-key="error">error / preview</th>
+</tr></thead><tbody id="events"></tbody></table></div>
+
+</section>
+
+<!-- ─── Checkpoints tab ────────────────────────────────────────── -->
+<section data-tab="checkpoints">
+
+<h2>Checkpoints <span class="muted" id="ck-count"></span>
+  <span class="muted">durable safetensors persisted via CheckpointStore</span>
+</h2>
+<div class="muted" id="ckDir" style="margin-bottom:8px"></div>
+<div class="table-wrap"><table data-table="checkpoints"><thead><tr>
+  <th data-key="exp_id" data-type="num">exp id</th>
+  <th data-key="meta.round_id" data-type="num">round</th>
+  <th data-key="meta.miner_id">miner</th>
+  <th data-key="meta.name">name</th>
+  <th data-key="meta.task">task</th>
+  <th class="num" data-key="size_bytes" data-type="num">size</th>
+  <th class="num" data-key="meta.metric" data-type="num">metric</th>
+  <th class="num" data-key="meta.n_rounds" data-type="num">rounds</th>
+  <th class="num" data-key="meta.parent_index" data-type="num">parent</th>
+  <th class="num" data-key="meta.cumulative_compute" data-type="num">Σ compute</th>
+  <th data-key="mtime" data-type="num">mtime</th>
+</tr></thead><tbody id="checkpoints"></tbody></table></div>
 
 </section>
 
