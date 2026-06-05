@@ -82,7 +82,9 @@ body {
 /* Section visibility — driven by body[data-active-tab]. */
 section[data-tab] { display: none; }
 body[data-active-tab="architecture"] section[data-tab="architecture"],
-body[data-active-tab="data_pipeline"] section[data-tab="data_pipeline"] {
+body[data-active-tab="data_pipeline"] section[data-tab="data_pipeline"],
+body[data-active-tab="service_log"] section[data-tab="service_log"],
+body[data-active-tab="checkpoints"] section[data-tab="checkpoints"] {
   display: block;
 }
 .refresh {
@@ -314,4 +316,152 @@ canvas { background: var(--bg-2); border-radius: var(--radius-sm); display: bloc
 .badge-cont {
   color: #c9a8e8; background: rgba(160, 124, 199, 0.16);
   border-color: rgba(160, 124, 199, 0.36);
+}
+
+/* ─── Scrollbars (Firefox + WebKit) ────────────────────── */
+* { scrollbar-width: thin; scrollbar-color: var(--bg-4) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--bg-4); border-radius: 6px;
+  border: 2px solid transparent; background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--border-2); background-clip: padding-box; border: 2px solid transparent; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* Slightly tighter for compact table-wraps so the chrome doesn't eat
+   visual weight on small tables. */
+.table-wrap::-webkit-scrollbar { width: 8px; height: 8px; }
+
+/* ─── Focus rings (accessibility + keyboard nav) ──────── */
+button:focus-visible,
+input:focus-visible,
+.tab:focus-visible,
+.chip:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 1px;
+  border-radius: var(--radius-sm);
+}
+
+/* ─── Service-log: filter bar + chips + kind pill ─────── */
+.filter-bar {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 12px 14px; margin-bottom: 8px;
+  background: linear-gradient(180deg, var(--bg-2) 0%, var(--bg-1) 100%);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow-1);
+}
+.chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  --chip-accent: var(--fg-3);
+  appearance: none; cursor: pointer; user-select: none;
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px 3px 8px; border-radius: 999px;
+  font: 500 11px var(--font-ui); letter-spacing: 0.02em;
+  background: var(--bg-2); color: var(--fg-1);
+  border: 1px solid var(--border-2);
+  transition: color .12s, background .12s, border-color .12s;
+}
+.chip:hover { color: var(--fg-0); border-color: var(--chip-accent); }
+.chip[data-active="true"] {
+  color: var(--fg-0); background: var(--bg-3);
+  border-color: var(--chip-accent);
+  box-shadow: inset 0 0 0 1px var(--chip-accent);
+}
+.chip .chip-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--chip-accent);
+}
+.chip .chip-label { text-transform: lowercase; }
+.chip .chip-count {
+  color: var(--fg-3); font: 500 10px var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  padding-left: 6px; border-left: 1px solid var(--border);
+  margin-left: 2px;
+}
+.chip[data-active="true"] .chip-count { color: var(--fg-1); }
+
+.filter-controls {
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+}
+.filter-field {
+  display: inline-flex; align-items: center; gap: 6px;
+  color: var(--fg-3); font: 500 10px var(--font-ui);
+  text-transform: uppercase; letter-spacing: 0.08em;
+}
+.filter-field input {
+  background: var(--bg-2); border: 1px solid var(--border);
+  color: var(--fg-1); font: 11px var(--font-mono);
+  padding: 4px 8px; border-radius: var(--radius-sm);
+  min-width: 90px; width: 110px;
+  transition: border-color .12s, color .12s;
+}
+.filter-field input:focus { outline: none; border-color: var(--border-2); color: var(--fg-0); }
+#evErrorsToggle { font-size: 11px; }
+
+.kind-pill {
+  --chip-accent: var(--fg-3);
+  display: inline-block; padding: 1px 8px;
+  font: 500 10px/1.6 var(--font-ui); letter-spacing: 0.04em;
+  border-radius: 999px; color: var(--fg-0);
+  background: color-mix(in srgb, var(--chip-accent) 18%, var(--bg-2));
+  border: 1px solid color-mix(in srgb, var(--chip-accent) 50%, var(--bg-2));
+}
+
+/* Wider log table; clamp long endpoints / previews. */
+.log-wrap { max-height: 540px; }
+table[data-table="events"] td.ep,
+table[data-table="events"] th.ep {
+  max-width: 360px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+table[data-table="events"] td.muted { color: var(--fg-3); }
+
+/* ─── Modal: event detail (request/response panes) ───── */
+.event-meta {
+  display: flex; flex-wrap: wrap; gap: 14px 18px;
+  padding: 8px 0 12px; margin-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg-1); font: 12px var(--font-mono);
+}
+.event-meta b {
+  color: var(--fg-3); font: 500 10px var(--font-ui);
+  text-transform: uppercase; letter-spacing: 0.06em;
+  margin-right: 4px;
+}
+.event-meta .ok { color: var(--green); }
+.event-meta .fail { color: var(--red); }
+.event-meta code {
+  font: 11px var(--font-mono); color: var(--fg-1);
+  background: var(--bg-2); padding: 1px 6px; border-radius: 3px;
+  border: 1px solid var(--border);
+}
+.json-grid {
+  display: grid; gap: 14px;
+  grid-template-columns: 1fr 1fr;
+  margin-top: 8px;
+}
+@media (max-width: 1100px) {
+  .json-grid { grid-template-columns: 1fr; }
+}
+.json-grid h3,
+.modal-inner h3 {
+  margin: 8px 0 6px; color: var(--fg-2);
+  font: 600 11px var(--font-ui);
+  text-transform: uppercase; letter-spacing: 0.08em;
+  display: flex; align-items: center; gap: 8px;
+}
+.json-pre {
+  background: var(--bg-0); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 10px 12px;
+  font: 11px/1.55 var(--font-mono); color: var(--fg-1);
+  max-height: 60vh; overflow: auto;
+  white-space: pre-wrap; word-break: break-word;
+  min-width: 300px;
+}
+pre.err {
+  background: rgba(255, 107, 107, 0.08); border: 1px solid rgba(255, 107, 107, 0.35);
+  color: var(--red); padding: 8px 12px; border-radius: var(--radius-sm);
+  font: 11px/1.5 var(--font-mono);
+  white-space: pre-wrap; word-break: break-word;
 }
