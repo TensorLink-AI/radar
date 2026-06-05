@@ -140,24 +140,30 @@ h2::before {
 
 /* ─── Tables ───────────────────────────────────────────── */
 .table-wrap {
-  max-height: 380px; overflow: auto;
-  border: 1px solid var(--border); border-radius: var(--radius);
+  max-height: 420px; overflow: auto;
+  border: 1px solid var(--border-2); border-radius: var(--radius);
   background: var(--bg-2); box-shadow: var(--shadow-1);
 }
-table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--bg-3); }
+table { width: 100%; border-collapse: separate; border-spacing: 0; }
+th, td {
+  text-align: left; padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+}
+tbody tr:nth-child(even) td { background: rgba(255, 255, 255, 0.015); }
 tbody tr:last-child td { border-bottom: none; }
 thead th {
   position: sticky; top: 0; z-index: 1;
-  background: var(--bg-2); color: var(--fg-2);
-  font: 500 10px/1 var(--font-ui);
+  background: var(--bg-3); color: var(--fg-2);
+  font: 600 10px/1 var(--font-ui);
   text-transform: uppercase; letter-spacing: 0.08em;
-  padding: 9px 10px; border-bottom: 1px solid var(--border-2);
+  padding: 10px 12px;
+  border-bottom: 2px solid var(--border-2);
+  box-shadow: 0 1px 0 var(--border-2);
 }
 td { font: 12px var(--font-mono); color: var(--fg-1); font-variant-numeric: tabular-nums; }
 tr.row { cursor: pointer; transition: background .1s; }
-tr.row:hover { background: var(--bg-3); }
-tr.row.selected {
+tr.row:hover td { background: var(--bg-3); }
+tr.row.selected td {
   background: linear-gradient(90deg, var(--amber-2), transparent 70%);
   box-shadow: inset 2px 0 0 var(--amber);
 }
@@ -203,9 +209,9 @@ th.sort-desc::after { border-top-color: var(--amber); opacity: 1;
 
 /* ─── Charts ───────────────────────────────────────────── */
 .chart-host {
-  position: relative; display: inline-block;
-  margin-top: 4px; padding: 4px;
-  background: var(--bg-2); border: 1px solid var(--border);
+  position: relative; display: block;
+  margin-top: 4px; padding: 10px 12px 8px;
+  background: var(--bg-2); border: 1px solid var(--border-2);
   border-radius: var(--radius); box-shadow: var(--shadow-1);
 }
 canvas { background: var(--bg-2); border-radius: var(--radius-sm); display: block; max-width: 100%; }

@@ -581,10 +581,10 @@ function drawPareto(canvas, front, all) {
   const xMin = Math.log10(Math.min(...xs));
   const xMax = Math.log10(Math.max(...xs) + 1);
   const yMin = Math.min(...ys), yMax = Math.max(...ys);
-  const pad = 36;
+  const pad = PAD_L;
   const xRange = Math.max(1e-6, xMax - xMin), yRange = Math.max(1e-6, yMax - yMin);
-  const px = x => pad + (Math.log10(Math.max(1, x)) - xMin) / xRange * (c.width - 2 * pad);
-  const py = y => c.height - pad - (y - yMin) / yRange * (c.height - 2 * pad);
+  const px = x => PAD_L + (Math.log10(Math.max(1, x)) - xMin) / xRange * (c.width - PAD_L - PAD_R);
+  const py = y => c.height - PAD_B - (y - yMin) / yRange * (c.height - PAD_T - PAD_B);
   drawGrid(ctx, c, pad);
   // all points
   for (const e of points) {
@@ -627,10 +627,10 @@ function drawParetoCM(canvas, front, all) {
   const ys = points.map(e => obj(e, 'mase'));
   const xMin = Math.min(...xs), xMax = Math.max(...xs);
   const yMin = Math.min(...ys), yMax = Math.max(...ys);
-  const pad = 40;
+  const pad = PAD_L;
   const xRange = Math.max(1e-6, xMax - xMin), yRange = Math.max(1e-6, yMax - yMin);
-  const px = x => pad + (x - xMin) / xRange * (c.width - 2 * pad);
-  const py = y => c.height - pad - (y - yMin) / yRange * (c.height - 2 * pad);
+  const px = x => PAD_L + (x - xMin) / xRange * (c.width - PAD_L - PAD_R);
+  const py = y => c.height - PAD_B - (y - yMin) / yRange * (c.height - PAD_T - PAD_B);
   drawGrid(ctx, c, pad);
   for (const e of points) {
     const x = px(obj(e, 'crps')), y = py(obj(e, 'mase'));
@@ -681,11 +681,11 @@ function drawParetoDP(canvas, front, all) {
   const ys = points.map(e => obj(e, 'gift_metric'));
   const xMin = Math.min(...xs), xMax = Math.max(...xs);
   const yMin = Math.min(...ys), yMax = Math.max(...ys);
-  const pad = 40;
+  const pad = PAD_L;
   const xRange = Math.max(1e-9, xMax - xMin);
   const yRange = Math.max(1e-9, yMax - yMin);
-  const px = x => pad + (x - xMin) / xRange * (c.width - 2 * pad);
-  const py = y => c.height - pad - (y - yMin) / yRange * (c.height - 2 * pad);
+  const px = x => PAD_L + (x - xMin) / xRange * (c.width - PAD_L - PAD_R);
+  const py = y => c.height - PAD_B - (y - yMin) / yRange * (c.height - PAD_T - PAD_B);
   drawGrid(ctx, c, pad);
   // Off-frontier points, colored by frozen_arch_version.
   for (const e of points) {
@@ -745,17 +745,17 @@ function drawParetoCont(canvas, front, all) {
   const xMax = Math.max(...xs.map(xT));
   const yMin = Math.min(...ys, 0);  // anchor at 0 so the "no progress" line shows
   const yMax = Math.max(...ys, 0);
-  const pad = 40;
+  const pad = PAD_L;
   const xRange = Math.max(1e-6, xMax - xMin), yRange = Math.max(1e-6, yMax - yMin);
-  const px = x => pad + (xT(x) - xMin) / xRange * (c.width - 2 * pad);
-  const py = y => c.height - pad - (y - yMin) / yRange * (c.height - 2 * pad);
+  const px = x => PAD_L + (xT(x) - xMin) / xRange * (c.width - PAD_L - PAD_R);
+  const py = y => c.height - PAD_B - (y - yMin) / yRange * (c.height - PAD_T - PAD_B);
   drawGrid(ctx, c, pad);
   // zero-Δ reference line: above it = improved on parent.
   if (yMin < 0 && yMax > 0) {
     ctx.strokeStyle = '#3a4050'; ctx.setLineDash([4, 4]); ctx.lineWidth = 1;
     ctx.beginPath();
     const yz = py(0);
-    ctx.moveTo(pad, yz); ctx.lineTo(c.width - pad/2, yz);
+    ctx.moveTo(PAD_L, yz); ctx.lineTo(c.width - PAD_R, yz);
     ctx.stroke(); ctx.setLineDash([]);
   }
   // all continuation points — color-code by Δ sign so regressions read red.
@@ -790,34 +790,56 @@ function drawParetoCont(canvas, front, all) {
 }
 
 // ── Shared chart helpers ───────────────────────────────────
+// All charts share the same plot-region geometry: `pad` is the inset
+// from the canvas edges to the plot area. Bottom/left get extra room
+// for axis labels; top/right stay snug. Keep in sync with drawGrid,
+// drawAxesLabels and per-chart px/py.
+const PAD_L = 58, PAD_R = 24, PAD_T = 18, PAD_B = 46;
 function drawGrid(ctx, c, pad) {
+  // `pad` arg kept for backwards compat — left/bottom use the shared
+  // PAD_L/PAD_B so axis-label spacing is consistent across charts.
   ctx.strokeStyle = '#2a2e3a'; ctx.lineWidth = 1;
   ctx.beginPath();
-  ctx.moveTo(pad, pad/2); ctx.lineTo(pad, c.height - pad);
-  ctx.lineTo(c.width - pad/2, c.height - pad);
+  ctx.moveTo(PAD_L, PAD_T); ctx.lineTo(PAD_L, c.height - PAD_B);
+  ctx.lineTo(c.width - PAD_R, c.height - PAD_B);
   ctx.stroke();
 }
 function drawYTicks(ctx, c, pad, yMin, yMax, n) {
-  ctx.fillStyle = '#777e8b'; ctx.font = '10px ui-monospace, monospace';
+  ctx.fillStyle = '#9aa0aa'; ctx.font = '11px ui-monospace, monospace';
+  ctx.textBaseline = 'middle';
   const range = Math.max(1e-9, yMax - yMin);
   for (let i = 0; i <= n; i++) {
     const yv = yMin + (range * i / n);
-    const yy = c.height - pad - (yv - yMin) / range * (c.height - 2 * pad);
-    ctx.strokeStyle = '#1c1f28';
-    ctx.beginPath(); ctx.moveTo(pad, yy); ctx.lineTo(c.width - pad/2, yy); ctx.stroke();
-    ctx.fillStyle = '#777e8b';
-    ctx.fillText(yv.toFixed(yv >= 100 ? 0 : yv >= 1 ? 2 : 3), 2, yy + 3);
+    const yy = c.height - PAD_B - (yv - yMin) / range * (c.height - PAD_T - PAD_B);
+    ctx.strokeStyle = '#202430';
+    ctx.beginPath(); ctx.moveTo(PAD_L, yy); ctx.lineTo(c.width - PAD_R, yy); ctx.stroke();
+    ctx.fillStyle = '#9aa0aa';
+    const txt = yv.toFixed(yv >= 100 ? 0 : yv >= 1 ? 2 : 3);
+    const tw = ctx.measureText(txt).width;
+    ctx.fillText(txt, PAD_L - 8 - tw, yy);
   }
+  ctx.textBaseline = 'alphabetic';
 }
 function drawAxesLabels(ctx, c, xLabel, yLabel) {
-  ctx.fillStyle = '#777e8b'; ctx.font = '11px ui-monospace, monospace';
-  ctx.fillText(xLabel, c.width - ctx.measureText(xLabel).width - 8, c.height - 8);
-  ctx.save(); ctx.translate(12, 80); ctx.rotate(-Math.PI/2);
-  ctx.fillText(yLabel, 0, 0); ctx.restore();
+  ctx.fillStyle = '#d5d7dc';
+  ctx.font = '600 12px -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif';
+  // X-axis label: centered along the bottom of the plot region.
+  const plotW = c.width - PAD_L - PAD_R;
+  const xw = ctx.measureText(xLabel).width;
+  ctx.fillText(xLabel, PAD_L + (plotW - xw) / 2, c.height - 10);
+  // Y-axis label: rotated, centered vertically along the left edge.
+  ctx.save();
+  ctx.translate(16, PAD_T + (c.height - PAD_T - PAD_B) / 2);
+  ctx.rotate(-Math.PI / 2);
+  const yw = ctx.measureText(yLabel).width;
+  ctx.fillText(yLabel, -yw / 2, 0);
+  ctx.restore();
 }
 function drawEmpty(ctx, c, msg) {
-  ctx.fillStyle = '#777e8b'; ctx.font = '12px ui-monospace, monospace';
-  ctx.fillText(msg, 20, 30);
+  ctx.fillStyle = '#9aa0aa'; ctx.font = '12px ui-monospace, monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(msg, c.width / 2, c.height / 2);
+  ctx.textAlign = 'left';
 }
 
 // ── Chart hover/click registration ─────────────────────────
