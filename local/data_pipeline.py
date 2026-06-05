@@ -198,6 +198,105 @@ def _compute_aulc(val_curve: list[dict]) -> Optional[float]:
     return area / rng
 
 
+# Deterministic AR(1) reference pipeline. Used once per frozen-arch
+# version to compute the baseline AULC the real metric anchors against.
+# Kept here (not imported from a file) so the baseline is reproducible
+# across machines / installs without an extra artifact to ship.
+REFERENCE_PIPELINE_CODE = '''
+"""Reference pipeline: deterministic AR(1) random walks.
+
+Used by ``ensure_baseline_aulc`` to compute a per-frozen-arch baseline
+AULC. Has enough structure that the val loss curve isn't flat (so the
+baseline isn't degenerate), but no miner-specific signal — every miner
+is scored against the same yardstick.
+"""
+
+import torch
+
+
+def build_pipeline(context_len, prediction_len, num_variates, quantiles):
+    g = torch.Generator()
+    g.manual_seed(0xBA5E11AE)
+    batch_size = 32
+    total = int(context_len) + int(prediction_len)
+    rho = 0.95
+    while True:
+        noise = torch.randn(
+            batch_size, total, int(num_variates), generator=g,
+        )
+        series = torch.empty_like(noise)
+        series[:, 0, :] = noise[:, 0, :]
+        for t in range(1, total):
+            series[:, t, :] = rho * series[:, t - 1, :] + noise[:, t, :]
+        yield {
+            "input": series[:, :int(context_len), :],
+            "target": series[:, int(context_len):, :],
+        }
+'''
+
+
+# Stable seed for baseline runs. Distinct from any round_id so a baseline
+# computed concurrently with a real round can't collide on temp paths
+# that are derived from the seed.
+_BASELINE_SEED = 0xBA5E_1A1C
+
+
+def ensure_baseline_aulc(arch_store, frozen_arch, *, task) -> Optional[float]:
+    """Return the baseline AULC for ``frozen_arch``, computing it lazily.
+
+    On first call for a given version, trains the frozen arch on the
+    deterministic reference pipeline, persists the resulting AULC onto
+    the frozen-arch JSON, and returns it. Subsequent calls short-circuit
+    on the cached value. Best-effort: on any failure (missing torch, no
+    val cache, harness crash) returns None and logs a warning — the
+    caller is expected to fall back to absolute AULC scoring.
+    """
+    if frozen_arch is None:
+        return None
+    cached = getattr(frozen_arch, "baseline_aulc", None)
+    if cached is not None:
+        return float(cached)
+    logger.info(
+        "computing baseline AULC for frozen arch v%d (one-time)",
+        frozen_arch.version,
+    )
+    try:
+        result = run_data_pipeline_training(
+            REFERENCE_PIPELINE_CODE,
+            seed=_BASELINE_SEED,
+            task=task,
+            min_flops=0,
+            max_flops=0,
+            frozen_arch=frozen_arch,
+            _baseline_only=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "baseline AULC compute crashed for v%d: %s",
+            frozen_arch.version, e,
+        )
+        return None
+    if not result.get("success"):
+        logger.warning(
+            "baseline AULC compute failed for v%d: %s",
+            frozen_arch.version, result.get("error") or result.get("analysis"),
+        )
+        return None
+    baseline = result.get("baseline_aulc")
+    if baseline is None or not math.isfinite(float(baseline)) or float(baseline) <= 0:
+        logger.warning(
+            "baseline AULC non-positive for v%d: %r",
+            frozen_arch.version, baseline,
+        )
+        return None
+    updated = arch_store.update_baseline_aulc(frozen_arch.version, float(baseline))
+    if updated is not None:
+        # Mutate the in-memory dataclass too so the caller's reference
+        # picks up the cached value without a reload.
+        frozen_arch.baseline_aulc = updated.baseline_aulc
+    return float(baseline)
+
+
 def _fail(reason: str, objectives: dict, loss_curve: list,
           workdir: Path, *, error: Optional[str] = None,
           val_curve: Optional[list] = None,
@@ -229,6 +328,8 @@ def run_data_pipeline_training(
     parent_checkpoint_path: str | None = None,
     compute_offset: float = 0.0,
     step_offset: int = 0,
+    baseline_aulc: Optional[float] = None,
+    _baseline_only: bool = False,
 ) -> dict:
     """Train the frozen arch on the miner's pipeline, then run GIFT-Eval.
 
@@ -238,6 +339,15 @@ def run_data_pipeline_training(
     coordinates into lineage-absolute space (mirrors ts_forecasting). The
     epoch (``frozen_arch_version``) must match across parent and child —
     the validator enforces that gate before we get here.
+
+    ``baseline_aulc`` anchors the AULC half of the composite metric:
+    when provided, the metric uses ``aulc / baseline_aulc`` so a tougher
+    val window can't penalise a miner whose pipeline is genuinely good.
+    When None (or unusable), falls back to absolute AULC with a warning.
+
+    ``_baseline_only=True`` short-circuits after the training pass and
+    returns ``{"baseline_aulc": ...}`` — used by ``ensure_baseline_aulc``
+    to compute the anchor without paying for GIFT-Eval.
 
     Returns the same dict shape ``local/validator.py`` already consumes for
     ts_forecasting, plus a ``frozen_arch_version`` key in ``objectives`` so
@@ -436,10 +546,37 @@ def run_data_pipeline_training(
             objectives, loss_curve, workdir, val_curve=val_curve,
         )
     if aulc is None:
+        if _baseline_only:
+            # Baseline computation: nothing salvageable, surface a clear
+            # error so the caller falls back to absolute AULC scoring.
+            return _fail(
+                "baseline val curve too sparse",
+                objectives, loss_curve, workdir, val_curve=val_curve,
+                harness_status=status,
+            )
         return _fail(
             "in-training val curve too sparse to score (need val shard cache)",
             objectives, loss_curve, workdir, val_curve=val_curve,
         )
+
+    if _baseline_only:
+        # Skip GIFT-Eval and metric assembly — caller only needs the
+        # AULC anchor. Return a minimal success record.
+        objectives["aulc"] = float(aulc)
+        return {
+            "success": True,
+            "metric": None,
+            "objectives": objectives,
+            "loss_curve": loss_curve,
+            "val_curve": val_curve,
+            "analysis": (
+                f"baseline-only run: frozen_arch=v{frozen_arch.version} "
+                f"aulc={aulc:.4f}"
+            ),
+            "error": "",
+            "workdir": str(workdir),
+            "baseline_aulc": float(aulc),
+        }
 
     try:
         from local.trainer import _gift_eval_score
@@ -477,15 +614,39 @@ def run_data_pipeline_training(
         logger.debug("could not capture param signature: %s", e)
 
     gift = math.sqrt(max(crps, 0.0) * max(mase, 0.0))
-    # Composite trajectory + leaderboard score: geomean(AULC, GIFT). Both
-    # lower=better. Stamping frozen_arch_version in objectives means a chart
-    # filter can keep cross-version comparisons honest.
-    metric = math.sqrt(max(aulc, 0.0) * max(gift, 0.0))
+    # Composite trajectory + leaderboard score: geomean(AULC_ratio, GIFT).
+    # AULC_ratio = this_aulc / baseline_aulc anchors the curve half against
+    # the frozen arch's own AULC on a fixed reference pipeline, so a
+    # tougher val window can't penalise a genuinely good miner pipeline.
+    # When the baseline is missing (legacy snapshot, baseline compute
+    # failed) we fall back to the raw AULC and stamp aulc_ratio=None so
+    # the dashboard can tell the two regimes apart.
+    if baseline_aulc is not None and math.isfinite(baseline_aulc) and baseline_aulc > 0:
+        aulc_score = float(aulc) / float(baseline_aulc)
+        objectives["baseline_aulc"] = float(baseline_aulc)
+        objectives["aulc_ratio"] = float(aulc_score)
+    else:
+        if baseline_aulc is not None:
+            logger.warning(
+                "baseline_aulc unusable (%r); scoring on absolute AULC",
+                baseline_aulc,
+            )
+        else:
+            logger.warning(
+                "no baseline_aulc supplied; scoring on absolute AULC",
+            )
+        aulc_score = float(aulc)
+        objectives["aulc_ratio"] = None
+    metric = math.sqrt(max(aulc_score, 0.0) * max(gift, 0.0))
     objectives["gift_metric"] = gift
 
+    if objectives.get("aulc_ratio") is not None:
+        aulc_repr = f"aulc={aulc:.4f} ratio={aulc_score:.4f}"
+    else:
+        aulc_repr = f"aulc={aulc:.4f} (absolute; no baseline)"
     analysis = (
         f"task=ts_data_pipeline status={status} "
-        f"frozen_arch=v{frozen_arch.version} aulc={aulc:.4f} "
+        f"frozen_arch=v{frozen_arch.version} {aulc_repr} "
         f"crps={crps:.4f} mase={mase:.4f} gift={gift:.4f}"
     )
     return {

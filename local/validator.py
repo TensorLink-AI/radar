@@ -536,6 +536,14 @@ def run_round(store: LocalStore, task, round_id: int,
                 "Run ts_forecasting first so there's a frontier to snapshot.",
             )
             return
+        # Anchor the AULC half of the data-pipeline metric. Computed
+        # once per snapshot on a fixed reference pipeline so miners are
+        # scored on improvement-over-baseline rather than raw curve
+        # area (which is dominated by val-window difficulty). Best-effort
+        # — a None return means absolute-AULC fallback with a warning.
+        if frozen_arch.baseline_aulc is None:
+            from local.data_pipeline import ensure_baseline_aulc
+            ensure_baseline_aulc(frozen_arch_store, frozen_arch, task=task)
 
     # Frozen-pipeline refresh (ts_forecasting only). Snapshots at every_n
     # successful forecasting rounds — staggered from arch refresh so both

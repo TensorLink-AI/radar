@@ -299,11 +299,14 @@ def _continuation_frontier(conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def _data_pipeline_frontier(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Non-dominated set on (aulc, gift_metric) for ts_data_pipeline runs.
+    """Non-dominated set on (aulc_axis, gift_metric) for ts_data_pipeline runs.
 
-    Both lower=better. Returns ``{frontier, all, versions}`` so the chart can
-    render off-frontier dots and segment per frozen-arch version (since each
-    version anchors its own comparison).
+    Both lower=better. Returns ``{frontier, all, versions, aulc_axis}`` so the
+    chart can render off-frontier dots and segment per frozen-arch version
+    (since each version anchors its own comparison). ``aulc_axis`` is
+    ``"aulc_ratio"`` whenever every plotted point carries the
+    baseline-normalised ratio (the quantity the metric uses) and falls
+    back to ``"aulc"`` for legacy rows logged before the baseline anchor.
     """
     rows = conn.execute(
         "SELECT * FROM experiments WHERE success=1 AND metric IS NOT NULL "
@@ -315,27 +318,37 @@ def _data_pipeline_frontier(conn: sqlite3.Connection) -> dict[str, Any]:
         if p["objectives"].get("aulc") is not None
         and p["objectives"].get("gift_metric") is not None
     ]
+    aulc_axis = (
+        "aulc_ratio"
+        if points and all(
+            p["objectives"].get("aulc_ratio") is not None for p in points
+        )
+        else "aulc"
+    )
     front: list[dict[str, Any]] = []
     for p in points:
-        pa = p["objectives"]["aulc"]
+        pa = p["objectives"][aulc_axis]
         pg = p["objectives"]["gift_metric"]
         dominated = False
         for o in points:
             if o is p:
                 continue
-            oa = o["objectives"]["aulc"]
+            oa = o["objectives"][aulc_axis]
             og = o["objectives"]["gift_metric"]
             if oa <= pa and og <= pg and (oa < pa or og < pg):
                 dominated = True
                 break
         if not dominated:
             front.append(p)
-    front.sort(key=lambda e: e["objectives"]["aulc"])
+    front.sort(key=lambda e: e["objectives"][aulc_axis])
     versions = sorted({
         int(p["objectives"].get("frozen_arch_version") or 0)
         for p in points
     })
-    return {"frontier": front, "all": points, "versions": versions}
+    return {
+        "frontier": front, "all": points, "versions": versions,
+        "aulc_axis": aulc_axis,
+    }
 
 
 def _frozen_archs(base_dir: str) -> list[dict[str, Any]]:
