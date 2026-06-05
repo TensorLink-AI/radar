@@ -12,7 +12,10 @@ from pathlib import Path
 
 import pytest
 
-from local.data_pipeline import _compute_aulc
+from local.data_pipeline import (
+    REFERENCE_PIPELINE_CODE, _compute_aulc, _exec_pipeline_submission,
+    ensure_baseline_aulc,
+)
 from local.dashboard import _data_pipeline_frontier, _frozen_archs
 from local.frozen_arch import FrozenArchStore, maybe_refresh
 from local.scoring import passes_size_gate
@@ -92,10 +95,81 @@ def test_frozen_arch_save_and_load(tmp_path):
     assert loaded is not None
     assert loaded.source_experiment_id == 42
     assert loaded.source_metric == pytest.approx(0.123)
+    # Baseline is unset until the validator computes it lazily.
+    assert loaded.baseline_aulc is None
     versions = store.all_versions()
     assert len(versions) == 1
     assert versions[0]["version"] == 1
     assert "code" not in versions[0]   # all_versions strips code
+
+
+def test_frozen_arch_update_baseline_aulc_round_trips(tmp_path):
+    store = FrozenArchStore(base_dir=str(tmp_path))
+    store.save(
+        code="x", source_experiment_id=1, source_metric=0.5,
+        source_crps=0.3, source_mase=0.7, source_flops=1_000_000,
+        source_name="v1",
+    )
+    updated = store.update_baseline_aulc(1, 0.1234)
+    assert updated is not None
+    assert updated.baseline_aulc == pytest.approx(0.1234)
+    # Survives a fresh store instance (persisted to JSON).
+    reloaded = FrozenArchStore(base_dir=str(tmp_path)).current()
+    assert reloaded is not None
+    assert reloaded.baseline_aulc == pytest.approx(0.1234)
+
+
+def test_frozen_arch_load_tolerates_legacy_json(tmp_path):
+    """Pre-baseline snapshots on disk must still load with baseline_aulc=None."""
+    base = tmp_path / "arch"
+    base.mkdir()
+    legacy = {
+        "version": 1, "code": "x", "source_experiment_id": 1,
+        "source_metric": 0.5, "source_crps": 0.3, "source_mase": 0.7,
+        "source_flops": 1, "source_name": "v1", "created_at": 0.0,
+        "unknown_future_field": "ignored",
+    }
+    (base / "v000001.json").write_text(json.dumps(legacy))
+    (base / "manifest.json").write_text(json.dumps({"current": 1, "versions": [1]}))
+    arch = FrozenArchStore(base_dir=str(base)).current()
+    assert arch is not None
+    assert arch.baseline_aulc is None
+
+
+def test_ensure_baseline_aulc_returns_cached(tmp_path):
+    """When baseline is already set the helper must not re-run training."""
+    store = FrozenArchStore(base_dir=str(tmp_path))
+    arch = store.save(
+        code="x", source_experiment_id=1, source_metric=0.5,
+        source_crps=0.3, source_mase=0.7, source_flops=1_000_000,
+        source_name="v1",
+    )
+    store.update_baseline_aulc(arch.version, 0.42)
+    arch = store.current()  # reload with cached baseline
+    # task=None would crash any training path; cache hit must short-circuit.
+    out = ensure_baseline_aulc(store, arch, task=None)
+    assert out == pytest.approx(0.42)
+
+
+def test_reference_pipeline_executes_and_yields_correct_shape():
+    """The baseline-anchor pipeline must be a valid build_pipeline."""
+    torch = pytest.importorskip("torch")
+    build_pipeline = _exec_pipeline_submission(REFERENCE_PIPELINE_CODE)
+    it = build_pipeline(64, 16, 1, (0.5,))
+    batch = next(iter(it))
+    assert "input" in batch and "target" in batch
+    inp, tgt = batch["input"], batch["target"]
+    assert torch.is_tensor(inp) and torch.is_tensor(tgt)
+    assert inp.dim() == 3 and tgt.dim() == 3
+    assert inp.shape[1] == 64 and tgt.shape[1] == 16
+    assert inp.shape[2] == 1 and tgt.shape[2] == 1
+    assert inp.shape[0] == tgt.shape[0]
+    # Determinism: a second build draws from a freshly seeded generator,
+    # so the first batch must match bit-for-bit.
+    it2 = build_pipeline(64, 16, 1, (0.5,))
+    batch2 = next(iter(it2))
+    assert torch.equal(batch["input"], batch2["input"])
+    assert torch.equal(batch["target"], batch2["target"])
 
 
 def test_frozen_arch_bootstraps_from_ts_forecasting(tmp_path):

@@ -23,6 +23,7 @@ data-pipeline run can't silently swap the target out from under itself.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -49,6 +50,13 @@ class FrozenArch:
     source_flops: int
     source_name: str
     created_at: float
+    # AULC produced by training this arch on a fixed reference pipeline.
+    # Anchors the data-pipeline metric: miner aulc is scored as a ratio
+    # against this value so a tougher val window can't masquerade as a
+    # worse miner pipeline. None until the validator computes it lazily
+    # on first use of the snapshot (see local/data_pipeline.py
+    # ``ensure_baseline_aulc``); persists across restarts.
+    baseline_aulc: Optional[float] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -95,10 +103,36 @@ class FrozenArchStore:
             return None
         try:
             d = json.loads(p.read_text())
+            field_names = {f.name for f in dataclasses.fields(FrozenArch)}
+            d = {k: v for k, v in d.items() if k in field_names}
             return FrozenArch(**d)
         except (OSError, json.JSONDecodeError, TypeError) as e:
             logger.warning("frozen arch v%d unreadable: %s", version, e)
             return None
+
+    def update_baseline_aulc(self, version: int, value: float) -> Optional[FrozenArch]:
+        """Persist a computed baseline AULC for an existing arch version.
+
+        No-op if the version is missing. Rewrites the version JSON
+        atomically so a concurrent reader either sees the old value or
+        the new one, never a partial write.
+        """
+        arch = self.load(version)
+        if arch is None:
+            logger.warning(
+                "update_baseline_aulc: arch v%d not found", version,
+            )
+            return None
+        arch.baseline_aulc = float(value)
+        p = self._version_path(version)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(arch.to_dict(), indent=2))
+        tmp.replace(p)
+        logger.info(
+            "frozen arch v%d baseline_aulc=%.6f persisted",
+            version, arch.baseline_aulc,
+        )
+        return arch
 
     def all_versions(self) -> list[dict]:
         """Metadata (no code) for every persisted version, oldest first."""

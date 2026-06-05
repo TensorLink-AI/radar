@@ -192,6 +192,7 @@ def run_training(
             parent_checkpoint_path=parent_checkpoint_path,
             compute_offset=compute_offset,
             step_offset=step_offset,
+            baseline_aulc=getattr(frozen_arch, "baseline_aulc", None),
         )
     if isinstance(task, TSForecastingSpec):
         return _run_ts_forecasting(
