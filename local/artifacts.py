@@ -10,7 +10,7 @@ download`` when needed.
 
 Bucket layout (``RADAR_ARTIFACT_BUCKET``, default ``radar-local``)::
 
-    runs/{task}/r{round_id:06d}/
+    [<RADAR_INSTANCE_ID>/]runs/{task}/r{round_id:06d}/
         challenge.json
         miners/{miner_id}/
             proposal.json
@@ -18,6 +18,13 @@ Bucket layout (``RADAR_ARTIFACT_BUCKET``, default ``radar-local``)::
             result.json
             checkpoints/...
             logs/...
+
+When ``RADAR_INSTANCE_ID`` is set the instance name is prepended as a
+top-level key prefix so co-tenant instances on a shared bucket don't
+trample each other's per-round artifacts (mirrors the backup,
+agent-events, and checkpoint conventions). Override with
+``RADAR_ARTIFACT_PREFIX`` for a custom prefix, or set it to an empty
+string to opt out and write to the bare ``runs/...`` layout.
 """
 
 from __future__ import annotations
@@ -85,6 +92,21 @@ def _have_creds() -> bool:
     )
 
 
+def _default_key_prefix() -> str:
+    """Top-level R2 key prefix, namespaced by ``RADAR_INSTANCE_ID``.
+
+    Mirrors the backup/agent-events/checkpoint convention so co-tenant
+    instances on a shared artifact bucket don't trample each other's
+    per-round files. ``RADAR_ARTIFACT_PREFIX`` overrides; set it to the
+    empty string to opt out and keep the bare ``runs/...`` layout.
+    """
+    explicit = os.environ.get("RADAR_ARTIFACT_PREFIX")
+    if explicit is not None:
+        return explicit.strip().strip("/")
+    instance = os.environ.get("RADAR_INSTANCE_ID", "").strip()
+    return instance.strip("/")
+
+
 @dataclass
 class ArtifactSink:
     """Per-round artifact recorder.
@@ -96,17 +118,20 @@ class ArtifactSink:
     store: LocalStore
     bucket: str = _DEFAULT_BUCKET
     r2_enabled: bool = False
+    key_prefix: str = ""
     _client: object = field(default=None, repr=False)
 
     @classmethod
     def from_env(cls, store: LocalStore) -> "ArtifactSink":
         bucket = os.environ.get("RADAR_ARTIFACT_BUCKET", _DEFAULT_BUCKET).strip() \
             or _DEFAULT_BUCKET
+        key_prefix = _default_key_prefix()
         if not _have_creds():
             logger.info(
                 "artifact sink: SQLite-only (no HIPPIUS_*/R2_* creds in env)"
             )
-            return cls(store=store, bucket=bucket, r2_enabled=False)
+            return cls(store=store, bucket=bucket, r2_enabled=False,
+                       key_prefix=key_prefix)
         try:
             # Pass only the bucket — every other knob (keys, endpoint,
             # region, account id) comes from the shared HIPPIUS_*/R2_*
@@ -117,13 +142,22 @@ class ArtifactSink:
             logger.warning(
                 "artifact sink: SQLite-only (R2 init failed: %s)", e
             )
-            return cls(store=store, bucket=bucket, r2_enabled=False)
-        logger.info("artifact sink: SQLite + R2 (bucket=%s)", bucket)
-        return cls(store=store, bucket=bucket, r2_enabled=True, _client=client)
+            return cls(store=store, bucket=bucket, r2_enabled=False,
+                       key_prefix=key_prefix)
+        if key_prefix:
+            logger.info(
+                "artifact sink: SQLite + R2 (bucket=%s, prefix=%s)",
+                bucket, key_prefix,
+            )
+        else:
+            logger.info("artifact sink: SQLite + R2 (bucket=%s)", bucket)
+        return cls(store=store, bucket=bucket, r2_enabled=True,
+                   key_prefix=key_prefix, _client=client)
 
     # ── key construction ────────────────────────────────────────────
     def _round_prefix(self, task_name: str, round_id: int) -> str:
-        return f"runs/{_safe(task_name)}/r{int(round_id):06d}"
+        runs = f"runs/{_safe(task_name)}/r{int(round_id):06d}"
+        return f"{self.key_prefix}/{runs}" if self.key_prefix else runs
 
     def _miner_prefix(self, task_name: str, round_id: int, miner_id: str) -> str:
         return f"{self._round_prefix(task_name, round_id)}/miners/{_safe(miner_id)}"
