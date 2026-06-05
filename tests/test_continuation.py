@@ -283,6 +283,99 @@ def test_prepare_continuation_rejects_bad_parent(store, tmp_path):
     assert "rejected" in prep["note"]
 
 
+def test_prepare_continuation_force_assigns_parent(store, tmp_path):
+    # On a validator-mandated continuation round, a miner that sends
+    # mode=new must still be warm-started from a seeded-random eligible
+    # parent. The miner only chooses which parent; the validator decides
+    # whether the round is a continuation.
+    cs = CheckpointStore(base_dir=tmp_path / "ck")
+    src = tmp_path / "m.safetensors"
+    src.write_bytes(b"w")
+    e1 = _add(store, metric=1.0, cumc=5.0)
+    cs.save(e1, src)
+    store.set_checkpoint_ref(e1, f"ckpt:{e1}")
+    e2 = _add(store, metric=0.9, cumc=3.0)
+    cs.save(e2, src)
+    store.set_checkpoint_ref(e2, f"ckpt:{e2}")
+
+    prep = prepare_continuation(
+        store, cs, payload={"mode": "new"},
+        task_name="ts_forecasting", min_flops=100, max_flops=100,
+        pool=[], shards_per_round=0, seed=1,
+        force_continuation=True, eligible_parent_ids=[e1, e2],
+        miner_id="alice",
+    )
+    assert prep["mode"] == "continue"
+    assert prep["parent_index"] in {e1, e2}
+    assert prep["parent_checkpoint_path"] is not None
+    assert "auto-assigned" in prep["note"]
+
+
+def test_prepare_continuation_force_falls_back_when_miner_picks_bad_parent(
+    store, tmp_path,
+):
+    # Miner sent a bogus parent_index on a forced-continuation round →
+    # validator records the rejection and still warm-starts from an
+    # eligible alternative.
+    cs = CheckpointStore(base_dir=tmp_path / "ck")
+    src = tmp_path / "m.safetensors"
+    src.write_bytes(b"w")
+    e1 = _add(store, metric=1.0, cumc=5.0)
+    cs.save(e1, src)
+    store.set_checkpoint_ref(e1, f"ckpt:{e1}")
+
+    prep = prepare_continuation(
+        store, cs, payload={"mode": "continue", "parent_index": 999},
+        task_name="ts_forecasting", min_flops=100, max_flops=100,
+        pool=[], shards_per_round=0, seed=2,
+        force_continuation=True, eligible_parent_ids=[e1],
+        miner_id="bob",
+    )
+    assert prep["mode"] == "continue"
+    assert prep["parent_index"] == e1
+
+
+def test_prepare_continuation_force_deterministic_per_miner(store, tmp_path):
+    # Same (seed, miner_id) must pick the same parent so retries are
+    # reproducible; different miners spread across parents.
+    cs = CheckpointStore(base_dir=tmp_path / "ck")
+    src = tmp_path / "m.safetensors"
+    src.write_bytes(b"w")
+    ids = []
+    for _ in range(5):
+        e = _add(store, metric=1.0, cumc=1.0)
+        cs.save(e, src)
+        store.set_checkpoint_ref(e, f"ckpt:{e}")
+        ids.append(e)
+
+    def pick(miner):
+        return prepare_continuation(
+            store, cs, payload={"mode": "new"},
+            task_name="ts_forecasting", min_flops=100, max_flops=100,
+            pool=[], shards_per_round=0, seed=42,
+            force_continuation=True, eligible_parent_ids=ids,
+            miner_id=miner,
+        )["parent_index"]
+
+    assert pick("alice") == pick("alice")
+    # Across many miners we should see >1 distinct parent picked.
+    picks = {pick(f"m{i}") for i in range(20)}
+    assert len(picks) > 1
+
+
+def test_prepare_continuation_force_no_eligible_stays_new(store, tmp_path):
+    cs = CheckpointStore(base_dir=tmp_path / "ck")
+    prep = prepare_continuation(
+        store, cs, payload={"mode": "new"},
+        task_name="ts_forecasting", min_flops=100, max_flops=100,
+        pool=[], shards_per_round=0, seed=1,
+        force_continuation=True, eligible_parent_ids=[],
+        miner_id="alice",
+    )
+    assert prep["mode"] == "new"
+    assert prep["parent_index"] is None
+
+
 # ── agent heuristic ──────────────────────────────────────────────────
 
 def test_tail_descending():

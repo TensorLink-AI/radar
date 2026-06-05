@@ -161,14 +161,19 @@ def prepare_continuation(
     shards_per_round: int,
     seed: int,
     current_epoch: dict | None = None,
+    force_continuation: bool = False,
+    eligible_parent_ids: list[int] | None = None,
+    miner_id: str = "",
 ) -> dict:
     """Resolve a proposal's continuation request into ``run_training`` kwargs.
 
     Validates the requested parent (must be eligible + have a resolvable
-    checkpoint); on any failure the run degrades to a fresh run and the
-    reason is reported in ``note`` so the validator can record
-    ``continuation_status``. Also computes the lineage-disjoint shard
-    assignment.
+    checkpoint). When ``force_continuation`` is true (the validator owns
+    the cadence and has declared a continuation round), a miner that
+    didn't pick a usable parent gets one auto-assigned at seeded random
+    from ``eligible_parent_ids`` — the miner only chooses *which* parent,
+    not *whether* to continue. Falls back to a fresh run only when no
+    eligible parent's checkpoint is resolvable.
 
     ``current_epoch`` is a dict of ``objectives``-keys → required values
     (e.g. ``{"frozen_arch_version": 3}`` for ts_data_pipeline). A parent
@@ -193,28 +198,56 @@ def prepare_continuation(
     }
     lineage_used: set[str] = set()
 
-    if mode == "continue" and isinstance(parent_index, int):
-        parent = store.get_experiment(parent_index)
+    def _try_parent(pid: int) -> tuple[bool, str]:
+        parent = store.get_experiment(pid)
         reason = _parent_reject_reason(
             parent, min_flops, max_flops, current_epoch=current_epoch,
         )
-        ckpt_path = (
-            ckpt_store.resolve(parent.get("checkpoint_ref"))
-            if parent is not None and reason is None else None
-        )
         if reason is not None:
+            return False, reason
+        ckpt_path = ckpt_store.resolve(parent.get("checkpoint_ref"))
+        if ckpt_path is None:
+            return False, "checkpoint unresolvable"
+        prep.update(
+            mode="continue",
+            parent_index=pid,
+            parent_metric=parent["metric"],
+            parent_checkpoint_path=ckpt_path,
+            compute_offset=float(parent.get("cumulative_compute", 0.0) or 0.0),
+            n_rounds=int(parent.get("n_rounds", 1) or 1) + 1,
+        )
+        nonlocal lineage_used
+        lineage_used = lineage_shards(store.lineage(pid))
+        return True, ""
+
+    if mode == "continue" and isinstance(parent_index, int):
+        ok, reason = _try_parent(parent_index)
+        if not ok:
             prep["note"] = f"continuation rejected: {reason}"
-        elif ckpt_path is None:
-            prep["note"] = "continuation rejected: checkpoint unresolvable"
+
+    if force_continuation and prep["mode"] != "continue" and eligible_parent_ids:
+        rng = random.Random(f"force-continuation-{seed}-{miner_id}")
+        order = list(eligible_parent_ids)
+        rng.shuffle(order)
+        prior_note = prep["note"]
+        for pid in order:
+            if pid == parent_index:
+                continue  # already tried above
+            ok, reason = _try_parent(pid)
+            if ok:
+                why = (
+                    "miner did not request continuation"
+                    if not prior_note else prior_note
+                )
+                prep["note"] = f"continuation auto-assigned parent {pid} ({why})"
+                break
         else:
-            prep.update(
-                mode="continue",
-                parent_metric=parent["metric"],
-                parent_checkpoint_path=ckpt_path,
-                compute_offset=float(parent.get("cumulative_compute", 0.0) or 0.0),
-                n_rounds=int(parent.get("n_rounds", 1) or 1) + 1,
+            # Every eligible parent failed to resolve — keep prep as "new".
+            prep["note"] = (
+                f"{prior_note}; force-continuation could not resolve any parent"
+                if prior_note
+                else "force-continuation could not resolve any parent"
             )
-            lineage_used = lineage_shards(store.lineage(parent_index))
 
     if pool:
         keys, reused = assign_shards(
