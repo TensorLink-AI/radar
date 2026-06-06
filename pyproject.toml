@@ -25,6 +25,9 @@ ts_forecasting = [
     "pandas>=2.0",
     "safetensors>=0.4",
     "httpx>=0.27",
+    # safetensors.torch imports packaging; some envs don't pull it
+    # in transitively (validator hit ModuleNotFoundError mid-round).
+    "packaging>=21.0",
 ]
 # Dependencies for the bundled real miner agents under miners/. All of
 # them import torch (FLOPs/shape inference), and the LLM-driving ones
