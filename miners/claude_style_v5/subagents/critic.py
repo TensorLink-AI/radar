@@ -23,7 +23,13 @@ except ImportError:
 # Critic calls are short. Smaller max_tokens than the designer keeps
 # the round budget in check, and a lower temperature keeps the
 # critique consistent across iterations.
-CRITIC_MAX_TOKENS = 512
+#
+# v5: dropped from 512 to 256. The static recipe-sanity inspector
+# (``core.recipe_sanity``) now covers mechanical recipe issues, so the
+# critic's prompt scopes it to architecture / brief-adherence / the
+# DIVERGE line — a four-line template fits comfortably in 256 tokens
+# and the smaller cap stops the LLM from padding with prose.
+CRITIC_MAX_TOKENS = 256
 CRITIC_TEMPERATURE = 0.4
 
 

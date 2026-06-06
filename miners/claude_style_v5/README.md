@@ -31,9 +31,10 @@ working — and live in three places.
 |---|---|---|
 | Static recipe inspection | none — only the runtime smoke test in `core.validation` | new `core.recipe_sanity` AST inspector flags lr/weight-decay/grad-clip/scheduler/AMP/batch anti-patterns |
 | Designer feedback loop | critic-only after each `validate_code` | critic **+** recipe-sanity findings appended in one message |
-| Researcher brief schema | `relevant_prior_work`, `frontier_gaps`, `ideas_to_try`, `plan` | + `divergence_axes` (required, non-empty) |
+| Researcher brief schema | `relevant_prior_work`, `frontier_gaps`, `ideas_to_try`, `plan` | `relevant_prior_work`, `ideas_to_try`, `divergence_axes` (required, non-empty), `plan` — `frontier_gaps` collapsed into `divergence_axes` (an axis everyone fixes the same way IS the gap, naming the break is more actionable) |
 | Designer "divergence" framing | implicit ("beat the frontier") | explicit ("honor the brief's `divergence_axes` or you tie") |
-| Critic template | 3 lines (KEEP / CHANGE / DROP) | 4 lines (+ DIVERGE — name the axis the candidate breaks on, or call out that it matches) |
+| Critic template | 3 lines (KEEP / CHANGE / DROP) covering architecture **and** recipe | 4 lines (+ DIVERGE) scoped to **architecture only** — recipe coverage handed off to the static inspector |
+| Critic `max_tokens` | 512 | 256 (the four-line template fits comfortably and the cap stops prose padding) |
 | Continuation parent friendliness | mentioned in `docs/continuation_training.md` only | explicit designer-prompt principle to keep arch / recipe cleanly separable |
 | Fallback tag | `FALLBACK_VERSION = "v3"` | `FALLBACK_VERSION = "v4"` (DB analysis can tell v5 fallback rounds apart) |
 

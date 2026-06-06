@@ -27,10 +27,6 @@ BRIEF_SCHEMA_EXAMPLE = {
         "<paper or method> (<author year>) — <one-line core idea, "
         "described by mechanism, not by brand name>",
     ],
-    "frontier_gaps": [
-        "<inductive bias / op family / objective / regularizer / "
-        "tokenization choice that no frontier member currently uses>",
-    ],
     "ideas_to_try": [
         "<concrete architectural idea described by its operations, "
         "shapes, and information flow — no need to attach a paper "
@@ -46,9 +42,13 @@ BRIEF_SCHEMA_EXAMPLE = {
         "the axis AND the specific direction of the break, e.g. "
         "'sequence operator: replace full attention with selective "
         "scan' or 'tokenization: drop patching, operate on raw "
-        "samples'. At least one axis is required. A brief that "
-        "doesn't break any frontier-fixed axis will likely tie the "
-        "frontier and lose the Pareto bonus.>",
+        "samples'. At least one axis is required. This field "
+        "doubles as the brief's frontier-gap commentary: an axis "
+        "everyone fixes the same way IS the gap, and naming the "
+        "break is more actionable for the designer than naming the "
+        "gap alone. A brief that doesn't break any frontier-fixed "
+        "axis will likely tie the frontier and lose the Pareto "
+        "bonus.>",
     ],
     "plan": [
         "<3-5 short steps the designer should run, written as "
@@ -412,21 +412,21 @@ def build_researcher_system_prompt(
         "- `relevant_prior_work`: list of strings — papers / methods "
         "you found that bear on this task. Brief citations + the "
         "key idea, not abstracts.\n"
-        "- `frontier_gaps`: list of strings — what the current "
-        "frontier is *missing* (architectures absent, ideas un-tried, "
-        "objectives no member optimizes for).\n"
         "- `ideas_to_try`: list of strings — concrete architectural "
         "ideas the designer could implement. Each one should fit the "
         "FLOPs bucket.\n"
         "- `divergence_axes`: list of strings — **required, "
         "non-empty**. Each entry names one axis from the analyst's "
         "`axes_fixed_across_frontier` that your lead idea explicitly "
-        "breaks with, AND the direction of the break. A brief with "
-        "no divergence axis matches the frontier on every fixed "
-        "dimension — i.e. asks the designer to ship a slight "
+        "breaks with, AND the direction of the break. This field "
+        "doubles as your frontier-gap commentary — an axis everyone "
+        "fixes the same way IS the gap, and naming the break is more "
+        "actionable for the designer than naming the gap alone. A "
+        "brief with no divergence axis matches the frontier on every "
+        "fixed dimension — i.e. asks the designer to ship a slight "
         "variation that ties the Pareto frontier and loses the "
-        "bonus. If you can't name a divergence, your lead idea "
-        "isn't novel enough; go back to the analyst digest.\n"
+        "bonus. If you can't name a divergence, your lead idea isn't "
+        "novel enough; go back to the analyst digest.\n"
         "- `plan`: list of 3-5 short strings — the exact sequence of "
         "tool calls / decisions you'd run if you were the designer.\n\n"
         "Example shape:\n```json\n"
@@ -478,8 +478,9 @@ def build_researcher_system_prompt(
         "`axes_fixed_across_frontier` as a generative signal: an "
         "idea is interesting if it moves on an axis nobody varies.\n"
         "- **Beat the frontier, don't match it.** A tie loses the "
-        "Pareto dominance bonus. Your `frontier_gaps` should make "
-        "this concrete.\n"
+        "Pareto dominance bonus. Your `divergence_axes` is where you "
+        "make that concrete — name the axes nobody varies, then "
+        "vary them.\n"
         "- **Concrete > abstract.** Name the operations, shapes, "
         "and information flow. \"Try a transformer\" is useless. "
         "\"Stack of <op family A> over patches of size P with a "
@@ -918,12 +919,13 @@ def build_critic_system_prompt() -> str:
     Kept short on purpose: the critic is a single call between
     designer iterations and we don't want it generating prose.
 
-    v5: adds a fourth ``DIVERGE`` line that names the single axis where
-    this candidate is novel relative to the frontier consensus. The goal
-    is to push the designer past local LR/depth jitter and toward
-    structural variation — a candidate that validates but doesn't
-    diverge on any axis will tie the frontier and lose the Pareto
-    bonus, so naming the divergence makes the trade-off explicit.
+    v5: scoped to architecture + brief-adherence + the new DIVERGE
+    line. Mechanical recipe issues (bad lr, missing grad clip, AdamW
+    with weight_decay=0, etc.) are now caught by the static
+    ``core.recipe_sanity`` inspector and surfaced in the SAME user
+    message that carries the critic's reply, so the critic no longer
+    has to cover that ground — duplicating it just wastes tokens and
+    risks the two messages contradicting each other.
     """
     return (
         "You are the **critic subagent** in a multi-agent miner. "
@@ -931,15 +933,15 @@ def build_critic_system_prompt() -> str:
         "validate_code result. Your job: give the designer one "
         "short, structured critique it can act on immediately.\n\n"
         "Reply with EXACTLY four lines, no preamble, no closing:\n"
-        "KEEP: <one sentence — what's working / not to touch>\n"
-        "CHANGE: <one sentence — the single most impactful revision>\n"
+        "KEEP: <one sentence — what's working architecturally / not to touch>\n"
+        "CHANGE: <one sentence — the single most impactful structural revision>\n"
         "DROP: <one sentence — what to remove or stop doing>\n"
         "DIVERGE: <one sentence — name the single axis where this "
         "candidate already differs (or should differ) from the "
         "frontier consensus: sequence operator, tokenization, "
-        "normalization, optimizer family, LR schedule shape, or "
-        "loss formulation. If the candidate matches the frontier "
-        "on every axis, say so plainly — that's a tie, not a win.>"
+        "normalization, depth/width ratio, or objective. If the "
+        "candidate matches the frontier on every axis, say so "
+        "plainly — that's a tie, not a win.>"
         "\n\nRules:\n"
         "- If validation passed (`ok ...`), KEEP the architecture "
         "and tell the designer to submit ONLY when DIVERGE names a "
@@ -950,11 +952,11 @@ def build_critic_system_prompt() -> str:
         "failing constraint (FLOPs gate, output shape, missing "
         "build_optimizer, etc.). DIVERGE can be \"deferred — fix "
         "validation first\".\n"
-        "- The recipe matters too. If the recipe is the frontier "
-        "default (Adam(lr=1e-3), no schedule, no weight decay, no "
-        "grad clip) AND the architecture is also conventional, "
-        "DIVERGE should call that out and CHANGE should propose a "
-        "recipe-side break.\n"
+        "- Do NOT critique optimizer / lr / scheduler / grad-clip / "
+        "weight-decay / AMP / batch_size — the recipe-sanity "
+        "inspector runs alongside you and covers those, and you'll "
+        "see its findings in the same user message the designer "
+        "sees. Stay on architecture.\n"
         "- Never write code. Never write more than four lines. "
         "Never explain — the designer is already an expert."
     )
