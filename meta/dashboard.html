@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>radar meta-orchestrator</title>
+<style>
+  body { font-family: ui-monospace, "SF Mono", Menlo, monospace;
+         margin: 24px; background: #0f1115; color: #e6e6e6; }
+  h1 { font-size: 18px; margin-bottom: 8px; }
+  h2 { font-size: 14px; margin-top: 24px; border-bottom: 1px solid #333;
+       padding-bottom: 4px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #222;
+           font-size: 12px; }
+  th { color: #999; font-weight: normal; text-transform: uppercase;
+       font-size: 10px; }
+  td.metric { font-variant-numeric: tabular-nums; }
+  .status-queued { color: #aaa; }
+  .status-running { color: #6f6; }
+  .status-failed { color: #f66; }
+  .status-done { color: #6cf; }
+  .pill { display: inline-block; padding: 1px 6px; border-radius: 3px;
+          background: #222; font-size: 10px; }
+  .small { color: #888; font-size: 11px; }
+  a { color: #6cf; }
+</style>
+</head>
+<body>
+<h1>radar · meta-orchestrator</h1>
+<p class="small">Refresh: <button onclick="loadAll()">reload</button>
+   · <a href="/api/xcompare">/api/xcompare</a>
+   · <a href="/api/experiments">/api/experiments</a></p>
+
+<h2>cross-experiment digest</h2>
+<pre id="digest">…</pre>
+
+<h2>experiments</h2>
+<table>
+  <thead><tr>
+    <th>name</th><th>status</th><th>budget</th><th>spent</th>
+    <th>started</th><th>actions</th>
+  </tr></thead>
+  <tbody id="experiments"></tbody>
+</table>
+
+<h2 id="detail-head">unit detail</h2>
+<p class="small">click an experiment row above to load its units.</p>
+<table>
+  <thead><tr>
+    <th>unit</th><th>status</th><th>pod</th><th>$/hr</th>
+    <th>spent</th><th>round</th><th>kill reason</th>
+  </tr></thead>
+  <tbody id="units"></tbody>
+</table>
+
+<h2 id="best-head">per-unit best metric</h2>
+<table>
+  <thead><tr>
+    <th>unit</th><th>best metric</th><th>n_rows</th>
+    <th>n_success</th><th>max round</th>
+  </tr></thead>
+  <tbody id="best"></tbody>
+</table>
+
+<script>
+async function jget(url) { const r = await fetch(url); return r.json(); }
+
+function pill(s) { return `<span class="pill status-${s}">${s}</span>`; }
+
+async function loadExperiments() {
+  const data = await jget("/api/experiments");
+  const body = document.getElementById("experiments");
+  body.innerHTML = "";
+  for (const r of data.experiments) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><a href="#" data-name="${r.name}">${r.name}</a></td>
+      <td>${pill(r.status)}</td>
+      <td>$${Number(r.budget_usd).toFixed(2)}</td>
+      <td>$${Number(r.spent_usd).toFixed(2)}</td>
+      <td class="small">${r.started_at || ""}</td>
+      <td class="small">
+        <a href="/api/experiment/${r.name}">json</a>
+      </td>`;
+    tr.querySelector("a[data-name]").addEventListener("click", (ev) => {
+      ev.preventDefault();
+      loadExperiment(r.name);
+    });
+    body.appendChild(tr);
+  }
+}
+
+async function loadExperiment(name) {
+  document.getElementById("detail-head").textContent = `unit detail — ${name}`;
+  document.getElementById("best-head").textContent = `per-unit best metric — ${name}`;
+  const data = await jget(`/api/experiment/${name}`);
+  const ub = document.getElementById("units");
+  ub.innerHTML = "";
+  for (const u of data.units) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${u.id}</td>
+      <td>${pill(u.status)}</td>
+      <td class="small">${u.pod_id || "-"}</td>
+      <td class="metric">$${Number(u.hourly_usd || 0).toFixed(2)}</td>
+      <td class="metric">$${Number(u.cost_usd || 0).toFixed(2)}</td>
+      <td class="metric">${u.last_round_seen}</td>
+      <td class="small">${u.kill_reason || ""}</td>`;
+    ub.appendChild(tr);
+  }
+  const bb = document.getElementById("best");
+  bb.innerHTML = "";
+  for (const b of data.best) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${b.unit_id}</td>
+      <td class="metric">${b.best_metric ?? "-"}</td>
+      <td class="metric">${b.n_rows}</td>
+      <td class="metric">${b.n_success}</td>
+      <td class="metric">${b.max_round}</td>`;
+    bb.appendChild(tr);
+  }
+}
+
+async function loadDigest() {
+  const d = await jget("/api/xcompare");
+  document.getElementById("digest").textContent = JSON.stringify(d, null, 2);
+}
+
+async function loadAll() {
+  await Promise.all([loadDigest(), loadExperiments()]);
+}
+loadAll();
+setInterval(loadAll, 30000);
+</script>
+</body>
+</html>

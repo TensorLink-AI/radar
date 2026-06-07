@@ -13,6 +13,13 @@ prompts/
 # but checked-in seed files are part of the agent definition.
 !miners/claude_style_v2_gepa/prompts/
 !miners/claude_style_v2_gepa/prompts/active.json
+# Meta-orchestrator: version-controlled ablation specs + researcher
+# prompt are part of the package. Runtime state lives in meta/data/
+# which is still ignored via the top-level ``data/`` rule.
+!meta/experiments/
+!meta/experiments/*.yaml
+!meta/prompts/
+!meta/prompts/*.md
 local/radar_local.db*
 local/scratchpads/
 

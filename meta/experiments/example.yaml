@@ -1,0 +1,44 @@
+# Example experiment spec: a small continuation-equilibrium sweep.
+#
+# Submit with:
+#   python -m meta submit meta/experiments/example.yaml
+#
+# Each `units[*].id` becomes the unit's RADAR_INSTANCE_ID (prefixed
+# with `orch-<orch-id>-<experiment>-`), which auto-namespaces every R2
+# path the existing local/ stack writes to.
+
+name: cont-equilibrium-sweep-example
+base:
+  task: ts_forecasting
+  rounds: 50
+  miners: 2
+  agent_dir: miners/claude_style_v2
+  training_seconds: 3600
+  agent_seconds: 1800
+  shards_per_round: 4
+
+units:
+  - id: eq50
+    overrides:
+      continuation_equilibrium: 0.5
+  - id: eq70
+    overrides:
+      continuation_equilibrium: 0.7
+  - id: eq90
+    overrides:
+      continuation_equilibrium: 0.9
+
+pod:
+  provider: runpod
+  gpu: A100-40GB
+  image: ghcr.io/tensorlink-ai/radar:latest
+  disk_gb: 200
+  max_hours: 24
+
+cost:
+  # Hard filter: scheduler rejects this experiment if no A100-40GB pod
+  # is available at or below this rate.
+  max_usd_per_hour: 0.30
+  # Total spend cap across all three units. Crossing this SIGTERMs the
+  # remaining units.
+  budget_usd: 50
