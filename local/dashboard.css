@@ -324,6 +324,24 @@ canvas { background: var(--bg-2); border-radius: var(--radius-sm); display: bloc
   border-color: rgba(160, 124, 199, 0.36);
 }
 
+/* ─── Task badge (forecast / pipeline / synth) ────────── */
+.badge-task-fc {
+  color: #7ec5e8; background: rgba(126, 197, 232, 0.14);
+  border-color: rgba(126, 197, 232, 0.34);
+}
+.badge-task-dp {
+  color: #e8c47e; background: rgba(232, 196, 126, 0.14);
+  border-color: rgba(232, 196, 126, 0.34);
+}
+.badge-task-synth {
+  color: #9aa4b2; background: rgba(154, 164, 178, 0.14);
+  border-color: rgba(154, 164, 178, 0.32);
+}
+.badge-task-other {
+  color: #9aa4b2; background: rgba(154, 164, 178, 0.12);
+  border-color: rgba(154, 164, 178, 0.28);
+}
+
 /* ─── Scrollbars (Firefox + WebKit) ────────────────────── */
 * { scrollbar-width: thin; scrollbar-color: var(--bg-4) transparent; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
