@@ -19,6 +19,8 @@ Endpoints:
                                    warm-started runs only
   GET /api/data_pipeline_frontier  Pareto front on (aulc, gift_metric) —
                                    ts_data_pipeline runs only
+  GET /api/lineage                 Lineage forest (nodes/edges) + frozen-arch
+                                   cross-task interaction links
   GET /api/frozen_archs            Frozen-arch version list (ts_data_pipeline)
   GET /api/experiment/<id>         full row (incl. code, loss_curve)
   GET /api/events                  agent_events list (round_id, miner_id,
@@ -393,6 +395,101 @@ def _experiment(conn: sqlite3.Connection, exp_id: int) -> dict[str, Any] | None:
     return _row(r, with_code=True) if r else None
 
 
+def _lineage(conn: sqlite3.Connection, frozen_arch_dir: str) -> dict[str, Any]:
+    """Lineage forest + cross-task interactions for the tree viewer.
+
+    Nodes are experiments; ``parent_index`` chains form within-task
+    lineages (novel root → continuation children). The cross-task
+    interaction is the frozen-arch promotion: a ``ts_forecasting``
+    experiment is snapshotted as a frozen-arch version which
+    ``ts_data_pipeline`` runs then train against. Each version becomes an
+    ``arch:<v>`` node with a ``promote`` edge in from its source forecasting
+    experiment and ``train`` edges out to the pipeline runs that consumed it.
+
+    Returns ``{nodes, archs, edges}``. ``edges`` reference experiments by
+    integer id and arch versions by the string id ``"arch:<v>"``. Each node
+    carries ``depth`` (lineage distance from its root) and ``in_lineage``
+    (participates in a chain or interaction) so the client can hide isolated
+    single-run nodes by default.
+    """
+    rows = conn.execute("SELECT * FROM experiments ORDER BY id").fetchall()
+    by_id: dict[int, dict[str, Any]] = {}
+    nodes: list[dict[str, Any]] = []
+    for r in rows:
+        p = _row(r)
+        by_id[p["id"]] = p
+        nodes.append(p)
+
+    children: dict[int, list[int]] = {}
+    for p in nodes:
+        pid = p.get("parent_index")
+        if pid is not None and pid in by_id:
+            children.setdefault(pid, []).append(p["id"])
+
+    def _depth(start: int) -> int:
+        seen: set[int] = set()
+        d = 0
+        cur = by_id.get(start)
+        while cur is not None and cur["id"] not in seen:
+            seen.add(cur["id"])
+            par = cur.get("parent_index")
+            if par is None or par not in by_id:
+                break
+            d += 1
+            cur = by_id.get(par)
+        return d
+
+    # Pipeline runs grouped by the frozen-arch version they trained against.
+    consumers: dict[int, list[int]] = {}
+    for p in nodes:
+        if p["task"] == "ts_data_pipeline":
+            v = p["objectives"].get("frozen_arch_version")
+            if v:
+                consumers.setdefault(int(v), []).append(p["id"])
+
+    edges: list[dict[str, Any]] = []
+    for p in nodes:
+        pid = p.get("parent_index")
+        if pid is not None and pid in by_id:
+            edges.append({"kind": "lineage", "from": pid, "to": p["id"]})
+
+    archs_out: list[dict[str, Any]] = []
+    for a in _frozen_archs(frozen_arch_dir):
+        v = int(a.get("version") or 0)
+        src = a.get("source_experiment_id")
+        cons = consumers.get(v, [])
+        archs_out.append({
+            "version": v,
+            "source_experiment_id": src,
+            "source_metric": a.get("source_metric"),
+            "source_task": "ts_forecasting",
+            "created_at": a.get("created_at"),
+            "n_consumers": len(cons),
+        })
+        if src is not None and src in by_id:
+            edges.append({"kind": "promote", "from": src, "to": f"arch:{v}"})
+        for cid in cons:
+            edges.append({"kind": "train", "from": f"arch:{v}", "to": cid})
+
+    # A node "participates" if it sits on a parent/child chain or touches an
+    # interaction edge — used to hide noise-floor singleton novel runs.
+    touched: set[int] = set()
+    for e in edges:
+        for end in (e["from"], e["to"]):
+            if isinstance(end, int):
+                touched.add(end)
+    for p in nodes:
+        p["depth"] = _depth(p["id"])
+        p["child_ids"] = children.get(p["id"], [])
+        p["in_lineage"] = (
+            p["id"] in touched
+            or p.get("parent_index") is not None
+            or bool(children.get(p["id"]))
+        )
+
+    return {"nodes": nodes, "archs": archs_out, "edges": edges}
+
+
 class _Handler(BaseHTTPRequestHandler):
     db_path: str = ""
     frozen_arch_dir: str = ""
@@ -447,6 +544,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, _continuation_frontier(conn))
             if path == "/api/data_pipeline_frontier":
                 return self._json(200, _data_pipeline_frontier(conn))
+            if path == "/api/lineage":
+                return self._json(200, _lineage(conn, self.frozen_arch_dir))
             if path == "/api/frozen_archs":
                 return self._json(200, _frozen_archs(self.frozen_arch_dir))
             if path.startswith("/api/experiment/"):
