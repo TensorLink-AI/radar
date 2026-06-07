@@ -178,6 +178,9 @@ def _package(
     return out
 
 
+_LAST_GOOD_PROMPT_ROWS: list | None = None
+
+
 def _load_active_prompt(round_id: int) -> dict:
     """Return ``{id, template}`` for the prompt variant this round.
 
@@ -187,16 +190,26 @@ def _load_active_prompt(round_id: int) -> dict:
     falls back to its hardcoded system prompt. ``id`` round-trips back
     via ``experiments.prompt_id`` so Phase C scores attribute to the
     variant that produced them, closing the GEPA loop.
+
+    On a parse failure (e.g. ``promote_prompts.py`` mid-rename — atomic
+    on POSIX but defensive code is cheap), fall back to the last
+    successfully parsed pool so the round stays on a known-good variant
+    instead of dropping to the hardcoded system prompt.
     """
+    global _LAST_GOOD_PROMPT_ROWS
     prompts_dir = os.getenv("MINER_PROMPTS_DIR", "prompts")
     path = os.path.join(prompts_dir, "active.json")
+    rows: list | None = None
     try:
         with open(path) as f:
             payload = json.load(f)
+        candidate = payload.get("prompts") if isinstance(payload, dict) else payload
+        if isinstance(candidate, list) and candidate:
+            rows = candidate
+            _LAST_GOOD_PROMPT_ROWS = candidate
     except (OSError, json.JSONDecodeError):
-        return {"id": "", "template": ""}
-    rows = payload.get("prompts") if isinstance(payload, dict) else payload
-    if not isinstance(rows, list) or not rows:
+        rows = _LAST_GOOD_PROMPT_ROWS
+    if not rows:
         return {"id": "", "template": ""}
     pick = rows[round_id % len(rows)]
     if not isinstance(pick, dict):
