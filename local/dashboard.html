@@ -15,6 +15,9 @@
     <button class="tab" role="tab" data-tab="data_pipeline" aria-selected="false">
       Data pipeline
     </button>
+    <button class="tab" role="tab" data-tab="lineage" aria-selected="false">
+      Lineage
+    </button>
     <button class="tab" role="tab" data-tab="service_log" aria-selected="false">
       Service log
     </button>
@@ -250,6 +253,39 @@
   <th class="num" data-key="meta.cumulative_compute" data-type="num">Σ compute</th>
   <th data-key="mtime" data-type="num">mtime</th>
 </tr></thead><tbody id="checkpoints"></tbody></table></div>
+
+</section>
+
+<!-- ─── Lineage tab ────────────────────────────────────────────── -->
+<section data-tab="lineage">
+
+<h2>Lineage forest <span class="muted" id="lin-count"></span>
+  <span class="muted">forecasting (top) → frozen-arch ◆ → pipeline (bottom)</span>
+</h2>
+<div class="filter-bar">
+  <div class="chip-row" id="linTaskChips"></div>
+  <div class="filter-controls">
+    <label class="toggle">
+      <input type="checkbox" id="linInteractions" checked>
+      <span>interactions</span>
+    </label>
+    <label class="toggle">
+      <input type="checkbox" id="linSingletons">
+      <span>show singletons</span>
+    </label>
+    <button class="copy-btn" id="linRefresh">refresh</button>
+  </div>
+</div>
+<div class="lineage-legend muted">
+  <span><span class="lin-key lin-fc"></span> forecasting</span>
+  <span><span class="lin-key lin-dp"></span> pipeline</span>
+  <span>● novel</span>
+  <span>▲ continuation</span>
+  <span>◆ frozen arch</span>
+  <span><span class="lin-edge lin-edge-line"></span> lineage</span>
+  <span><span class="lin-edge lin-edge-dash"></span> promote / train</span>
+</div>
+<div class="lineage-scroll"><canvas id="lineageTree" width="900" height="420"></canvas></div>
 
 </section>
 

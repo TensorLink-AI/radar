@@ -83,6 +83,7 @@ body {
 section[data-tab] { display: none; }
 body[data-active-tab="architecture"] section[data-tab="architecture"],
 body[data-active-tab="data_pipeline"] section[data-tab="data_pipeline"],
+body[data-active-tab="lineage"] section[data-tab="lineage"],
 body[data-active-tab="service_log"] section[data-tab="service_log"],
 body[data-active-tab="checkpoints"] section[data-tab="checkpoints"] {
   display: block;
@@ -341,6 +342,28 @@ canvas { background: var(--bg-2); border-radius: var(--radius-sm); display: bloc
   color: #9aa4b2; background: rgba(154, 164, 178, 0.12);
   border-color: rgba(154, 164, 178, 0.28);
 }
+
+/* ─── Lineage tab ─────────────────────────────────────── */
+.lineage-legend {
+  display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
+  margin: 8px 0 6px; font: 11px/1.6 var(--font-mono);
+}
+.lineage-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.lin-key {
+  display: inline-block; width: 11px; height: 11px; border-radius: 3px;
+}
+.lin-key.lin-fc { background: #7ec5e8; }
+.lin-key.lin-dp { background: #e8c47e; }
+.lin-edge { display: inline-block; width: 20px; height: 0; }
+.lin-edge-line { border-top: 2px solid #5a6172; }
+.lin-edge-dash { border-top: 2px dashed #8a7ec0; }
+.lineage-scroll {
+  margin-top: 4px; padding: 10px 12px; overflow: auto; max-height: 78vh;
+  background: var(--bg-2); border: 1px solid var(--border-2);
+  border-radius: var(--radius); box-shadow: var(--shadow-1);
+}
+/* Tree canvas scrolls instead of shrinking, so deep lineages stay legible. */
+.lineage-scroll canvas { max-width: none; }
 
 /* ─── Scrollbars (Firefox + WebKit) ────────────────────── */
 * { scrollbar-width: thin; scrollbar-color: var(--bg-4) transparent; }

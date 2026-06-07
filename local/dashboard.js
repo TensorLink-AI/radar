@@ -15,7 +15,7 @@ const esc = s => String(s == null ? '' : s).replace(/[&<>]/g,
 async function get(p) { const r = await fetch(p); return r.json(); }
 
 const TAB_KEY = 'radar.activeTab';
-const VALID_TABS = ['architecture', 'data_pipeline', 'service_log', 'checkpoints'];
+const VALID_TABS = ['architecture', 'data_pipeline', 'lineage', 'service_log', 'checkpoints'];
 
 const state = {
   selectedId: null,
@@ -1214,6 +1214,263 @@ function openLossModal(e) {
   });
 }
 
+// ── Lineage forest ─────────────────────────────────────────
+// A two-lane tree of parent→child lineages (forecasting on top,
+// pipeline on the bottom) plus the cross-task frozen-arch interaction:
+// a forecasting experiment is promoted to an arch snapshot (◆ on the
+// divider) that pipeline runs train against. Solid edges = continuation
+// lineage; dashed = promote (forecast→arch) and train (arch→pipeline).
+const LIN_TASKS = ['ts_forecasting', 'ts_data_pipeline'];
+const LIN_COLORS = { ts_forecasting: '#7ec5e8', ts_data_pipeline: '#e8c47e' };
+const LIN_ARCH_COLOR = '#a07cc7';
+const linState = {
+  task: 'all', interactions: true, singletons: false, data: null, hits: [],
+};
+
+async function loadLineage() {
+  try {
+    linState.data = await get('/api/lineage');
+  } catch (_e) {
+    linState.data = { nodes: [], archs: [], edges: [] };
+  }
+  renderLineage();
+}
+
+// Tidy per-lane forest layout: column = in-lane lineage depth, row =
+// leaf order (internal nodes centre over their children).
+function layoutLineage(data, opts) {
+  const COL_W = 64, ROW_H = 30, PAD_X = 40, PAD_TOP = 26, PAD_BOT = 20;
+  const LANE_GAP = 70;  // room for arch nodes + lane labels on the divider
+  const taskOK = t =>
+    opts.task === 'all' ? LIN_TASKS.includes(t) : t === opts.task;
+  const all = (data.nodes || []).filter(n =>
+    taskOK(n.task) && (n.in_lineage || opts.singletons));
+  const byId = {};
+  for (const n of all) byId[n.id] = n;
+
+  function layoutLane(task) {
+    const lane = all.filter(n => n.task === task);
+    const laneSet = new Set(lane.map(n => n.id));
+    const kids = {};
+    for (const n of lane) {
+      const p = n.parent_index;
+      if (p != null && laneSet.has(p)) (kids[p] = kids[p] || []).push(n.id);
+    }
+    const colOf = {};
+    function col(id, seen) {
+      if (colOf[id] != null) return colOf[id];
+      const p = byId[id].parent_index;
+      let c = 0;
+      if (p != null && laneSet.has(p) && !(seen && seen.has(id))) {
+        const s = seen || new Set(); s.add(id);
+        c = col(p, s) + 1;
+      }
+      colOf[id] = c; return c;
+    }
+    for (const n of lane) col(n.id);
+    const roots = lane
+      .filter(n => { const p = n.parent_index; return !(p != null && laneSet.has(p)); })
+      .sort((a, b) => a.id - b.id);
+    const rowOf = {};
+    let nextRow = 0;
+    function assign(id) {
+      const ks = (kids[id] || []).slice().sort((a, b) => a - b);
+      if (ks.length === 0) { rowOf[id] = nextRow++; return rowOf[id]; }
+      const rs = ks.map(assign);
+      rowOf[id] = rs.reduce((a, b) => a + b, 0) / rs.length;
+      return rowOf[id];
+    }
+    for (const r of roots) { assign(r.id); nextRow += 0.6; }
+    const pos = {};
+    let maxCol = 0;
+    for (const n of lane) {
+      pos[n.id] = { col: colOf[n.id], row: rowOf[n.id] };
+      if (colOf[n.id] > maxCol) maxCol = colOf[n.id];
+    }
+    return { lane, pos, maxCol, rows: nextRow };
+  }
+
+  const fc = layoutLane('ts_forecasting');
+  const dp = layoutLane('ts_data_pipeline');
+  const maxCol = Math.max(fc.maxCol, dp.maxCol, 0);
+  const width = Math.max(900, PAD_X * 2 + (maxCol + 1) * COL_W);
+  const fcTop = PAD_TOP;
+  const fcH = Math.max(1, fc.rows) * ROW_H;
+  const dividerY = fcTop + fcH + LANE_GAP / 2;
+  const dpTop = fcTop + fcH + LANE_GAP;
+  const dpH = Math.max(1, dp.rows) * ROW_H;
+  const height = dpTop + dpH + PAD_BOT;
+
+  const xOf = c => PAD_X + c * COL_W + 14;
+  const placed = {};
+  const nodeDraws = [];
+  const hits = [];
+  function placeLane(layout, top) {
+    for (const n of layout.lane) {
+      const p = layout.pos[n.id];
+      const x = xOf(p.col), y = top + p.row * ROW_H + 14;
+      placed[n.id] = { x, y };
+      nodeDraws.push({
+        node: n, x, y, color: LIN_COLORS[n.task] || '#9aa4b2',
+        cont: !!n.is_continuation, selected: n.id === state.selectedId,
+      });
+      hits.push({ sx: x, sy: y, r: 8, kind: 'exp', node: n });
+    }
+  }
+  placeLane(fc, fcTop);
+  placeLane(dp, dpTop);
+
+  const edgeDraws = [];
+  for (const e of (data.edges || [])) {
+    if (e.kind !== 'lineage') continue;
+    const a = placed[e.from], b = placed[e.to];
+    if (a && b) edgeDraws.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y, dashed: false, color: '#4a5163' });
+  }
+
+  const archDraws = [];
+  if (opts.interactions) {
+    for (const a of (data.archs || [])) {
+      const src = placed[a.source_experiment_id];
+      const consumers = (data.edges || [])
+        .filter(e => e.kind === 'train' && e.from === `arch:${a.version}`)
+        .map(e => placed[e.to]).filter(Boolean);
+      if (!src && consumers.length === 0) continue;
+      const cAvg = consumers.length
+        ? consumers.reduce((s, c) => s + c.x, 0) / consumers.length : null;
+      const ax = (src && cAvg != null) ? (src.x + cAvg) / 2 : (src ? src.x : cAvg);
+      archDraws.push({ arch: a, x: ax, y: dividerY });
+      hits.push({ sx: ax, sy: dividerY, r: 8, kind: 'arch', node: a });
+      if (src) edgeDraws.push({ x1: src.x, y1: src.y, x2: ax, y2: dividerY, dashed: true, color: '#8a7ec0' });
+      for (const c of consumers)
+        edgeDraws.push({ x1: ax, y1: dividerY, x2: c.x, y2: c.y, dashed: true, color: '#8a7ec0' });
+    }
+  }
+
+  return {
+    width, height, nodeDraws, archDraws, edgeDraws, hits, dividerY,
+    fcTop, dpTop, nExp: nodeDraws.length, nArch: archDraws.length,
+  };
+}
+
+function drawLinEdge(ctx, e) {
+  ctx.save();
+  ctx.strokeStyle = e.color; ctx.lineWidth = 1.3;
+  ctx.setLineDash(e.dashed ? [4, 3] : []);
+  ctx.beginPath();
+  ctx.moveTo(e.x1, e.y1);
+  const dx = e.x2 - e.x1, dy = e.y2 - e.y1;
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    const cx = e.x1 + dx * 0.5;
+    ctx.bezierCurveTo(cx, e.y1, cx, e.y2, e.x2, e.y2);
+  } else {
+    const cy = e.y1 + dy * 0.5;
+    ctx.bezierCurveTo(e.x1, cy, e.x2, cy, e.x2, e.y2);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawDiamond(ctx, x, y, r) {
+  ctx.beginPath();
+  ctx.moveTo(x, y - r); ctx.lineTo(x + r, y);
+  ctx.lineTo(x, y + r); ctx.lineTo(x - r, y);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+}
+
+function drawLineage(canvas, L) {
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#161820'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (L.nExp === 0) { drawEmpty(ctx, canvas, 'no lineages to show'); return; }
+  ctx.strokeStyle = '#252a36'; ctx.lineWidth = 1; ctx.setLineDash([]);
+  ctx.beginPath(); ctx.moveTo(0, L.dividerY); ctx.lineTo(canvas.width, L.dividerY); ctx.stroke();
+  ctx.fillStyle = '#5a6172'; ctx.font = '600 11px ui-monospace, monospace';
+  ctx.fillText('forecasting', 8, 13);
+  ctx.fillText('pipeline', 8, L.dpTop - 6);
+  for (const e of L.edgeDraws) drawLinEdge(ctx, e);
+  ctx.setLineDash([]);
+  for (const d of L.nodeDraws) {
+    ctx.fillStyle = d.selected ? '#f0a040' : d.color;
+    drawMarker(ctx, d.x, d.y, d.selected ? 6 : 5, d.cont);
+  }
+  ctx.strokeStyle = '#11131a'; ctx.lineWidth = 1;
+  for (const a of L.archDraws) {
+    ctx.fillStyle = LIN_ARCH_COLOR;
+    drawDiamond(ctx, a.x, a.y, 6);
+  }
+}
+
+function archTooltip(a) {
+  const rows = [
+    ['frozen arch', `v${a.version}`],
+    ['source exp', a.source_experiment_id ?? '—'],
+    ['source metric', fmt(a.source_metric)],
+    ['consumers', fmtInt(a.n_consumers)],
+  ];
+  return rows.map(([k, v]) => `<span class="k">${k}</span> <b>${v}</b>`).join('<br>');
+}
+
+function renderLineage() {
+  const canvas = document.getElementById('lineageTree');
+  if (!canvas || !linState.data) return;
+  const L = layoutLineage(linState.data, linState);
+  canvas.width = L.width; canvas.height = L.height;
+  drawLineage(canvas, L);
+  linState.hits = L.hits;
+  const el = document.getElementById('lin-count');
+  if (el) el.textContent = ` (${L.nExp} runs · ${L.nArch} arch)`;
+}
+
+function buildLinChips() {
+  const host = document.getElementById('linTaskChips');
+  if (!host) return;
+  const opts = [['all', 'all'], ['ts_forecasting', 'forecasting'], ['ts_data_pipeline', 'pipeline']];
+  host.innerHTML = opts.map(([v, label]) =>
+    `<button class="chip" data-lintask="${v}"`
+    + (linState.task === v ? ' data-active="true"' : '') + '>'
+    + `<span class="chip-dot"></span><span class="chip-label">${label}</span></button>`
+  ).join('');
+  host.querySelectorAll('[data-lintask]').forEach(b => {
+    b.onclick = () => {
+      linState.task = b.dataset.lintask;
+      buildLinChips(); renderLineage();
+    };
+  });
+}
+
+function setupLineage() {
+  const canvas = document.getElementById('lineageTree');
+  if (!canvas) return;
+  const at = ev => {
+    const rect = canvas.getBoundingClientRect();
+    const sx = (ev.clientX - rect.left) * (canvas.width / rect.width);
+    const sy = (ev.clientY - rect.top) * (canvas.height / rect.height);
+    return nearest(linState.hits, sx, sy, 12);
+  };
+  canvas.addEventListener('mousemove', ev => {
+    const hit = at(ev);
+    if (hit) {
+      showTip(hit.kind === 'arch' ? archTooltip(hit.node) : expTooltip(hit.node), ev);
+      canvas.style.cursor = 'pointer';
+    } else { hideTip(); canvas.style.cursor = 'default'; }
+  });
+  canvas.addEventListener('mouseleave', hideTip);
+  canvas.addEventListener('click', ev => {
+    const hit = at(ev);
+    if (!hit) return;
+    if (hit.kind === 'arch') {
+      if (hit.node.source_experiment_id) showDetail(hit.node.source_experiment_id);
+    } else showDetail(hit.node.id);
+  });
+  const it = document.getElementById('linInteractions');
+  const sg = document.getElementById('linSingletons');
+  const rf = document.getElementById('linRefresh');
+  if (it) it.onchange = e => { linState.interactions = e.target.checked; renderLineage(); };
+  if (sg) sg.onchange = e => { linState.singletons = e.target.checked; renderLineage(); };
+  if (rf) rf.onclick = loadLineage;
+  buildLinChips();
+}
+
 // ── Refresh loop ───────────────────────────────────────────
 async function refresh() {
   try {
@@ -1324,6 +1581,7 @@ for (const [id, m] of Object.entries({
 tableState.events.sortKey = 'id'; tableState.events.sortDir = 'desc';
 tableState.checkpoints.sortKey = 'mtime'; tableState.checkpoints.sortDir = 'desc';
 setupTables();
+setupLineage();
 
 // ── Service-log filter bar ────────────────────────────────
 function applyEventFilters() {
@@ -1403,6 +1661,8 @@ function setActiveTab(name) {
     loadEventStats(); loadEvents();
   } else if (name === 'checkpoints') {
     loadCheckpoints();
+  } else if (name === 'lineage') {
+    loadLineage();
   }
 }
 
@@ -1426,6 +1686,8 @@ function startTimer() {
       loadEventStats(); loadEvents();
     } else if (state.activeTab === 'checkpoints') {
       loadCheckpoints();
+    } else if (state.activeTab === 'lineage') {
+      loadLineage();
     }
   }, 5000);
 }
