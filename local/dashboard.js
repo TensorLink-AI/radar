@@ -89,6 +89,20 @@ function kindBadge(e) {
     : `<span class="badge badge-novel" title="trained from scratch">novel</span>`;
 }
 
+// Short task label so the leaderboard/recent tables show whether a row
+// came from the real torch+GIFT-Eval forecasting challenge, the
+// synthetic-data pipeline challenge, or the numpy regression task.
+const TASK_LABELS = {
+  ts_forecasting: { short: 'forecast', cls: 'badge-task-fc' },
+  ts_data_pipeline: { short: 'pipeline', cls: 'badge-task-dp' },
+  synth_regression: { short: 'synth', cls: 'badge-task-synth' },
+};
+function taskBadge(e) {
+  const t = e.task || '';
+  const meta = TASK_LABELS[t] || { short: t || '?', cls: 'badge-task-other' };
+  return `<span class="badge ${meta.cls}" title="${esc(t || 'unknown task')}">${esc(meta.short)}</span>`;
+}
+
 // ── Tables ─────────────────────────────────────────────────
 function row(e, rank) {
   const tr = document.createElement('tr');
@@ -98,6 +112,7 @@ function row(e, rank) {
   tr.innerHTML = (rank !== undefined ? `<td class="rank">${rank}</td>` : '')
     + `<td>${e.id}</td><td>${e.round_id}</td>`
     + `<td>${esc(e.miner_id)}</td><td>${esc(e.name)}</td>`
+    + `<td>${taskBadge(e)}</td>`
     + `<td>${kindBadge(e)}</td>`
     + `<td class="metric">${fmt(e.metric)}</td>`
     + `<td class="num">${fmt(obj(e, 'crps'))}</td>`
@@ -114,6 +129,7 @@ function recentRow(e) {
   tr.onclick = () => showDetail(e.id);
   tr.innerHTML = `<td>${e.id}</td><td>${e.round_id}</td>`
     + `<td>${esc(e.miner_id)}</td><td>${esc(e.name)}</td>`
+    + `<td>${taskBadge(e)}</td>`
     + `<td>${kindBadge(e)}</td>`
     + `<td class="metric">${fmt(e.metric)}</td>`
     + `<td class="score">${fmt(e.score, 3)}</td>`
