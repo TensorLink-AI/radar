@@ -138,11 +138,17 @@ differences from `ts_data_pipeline`:
 
 1. **The architecture is fixed.** Every round trains the *same*
    miniature (~10M-param) Toto-2.0-style **causal patch decoder** —
-   contiguous channel-independent patching, learned patch+positional
-   embeddings, causal (decoder) transformer blocks, a quantile head off
-   the final patch token. It lives in `local/synthetic_arch.py` as
-   source *text* (`REFERENCE_ARCH_CODE`, version `1`, never refreshed)
-   so the validator stays numpy-only until a round actually runs. There
+   contiguous channel-independent patching with an arcsinh robust scaler
+   and missing-value masking, residual-MLP patch projections, learned
+   patch+positional embeddings, causal (decoder) transformer blocks with
+   PerDimScale attention, and learned forecast-query tokens that emit the
+   horizon as contiguous output patches in a single pass (no last-token
+   bottleneck). The source text lives in `local/synthetic_arch_code.py`
+   (`REFERENCE_ARCH_CODE`); `local/synthetic_arch.py` is the version/card
+   wrapper. **Bumping `REFERENCE_ARCH_VERSION` to 2 is required before
+   the upgraded arch is merged** (it is parameter-incompatible with the
+   original v1 model). It stays source *text* so the validator stays
+   numpy-only until a round actually runs. There
    is no `FrozenArchStore` for this task — the arch never moves, so a
    continuation round is literally "keep training the same model's
    weights on (hopefully better) data" and warm-starts are always
