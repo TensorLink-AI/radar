@@ -6,7 +6,7 @@ HTTP router stays a thin dispatcher and ``services.py`` stays under the
 
 Endpoint coverage (mirrors the menu in ``miners/*/prompts.py``):
 
-  GET  /frontier?task=                  strict Pareto frontier
+  GET  /frontier?task=                  per-bucket Pareto frontier (union)
   GET  /experiments/recent?n=           most recent N (``limit=`` alias)
   GET  /experiments/pareto?task=        same as /frontier locally
   GET  /experiments/failures?n=         recent failures
@@ -28,7 +28,7 @@ import difflib
 from typing import Optional
 
 from local.continuation import continuation_frontier
-from local.scoring import compute_pareto
+from local.scoring import compute_pareto_by_bucket
 from local.store import LocalStore
 
 
@@ -39,9 +39,14 @@ def _filter_task(exps: list[dict], task: Optional[str]) -> list[dict]:
 
 
 def frontier(store: LocalStore, task: Optional[str] = None) -> dict:
+    # ``frontier`` is the per-bucket Pareto union: the non-dominated set is
+    # computed independently within each size bucket, so the best model in
+    # every bucket shows up (not just the globally non-dominated ones). The
+    # round-scoped, single-bucket view a miner is actually scored against is
+    # ``challenge["feasible_frontier"]``.
     exps = _filter_task(store.recent_experiments(n=10_000), task)
     return {
-        "frontier": compute_pareto(exps),
+        "frontier": compute_pareto_by_bucket(exps),
         "continuation": continuation_frontier(exps),
     }
 

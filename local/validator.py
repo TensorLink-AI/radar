@@ -42,7 +42,9 @@ from local.frozen_pipeline import (
     FrozenPipelineStore,
     maybe_refresh as maybe_refresh_pipeline,
 )
-from local.scoring import compute_pareto, passes_size_gate, score_round
+from local.scoring import (
+    compute_pareto, compute_pareto_by_bucket, passes_size_gate, score_round,
+)
 from local.services import ServicesServer
 from local.store import LocalStore
 from local.task import (
@@ -235,7 +237,13 @@ def _build_challenge(round_id: int, store: LocalStore, task,
     # same SQLite file) mean we can't compare metrics across tasks — filter
     # to this task before computing the per-round feasible frontier.
     same_task = [e for e in all_exps if e.get("task") == task.name]
-    pareto = compute_pareto(same_task)
+    # Per-bucket Pareto: compute the non-dominated set *within* this round's
+    # size bucket, not globally-then-filter. Otherwise a cheap, lower-metric
+    # model in a smaller bucket would dominate (lower metric AND lower flops)
+    # the best models here and knock them off this bucket's frontier.
+    in_bucket = [
+        e for e in same_task if passes_size_gate(e["objectives"], lo, hi)
+    ]
     feasible = [
         {
             "code": e["code"],
@@ -243,8 +251,7 @@ def _build_challenge(round_id: int, store: LocalStore, task,
             "objectives": e["objectives"],
             "name": e["name"],
         }
-        for e in pareto
-        if passes_size_gate(e["objectives"], lo, hi)
+        for e in compute_pareto(in_bucket)
     ]
     # The validator owns the round type: a scheduled continuation round only
     # becomes one if eligible (fully-eval'd, checkpoint-bearing, in-bucket)
@@ -476,7 +483,7 @@ def _gc_checkpoints(store: LocalStore, ckpt_store: CheckpointStore,
                     round_id: int, keep_rounds: int = 5) -> None:
     """Drop checkpoints that aren't on a frontier or a recent parent."""
     all_exps = store.recent_experiments(n=10_000)
-    keep = {e["id"] for e in compute_pareto(all_exps)}
+    keep = {e["id"] for e in compute_pareto_by_bucket(all_exps)}
     keep |= {e["id"] for e in continuation_frontier(all_exps)}
     keep |= {e["id"] for e in all_exps if e["round_id"] > round_id - keep_rounds}
     removed = ckpt_store.gc(keep)
