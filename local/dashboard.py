@@ -14,7 +14,8 @@ Endpoints:
   GET /api/leaderboard?n=N         top-N by metric ASC (lower=better)
   GET /api/recent?n=N              latest N by id
   GET /api/frontier                Pareto front on (metric, flops)
-  GET /api/frontier_crps_mase      Pareto front on (crps, mase) — ts_forecasting only
+  GET /api/frontier_crps_mase      Pareto front on (crps, mase) — GIFT-scored
+                                   tasks (ts_forecasting, synthetic_data_generator)
   GET /api/continuation_frontier   Pareto front on (cumulative_compute, Δ) for
                                    warm-started runs only
   GET /api/data_pipeline_frontier  Pareto front on (aulc, gift_metric) —
@@ -245,7 +246,8 @@ def _frontier(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 def _frontier_crps_mase(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """Non-dominated set on (crps, mase). Both lower=better. Only experiments
     that have both values in their objectives (i.e. GIFT-Eval succeeded)
-    contribute."""
+    contribute — that spans every GIFT-scored task (ts_forecasting and
+    synthetic_data_generator; ts_data_pipeline stamps them too)."""
     rows = conn.execute(
         "SELECT * FROM experiments WHERE success=1 AND metric IS NOT NULL"
     ).fetchall()

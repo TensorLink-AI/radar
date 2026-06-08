@@ -47,9 +47,10 @@ from local.scoring import (
 )
 from local.services import ServicesServer
 from local.store import LocalStore
+from local.synthetic_arch import REFERENCE_ARCH_VERSION, reference_arch
 from local.task import (
-    SIZE_BUCKETS, TaskSpec, TSDataPipelineSpec, TSForecastingSpec,
-    buckets_for, make_spec,
+    SIZE_BUCKETS, SyntheticDataGeneratorSpec, TaskSpec, TSDataPipelineSpec,
+    TSForecastingSpec, buckets_for, make_spec,
 )
 from local.trainer import run_training
 
@@ -130,6 +131,30 @@ def _task_dict(task) -> dict:
     Miners read this verbatim — see ``miners/*/agent.py`` and the
     ``challenge['task']`` description in radar-miner-examples/README.md.
     """
+    if isinstance(task, SyntheticDataGeneratorSpec):
+        return {
+            "name": task.name,
+            "task_params": {
+                "context_len": task.context_len,
+                "prediction_len": task.prediction_len,
+                "num_variates": task.num_variates,
+                "quantiles": list(task.quantiles),
+            },
+            "constraints": [
+                "torch + stdlib only",
+                "build_pipeline(context_len, prediction_len, num_variates, "
+                "quantiles) returns an iterator of {'input', 'target'} batches",
+            ],
+            # Scored GIFT-only (sqrt(crps*mase)) against the fixed reference
+            # arch — same surface as ts_data_pipeline, so the miner runner is
+            # shared.
+            "objectives": [
+                {"name": "crps", "primary": True, "minimize": True},
+                {"name": "mase", "primary": True, "minimize": True},
+            ],
+            "time_budget": task.time_budget_seconds,
+            "runner_dir": "ts_data_pipeline",
+        }
     if isinstance(task, TSDataPipelineSpec):
         return {
             "name": task.name,
@@ -192,6 +217,10 @@ def _current_epoch(task, frozen_arch=None, frozen_pipeline=None) -> dict:
         epoch["frozen_arch_version"] = int(frozen_arch.version)
     if isinstance(task, TSForecastingSpec) and frozen_pipeline is not None:
         epoch["frozen_pipeline_version"] = int(frozen_pipeline.version)
+    # The synthetic_data_generator arch is fixed, so this is always 1 today —
+    # but pinning it future-proofs continuation against a model swap.
+    if isinstance(task, SyntheticDataGeneratorSpec):
+        epoch["synth_arch_version"] = int(REFERENCE_ARCH_VERSION)
     return epoch
 
 
@@ -213,7 +242,8 @@ def _build_challenge(round_id: int, store: LocalStore, task,
     prefer_buckets: set[str] | None = None
     parents_any: list[dict] = []
     if (continuation_enabled and scheduled_continuation
-            and not isinstance(task, TSDataPipelineSpec)):
+            and not isinstance(
+                task, (TSDataPipelineSpec, SyntheticDataGeneratorSpec))):
         parents_any = store.eligible_parents(
             task=task.name, min_flops=0, max_flops=10**18,
         )
@@ -227,10 +257,11 @@ def _build_challenge(round_id: int, store: LocalStore, task,
                         prefer_buckets.add(bname)
                         break
     name, lo, hi = _pick_bucket(round_id, task=task, prefer_buckets=prefer_buckets)
-    # The data-pipeline task uses a fixed frozen architecture, so its
-    # FLOPs are identical across miners in a round — size buckets are
-    # meaningless here. Zero the bounds so the harness skips the gate.
-    if isinstance(task, TSDataPipelineSpec):
+    # Pipeline-style tasks (ts_data_pipeline, synthetic_data_generator) train a
+    # fixed architecture, so FLOPs are identical across miners in a round —
+    # size buckets are meaningless. Zero the bounds so the harness skips the
+    # gate.
+    if isinstance(task, (TSDataPipelineSpec, SyntheticDataGeneratorSpec)):
         name, lo, hi = "frozen", 0, 0
     all_exps = store.recent_experiments(n=10_000)
     # Mixed-task DBs (e.g. ts_forecasting + ts_data_pipeline against the
@@ -309,6 +340,11 @@ def _build_challenge(round_id: int, store: LocalStore, task,
         "cognition_wiki_url": f"{services_url}/wiki",
         "allowed_urls": services_url,
     }
+    # synthetic_data_generator ships the FIXED reference arch as the same
+    # ``frozen_arch`` card ts_data_pipeline uses, so the miner-facing tools
+    # (frozen-arch card, pipeline probe) work unchanged.
+    if isinstance(task, SyntheticDataGeneratorSpec):
+        payload["frozen_arch"] = reference_arch().to_card()
     if frozen_arch is not None:
         payload["frozen_arch"] = {
             "version": frozen_arch.version,
@@ -847,7 +883,8 @@ def main(argv: list[str] | None = None) -> int:
                              "the agent at GET /wiki. Empty = no wiki.")
     parser.add_argument(
         "--task", default="synth_regression",
-        choices=["synth_regression", "ts_forecasting", "ts_data_pipeline"],
+        choices=["synth_regression", "ts_forecasting", "ts_data_pipeline",
+                 "synthetic_data_generator"],
         help="Which task this validator drives (single-task shorthand). "
              "Mutually exclusive with --tasks.",
     )
@@ -893,9 +930,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--continuation", default="auto",
                         choices=["auto", "on", "off"],
                         help="Allow continuation (warm-start) proposals. "
-                             "'auto' = on for ts_forecasting and "
-                             "ts_data_pipeline (both persist checkpoints), "
-                             "off for synth_regression.")
+                             "'auto' = on for ts_forecasting, ts_data_pipeline "
+                             "and synthetic_data_generator (all persist "
+                             "checkpoints), off for synth_regression.")
     parser.add_argument("--shards_per_round", type=int, default=0,
                         help="Pretrain shards assigned per run. 0 = all "
                              "(legacy; continuations then reuse shards). "
@@ -959,7 +996,8 @@ def main(argv: list[str] | None = None) -> int:
             spec.time_budget_seconds = args.training_seconds
         specs[name] = spec
     needs_ts_caches = any(
-        isinstance(specs[name], (TSForecastingSpec, TSDataPipelineSpec))
+        isinstance(specs[name], (TSForecastingSpec, TSDataPipelineSpec,
+                                 SyntheticDataGeneratorSpec))
         for name, _ in mixture
     )
     if needs_ts_caches and not _ensure_ts_caches():
@@ -1019,10 +1057,11 @@ def main(argv: list[str] | None = None) -> int:
     elif args.continuation == "off":
         continuation_enabled = False
     else:  # auto
-        # Both ts_forecasting and ts_data_pipeline persist checkpoints and
-        # support continuation; synthetic regression doesn't.
+        # ts_forecasting, ts_data_pipeline and synthetic_data_generator all
+        # persist checkpoints and support continuation; synth_regression doesn't.
         continuation_enabled = any(
-            isinstance(specs[name], (TSForecastingSpec, TSDataPipelineSpec))
+            isinstance(specs[name], (TSForecastingSpec, TSDataPipelineSpec,
+                                     SyntheticDataGeneratorSpec))
             for name, _ in mixture
         )
 

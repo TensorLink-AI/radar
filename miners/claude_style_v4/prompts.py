@@ -926,34 +926,66 @@ def build_pipeline_designer_system_prompt(
     param_str = ", ".join(tp.keys()) if tp else "**task_params"
     fa = challenge.get("frozen_arch") or {}
     fa_version = fa.get("version")
+    # synthetic_data_generator shares this designer flow but pins a FIXED
+    # ~10M arch and is scored GIFT-only (no AULC composite).
+    is_synth = (task.get("name") or "") == "synthetic_data_generator"
 
     parts: list[str] = []
-    parts.append(
-        "You are the **pipeline designer** for the `ts_data_pipeline` "
-        "task. The validator pairs every proposal with a *frozen* "
-        "time-series architecture and trains it from fresh weights on "
-        "the data your `build_pipeline` yields. Your job is to design "
-        "the data generator / augmentor that makes that fixed model "
-        "train faster AND generalize better.\n\n"
-        f"Frozen architecture is v{fa_version if fa_version is not None else '?'}; "
-        "it refreshes every 50 successful rounds. Pipelines that "
-        "over-fit to a single arch version silently degrade at the "
-        "cutover — design for the I/O contract, not for the source."
-    )
+    if is_synth:
+        parts.append(
+            "You are the **pipeline designer** for the "
+            "`synthetic_data_generator` task. The validator pairs every "
+            "proposal with a *fixed* ~10M-param Toto-style causal patch "
+            "decoder and trains it on the data your `build_pipeline` "
+            "yields. Your job is to design the data generator / augmentor "
+            "that makes that model generalize best on held-out GIFT-Eval.\n\n"
+            "The architecture NEVER changes (version is permanently v1), so "
+            "you may exploit its inductive bias (e.g. patch size) freely — "
+            "there is no refresh cutover to design around. On continuation "
+            "rounds the same model keeps training from a parent checkpoint, "
+            "so your data just has to keep moving GIFT-Eval down."
+        )
+    else:
+        parts.append(
+            "You are the **pipeline designer** for the `ts_data_pipeline` "
+            "task. The validator pairs every proposal with a *frozen* "
+            "time-series architecture and trains it from fresh weights on "
+            "the data your `build_pipeline` yields. Your job is to design "
+            "the data generator / augmentor that makes that fixed model "
+            "train faster AND generalize better.\n\n"
+            f"Frozen architecture is v{fa_version if fa_version is not None else '?'}; "
+            "it refreshes every 50 successful rounds. Pipelines that "
+            "over-fit to a single arch version silently degrade at the "
+            "cutover — design for the I/O contract, not for the source."
+        )
 
-    parts.append(
-        "## Scoring\n\n"
-        "`metric = sqrt(AULC × sqrt(crps · mase))` — lower is better.\n"
-        "- **AULC** = trapezoidal area under the in-training val-loss "
-        "curve, normalized per-step. Rewards *both* fast convergence "
-        "AND a low end-state.\n"
-        "- **GIFT-Eval** (crps + mase) is the held-out gate. Pipelines "
-        "that memorize leaderboard distributions lose here.\n"
-        "- AULC and gift_metric are stored separately in `objectives` "
-        "and segmented by `frozen_arch_version` on the dashboard, so "
-        "the trajectory and the generalization signal are visible "
-        "independently — optimize both."
-    )
+    if is_synth:
+        parts.append(
+            "## Scoring\n\n"
+            "`metric = sqrt(crps · mase)` — lower is better. GIFT-Eval only "
+            "(same as ts_forecasting); there is **no AULC term**.\n"
+            "- **crps + mase** come from the held-out GIFT-Eval leaderboard. "
+            "That is the *entire* score — optimize generalization, not the "
+            "training curve.\n"
+            "- The in-training val curve is diagnostics only (it picks the "
+            "best-val checkpoint); a fast-dropping curve earns you nothing "
+            "if GIFT-Eval doesn't move. Generators that memorize a single "
+            "mode train smoothly and then collapse on the gate."
+        )
+    else:
+        parts.append(
+            "## Scoring\n\n"
+            "`metric = sqrt(AULC × sqrt(crps · mase))` — lower is better.\n"
+            "- **AULC** = trapezoidal area under the in-training val-loss "
+            "curve, normalized per-step. Rewards *both* fast convergence "
+            "AND a low end-state.\n"
+            "- **GIFT-Eval** (crps + mase) is the held-out gate. Pipelines "
+            "that memorize leaderboard distributions lose here.\n"
+            "- AULC and gift_metric are stored separately in `objectives` "
+            "and segmented by `frozen_arch_version` on the dashboard, so "
+            "the trajectory and the generalization signal are visible "
+            "independently — optimize both."
+        )
 
     parts.append(
         "## Code contract\n\n"
@@ -987,8 +1019,10 @@ def build_pipeline_designer_system_prompt(
         "here; if you augment, augment the procedural stream.\n"
         "3. **Hybrid curricula.** Start with easy procedural (clean "
         "sinusoid) and ramp toward noisier mixtures as steps advance. "
-        "AULC directly rewards easy-early curricula — they drop val "
-        "loss faster, which dominates the trapezoidal area.\n"
+        + ("" if is_synth else
+           "AULC directly rewards easy-early curricula — they drop val "
+           "loss faster, which dominates the trapezoidal area.")
+        + "\n"
         "4. **Distribution mixers.** Sample a regime per batch from a "
         "small library so the frozen arch sees broader coverage than "
         "any single shard could give it (domain randomization)."
@@ -1008,8 +1042,10 @@ def build_pipeline_designer_system_prompt(
         "- `submit(code|candidate_id, name, motivation, note=...)` — "
         "stash early, ship in the last 5 minutes.\n"
         "- `list_frontier` / `get_frontier_member` — what already scored "
-        "well on this task. Look at `objectives.aulc` and "
-        "`objectives.gift_metric` to see WHY they're on the frontier.\n"
+        "well on this task. Look at "
+        + ("`objectives.crps` and `objectives.mase`" if is_synth else
+           "`objectives.aulc` and `objectives.gift_metric`")
+        + " to see WHY they're on the frontier.\n"
         "- `read_scratchpad` / `read_my_submissions` — cross-round "
         "memory. Read these FIRST so you don't re-run a dead end.\n"
         "- `write_scratchpad` — record what you tried and which axis "
@@ -1022,7 +1058,8 @@ def build_pipeline_designer_system_prompt(
         "against this or earlier frozen-arch versions.\n"
         "2. `read_frozen_arch` (card only; source only if necessary) + "
         "`list_frontier` → what's currently strong on the "
-        "(AULC, GIFT) plane.\n"
+        + ("(crps, mase)" if is_synth else "(AULC, GIFT)")
+        + " plane.\n"
         "3. Pick ONE design-space family. Write `build_pipeline`.\n"
         "4. `pipeline_smoke_test` until shapes are clean.\n"
         "5. `validate_code` → fix any structural error.\n"
@@ -1034,9 +1071,12 @@ def build_pipeline_designer_system_prompt(
 
     parts.append(
         "## Anti-patterns\n\n"
-        "- Hardcoding constants from a specific `frozen_arch_version` "
-        "into your generator. Refresh wipes that out.\n"
-        "- Generators that emit perfectly-clean signals. The arch "
+        + ("- Optimizing the in-training val curve instead of held-out "
+           "GIFT-Eval. A smooth, fast-dropping curve scores nothing here "
+           "— only crps/mase on the leaderboard counts.\n" if is_synth else
+           "- Hardcoding constants from a specific `frozen_arch_version` "
+           "into your generator. Refresh wipes that out.\n")
+        + "- Generators that emit perfectly-clean signals. The arch "
         "memorizes a single mode; GIFT-Eval gate then collapses.\n"
         "- Building an iterator that runs `for _ in range(N): yield` "
         "and exhausts. Yield indefinitely.\n"
@@ -1054,15 +1094,25 @@ def build_pipeline_designer_user_prompt(
     fa = challenge.get("frozen_arch") or {}
     task = challenge.get("task", {}) or {}
     tp = task.get("task_params", {}) or {}
+    task_name = task.get("name") or "ts_data_pipeline"
     parts: list[str] = []
-    parts.append(
-        f"Round task: `ts_data_pipeline`. Frozen arch is "
-        f"v{fa.get('version')} (source experiment "
-        f"#{fa.get('source_experiment_id')}, name "
-        f"{fa.get('source_name')!r}, metric={fa.get('source_metric')!r}, "
-        f"flops={fa.get('source_flops')!r}, "
-        f"code_bytes={len(fa.get('code') or '')})."
-    )
+    if (task.get("name") or "") == "synthetic_data_generator":
+        parts.append(
+            "Round task: `synthetic_data_generator`. The arch is the FIXED "
+            f"reference model v{fa.get('version')} (name "
+            f"{fa.get('source_name')!r}, code_bytes="
+            f"{len(fa.get('code') or '')}); it never changes. Scored "
+            "GIFT-only: `metric = sqrt(crps · mase)`."
+        )
+    else:
+        parts.append(
+            f"Round task: `{task_name}`. Frozen arch is "
+            f"v{fa.get('version')} (source experiment "
+            f"#{fa.get('source_experiment_id')}, name "
+            f"{fa.get('source_name')!r}, metric={fa.get('source_metric')!r}, "
+            f"flops={fa.get('source_flops')!r}, "
+            f"code_bytes={len(fa.get('code') or '')})."
+        )
     parts.append(
         "I/O contract — input `(B, "
         f"{tp.get('context_len')}, {tp.get('num_variates')})`, target "

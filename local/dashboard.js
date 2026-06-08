@@ -95,6 +95,7 @@ function kindBadge(e) {
 const TASK_LABELS = {
   ts_forecasting: { short: 'forecast', cls: 'badge-task-fc' },
   ts_data_pipeline: { short: 'pipeline', cls: 'badge-task-dp' },
+  synthetic_data_generator: { short: 'datagen', cls: 'badge-task-sdg' },
   synth_regression: { short: 'synth', cls: 'badge-task-synth' },
 };
 function taskBadge(e) {
@@ -1220,8 +1221,17 @@ function openLossModal(e) {
 // a forecasting experiment is promoted to an arch snapshot (◆ on the
 // divider) that pipeline runs train against. Solid edges = continuation
 // lineage; dashed = promote (forecast→arch) and train (arch→pipeline).
-const LIN_TASKS = ['ts_forecasting', 'ts_data_pipeline'];
-const LIN_COLORS = { ts_forecasting: '#7ec5e8', ts_data_pipeline: '#e8c47e' };
+const LIN_TASKS = ['ts_forecasting', 'ts_data_pipeline', 'synthetic_data_generator'];
+const LIN_COLORS = {
+  ts_forecasting: '#7ec5e8',
+  ts_data_pipeline: '#e8c47e',
+  synthetic_data_generator: '#8fd49a',
+};
+const LIN_LANE_LABELS = {
+  ts_forecasting: 'forecasting',
+  ts_data_pipeline: 'pipeline',
+  synthetic_data_generator: 'datagen (fixed arch)',
+};
 const LIN_ARCH_COLOR = '#a07cc7';
 const linState = {
   task: 'all', interactions: true, singletons: false, data: null, hits: [],
@@ -1290,35 +1300,51 @@ function layoutLineage(data, opts) {
     return { lane, pos, maxCol, rows: nextRow };
   }
 
-  const fc = layoutLane('ts_forecasting');
-  const dp = layoutLane('ts_data_pipeline');
-  const maxCol = Math.max(fc.maxCol, dp.maxCol, 0);
+  // Stack the present lanes top→bottom in fixed task order. In 'all' mode show
+  // every task that has nodes; a single-task filter shows just that lane.
+  const laneTasks = (opts.task === 'all' ? LIN_TASKS : [opts.task])
+    .filter(t => all.some(n => n.task === t));
+  const layouts = laneTasks.map(t => Object.assign({ task: t }, layoutLane(t)));
+  const maxCol = Math.max(0, ...layouts.map(l => l.maxCol));
   const width = Math.max(900, PAD_X * 2 + (maxCol + 1) * COL_W);
-  const fcTop = PAD_TOP;
-  const fcH = Math.max(1, fc.rows) * ROW_H;
-  const dividerY = fcTop + fcH + LANE_GAP / 2;
-  const dpTop = fcTop + fcH + LANE_GAP;
-  const dpH = Math.max(1, dp.rows) * ROW_H;
-  const height = dpTop + dpH + PAD_BOT;
 
   const xOf = c => PAD_X + c * COL_W + 14;
   const placed = {};
   const nodeDraws = [];
   const hits = [];
-  function placeLane(layout, top) {
+  const lanes = [];
+  const dividers = [];
+  // The frozen-arch promotion interaction lives on the divider between the
+  // forecasting and pipeline lanes; null when both aren't currently shown.
+  let archDividerY = null;
+  let y = PAD_TOP;
+  layouts.forEach((layout, i) => {
+    if (i > 0) {
+      const divY = y - LANE_GAP / 2;
+      dividers.push(divY);
+      if (layouts[i - 1].task === 'ts_forecasting'
+          && layout.task === 'ts_data_pipeline') archDividerY = divY;
+    }
+    const top = y;
+    lanes.push({
+      task: layout.task, top,
+      label: LIN_LANE_LABELS[layout.task] || layout.task,
+    });
     for (const n of layout.lane) {
       const p = layout.pos[n.id];
-      const x = xOf(p.col), y = top + p.row * ROW_H + 14;
-      placed[n.id] = { x, y };
+      const x = xOf(p.col), ny = top + p.row * ROW_H + 14;
+      placed[n.id] = { x, y: ny };
       nodeDraws.push({
-        node: n, x, y, color: LIN_COLORS[n.task] || '#9aa4b2',
+        node: n, x, y: ny, color: LIN_COLORS[n.task] || '#9aa4b2',
         cont: !!n.is_continuation, selected: n.id === state.selectedId,
       });
-      hits.push({ sx: x, sy: y, r: 8, kind: 'exp', node: n });
+      hits.push({ sx: x, sy: ny, r: 8, kind: 'exp', node: n });
     }
-  }
-  placeLane(fc, fcTop);
-  placeLane(dp, dpTop);
+    y = top + Math.max(1, layout.rows) * ROW_H + LANE_GAP;
+  });
+  // No lanes (no nodes in view) → keep a sane canvas so the empty-state
+  // message still renders rather than a 0/negative-height canvas.
+  const height = Math.max(PAD_TOP + ROW_H + PAD_BOT, (y - LANE_GAP) + PAD_BOT);
 
   const edgeDraws = [];
   for (const e of (data.edges || [])) {
@@ -1328,7 +1354,7 @@ function layoutLineage(data, opts) {
   }
 
   const archDraws = [];
-  if (opts.interactions) {
+  if (opts.interactions && archDividerY != null) {
     for (const a of (data.archs || [])) {
       const src = placed[a.source_experiment_id];
       const consumers = (data.edges || [])
@@ -1338,17 +1364,17 @@ function layoutLineage(data, opts) {
       const cAvg = consumers.length
         ? consumers.reduce((s, c) => s + c.x, 0) / consumers.length : null;
       const ax = (src && cAvg != null) ? (src.x + cAvg) / 2 : (src ? src.x : cAvg);
-      archDraws.push({ arch: a, x: ax, y: dividerY });
-      hits.push({ sx: ax, sy: dividerY, r: 8, kind: 'arch', node: a });
-      if (src) edgeDraws.push({ x1: src.x, y1: src.y, x2: ax, y2: dividerY, dashed: true, color: '#8a7ec0' });
+      archDraws.push({ arch: a, x: ax, y: archDividerY });
+      hits.push({ sx: ax, sy: archDividerY, r: 8, kind: 'arch', node: a });
+      if (src) edgeDraws.push({ x1: src.x, y1: src.y, x2: ax, y2: archDividerY, dashed: true, color: '#8a7ec0' });
       for (const c of consumers)
-        edgeDraws.push({ x1: ax, y1: dividerY, x2: c.x, y2: c.y, dashed: true, color: '#8a7ec0' });
+        edgeDraws.push({ x1: ax, y1: archDividerY, x2: c.x, y2: c.y, dashed: true, color: '#8a7ec0' });
     }
   }
 
   return {
-    width, height, nodeDraws, archDraws, edgeDraws, hits, dividerY,
-    fcTop, dpTop, nExp: nodeDraws.length, nArch: archDraws.length,
+    width, height, nodeDraws, archDraws, edgeDraws, hits,
+    lanes, dividers, nExp: nodeDraws.length, nArch: archDraws.length,
   };
 }
 
@@ -1383,10 +1409,13 @@ function drawLineage(canvas, L) {
   ctx.fillStyle = '#161820'; ctx.fillRect(0, 0, canvas.width, canvas.height);
   if (L.nExp === 0) { drawEmpty(ctx, canvas, 'no lineages to show'); return; }
   ctx.strokeStyle = '#252a36'; ctx.lineWidth = 1; ctx.setLineDash([]);
-  ctx.beginPath(); ctx.moveTo(0, L.dividerY); ctx.lineTo(canvas.width, L.dividerY); ctx.stroke();
+  for (const dy of (L.dividers || [])) {
+    ctx.beginPath(); ctx.moveTo(0, dy); ctx.lineTo(canvas.width, dy); ctx.stroke();
+  }
   ctx.fillStyle = '#5a6172'; ctx.font = '600 11px ui-monospace, monospace';
-  ctx.fillText('forecasting', 8, 13);
-  ctx.fillText('pipeline', 8, L.dpTop - 6);
+  for (const lane of (L.lanes || [])) {
+    ctx.fillText(lane.label, 8, Math.max(11, lane.top - 14));
+  }
   for (const e of L.edgeDraws) drawLinEdge(ctx, e);
   ctx.setLineDash([]);
   for (const d of L.nodeDraws) {
@@ -1424,7 +1453,9 @@ function renderLineage() {
 function buildLinChips() {
   const host = document.getElementById('linTaskChips');
   if (!host) return;
-  const opts = [['all', 'all'], ['ts_forecasting', 'forecasting'], ['ts_data_pipeline', 'pipeline']];
+  const opts = [['all', 'all'], ['ts_forecasting', 'forecasting'],
+                ['ts_data_pipeline', 'pipeline'],
+                ['synthetic_data_generator', 'datagen']];
   host.innerHTML = opts.map(([v, label]) =>
     `<button class="chip" data-lintask="${v}"`
     + (linState.task === v ? ' data-active="true"' : '') + '>'

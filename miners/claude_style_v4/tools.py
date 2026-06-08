@@ -1284,10 +1284,12 @@ def build_handlers(
         """ts_data_pipeline: exec + probe the miner's build_pipeline."""
         if not code or not code.strip():
             return "error: empty code"
-        if (challenge.get("task") or {}).get("name") != "ts_data_pipeline":
+        if (challenge.get("task") or {}).get("name") not in (
+            "ts_data_pipeline", "synthetic_data_generator",
+        ):
             return (
                 "error: pipeline_smoke_test is only valid on a "
-                "ts_data_pipeline round"
+                "ts_data_pipeline / synthetic_data_generator round"
             )
         result = smoke_test_pipeline(code, challenge)
         return json.dumps(result, indent=2, default=str)

@@ -62,10 +62,13 @@ def main(argv: list[str] | None = None) -> int:
                              "agent at GET /wiki.")
     parser.add_argument(
         "--task", default="synth_regression",
-        choices=["synth_regression", "ts_forecasting", "ts_data_pipeline"],
+        choices=["synth_regression", "ts_forecasting", "ts_data_pipeline",
+                 "synthetic_data_generator"],
         help="Task spec (synthetic regression, ts_forecasting with torch + "
-             "GIFT-Eval data, or ts_data_pipeline — data generators paired "
-             "with a frozen architecture). Mutually exclusive with --tasks.",
+             "GIFT-Eval data, ts_data_pipeline — data generators paired with "
+             "the evolving frozen arch, or synthetic_data_generator — data "
+             "generators paired with a FIXED 10M Toto-style decoder, scored "
+             "GIFT-only). Mutually exclusive with --tasks.",
     )
     parser.add_argument(
         "--tasks", default="",
