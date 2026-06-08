@@ -92,6 +92,42 @@ def compute_pareto(experiments: list[dict]) -> list[dict]:
     return front
 
 
+def compute_pareto_by_bucket(experiments: list[dict]) -> list[dict]:
+    """Per-bucket Pareto union across a (possibly mixed-task) list.
+
+    Each task uses its own size-bucket scheme; within every bucket the
+    non-dominated set on ``(metric, flops)`` is computed independently and
+    the results are unioned (an experiment near a tolerance boundary may
+    sit on two adjacent buckets' frontiers). Computing Pareto *per bucket*
+    — rather than once globally and then filtering by size gate — keeps the
+    strongest model in a large bucket on the frontier even when a cheaper,
+    lower-metric model in a smaller bucket would dominate it globally.
+    """
+    from local.task import SIZE_BUCKETS, buckets_for, make_spec
+
+    by_task: dict[Optional[str], list[dict]] = {}
+    for e in experiments:
+        by_task.setdefault(e.get("task"), []).append(e)
+
+    out: list[dict] = []
+    seen: set[int] = set()
+    for tname, group in by_task.items():
+        try:
+            buckets = buckets_for(make_spec(tname))
+        except ValueError:
+            buckets = SIZE_BUCKETS
+        for lo, hi in buckets.values():
+            members = [
+                e for e in group
+                if passes_size_gate(e.get("objectives", {}), lo, hi)
+            ]
+            for e in compute_pareto(members):
+                if id(e) not in seen:
+                    seen.add(id(e))
+                    out.append(e)
+    return out
+
+
 def score_round(
     proposals_with_metrics: list[dict],
     min_flops: int,

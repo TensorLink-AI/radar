@@ -28,7 +28,7 @@ import difflib
 from typing import Optional
 
 from local.continuation import continuation_frontier
-from local.scoring import compute_pareto
+from local.scoring import compute_pareto_by_bucket
 from local.store import LocalStore
 
 
@@ -41,7 +41,7 @@ def _filter_task(exps: list[dict], task: Optional[str]) -> list[dict]:
 def frontier(store: LocalStore, task: Optional[str] = None) -> dict:
     exps = _filter_task(store.recent_experiments(n=10_000), task)
     return {
-        "frontier": compute_pareto(exps),
+        "frontier": compute_pareto_by_bucket(exps),
         "continuation": continuation_frontier(exps),
     }
 
