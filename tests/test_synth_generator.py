@@ -35,9 +35,9 @@ def test_buckets_for_synth_matches_ts():
 
 def test_reference_arch_card_is_fixed():
     arch = reference_arch()
-    assert arch.version == REFERENCE_ARCH_VERSION == 1
+    assert arch.version == REFERENCE_ARCH_VERSION
     card = arch.to_card()
-    assert card["version"] == 1
+    assert card["version"] == REFERENCE_ARCH_VERSION
     assert card["fixed"] is True
     assert card["code"] == REFERENCE_ARCH_CODE
     assert "build_model" in card["code"]
@@ -85,7 +85,7 @@ def test_current_epoch_pins_synth_arch_version():
     from local.validator import _current_epoch
 
     sdg = make_spec("synthetic_data_generator")
-    assert _current_epoch(sdg) == {"synth_arch_version": 1}
+    assert _current_epoch(sdg) == {"synth_arch_version": REFERENCE_ARCH_VERSION}
 
 
 # ── reference model (torch-gated) ───────────────────────────────────
@@ -110,6 +110,75 @@ def test_reference_model_param_count_and_forward_shape():
     out = model(x)
     assert out.shape == (4, prediction_len, num_variates, len(quantiles))
     assert torch.isfinite(out).all()
+
+
+def _exec_arch():
+    ns: dict = {"__name__": "ref_arch"}
+    exec(REFERENCE_ARCH_CODE, ns)
+    return ns
+
+
+def test_reference_model_handles_missing_values():
+    torch = pytest.importorskip("torch")
+    ns = _exec_arch()
+    Q = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+    model = ns["build_model"](512, 96, 1, Q)
+    x = torch.randn(2, 512, 1)
+    x[:, :40, :] = float("nan")          # leading gap
+    x[0, 200:260, :] = float("nan")      # interior gap
+    out = model(x)
+    assert out.shape == (2, 96, 1, len(Q))
+    assert torch.isfinite(out).all()     # robust scaler + mask stay finite
+
+
+def test_reference_model_clamp_blocks_sinh_overflow():
+    torch = pytest.importorskip("torch")
+    ns = _exec_arch()
+    Q = (0.1, 0.5, 0.9)
+    model = ns["build_model"](64, 32, 1, Q)
+    with torch.no_grad():               # force absurd head outputs
+        model.out_head.weight.mul_(50.0)
+        model.out_head.bias.add_(25.0)
+    out = model(torch.randn(2, 64, 1))
+    assert torch.isfinite(out).all()
+
+
+def test_normuon_optimizer_trains():
+    torch = pytest.importorskip("torch")
+    ns = _exec_arch()
+    Q = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+    qs = torch.tensor(Q)
+
+    def pinball(pred, tgt):
+        e = tgt.unsqueeze(-1) - pred
+        return torch.max(qs * e, (qs - 1) * e).mean()
+
+    torch.manual_seed(0)
+    model = ns["build_model"](128, 32, 1, Q)
+    ns["init_weights"](model)
+    opt = ns["build_optimizer"](model)
+    assert type(opt).__name__ == "NorMuon"
+    sched = ns["build_scheduler"](opt, 200)
+    # A learnable target (deterministic function of the context) so a real
+    # optimizer must drive the loss down meaningfully.
+    ctx = torch.randn(8, 128, 1)
+    tgt = ctx[:, -32:, :] * 0.8 + 0.1
+    model.train()
+    first = None
+    for i in range(120):
+        opt.zero_grad()
+        loss = pinball(model(ctx), tgt)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        sched.step()
+        assert torch.isfinite(loss), f"NaN loss at step {i}"
+        if i == 0:
+            first = loss.item()
+    # A clear, machine-robust margin — proves NorMuon actually optimizes
+    # (a broken optimizer plateaus or diverges) without tuning to a seed.
+    assert loss.item() < first * 0.85
+    assert all(torch.isfinite(p).all() for p in model.parameters())
 
 
 def test_reference_model_hooks_present():

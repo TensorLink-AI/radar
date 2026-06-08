@@ -137,12 +137,19 @@ validator trains a model on it and scores on GIFT-Eval. Two deliberate
 differences from `ts_data_pipeline`:
 
 1. **The architecture is fixed.** Every round trains the *same*
-   miniature (~10M-param) Toto-2.0-style **causal patch decoder** —
-   contiguous channel-independent patching, learned patch+positional
-   embeddings, causal (decoder) transformer blocks, a quantile head off
-   the final patch token. It lives in `local/synthetic_arch.py` as
-   source *text* (`REFERENCE_ARCH_CODE`, version `1`, never refreshed)
-   so the validator stays numpy-only until a round actually runs. There
+   miniature (~10M-param) Toto-2.0-style **causal patch decoder**,
+   implementing the salient pieces of the real design: contiguous
+   channel-independent patching with an **arcsinh robust scaler**
+   (median/IQR) + **missing-value masking**, **residual-MLP patch
+   projections**, causal transformer blocks with **PerDimScale**
+   attention + μP-flavored init, **single-pass contiguous patch
+   masking** (learnable horizon-query tokens decode the forecast as
+   output patches in one pass), a quantile head, and a **NorMuon**
+   optimizer (Newton–Schulz-orthogonalized Muon + per-neuron RMS norm
+   for 2-D matrices; AdamW for the rest). It lives in
+   `local/synthetic_arch.py` as source *text* (`REFERENCE_ARCH_CODE`,
+   `REFERENCE_ARCH_VERSION`, never refreshed) so the validator stays
+   numpy-only until a round actually runs. There
    is no `FrozenArchStore` for this task — the arch never moves, so a
    continuation round is literally "keep training the same model's
    weights on (hopefully better) data" and warm-starts are always
