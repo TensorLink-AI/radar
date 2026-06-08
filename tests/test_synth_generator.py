@@ -121,3 +121,69 @@ def test_reference_model_hooks_present():
         assert callable(ns.get(hook)), hook
     cfg = ns["training_config"]()
     assert cfg["batch_size"] > 0
+
+
+# ── dashboard surfacing ─────────────────────────────────────────────
+
+
+def _add_sdg_exp(store, *, name, crps, mase, metric, parent_index=None,
+                 mode="new", n_rounds=1, cumc=0.0):
+    return store.add_experiment(
+        round_id=0, miner_id="m", name=name, code="c", motivation="",
+        reasoning="", tool_calls=[], metric=metric, success=True,
+        objectives={
+            "flops_equivalent_size": 9_800_000, "num_params": 9_817_824,
+            "crps": crps, "mase": mase, "synth_arch_version": 1,
+            "cumulative_compute": cumc,
+        },
+        score=0.0, loss_curve=[], task="synthetic_data_generator",
+        parent_index=parent_index, mode=mode, n_rounds=n_rounds,
+        cumulative_compute=cumc,
+    )
+
+
+def test_dashboard_crps_mase_frontier_includes_synth(tmp_path):
+    import sqlite3
+
+    from local.dashboard import _frontier_crps_mase
+    from local.store import LocalStore
+
+    db_path = tmp_path / "t.db"
+    store = LocalStore(str(db_path))
+    _add_sdg_exp(store, name="sdg_a", crps=0.4, mase=0.6, metric=0.49)
+    store.close()
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        front = _frontier_crps_mase(conn)
+    finally:
+        conn.close()
+    assert "sdg_a" in {p["name"] for p in front}
+
+
+def test_dashboard_lineage_includes_synth_continuation(tmp_path):
+    import sqlite3
+
+    from local.dashboard import _lineage
+    from local.store import LocalStore
+
+    db_path = tmp_path / "t.db"
+    store = LocalStore(str(db_path))
+    root = _add_sdg_exp(store, name="sdg_root", crps=0.5, mase=0.7, metric=0.59)
+    _add_sdg_exp(store, name="sdg_child", crps=0.4, mase=0.6, metric=0.49,
+                 parent_index=root, mode="continue", n_rounds=2, cumc=1e9)
+    store.close()
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        lin = _lineage(conn, "")
+    finally:
+        conn.close()
+    tasks = {n["task"] for n in lin["nodes"]}
+    assert "synthetic_data_generator" in tasks
+    # The continuation chain produces a within-task lineage edge.
+    assert any(
+        e["kind"] == "lineage" and e["from"] == root for e in lin["edges"]
+    )

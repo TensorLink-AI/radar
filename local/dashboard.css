@@ -334,6 +334,10 @@ canvas { background: var(--bg-2); border-radius: var(--radius-sm); display: bloc
   color: #e8c47e; background: rgba(232, 196, 126, 0.14);
   border-color: rgba(232, 196, 126, 0.34);
 }
+.badge-task-sdg {
+  color: #8fd49a; background: rgba(143, 212, 154, 0.14);
+  border-color: rgba(143, 212, 154, 0.34);
+}
 .badge-task-synth {
   color: #9aa4b2; background: rgba(154, 164, 178, 0.14);
   border-color: rgba(154, 164, 178, 0.32);
@@ -354,6 +358,7 @@ canvas { background: var(--bg-2); border-radius: var(--radius-sm); display: bloc
 }
 .lin-key.lin-fc { background: #7ec5e8; }
 .lin-key.lin-dp { background: #e8c47e; }
+.lin-key.lin-sdg { background: #8fd49a; }
 .lin-edge { display: inline-block; width: 20px; height: 0; }
 .lin-edge-line { border-top: 2px solid #5a6172; }
 .lin-edge-dash { border-top: 2px dashed #8a7ec0; }
