@@ -93,14 +93,32 @@ class TSDataPipelineSpec:
     time_budget_seconds: int = 1800
 
 
+@dataclass
+class SyntheticDataGeneratorSpec:
+    """Miners design synthetic data generators (``build_pipeline``) that train
+    a **fixed** ~10M Toto-2.0-style causal patch decoder (see
+    ``local/synthetic_arch.py`` — never refreshed, unlike ts_data_pipeline's
+    frozen arch). Scored GIFT-only (``sqrt(crps*mase)``) like ts_forecasting.
+    Continuation just keeps training the same model's weights on new data.
+    """
+    name: str = "synthetic_data_generator"
+    context_len: int = TS_CONTEXT_LEN
+    prediction_len: int = TS_PREDICTION_LEN
+    num_variates: int = TS_NUM_VARIATES
+    quantiles: tuple[float, ...] = TS_QUANTILES
+    time_budget_seconds: int = 1800
+
+
 def make_spec(name: str):
-    """Return a TaskSpec / TSForecastingSpec / TSDataPipelineSpec by short name."""
+    """Return a task spec dataclass by short name."""
     if name in (None, "", "synth_regression"):
         return TaskSpec()
     if name == "ts_forecasting":
         return TSForecastingSpec()
     if name == "ts_data_pipeline":
         return TSDataPipelineSpec()
+    if name == "synthetic_data_generator":
+        return SyntheticDataGeneratorSpec()
     raise ValueError(f"unknown task: {name!r}")
 
 
@@ -130,7 +148,9 @@ TS_SIZE_BUCKETS: dict[str, tuple[int, int]] = {
 
 def buckets_for(task) -> dict[str, tuple[int, int]]:
     """Return the bucket dict appropriate for ``task``."""
-    if isinstance(task, (TSForecastingSpec, TSDataPipelineSpec)):
+    if isinstance(
+        task, (TSForecastingSpec, TSDataPipelineSpec, SyntheticDataGeneratorSpec)
+    ):
         return TS_SIZE_BUCKETS
     return SIZE_BUCKETS
 

@@ -558,7 +558,9 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     surface is entirely different.
     """
     task_name = (challenge.get("task") or {}).get("name") or ""
-    if task_name == "ts_data_pipeline":
+    # synthetic_data_generator shares ts_data_pipeline's build_pipeline surface
+    # (only the validator-side arch + scoring differ), so it uses the same flow.
+    if task_name in ("ts_data_pipeline", "synthetic_data_generator"):
         return _design_data_pipeline(challenge, gated_client)
 
     t_start = time.monotonic()

@@ -127,6 +127,42 @@ and a `continuation` block on `/frontier`. Full write-up in
 `docs/continuation_training.md`. Code: `local/continuation.py`,
 `local/shards.py`, `local/checkpoints.py`.
 
+## synthetic_data_generator task
+
+`local/run.py --task synthetic_data_generator` (and `--task` on the
+validator) is a sibling of `ts_data_pipeline`: miners design a synthetic
+data generator (`build_pipeline(context_len, prediction_len,
+num_variates, quantiles)` yielding `{input, target}` batches), the
+validator trains a model on it and scores on GIFT-Eval. Two deliberate
+differences from `ts_data_pipeline`:
+
+1. **The architecture is fixed.** Every round trains the *same*
+   miniature (~10M-param) Toto-2.0-style **causal patch decoder** —
+   contiguous channel-independent patching, learned patch+positional
+   embeddings, causal (decoder) transformer blocks, a quantile head off
+   the final patch token. It lives in `local/synthetic_arch.py` as
+   source *text* (`REFERENCE_ARCH_CODE`, version `1`, never refreshed)
+   so the validator stays numpy-only until a round actually runs. There
+   is no `FrozenArchStore` for this task — the arch never moves, so a
+   continuation round is literally "keep training the same model's
+   weights on (hopefully better) data" and warm-starts are always
+   shape-compatible. The fixed arch rides on the challenge as the same
+   `frozen_arch` card `ts_data_pipeline` uses, so the miner-facing
+   pipeline tools work unchanged.
+2. **Scoring is GIFT-only**, exactly like `ts_forecasting`:
+   `metric = sqrt(crps * mase)` (lower=better). No AULC composite — the
+   in-training val curve is diagnostics only (and best-val checkpoint
+   selection), so a sparse val curve is not fatal here. **No fallback**:
+   missing checkpoint / GIFT cache / non-finite metrics ⇒ failure.
+
+`objectives` stamps `synth_arch_version` (gates continuation lineages
+against a future model swap). Continuation uses the standard second
+frontier (`cumulative_compute` vs GIFT Δ). Needs the same caches as
+`ts_forecasting` (`RADAR_GIFT_EVAL_CACHE` + pretrain val shard) and the
+`[ts_forecasting]` extra. Code: `local/synth_generator.py`
+(`run_synth_generator_training`), `local/synthetic_arch.py`; dispatch in
+`local/trainer.py`; wiring in `local/task.py` + `local/validator.py`.
+
 ## Key files
 
 | File | Purpose |

@@ -42,7 +42,7 @@ import numpy as np
 from local.task import (
     MAX_EPOCHS, MAX_HIDDEN_LAYERS, MAX_HIDDEN_WIDTH,
     INPUT_DIM, OUTPUT_DIM, estimate_flops_equivalent, make_dataset,
-    TSForecastingSpec, TSDataPipelineSpec,
+    TSForecastingSpec, TSDataPipelineSpec, SyntheticDataGeneratorSpec,
 )
 
 logger = logging.getLogger(__name__)
@@ -193,6 +193,14 @@ def run_training(
             compute_offset=compute_offset,
             step_offset=step_offset,
             baseline_aulc=getattr(frozen_arch, "baseline_aulc", None),
+        )
+    if isinstance(task, SyntheticDataGeneratorSpec):
+        from local.synth_generator import run_synth_generator_training
+        return run_synth_generator_training(
+            code, seed=seed, task=task,
+            min_flops=min_flops, max_flops=max_flops,
+            parent_checkpoint_path=parent_checkpoint_path,
+            compute_offset=compute_offset, step_offset=step_offset,
         )
     if isinstance(task, TSForecastingSpec):
         return _run_ts_forecasting(
