@@ -172,6 +172,30 @@ def test_reference_pipeline_executes_and_yields_correct_shape():
     assert torch.equal(batch["target"], batch2["target"])
 
 
+@pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+def test_validating_batch_iter_rejects_non_finite(bad):
+    """Non-finite miner batches (e.g. float32-overflow from a heavy-tailed
+    generator) must fail the run with an attributable error rather than
+    silently poisoning training."""
+    torch = pytest.importorskip("torch")
+    from local.data_pipeline import _ValidatingBatchIter
+
+    constants = {
+        "context_len": 8, "prediction_len": 4,
+        "num_variates": 1, "quantiles": (0.5,),
+    }
+
+    def gen():
+        inp = torch.zeros(2, 8, 1)
+        tgt = torch.zeros(2, 4, 1)
+        inp[0, 0, 0] = bad
+        yield {"input": inp, "target": tgt}
+
+    it = _ValidatingBatchIter(gen(), constants, batch_size=2)
+    with pytest.raises(ValueError, match="non-finite"):
+        next(it)
+
+
 def test_frozen_arch_bootstraps_from_ts_forecasting(tmp_path):
     db = LocalStore(str(tmp_path / "test.db"))
     db.add_experiment(
