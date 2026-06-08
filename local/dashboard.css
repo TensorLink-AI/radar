@@ -83,6 +83,7 @@ body {
 section[data-tab] { display: none; }
 body[data-active-tab="architecture"] section[data-tab="architecture"],
 body[data-active-tab="data_pipeline"] section[data-tab="data_pipeline"],
+body[data-active-tab="synth"] section[data-tab="synth"],
 body[data-active-tab="lineage"] section[data-tab="lineage"],
 body[data-active-tab="service_log"] section[data-tab="service_log"],
 body[data-active-tab="checkpoints"] section[data-tab="checkpoints"] {

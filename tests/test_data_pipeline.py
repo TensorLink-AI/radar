@@ -16,7 +16,9 @@ from local.data_pipeline import (
     REFERENCE_PIPELINE_CODE, _compute_aulc, _exec_pipeline_submission,
     ensure_baseline_aulc,
 )
-from local.dashboard import _data_pipeline_frontier, _frozen_archs
+from local.dashboard import (
+    _data_pipeline_frontier, _frozen_archs, _synth_frontier,
+)
 from local.frozen_arch import FrozenArchStore, maybe_refresh
 from local.scoring import passes_size_gate
 from local.store import LocalStore
@@ -289,6 +291,51 @@ def test_data_pipeline_frontier_filters_by_task(tmp_path):
     assert len(result["frontier"]) == 1
     assert result["frontier"][0]["name"] == "dp_b"
     assert result["versions"] == [1]
+
+
+def test_synth_frontier_filters_by_task_and_lists_versions(tmp_path):
+    db_path = tmp_path / "test.db"
+    db = LocalStore(str(db_path))
+    # ts_forecasting row shares crps/mase but must be excluded from the
+    # synth-only frontier.
+    db.add_experiment(
+        round_id=0, miner_id="m0", name="ts_a", code="",
+        motivation="", reasoning="", tool_calls=[],
+        metric=0.5, success=True,
+        objectives={"crps": 0.3, "mase": 0.7},
+        score=0.8, loss_curve=[], analysis="",
+        task="ts_forecasting",
+    )
+    # Two synth rows; sdg_b dominates sdg_a on both axes.
+    db.add_experiment(
+        round_id=1, miner_id="m1", name="sdg_a", code="",
+        motivation="", reasoning="", tool_calls=[],
+        metric=0.45, success=True,
+        objectives={"crps": 0.4, "mase": 0.6, "synth_arch_version": 2},
+        score=0.7, loss_curve=[], analysis="",
+        task="synthetic_data_generator",
+    )
+    db.add_experiment(
+        round_id=2, miner_id="m2", name="sdg_b", code="",
+        motivation="", reasoning="", tool_calls=[],
+        metric=0.35, success=True,
+        objectives={"crps": 0.3, "mase": 0.5, "synth_arch_version": 2},
+        score=0.9, loss_curve=[], analysis="",
+        task="synthetic_data_generator",
+    )
+    db.close()
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        result = _synth_frontier(conn)
+    finally:
+        conn.close()
+    names = {p["name"] for p in result["all"]}
+    assert names == {"sdg_a", "sdg_b"}  # ts_forecasting row excluded
+    assert len(result["frontier"]) == 1
+    assert result["frontier"][0]["name"] == "sdg_b"
+    assert result["versions"] == [2]
 
 
 def test_frozen_archs_endpoint_lists_versions(tmp_path):

@@ -15,6 +15,9 @@
     <button class="tab" role="tab" data-tab="data_pipeline" aria-selected="false">
       Data pipeline
     </button>
+    <button class="tab" role="tab" data-tab="synth" aria-selected="false">
+      Datagen
+    </button>
     <button class="tab" role="tab" data-tab="lineage" aria-selected="false">
       Lineage
     </button>
@@ -171,6 +174,48 @@
   <th class="num" data-key="metric" data-type="num">metric</th>
   <th data-key="success">ok</th>
 </tr></thead><tbody id="recentDP"></tbody></table></div>
+
+</section>
+
+<!-- ─── Synthetic-data-generator tab ───────────────────────────── -->
+<section data-tab="synth">
+
+<h2>Datagen frontier (crps × mase) <span class="muted" id="sdg-count"></span>
+  <span class="muted">synthetic_data_generator · fixed arch <span id="sdg-archv"></span>
+    · novel ● · continuation ▲</span>
+  <button class="chart-expand" data-chart="paretoSDG" title="enlarge">⤢</button>
+  <input class="tbl-search" data-table="synthFrontier" placeholder="filter…">
+</h2>
+<div class="chart-host"><canvas id="paretoSDG" width="900" height="320"></canvas></div>
+<div class="table-wrap"><table data-table="synthFrontier"><thead><tr>
+  <th data-key="id" data-type="num">id</th>
+  <th data-key="round_id" data-type="num">round</th>
+  <th data-key="miner_id">miner</th>
+  <th data-key="name">name</th>
+  <th class="num" data-key="objectives.synth_arch_version" data-type="num">arch v</th>
+  <th data-key="is_continuation">kind</th>
+  <th class="num" data-key="objectives.crps" data-type="num">crps</th>
+  <th class="num" data-key="objectives.mase" data-type="num">mase</th>
+  <th class="num" data-key="objectives.flops_equivalent_size" data-type="num">flops</th>
+  <th class="num" data-key="metric" data-type="num">metric</th>
+  <th class="num" data-key="score" data-type="num">score</th>
+</tr></thead><tbody id="synthFrontier"></tbody></table></div>
+
+<h2>Recent datagen runs
+  <input class="tbl-search" data-table="recentSDG" placeholder="filter…">
+</h2>
+<div class="table-wrap"><table data-table="recentSDG"><thead><tr>
+  <th data-key="id" data-type="num">id</th>
+  <th data-key="round_id" data-type="num">round</th>
+  <th data-key="miner_id">miner</th>
+  <th data-key="name">name</th>
+  <th class="num" data-key="objectives.synth_arch_version" data-type="num">arch v</th>
+  <th data-key="is_continuation">kind</th>
+  <th class="num" data-key="objectives.crps" data-type="num">crps</th>
+  <th class="num" data-key="objectives.mase" data-type="num">mase</th>
+  <th class="num" data-key="metric" data-type="num">metric</th>
+  <th data-key="success">ok</th>
+</tr></thead><tbody id="recentSDG"></tbody></table></div>
 
 </section>
 
