@@ -15,6 +15,7 @@ from local.checkpoints import CheckpointStore, read_signature
 from local.continuation import (
     continuation_frontier,
     is_continuation,
+    is_extend_round,
     prepare_continuation,
     score_continuation,
 )
@@ -309,6 +310,64 @@ def test_prepare_continuation_force_assigns_parent(store, tmp_path):
     assert prep["parent_index"] in {e1, e2}
     assert prep["parent_checkpoint_path"] is not None
     assert "auto-assigned" in prep["note"]
+
+
+# ── extend vs modify split ───────────────────────────────────────────
+
+def test_is_extend_round_bounds_and_split():
+    # Degenerate rates short-circuit.
+    assert all(not is_extend_round(r, 0.0) for r in range(50))
+    assert all(is_extend_round(r, 1.0) for r in range(50))
+    # Deterministic per round_id.
+    assert is_extend_round(7, 0.5) == is_extend_round(7, 0.5)
+    # ~half over many rounds at 0.5.
+    hits = sum(is_extend_round(r, 0.5) for r in range(2000))
+    assert 850 < hits < 1150
+    # Independent namespace from the new-vs-continuation schedule.
+    from local.continuation import is_continuation_round
+    same = sum(
+        is_extend_round(r, 0.5) == is_continuation_round(r, 1000)
+        for r in range(2000)
+    )
+    assert 850 < same < 1150  # uncorrelated → ~half agree by chance
+
+
+def _add_with_ckpt(store, cs, tmp_path, **kw):
+    src = tmp_path / "m.safetensors"
+    if not src.exists():
+        src.write_bytes(b"w")
+    eid = _add(store, **kw)
+    cs.save(eid, src)
+    store.set_checkpoint_ref(eid, f"ckpt:{eid}")
+    return eid
+
+
+def test_prepare_continuation_extend_reuses_parent_code(store, tmp_path):
+    cs = CheckpointStore(base_dir=tmp_path / "ck")
+    e1 = _add_with_ckpt(store, cs, tmp_path, metric=1.0, cumc=5.0,
+                        task="synthetic_data_generator")
+    prep = prepare_continuation(
+        store, cs, payload={"mode": "continue", "parent_index": e1},
+        task_name="synthetic_data_generator", min_flops=0, max_flops=0,
+        pool=[], shards_per_round=0, seed=1, extend=True,
+    )
+    assert prep["mode"] == "continue"
+    assert prep["continuation_kind"] == "extend"
+    # Trains on the parent's own generator code, not the miner's submission.
+    assert prep["train_code"] == "c"
+
+
+def test_prepare_continuation_modify_ignores_parent_code(store, tmp_path):
+    cs = CheckpointStore(base_dir=tmp_path / "ck")
+    e1 = _add_with_ckpt(store, cs, tmp_path, metric=1.0, cumc=5.0,
+                        task="synthetic_data_generator")
+    prep = prepare_continuation(
+        store, cs, payload={"mode": "continue", "parent_index": e1},
+        task_name="synthetic_data_generator", min_flops=0, max_flops=0,
+        pool=[], shards_per_round=0, seed=1, extend=False,
+    )
+    assert prep["continuation_kind"] == "modify"
+    assert prep["train_code"] is None
 
 
 def test_prepare_continuation_force_falls_back_when_miner_picks_bad_parent(

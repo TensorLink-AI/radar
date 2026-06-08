@@ -81,6 +81,55 @@ def test_build_challenge_injects_fixed_reference_arch(tmp_path):
     assert challenge["max_flops_equivalent"] == 0
 
 
+def test_build_challenge_stamps_extend_vs_modify_kind(tmp_path):
+    from local.store import LocalStore
+    from local.validator import _build_challenge
+
+    store = LocalStore(str(tmp_path / "t.db"))
+    try:
+        # An eligible parent (success + checkpoint + matching synth_arch epoch)
+        # makes the scheduled continuation actually fire.
+        pid = _add_sdg_exp(store, name="p", crps=0.4, mase=0.6, metric=0.49)
+        store.set_checkpoint_ref(pid, f"ckpt:{pid}")
+
+        spec = make_spec("synthetic_data_generator")
+        extend = _build_challenge(
+            1, store, spec, services_url="http://127.0.0.1:0",
+            continuation_enabled=True, scheduled_continuation=True,
+            scheduled_extend=True,
+        )
+        modify = _build_challenge(
+            1, store, spec, services_url="http://127.0.0.1:0",
+            continuation_enabled=True, scheduled_continuation=True,
+            scheduled_extend=False,
+        )
+    finally:
+        store.close()
+    assert extend["round_type"] == "continuation"
+    assert extend["continuation_kind"] == "extend"
+    assert modify["continuation_kind"] == "modify"
+
+
+def test_build_challenge_kind_blank_when_no_parents(tmp_path):
+    from local.store import LocalStore
+    from local.validator import _build_challenge
+
+    store = LocalStore(str(tmp_path / "t.db"))
+    try:
+        # No eligible parents → scheduled continuation downgrades to "new",
+        # so there is no extend/modify kind to stamp.
+        ch = _build_challenge(
+            1, store, make_spec("synthetic_data_generator"),
+            services_url="http://127.0.0.1:0",
+            continuation_enabled=True, scheduled_continuation=True,
+            scheduled_extend=True,
+        )
+    finally:
+        store.close()
+    assert ch["round_type"] == "new"
+    assert ch["continuation_kind"] == ""
+
+
 def test_current_epoch_pins_synth_arch_version():
     from local.validator import _current_epoch
 
