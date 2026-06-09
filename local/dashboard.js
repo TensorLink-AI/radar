@@ -15,7 +15,7 @@ const esc = s => String(s == null ? '' : s).replace(/[&<>]/g,
 async function get(p) { const r = await fetch(p); return r.json(); }
 
 const TAB_KEY = 'radar.activeTab';
-const VALID_TABS = ['architecture', 'data_pipeline', 'lineage', 'service_log', 'checkpoints'];
+const VALID_TABS = ['architecture', 'data_pipeline', 'synth', 'lineage', 'service_log', 'checkpoints'];
 
 const state = {
   selectedId: null,
@@ -76,6 +76,8 @@ function expTooltip(e) {
     rows.push(['gift', fmt(obj(e, 'gift_metric'))]);
   if (obj(e, 'frozen_arch_version') !== null)
     rows.push(['arch v', `v${obj(e, 'frozen_arch_version')}`]);
+  if (obj(e, 'synth_arch_version') !== null)
+    rows.push(['arch v', `v${obj(e, 'synth_arch_version')}`]);
   if (obj(e, 'crps') !== null) rows.push(['crps', fmt(obj(e, 'crps'))]);
   if (obj(e, 'mase') !== null) rows.push(['mase', fmt(obj(e, 'mase'))]);
   if (obj(e, 'flops_equivalent_size') !== null)
@@ -206,6 +208,43 @@ function recentDPRow(e) {
     + `<td class="num">${fmtInt(obj(e, 'frozen_arch_version'))}</td>`
     + `<td class="num">${fmt(obj(e, 'aulc'))}</td>`
     + `<td class="num">${fmt(obj(e, 'gift_metric'))}</td>`
+    + `<td class="metric">${fmt(e.metric)}</td>`
+    + (e.success ? `<td class="ok">ok</td>` : `<td class="fail">fail</td>`);
+  return tr;
+}
+
+// synthetic_data_generator tab. Same GIFT-only crps×mase scoring as
+// ts_forecasting, but the arch is fixed — so the per-row version of
+// interest is synth_arch_version (continuation lineages pin to it), not a
+// frozen_arch_version.
+function synthFrontierRow(e) {
+  const tr = document.createElement('tr');
+  tr.className = 'row' + (e.id === state.selectedId ? ' selected' : '');
+  tr.dataset.expId = e.id;
+  tr.onclick = () => showDetail(e.id);
+  tr.innerHTML = `<td>${e.id}</td><td>${e.round_id}</td>`
+    + `<td>${esc(e.miner_id)}</td><td>${esc(e.name)}</td>`
+    + `<td class="num">${fmtInt(obj(e, 'synth_arch_version'))}</td>`
+    + `<td>${kindBadge(e)}</td>`
+    + `<td class="num">${fmt(obj(e, 'crps'))}</td>`
+    + `<td class="num">${fmt(obj(e, 'mase'))}</td>`
+    + `<td class="num">${fmtInt(obj(e, 'flops_equivalent_size'))}</td>`
+    + `<td class="metric">${fmt(e.metric)}</td>`
+    + `<td class="score">${fmt(e.score, 3)}</td>`;
+  return tr;
+}
+
+function recentSDGRow(e) {
+  const tr = document.createElement('tr');
+  tr.className = 'row' + (e.id === state.selectedId ? ' selected' : '');
+  tr.dataset.expId = e.id;
+  tr.onclick = () => showDetail(e.id);
+  tr.innerHTML = `<td>${e.id}</td><td>${e.round_id}</td>`
+    + `<td>${esc(e.miner_id)}</td><td>${esc(e.name)}</td>`
+    + `<td class="num">${fmtInt(obj(e, 'synth_arch_version'))}</td>`
+    + `<td>${kindBadge(e)}</td>`
+    + `<td class="num">${fmt(obj(e, 'crps'))}</td>`
+    + `<td class="num">${fmt(obj(e, 'mase'))}</td>`
     + `<td class="metric">${fmt(e.metric)}</td>`
     + (e.success ? `<td class="ok">ok</td>` : `<td class="fail">fail</td>`);
   return tr;
@@ -1505,15 +1544,16 @@ function setupLineage() {
 // ── Refresh loop ───────────────────────────────────────────
 async function refresh() {
   try {
-    const [stats, lb, fr, frCM, cont, dp, archs, recent] = await Promise.all([
+    const [stats, lb, fr, frCM, cont, dp, archs, recent, synth] = await Promise.all([
       get('/api/stats'), get('/api/leaderboard?n=20'),
       get('/api/frontier'), get('/api/frontier_crps_mase'),
       get('/api/continuation_frontier'),
       get('/api/data_pipeline_frontier'),
       get('/api/frozen_archs'),
       get('/api/recent?n=30'),
+      get('/api/synth_frontier'),
     ]);
-    state.lastData = { stats, lb, fr, frCM, cont, dp, archs, recent };
+    state.lastData = { stats, lb, fr, frCM, cont, dp, archs, recent, synth };
     redraw(state.lastData);
     document.getElementById('refresh').textContent =
       'refreshed ' + new Date().toLocaleTimeString();
@@ -1521,7 +1561,7 @@ async function refresh() {
     document.getElementById('refresh').textContent = 'error: ' + e;
   }
 }
-function redraw({ stats, lb, fr, frCM, cont, dp, archs, recent }) {
+function redraw({ stats, lb, fr, frCM, cont, dp, archs, recent, synth }) {
   // novel/cont split surfaces continuation activity at a glance —
   // raw count + how many of them actually succeeded.
   const novelLine = `${fmtInt(stats.n_novel_successful)} / ${fmtInt(stats.n_novel)}`;
@@ -1558,6 +1598,13 @@ function redraw({ stats, lb, fr, frCM, cont, dp, archs, recent }) {
   tableRaw.recentDP     = (recent || []).filter(
     e => e.task === 'ts_data_pipeline',
   );
+  // synthetic_data_generator tab: its own crps×mase frontier + recent runs.
+  const synthAll        = (synth && synth.all) || [];
+  const synthFront      = (synth && synth.frontier) || [];
+  tableRaw.synthFrontier = synthFront;
+  tableRaw.recentSDG    = (recent || []).filter(
+    e => e.task === 'synthetic_data_generator',
+  );
   renderTable('leaderboard');
   renderTable('frontier');
   renderTable('frontierCM');
@@ -1566,6 +1613,8 @@ function redraw({ stats, lb, fr, frCM, cont, dp, archs, recent }) {
   renderTable('frozenArchs');
   renderTable('recent');
   renderTable('recentDP');
+  renderTable('synthFrontier');
+  renderTable('recentSDG');
   document.getElementById('lb-count').textContent = ` (${lb.length})`;
   document.getElementById('cm-count').textContent = ` (${frCM.length})`;
   const cAll = (cont && cont.all) || [];
@@ -1578,6 +1627,14 @@ function redraw({ stats, lb, fr, frCM, cont, dp, archs, recent }) {
     ` (${dpFront.length} on front / ${dpAll.length} total)`;
   document.getElementById('fa-count').textContent =
     ` (${(archs || []).length})`;
+  const sdgCount = document.getElementById('sdg-count');
+  if (sdgCount) sdgCount.textContent =
+    ` (${synthFront.length} on front / ${synthAll.length} total)`;
+  const sdgArchv = document.getElementById('sdg-archv');
+  if (sdgArchv) {
+    const vs = ((synth && synth.versions) || []).filter(v => v);
+    sdgArchv.textContent = vs.length ? 'v' + vs.join('/') : '';
+  }
 
   // Charts share the combined point set so off-frontier points are
   // still hover/click-able.
@@ -1585,10 +1642,12 @@ function redraw({ stats, lb, fr, frCM, cont, dp, archs, recent }) {
   charts.paretoCM.getArgs = () => [frCM, lb.concat(recent)];
   charts.paretoCont.getArgs = () => [cFront, cAll];
   charts.paretoDP.getArgs = () => [dpFront, dpAll];
+  charts.paretoSDG.getArgs = () => [synthFront, synthAll];
   renderChart('pareto');
   renderChart('paretoCM');
   renderChart('paretoCont');
   renderChart('paretoDP');
+  renderChart('paretoSDG');
 }
 
 // ── Boot ───────────────────────────────────────────────────
@@ -1599,8 +1658,10 @@ for (const [id, m] of Object.entries({
   continuation: { rowFn: contRow,         rank: false },
   dataPipeline: { rowFn: dpRow,           rank: false },
   frozenArchs:  { rowFn: frozenArchRow,   rank: false },
+  synthFrontier:{ rowFn: synthFrontierRow,rank: false },
   recent:       { rowFn: recentRow,       rank: false },
   recentDP:     { rowFn: recentDPRow,     rank: false },
+  recentSDG:    { rowFn: recentSDGRow,    rank: false },
   events:       { rowFn: eventRow,        rank: false },
   checkpoints:  { rowFn: ckRow,           rank: false },
 })) {
@@ -1654,6 +1715,7 @@ registerChart('pareto', drawPareto, () => null);
 registerChart('paretoCM', drawParetoCM, () => null);
 registerChart('paretoCont', drawParetoCont, () => null);
 registerChart('paretoDP', drawParetoDP, () => null);
+registerChart('paretoSDG', drawParetoCM, () => null);
 
 // Expand buttons on the main charts.
 document.querySelectorAll('.chart-expand').forEach(btn => {
