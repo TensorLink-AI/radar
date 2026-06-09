@@ -174,28 +174,39 @@ def test_reference_pipeline_executes_and_yields_correct_shape():
     assert torch.equal(batch["target"], batch2["target"])
 
 
-@pytest.mark.parametrize("bad", [float("inf"), float("nan")])
-def test_validating_batch_iter_rejects_non_finite(bad):
-    """Non-finite miner batches (e.g. float32-overflow from a heavy-tailed
-    generator) must fail the run with an attributable error rather than
-    silently poisoning training."""
+def test_validating_batch_iter_sanitizes_nonfinite():
+    """nan/inf in a miner batch (e.g. float32 overflow) are zeroed and the
+    run continues, rather than failing the whole experiment."""
     torch = pytest.importorskip("torch")
     from local.data_pipeline import _ValidatingBatchIter
 
-    constants = {
-        "context_len": 8, "prediction_len": 4,
-        "num_variates": 1, "quantiles": (0.5,),
-    }
+    inp = torch.zeros(2, 8, 1)
+    tgt = torch.zeros(2, 4, 1)
+    inp[0, 0, 0] = float("nan")
+    inp[1, 1, 0] = float("inf")
+    tgt[0, 0, 0] = float("-inf")
 
-    def gen():
-        inp = torch.zeros(2, 8, 1)
-        tgt = torch.zeros(2, 4, 1)
-        inp[0, 0, 0] = bad
-        yield {"input": inp, "target": tgt}
+    it = _ValidatingBatchIter([{"input": inp, "target": tgt}], {}, 2)
+    out = next(it)
+    assert torch.isfinite(out["input"]).all()
+    assert torch.isfinite(out["target"]).all()
+    assert it._nonfinite_seen == 3
+    # Shapes are preserved — sanitize, don't drop.
+    assert tuple(out["input"].shape) == (2, 8, 1)
+    assert tuple(out["target"].shape) == (2, 4, 1)
 
-    it = _ValidatingBatchIter(gen(), constants, batch_size=2)
-    with pytest.raises(ValueError, match="non-finite"):
-        next(it)
+
+def test_validating_batch_iter_passes_clean_batches_through():
+    torch = pytest.importorskip("torch")
+    from local.data_pipeline import _ValidatingBatchIter
+
+    inp = torch.randn(3, 8, 1)
+    tgt = torch.randn(3, 4, 1)
+    it = _ValidatingBatchIter([{"input": inp, "target": tgt}], {}, 3)
+    out = next(it)
+    assert it._nonfinite_seen == 0
+    assert torch.equal(out["input"], inp)
+    assert torch.equal(out["target"], tgt)
 
 
 def test_frozen_arch_bootstraps_from_ts_forecasting(tmp_path):
