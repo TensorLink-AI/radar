@@ -121,6 +121,20 @@ validator gates eligible parents, runs lineage-disjoint shard assignment
 (`--shards_per_round`), and scores continuations on a **second frontier**
 — `cumulative_compute` vs GIFT-eval Δ (`parent.metric − this.metric`) —
 separate from the absolute initial frontier. Val loss is never scored.
+
+For **synthetic_data_generator** the validator owns a *second* split on top
+of the continuation flip: a continuation round is either `extend` (re-train
+the parent's **own** generator on the warm-started weights — more compute on
+identical data) or `modify` (train the miner's freshly submitted generator).
+The share is a seeded coin at `--continuation_extend_pct` (0.5) in a
+namespace independent of the new-vs-continuation schedule; `prepare_continuation`
+swaps in the parent's stored `code` as `train_code` on an extend round (the
+miner's submission is ignored — the miner still only picks the parent). The
+resolved kind is stamped on `challenge['continuation_kind']` and the
+experiment's `objectives['continuation_kind']`, so the two share the second
+frontier but stay separable: `extend` isolates "more compute, same data",
+`modify` isolates "better data". The split is scoped to this task (the arch
+is fixed, so warm-starts are shape-compatible regardless of which code trains).
 Checkpoints persist via `local/checkpoints.py`. Agent surface:
 `/parents`, `/experiments/{id}/trajectory`, `/experiments/{id}/signature`,
 and a `continuation` block on `/frontier`. Full write-up in

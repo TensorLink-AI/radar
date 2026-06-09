@@ -57,6 +57,32 @@ flip seeded by `round_id` (reproducible, independent of the training
 seed). See `local/continuation.py::continuation_rate` /
 `is_continuation_round` and `store.attempted_round_count`.
 
+### Extend vs modify (synthetic_data_generator only)
+
+For the `synthetic_data_generator` task the deliverable is the *data
+generator*, not the architecture (which is fixed). That makes two flavors
+of continuation meaningful, and the validator owns the split between them
+with a second seeded coin:
+
+* **modify** — warm-start from the parent checkpoint and train the miner's
+  freshly submitted generator (the original continuation behavior).
+* **extend** — warm-start from the parent checkpoint and re-train the
+  parent's **own** generator: literally "more compute on identical data".
+  `prepare_continuation(extend=True)` swaps the parent's stored `code` in as
+  `train_code`, so the miner's submission is ignored — the miner still only
+  picks *which* parent.
+
+The flavor is a per-round Bernoulli flip at `--continuation_extend_pct`
+(default **0.5**) seeded by `round_id` in the namespace
+`continuation-extend-{round_id}` — independent of the new-vs-continuation
+schedule (`local/continuation.py::is_extend_round`). The resolved kind is
+stamped on `challenge['continuation_kind']` (`extend`/`modify`/`""`) and on
+the experiment's `objectives['continuation_kind']`. Both flavors share the
+same second frontier (`cumulative_compute` vs Δ), which is exactly what
+makes the comparison honest: **extend** isolates the gain from more compute
+on the same data; **modify** isolates the gain from better data. Because
+the arch never changes, an extend warm-start is always shape-compatible.
+
 ## How a miner picks a parent
 
 On a continuation round the agent inspects each eligible parent's

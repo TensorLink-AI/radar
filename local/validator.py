@@ -34,6 +34,7 @@ from local.continuation import (
     continuation_frontier,
     continuation_rate,
     is_continuation_round,
+    is_extend_round,
     prepare_continuation,
 )
 from local.experiments_api import _parent_summary
@@ -235,6 +236,7 @@ def _build_challenge(round_id: int, store: LocalStore, task,
                      services_url: str, agent_seconds: int = 180,
                      continuation_enabled: bool = False,
                      scheduled_continuation: bool = False,
+                     scheduled_extend: bool = False,
                      frozen_arch=None, frozen_pipeline=None) -> dict:
     # On scheduled-continuation rounds, bias the bucket pick toward buckets
     # that actually have eligible parents — otherwise round-robin wastes
@@ -302,6 +304,16 @@ def _build_challenge(round_id: int, store: LocalStore, task,
         if (scheduled_continuation and eligible_parents) else "new"
     )
     continuation_allowed = round_type == "continuation"
+    # On a synthetic_data_generator continuation round, the validator also owns
+    # the extend-vs-modify split: ``extend`` re-trains the parent's own
+    # generator (more compute on identical data), ``modify`` trains the miner's
+    # freshly submitted one. The split is meaningless for arch-evolution tasks,
+    # so the kind stays "" off the synth task.
+    continuation_kind = (
+        ("extend" if scheduled_extend else "modify")
+        if (continuation_allowed
+            and isinstance(task, SyntheticDataGeneratorSpec)) else ""
+    )
     # Persist scheduled-vs-actual so the dashboard can show "scheduled
     # continuation downgraded because no parents" instead of silently
     # bucketing it as a novel round.
@@ -326,6 +338,7 @@ def _build_challenge(round_id: int, store: LocalStore, task,
         "feasible_frontier": feasible,
         "round_type": round_type,
         "scheduled_round_type": scheduled_round_type,
+        "continuation_kind": continuation_kind,
         "downgrade_reason": downgrade_reason,
         "continuation_allowed": bool(continuation_allowed),
         "eligible_parents": eligible_parents if continuation_allowed else [],
@@ -484,8 +497,10 @@ def _train_proposal(payload: dict, task, round_id: int,
     """Run one proposal, retrying as a fresh run if a continuation
     warm-start turns out to be architecture-incompatible (strict load)."""
     def _run() -> dict:
+        # ``train_code`` overrides the miner submission on an extend round
+        # (re-train the parent's own generator); otherwise the miner's code.
         return run_training(
-            payload.get("code", ""),
+            prep.get("train_code") or payload.get("code", ""),
             seed=round_id,
             task=task,
             min_flops=challenge["min_flops_equivalent"],
@@ -509,7 +524,7 @@ def _train_proposal(payload: dict, task, round_id: int,
         prep.update(
             mode="new", parent_index=None, parent_metric=None,
             parent_checkpoint_path=None, compute_offset=0.0,
-            step_offset=0, n_rounds=1,
+            step_offset=0, n_rounds=1, continuation_kind="", train_code=None,
         )
         result = _run()
     return result
@@ -537,6 +552,7 @@ def run_round(store: LocalStore, task, round_id: int,
               continuation_warmup_rounds: int = 20,
               continuation_step_pct: float = 2.0,
               continuation_step_every: int = 3,
+              continuation_extend_pct: float = 0.5,
               shards_per_round: int = 0,
               frozen_arch_store: FrozenArchStore | None = None,
               frozen_arch_refresh_every: int = 50,
@@ -563,6 +579,16 @@ def run_round(store: LocalStore, task, round_id: int,
         warmup_rounds=continuation_warmup_rounds,
         step_pct=continuation_step_pct,
         step_every=continuation_step_every,
+    )
+    # On a scheduled continuation round, a second seeded coin splits it into
+    # extend (re-train the parent's own generator) vs modify. Scoped to the
+    # synthetic_data_generator task, where the miner deliverable is the data
+    # generator and the architecture is fixed, so warm-starts are always
+    # shape-compatible regardless of which code trains.
+    scheduled_extend = (
+        scheduled
+        and isinstance(task, SyntheticDataGeneratorSpec)
+        and is_extend_round(round_id, continuation_extend_pct)
     )
     # Frozen-arch refresh (ts_data_pipeline only). Snapshots at every_n
     # successful data-pipeline rounds; the first one bootstraps from the
@@ -611,6 +637,7 @@ def run_round(store: LocalStore, task, round_id: int,
         round_id, store, task, services_url, agent_seconds=agent_seconds,
         continuation_enabled=continuation_enabled,
         scheduled_continuation=scheduled,
+        scheduled_extend=scheduled_extend,
         frozen_arch=frozen_arch,
         frozen_pipeline=frozen_pipeline,
     )
@@ -618,6 +645,8 @@ def run_round(store: LocalStore, task, round_id: int,
     bucket = challenge["bucket"]
     continuation_allowed = challenge["continuation_allowed"]
     type_field = challenge["round_type"]
+    if challenge.get("continuation_kind"):
+        type_field = f"{type_field}:{challenge['continuation_kind']}"
     if challenge.get("downgrade_reason"):
         type_field = f"new<-continuation({challenge['downgrade_reason']})"
     logger.info(
@@ -680,6 +709,7 @@ def run_round(store: LocalStore, task, round_id: int,
             pool=pool, shards_per_round=shards_per_round, seed=round_id,
             current_epoch=_current_epoch(task, frozen_arch, frozen_pipeline),
             force_continuation=True,
+            extend=challenge.get("continuation_kind") == "extend",
             eligible_parent_ids=[
                 int(p["id"]) for p in challenge.get("eligible_parents", [])
                 if isinstance(p.get("id"), int)
@@ -696,7 +726,8 @@ def run_round(store: LocalStore, task, round_id: int,
             "parent_metric": None,
             "parent_checkpoint_path": None, "compute_offset": 0.0,
             "step_offset": 0, "n_rounds": 1, "shard_paths": None,
-            "shard_reuse": False, "note": "",
+            "shard_reuse": False, "continuation_kind": "", "train_code": None,
+            "note": "",
         }
         if prep["note"]:
             logger.info("    %s", prep["note"])
@@ -711,12 +742,23 @@ def run_round(store: LocalStore, task, round_id: int,
 
         result["miner_id"] = miner_id
         result["name"] = name
-        result["code"] = payload.get("code", "")
+        # On an extend round the parent's generator is what actually trained,
+        # so record that as this experiment's code (the diff vs parent is then
+        # empty by construction — extend == "more compute, same data").
+        result["code"] = prep.get("train_code") or payload.get("code", "")
         result["motivation"] = payload.get("motivation", "")
         result["reasoning"] = payload.get("reasoning", "")
         result["tool_calls"] = payload.get("tool_calls", [])
         result["prompt_id"] = payload.get("prompt_id", "")
         result["mode"] = prep["mode"]
+        # The extend/modify label is only meaningful on the synth task; stamp
+        # the per-proposal resolved kind into objectives there so extend and
+        # modify lineages stay separable on the shared second frontier.
+        kind = prep.get("continuation_kind") or ""
+        result["continuation_kind"] = kind
+        if (kind and isinstance(task, SyntheticDataGeneratorSpec)
+                and isinstance(result.get("objectives"), dict)):
+            result["objectives"]["continuation_kind"] = kind
         result["parent_index"] = prep["parent_index"]
         result["parent_metric"] = prep["parent_metric"]
         result["n_rounds"] = prep["n_rounds"]
@@ -954,6 +996,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--continuation_step_every", type=int, default=3,
                         help="Attempted rounds per ramp step (default 3). "
                              "Defaults give 0→70%% over ~105 rounds post-warmup.")
+    parser.add_argument("--continuation_extend_pct", type=float, default=0.5,
+                        help="Fraction of synthetic_data_generator continuation "
+                             "rounds run as 'extend' (re-train the parent's own "
+                             "generator — more compute on identical data) vs "
+                             "'modify' (train the miner's new generator). "
+                             "Default 0.5.")
     parser.add_argument("--log_level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -1068,11 +1116,13 @@ def main(argv: list[str] | None = None) -> int:
     mixture_str = ", ".join(f"{n}:{w:g}" for n, w in mixture)
     logger.info(
         "starting; db=%s tasks=[%s] agent_seconds=%d training_seconds=%d "
-        "continuation=%s (eq=%.2f warmup=%d +%.1f%%/%d) shards_per_round=%d",
+        "continuation=%s (eq=%.2f warmup=%d +%.1f%%/%d extend=%.0f%%) "
+        "shards_per_round=%d",
         args.db, mixture_str, args.agent_seconds, args.training_seconds,
         continuation_enabled, args.continuation_equilibrium,
         args.continuation_warmup_rounds, args.continuation_step_pct,
-        args.continuation_step_every, args.shards_per_round,
+        args.continuation_step_every, args.continuation_extend_pct * 100,
+        args.shards_per_round,
     )
 
     sink = ArtifactSink.from_env(store)
@@ -1129,6 +1179,7 @@ def main(argv: list[str] | None = None) -> int:
                       continuation_warmup_rounds=args.continuation_warmup_rounds,
                       continuation_step_pct=args.continuation_step_pct,
                       continuation_step_every=args.continuation_step_every,
+                      continuation_extend_pct=args.continuation_extend_pct,
                       shards_per_round=args.shards_per_round,
                       frozen_arch_store=frozen_arch_store,
                       frozen_arch_refresh_every=args.frozen_arch_refresh_every,

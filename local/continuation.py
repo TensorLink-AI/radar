@@ -77,6 +77,24 @@ def is_continuation_round(
     return random.Random(f"continuation-schedule-{round_id}").random() < rate
 
 
+def is_extend_round(round_id: int, extend_pct: float = 0.5) -> bool:
+    """Deterministic per-round coin flip splitting a continuation round into
+    ``extend`` (re-train the parent's *own* generator on the warm-started
+    weights — more compute on identical data) vs ``modify`` (train the miner's
+    freshly submitted generator).
+
+    Seeded by ``round_id`` in a namespace distinct from the new-vs-continuation
+    flip so the two schedules are independent. Only meaningful on a round that
+    is already a continuation; the validator gates the call accordingly.
+    """
+    pct = max(0.0, min(1.0, extend_pct))
+    if pct <= 0.0:
+        return False
+    if pct >= 1.0:
+        return True
+    return random.Random(f"continuation-extend-{round_id}").random() < pct
+
+
 
 def _sigmoid(x: float) -> float:
     if x >= 0:
@@ -162,6 +180,7 @@ def prepare_continuation(
     seed: int,
     current_epoch: dict | None = None,
     force_continuation: bool = False,
+    extend: bool = False,
     eligible_parent_ids: list[int] | None = None,
     miner_id: str = "",
 ) -> dict:
@@ -179,6 +198,13 @@ def prepare_continuation(
     (e.g. ``{"frozen_arch_version": 3}`` for ts_data_pipeline). A parent
     whose objectives don't match is rejected, because Δ is only honest
     inside a fixed context epoch.
+
+    When ``extend`` is true (the validator declared an *extend* continuation
+    round) and a parent resolves, ``prep["train_code"]`` is set to the
+    parent's own generator code so the run literally keeps training the same
+    data — ``prep["continuation_kind"]`` is then ``"extend"`` rather than
+    ``"modify"`` (the miner's submitted code is ignored). The split is
+    validator-owned; the miner only ever picks *which* parent.
     """
     from local.shards import assign_shards, lineage_shards
 
@@ -194,9 +220,12 @@ def prepare_continuation(
         "n_rounds": 1,
         "shard_paths": None,
         "shard_reuse": False,
+        "continuation_kind": "",
+        "train_code": None,
         "note": "",
     }
     lineage_used: set[str] = set()
+    parent_code: str | None = None
 
     def _try_parent(pid: int) -> tuple[bool, str]:
         parent = store.get_experiment(pid)
@@ -216,8 +245,9 @@ def prepare_continuation(
             compute_offset=float(parent.get("cumulative_compute", 0.0) or 0.0),
             n_rounds=int(parent.get("n_rounds", 1) or 1) + 1,
         )
-        nonlocal lineage_used
+        nonlocal lineage_used, parent_code
         lineage_used = lineage_shards(store.lineage(pid))
+        parent_code = parent.get("code")
         return True, ""
 
     if mode == "continue" and isinstance(parent_index, int):
@@ -248,6 +278,19 @@ def prepare_continuation(
                 if prior_note
                 else "force-continuation could not resolve any parent"
             )
+
+    # Split a resolved continuation into extend vs modify. ``extend`` reuses
+    # the parent's own generator (more compute on identical data); it falls
+    # back to ``modify`` if the parent carries no usable code.
+    if prep["mode"] == "continue":
+        if extend and parent_code:
+            prep["continuation_kind"] = "extend"
+            prep["train_code"] = parent_code
+        else:
+            prep["continuation_kind"] = "modify"
+            if extend and not parent_code:
+                prefix = (prep["note"] + "; ") if prep["note"] else ""
+                prep["note"] = prefix + "extend requested but parent has no code"
 
     if pool:
         keys, reused = assign_shards(
