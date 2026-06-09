@@ -80,6 +80,24 @@ def test_pick_replicate_source_respects_epoch():
     ) is not None
 
 
+def test_gate_off_tasks_find_sources_outside_buckets():
+    # Pipeline tasks (fixed arch, size gate off) can report FLOPs outside
+    # every TS bucket; gate_off must still surface them as sources.
+    exps = [_exp(1, 0.5, 999_000_000, task="synthetic_data_generator")]
+    assert pick_replicate_source(
+        exps, task="synthetic_data_generator", round_id=1,
+    ) is None  # bucketed view misses it
+    src = pick_replicate_source(
+        exps, task="synthetic_data_generator", round_id=1, gate_off=True,
+    )
+    assert src["id"] == 1
+    t = pick_ablation_target(
+        exps, task="synthetic_data_generator", round_id=1,
+        min_flops=0, max_flops=0, gate_off=True,
+    )
+    assert t["id"] == 1
+
+
 def test_pick_ablation_target_in_bucket():
     exps = [_exp(1, 0.5, 1000), _exp(2, 0.3, 60_000)]
     t = pick_ablation_target(

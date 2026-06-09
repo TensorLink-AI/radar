@@ -63,20 +63,27 @@ def _in_epoch(exp: dict, epoch: Optional[dict]) -> bool:
 
 
 def _frontier_members(experiments: list[dict], task: str,
-                      epoch: Optional[dict]) -> list[dict]:
+                      epoch: Optional[dict],
+                      gate_off: bool = False) -> list[dict]:
     """Successful, code-bearing, in-epoch members of this task's
-    per-bucket Pareto union — replicates excluded (they're copies)."""
-    from local.scoring import compute_pareto_by_bucket
+    per-bucket Pareto union — replicates excluded (they're copies).
+
+    ``gate_off`` covers the pipeline tasks (fixed arch ⇒ size buckets
+    meaningless ⇒ every miner reports identical FLOPs, possibly outside
+    every bucket): the frontier is then the plain global Pareto set.
+    """
+    from local.scoring import compute_pareto, compute_pareto_by_bucket
 
     same_task = [
         e for e in experiments
         if e.get("task") == task and e.get("mode") != "replicate"
         and e.get("code")
     ]
-    return [
-        e for e in compute_pareto_by_bucket(same_task)
-        if _in_epoch(e, epoch)
-    ]
+    members = (
+        compute_pareto(same_task) if gate_off
+        else compute_pareto_by_bucket(same_task)
+    )
+    return [e for e in members if _in_epoch(e, epoch)]
 
 
 def _seeded_pick(members: list[dict], round_id: int, salt: str,
@@ -88,22 +95,25 @@ def _seeded_pick(members: list[dict], round_id: int, salt: str,
 
 
 def pick_replicate_source(experiments: list[dict], *, task: str,
-                          round_id: int,
-                          epoch: Optional[dict] = None) -> Optional[dict]:
+                          round_id: int, epoch: Optional[dict] = None,
+                          gate_off: bool = False) -> Optional[dict]:
     return _seeded_pick(
-        _frontier_members(experiments, task, epoch), round_id, "replicate",
+        _frontier_members(experiments, task, epoch, gate_off=gate_off),
+        round_id, "replicate",
     )
 
 
 def pick_ablation_target(experiments: list[dict], *, task: str,
                          round_id: int, min_flops: int, max_flops: int,
-                         epoch: Optional[dict] = None) -> Optional[dict]:
+                         epoch: Optional[dict] = None,
+                         gate_off: bool = False) -> Optional[dict]:
     """Frontier member inside this round's bucket (gate-disabled tasks
     match everything)."""
     from local.scoring import passes_size_gate
 
     members = [
-        e for e in _frontier_members(experiments, task, epoch)
+        e for e in _frontier_members(experiments, task, epoch,
+                                     gate_off=gate_off)
         if passes_size_gate(e.get("objectives", {}), min_flops, max_flops)
     ]
     return _seeded_pick(members, round_id, "ablate")

@@ -53,8 +53,12 @@ def run_replicate_round(store, task, round_id: int, *,
     """Run a full validator-only replicate round. Returns False when no
     eligible source exists (caller falls through to a normal round)."""
     exps = store.recent_experiments(n=10_000)
+    gate_off = isinstance(
+        task, (TSDataPipelineSpec, SyntheticDataGeneratorSpec),
+    )
     src = pick_replicate_source(
         exps, task=task.name, round_id=round_id, epoch=epoch,
+        gate_off=gate_off,
     )
     if src is None:
         logger.info(
@@ -173,6 +177,7 @@ def annotate_special(payload: dict, special: str, store, task, *,
         target = pick_ablation_target(
             exps, task=task.name, round_id=round_id,
             min_flops=lo, max_flops=hi, epoch=epoch,
+            gate_off=not bucketed,
         )
         if target is not None:
             card, key = source_card(target), "ablation_target"
