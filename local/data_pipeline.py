@@ -120,6 +120,8 @@ class _ValidatingBatchIter:
         self._inner = iter(inner)
         self._c = constants
         self._bs = int(batch_size)
+        self._nonfinite_seen = 0
+        self._warned = False
 
     def __iter__(self):
         return self
@@ -158,6 +160,24 @@ class _ValidatingBatchIter:
                 f"pipeline batch dim mismatch: input={inp.shape[0]} "
                 f"target={tgt.shape[0]}",
             )
+        # Ignore non-finite values (nan/inf — e.g. float32 overflow in the
+        # generator's casts) instead of failing the run: replace them with 0
+        # and keep training. The model's robust scaler masks zero-filled
+        # inputs; zeroed target positions were corrupt anyway. We only warn
+        # once so a noisy generator doesn't flood the log.
+        n_bad = int((~torch.isfinite(inp)).sum().item()
+                    + (~torch.isfinite(tgt)).sum().item())
+        if n_bad:
+            inp = torch.nan_to_num(inp, nan=0.0, posinf=0.0, neginf=0.0)
+            tgt = torch.nan_to_num(tgt, nan=0.0, posinf=0.0, neginf=0.0)
+            self._nonfinite_seen += n_bad
+            if not self._warned:
+                logger.warning(
+                    "pipeline emitted non-finite values (nan/inf) — sanitizing "
+                    "to 0 and continuing (likely float32 overflow in the "
+                    "generator's casts)",
+                )
+                self._warned = True
         return {"input": inp, "target": tgt}
 
 

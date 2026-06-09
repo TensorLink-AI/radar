@@ -173,7 +173,14 @@ differences from `ts_data_pipeline`:
    `metric = sqrt(crps * mase)` (lower=better). No AULC composite — the
    in-training val curve is diagnostics only (and best-val checkpoint
    selection), so a sparse val curve is not fatal here. **No fallback**:
-   missing checkpoint / GIFT cache / non-finite metrics ⇒ failure.
+   missing checkpoint / GIFT cache / non-finite *GIFT metrics* ⇒ failure.
+
+Non-finite values in the *generator's training batches* (nan/inf, e.g.
+float32 overflow in the generator's casts) are **not** fatal: the shared
+`_ValidatingBatchIter` (`local/data_pipeline.py`, used by both
+`ts_data_pipeline` and `synthetic_data_generator`) sanitizes them to 0 and
+keeps training (warn-once), so a single overflowing batch doesn't sink the
+whole run. This is distinct from the GIFT-metric failure policy above.
 
 `objectives` stamps `synth_arch_version` (gates continuation lineages
 against a future model swap). Continuation uses the standard second
