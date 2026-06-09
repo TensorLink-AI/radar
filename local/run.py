@@ -81,7 +81,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Phase B training budget for ts_forecasting "
                              "(default 60 min).")
     parser.add_argument("--log_level", default="INFO")
-    args = parser.parse_args(argv)
+    # Anything run.py doesn't recognise is forwarded to the validator —
+    # so flags like --replicate_pct / --screen_candidates /
+    # --frozen_pipeline_control_seconds work without re-declaring them here.
+    args, validator_extra = parser.parse_known_args(argv)
 
     py = sys.executable
 
@@ -106,6 +109,10 @@ def main(argv: list[str] | None = None) -> int:
         validator_cmd += ["--task", args.task]
     if args.wiki_dir:
         validator_cmd += ["--wiki_dir", args.wiki_dir]
+    if validator_extra:
+        print(f"[run] forwarding to validator: {' '.join(validator_extra)}",
+              flush=True)
+        validator_cmd += validator_extra
 
     procs: list[subprocess.Popen] = []
     print(f"[run] launching validator: {' '.join(validator_cmd)}", flush=True)

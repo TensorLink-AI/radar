@@ -37,23 +37,29 @@ from local.continuation import (
     is_extend_round,
     prepare_continuation,
 )
+from local.eval_metrics import paired_per_task_delta
 from local.experiments_api import _parent_summary
 from local.frozen_arch import FrozenArchStore, maybe_refresh as maybe_refresh_frozen
 from local.frozen_pipeline import (
     FrozenPipelineStore,
     maybe_refresh as maybe_refresh_pipeline,
 )
+from local.round_types import special_round_type
 from local.scoring import (
     compute_pareto, compute_pareto_by_bucket, passes_size_gate, score_round,
 )
+from local.screening import screen_candidates, screening_card
 from local.services import ServicesServer
+from local.special_rounds import (
+    annotate_special, run_replicate_round, stamp_special_objectives,
+)
 from local.store import LocalStore
 from local.synthetic_arch import REFERENCE_ARCH_VERSION, reference_arch
 from local.task import (
     SIZE_BUCKETS, SyntheticDataGeneratorSpec, TaskSpec, TSDataPipelineSpec,
     TSForecastingSpec, buckets_for, make_spec,
 )
-from local.trainer import run_training
+from local.train_subprocess import run_training_isolated
 
 
 logger = logging.getLogger("local.validator")
@@ -222,6 +228,12 @@ def _current_epoch(task, frozen_arch=None, frozen_pipeline=None) -> dict:
     # but pinning it future-proofs continuation against a model swap.
     if isinstance(task, SyntheticDataGeneratorSpec):
         epoch["synth_arch_version"] = int(REFERENCE_ARCH_VERSION)
+    # The scored metric changes meaning when a canary fraction is held
+    # out of the eval aggregate — pin lineages to the same split.
+    from local.eval_metrics import canary_frac
+    frac = canary_frac()
+    if frac > 0:
+        epoch["eval_canary_frac"] = frac
     return epoch
 
 
@@ -495,11 +507,15 @@ def _train_proposal(payload: dict, task, round_id: int,
                     challenge: dict, prep: dict,
                     frozen_arch=None, frozen_pipeline=None) -> dict:
     """Run one proposal, retrying as a fresh run if a continuation
-    warm-start turns out to be architecture-incompatible (strict load)."""
+    warm-start turns out to be architecture-incompatible (strict load).
+
+    Training runs through ``run_training_isolated`` — a crash or hang in
+    submitted code becomes a failed experiment instead of taking down
+    the validator process."""
     def _run() -> dict:
         # ``train_code`` overrides the miner submission on an extend round
         # (re-train the parent's own generator); otherwise the miner's code.
-        return run_training(
+        return run_training_isolated(
             prep.get("train_code") or payload.get("code", ""),
             seed=round_id,
             task=task,
@@ -523,8 +539,9 @@ def _train_proposal(payload: dict, task, round_id: int,
         prep["note"] = prefix + "continuation incompatible: retried fresh"
         prep.update(
             mode="new", parent_index=None, parent_metric=None,
-            parent_checkpoint_path=None, compute_offset=0.0,
-            step_offset=0, n_rounds=1, continuation_kind="", train_code=None,
+            parent_per_task=None, parent_checkpoint_path=None,
+            compute_offset=0.0, step_offset=0, n_rounds=1,
+            continuation_kind="", train_code=None,
         )
         result = _run()
     return result
@@ -559,7 +576,24 @@ def run_round(store: LocalStore, task, round_id: int,
               frozen_pipeline_store: FrozenPipelineStore | None = None,
               frozen_pipeline_refresh_every: int = 30,
               frozen_pipeline_num_shards: int = 16,
-              frozen_pipeline_batches_per_shard: int = 64) -> None:
+              frozen_pipeline_batches_per_shard: int = 64,
+              frozen_pipeline_control_seconds: int = 0,
+              frozen_pipeline_render_per_round: bool = False,
+              replicate_pct: float = 0.0,
+              ablate_pct: float = 0.0,
+              recipe_pct: float = 0.0,
+              transfer_pct: float = 0.0,
+              screen_candidates_n: int = 0,
+              screen_seconds: int = 600,
+              screen_eval_tasks: int = 15) -> None:
+    # Special round types (replicate / ablate / recipe_only / transfer) are
+    # scheduled by an independent seeded coin and pre-empt the continuation
+    # flip for the round. Each downgrades to a normal round when its
+    # prerequisite (a usable source experiment) is missing.
+    special = special_round_type(
+        round_id, replicate_pct=replicate_pct, ablate_pct=ablate_pct,
+        recipe_pct=recipe_pct, transfer_pct=transfer_pct,
+    )
     # The validator owns the cadence: a scheduled coin flip decides whether
     # this is a continuation round. The rate stays at 0 until
     # ``warmup_rounds`` attempted rounds, then climbs as a staircase to the
@@ -590,6 +624,9 @@ def run_round(store: LocalStore, task, round_id: int,
         and isinstance(task, SyntheticDataGeneratorSpec)
         and is_extend_round(round_id, continuation_extend_pct)
     )
+    if special:
+        scheduled = False
+        scheduled_extend = False
     # Frozen-arch refresh (ts_data_pipeline only). Snapshots at every_n
     # successful data-pipeline rounds; the first one bootstraps from the
     # ts_forecasting frontier.
@@ -625,6 +662,7 @@ def run_round(store: LocalStore, task, round_id: int,
             every_n=frozen_pipeline_refresh_every,
             num_shards=frozen_pipeline_num_shards,
             batches_per_shard=frozen_pipeline_batches_per_shard,
+            control_seconds=frozen_pipeline_control_seconds,
         )
         frozen_pipeline = frozen_pipeline_store.current()
         # Skip injection if the snapshot has no rendered shards (the
@@ -632,6 +670,33 @@ def run_round(store: LocalStore, task, round_id: int,
         # pipeline raised). The round still runs as pure-real.
         if frozen_pipeline is not None and not frozen_pipeline.shard_paths:
             frozen_pipeline = None
+        # Per-round re-render approximates streaming from the generator:
+        # each round draws a fresh window of the generator's stream
+        # instead of reusing one tiny fixed corpus forever.
+        if frozen_pipeline is not None and frozen_pipeline_render_per_round:
+            from local.pipeline_control import rerender_for_round
+            frozen_pipeline = rerender_for_round(
+                frozen_pipeline_store, frozen_pipeline, round_id,
+                num_shards=frozen_pipeline_num_shards,
+                batches_per_shard=frozen_pipeline_batches_per_shard,
+            )
+
+    # Replicate rounds are validator-only — no challenge is opened to
+    # miners; the round's whole job is re-measuring a frontier member.
+    if special == "replicate":
+        def _replicate_train(code: str, **kw) -> dict:
+            return run_training_isolated(
+                code, frozen_arch=frozen_arch,
+                frozen_pipeline=frozen_pipeline, **kw,
+            )
+        consumed = run_replicate_round(
+            store, task, round_id,
+            epoch=_current_epoch(task, frozen_arch, frozen_pipeline),
+            train_fn=_replicate_train, sink=sink,
+        )
+        if consumed:
+            return
+        special = ""  # no source to replicate — run a normal round
 
     challenge = _build_challenge(
         round_id, store, task, services_url, agent_seconds=agent_seconds,
@@ -641,6 +706,22 @@ def run_round(store: LocalStore, task, round_id: int,
         frozen_arch=frozen_arch,
         frozen_pipeline=frozen_pipeline,
     )
+    # Ablate / recipe_only / transfer mutate the freshly built challenge
+    # (round_type + target card) or record a downgrade reason.
+    if special:
+        annotate_special(
+            challenge, special, store, task, round_id=round_id,
+            epoch=_current_epoch(task, frozen_arch, frozen_pipeline),
+        )
+    # Screening tier: only meaningful on fresh ts_forecasting design
+    # rounds — the agent may submit extra candidates for cheap triage.
+    if (screen_candidates_n > 0 and isinstance(task, TSForecastingSpec)
+            and challenge.get("round_type") == "new"):
+        challenge["screening"] = screening_card(
+            max_candidates=screen_candidates_n,
+            budget_seconds=screen_seconds,
+            eval_max_tasks=screen_eval_tasks,
+        )
     challenge_id = challenge["challenge_id"]
     bucket = challenge["bucket"]
     continuation_allowed = challenge["continuation_allowed"]
@@ -723,7 +804,7 @@ def run_round(store: LocalStore, task, round_id: int,
                 payload.get("parent_index")
                 if isinstance(payload.get("parent_index"), int) else None
             ),
-            "parent_metric": None,
+            "parent_metric": None, "parent_per_task": None,
             "parent_checkpoint_path": None, "compute_offset": 0.0,
             "step_offset": 0, "n_rounds": 1, "shard_paths": None,
             "shard_reuse": False, "continuation_kind": "", "train_code": None,
@@ -731,6 +812,32 @@ def run_round(store: LocalStore, task, round_id: int,
         }
         if prep["note"]:
             logger.info("    %s", prep["note"])
+
+        # Screening tier: cheap triage of extra candidates before the one
+        # full-budget run. Fresh runs only — a warm-start's parent already
+        # fixed the architecture.
+        screening_summaries: list[dict] | None = None
+        scr = challenge.get("screening")
+        if (scr and prep["mode"] == "new" and not prep.get("train_code")
+                and payload.get("candidates")):
+            def _screen_train(code: str, **kw) -> dict:
+                return run_training_isolated(
+                    code, frozen_arch=frozen_arch,
+                    frozen_pipeline=frozen_pipeline, **kw,
+                )
+            winner, screening_summaries = screen_candidates(
+                payload.get("candidates"), task=task, seed=round_id,
+                min_flops=challenge["min_flops_equivalent"],
+                max_flops=challenge["max_flops_equivalent"],
+                budget_seconds=int(scr["budget_seconds"]),
+                eval_max_tasks=int(scr["eval_max_tasks"]),
+                train_fn=_screen_train,
+            )
+            if winner is not None:
+                payload["code"] = winner["code"]
+                payload["name"] = winner["name"]
+                name = winner["name"]
+
         logger.info(
             "  phase B/C: training '%s' from miner=%s mode=%s",
             name, miner_id, prep["mode"],
@@ -739,6 +846,20 @@ def run_round(store: LocalStore, task, round_id: int,
             payload, task, round_id, challenge, prep,
             frozen_arch=frozen_arch, frozen_pipeline=frozen_pipeline,
         )
+        # Pin the validator-declared comparison anchor (ablate / recipe /
+        # transfer) and the paired per-dataset parent comparison onto the
+        # result before scoring reads them.
+        stamp_special_objectives(result, payload, challenge)
+        if (prep["mode"] == "continue" and result.get("success")
+                and isinstance(result.get("objectives"), dict)):
+            paired = paired_per_task_delta(
+                prep.get("parent_per_task"),
+                result["objectives"].get("per_task"),
+            )
+            if paired:
+                result["objectives"]["paired"] = paired
+        if screening_summaries and isinstance(result.get("objectives"), dict):
+            result["objectives"]["screening"] = screening_summaries
 
         result["miner_id"] = miner_id
         result["name"] = name
@@ -845,6 +966,17 @@ def run_round(store: LocalStore, task, round_id: int,
     # lineage parents); drop the rest to bound disk use.
     if ckpt_store is not None:
         _gc_checkpoints(store, ckpt_store, round_id)
+
+    # Structured post-mortem per experiment — the round's findings outlive
+    # its scalar metric. Best-effort: a report failure must not break the
+    # round loop.
+    try:
+        from local.lab_reports import generate_round_reports
+        n_reports = generate_round_reports(store, round_id, task.name)
+        if n_reports:
+            logger.info("  lab reports: %d written", n_reports)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("lab report generation failed: %s", e)
 
     store.mark_challenge(challenge_id, "done")
 
@@ -1002,6 +1134,46 @@ def main(argv: list[str] | None = None) -> int:
                              "generator — more compute on identical data) vs "
                              "'modify' (train the miner's new generator). "
                              "Default 0.5.")
+    parser.add_argument("--replicate_pct", type=float, default=0.05,
+                        help="Fraction of rounds run as validator-only "
+                             "replicates (re-train a frontier member's exact "
+                             "code, new seed) to measure the eval noise floor. "
+                             "Default 0.05; 0 disables.")
+    parser.add_argument("--ablate_pct", type=float, default=0.05,
+                        help="Fraction of rounds where the miner is asked for "
+                             "a minimal one-component diff of a frontier "
+                             "member. Default 0.05; 0 disables.")
+    parser.add_argument("--recipe_pct", type=float, default=0.05,
+                        help="Fraction of rounds where the architecture is "
+                             "frozen (AST-enforced) and only the training "
+                             "recipe may change. Default 0.05; 0 disables.")
+    parser.add_argument("--transfer_pct", type=float, default=0.05,
+                        help="Fraction of rounds where a smaller-bucket "
+                             "frontier winner is handed to the miner to scale "
+                             "into this bucket. Default 0.05; 0 disables.")
+    parser.add_argument("--screen_candidates", type=int, default=0,
+                        help="Screening tier: max extra candidates an agent "
+                             "may submit for cheap triage before the full "
+                             "run (ts_forecasting fresh rounds only). "
+                             "0 = disabled (default).")
+    parser.add_argument("--screen_seconds", type=int, default=600,
+                        help="Training budget per screening candidate "
+                             "(default 600).")
+    parser.add_argument("--screen_eval_tasks", type=int, default=15,
+                        help="GIFT-Eval tasks used for screening eval "
+                             "(default 15).")
+    parser.add_argument("--frozen_pipeline_control_seconds", type=int,
+                        default=600,
+                        help="ts_forecasting only: paired-control budget for "
+                             "frozen-pipeline promotion — the candidate's "
+                             "synthetic shards must beat a pure-real run of "
+                             "the best arch under this training budget before "
+                             "promotion. 0 disables the gate. Default 600.")
+    parser.add_argument("--frozen_pipeline_render_per_round",
+                        action="store_true",
+                        help="Re-render the frozen pipeline's synthetic "
+                             "shards each round (fresh generator window) "
+                             "instead of reusing the promotion-time corpus.")
     parser.add_argument("--log_level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -1085,6 +1257,7 @@ def main(argv: list[str] | None = None) -> int:
             every_n=args.frozen_pipeline_refresh_every,
             num_shards=args.frozen_pipeline_num_shards,
             batches_per_shard=args.frozen_pipeline_batches_per_shard,
+            control_seconds=args.frozen_pipeline_control_seconds,
         )
         current_p = frozen_pipeline_store.current()
         if current_p is None:
@@ -1117,12 +1290,16 @@ def main(argv: list[str] | None = None) -> int:
     logger.info(
         "starting; db=%s tasks=[%s] agent_seconds=%d training_seconds=%d "
         "continuation=%s (eq=%.2f warmup=%d +%.1f%%/%d extend=%.0f%%) "
-        "shards_per_round=%d",
+        "shards_per_round=%d special=[repl=%.0f%% abl=%.0f%% rec=%.0f%% "
+        "xfer=%.0f%%] screening=%d",
         args.db, mixture_str, args.agent_seconds, args.training_seconds,
         continuation_enabled, args.continuation_equilibrium,
         args.continuation_warmup_rounds, args.continuation_step_pct,
         args.continuation_step_every, args.continuation_extend_pct * 100,
         args.shards_per_round,
+        args.replicate_pct * 100, args.ablate_pct * 100,
+        args.recipe_pct * 100, args.transfer_pct * 100,
+        args.screen_candidates,
     )
 
     sink = ArtifactSink.from_env(store)
@@ -1186,7 +1363,16 @@ def main(argv: list[str] | None = None) -> int:
                       frozen_pipeline_store=frozen_pipeline_store,
                       frozen_pipeline_refresh_every=args.frozen_pipeline_refresh_every,
                       frozen_pipeline_num_shards=args.frozen_pipeline_num_shards,
-                      frozen_pipeline_batches_per_shard=args.frozen_pipeline_batches_per_shard)
+                      frozen_pipeline_batches_per_shard=args.frozen_pipeline_batches_per_shard,
+                      frozen_pipeline_control_seconds=args.frozen_pipeline_control_seconds,
+                      frozen_pipeline_render_per_round=args.frozen_pipeline_render_per_round,
+                      replicate_pct=args.replicate_pct,
+                      ablate_pct=args.ablate_pct,
+                      recipe_pct=args.recipe_pct,
+                      transfer_pct=args.transfer_pct,
+                      screen_candidates_n=args.screen_candidates,
+                      screen_seconds=args.screen_seconds,
+                      screen_eval_tasks=args.screen_eval_tasks)
             round_id += 1
             completed += 1
             if args.rounds == 0 or completed < args.rounds:

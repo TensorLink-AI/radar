@@ -91,6 +91,22 @@ class FrozenPipelineStore:
     def current_version(self) -> int:
         return int(self._read_manifest().get("current", 0))
 
+    # Promotion-control rejection memory — a candidate that failed the
+    # paired control gate is not retried every round; it stays rejected
+    # until a different candidate overtakes it.
+
+    def is_rejected(self, exp_id: int) -> bool:
+        return str(int(exp_id)) in self._read_manifest().get("rejected", {})
+
+    def mark_rejected(self, exp_id: int, details: Optional[dict] = None) -> None:
+        m = self._read_manifest()
+        rejected = dict(m.get("rejected", {}))
+        rejected[str(int(exp_id))] = {
+            "at": time.time(), **(details or {}),
+        }
+        m["rejected"] = rejected
+        self._write_manifest(m)
+
     def current(self) -> Optional[FrozenPipeline]:
         v = self.current_version()
         if v <= 0:
@@ -174,6 +190,7 @@ def _candidate_from_store(store) -> Optional[dict]:
 def maybe_refresh(
     pipe_store: FrozenPipelineStore, db_store, *,
     every_n: int = 30, num_shards: int = 16, batches_per_shard: int = 64,
+    control_seconds: int = 0, control_eval_tasks: int = 12,
 ) -> Optional[FrozenPipeline]:
     """Snapshot a new frozen pipeline when conditions are met.
 
@@ -182,14 +199,22 @@ def maybe_refresh(
       * ``every_n`` successful ts_forecasting rounds since the last
         snapshot (staggered from the arch refresh — see module docstring).
 
+    When ``control_seconds`` > 0 the promotion must additionally pass the
+    paired control gate (``local/pipeline_control.py``): the candidate's
+    shards have to actually improve the current best ts_forecasting arch
+    over a pure-real run before they're allowed into the pretrain mix.
+    Rejected candidates are remembered and not retried.
+
     Returns the newly-saved FrozenPipeline on snapshot, None otherwise.
     """
     cand = _candidate_from_store(db_store)
-    if cand is None:
+    if cand is None or pipe_store.is_rejected(int(cand["id"])):
         return None
     current = pipe_store.current()
     if current is None:
-        return _do_save(pipe_store, cand, num_shards, batches_per_shard)
+        return _do_save(pipe_store, db_store, cand, num_shards,
+                        batches_per_shard, control_seconds,
+                        control_eval_tasks)
     if every_n <= 0:
         return None
     try:
@@ -205,11 +230,14 @@ def maybe_refresh(
         return None
     if cand["id"] == current.source_experiment_id:
         return None
-    return _do_save(pipe_store, cand, num_shards, batches_per_shard)
+    return _do_save(pipe_store, db_store, cand, num_shards,
+                    batches_per_shard, control_seconds, control_eval_tasks)
 
 
-def _do_save(pipe_store: FrozenPipelineStore, cand: dict,
-             num_shards: int, batches_per_shard: int) -> FrozenPipeline:
+def _do_save(pipe_store: FrozenPipelineStore, db_store, cand: dict,
+             num_shards: int, batches_per_shard: int,
+             control_seconds: int = 0,
+             control_eval_tasks: int = 12) -> Optional[FrozenPipeline]:
     objs = cand.get("objectives", {}) or {}
     next_version = pipe_store.current_version() + 1
     shards_dir = pipe_store.version_shard_dir(next_version)
@@ -217,6 +245,21 @@ def _do_save(pipe_store: FrozenPipelineStore, cand: dict,
         cand["code"], shards_dir,
         num_shards=num_shards, batches_per_shard=batches_per_shard,
     )
+    if control_seconds > 0 and shard_paths:
+        from local.pipeline_control import control_gate
+        ok, details = control_gate(
+            db_store, shard_paths=shard_paths,
+            seconds=control_seconds, eval_max_tasks=control_eval_tasks,
+        )
+        if not ok:
+            logger.warning(
+                "frozen pipeline candidate exp=%d REJECTED by paired "
+                "control: %s", cand["id"], details.get("reason"),
+            )
+            pipe_store.mark_rejected(int(cand["id"]), details)
+            import shutil
+            shutil.rmtree(shards_dir.parent, ignore_errors=True)
+            return None
     return pipe_store.save(
         code=cand["code"],
         source_experiment_id=int(cand["id"]),
@@ -232,12 +275,17 @@ def _do_save(pipe_store: FrozenPipelineStore, cand: dict,
 
 def _render_shards(
     code: str, out_dir: Path, *, num_shards: int, batches_per_shard: int,
+    skip_batches: int = 0,
 ) -> list[str]:
     """Pre-render synthetic shards from the miner's pipeline.
 
     Best-effort: if torch / pandas aren't importable, returns ``[]`` and
     the frozen pipeline is still recorded — just without shards. A later
     refresh on a richer environment can re-render.
+
+    ``skip_batches`` discards that many leading batches so per-round
+    re-renders (``pipeline_control.rerender_for_round``) draw a different
+    window of the generator's stream each round.
     """
     if num_shards <= 0 or batches_per_shard <= 0:
         return []
@@ -261,6 +309,11 @@ def _render_shards(
             TS_CONTEXT_LEN, TS_PREDICTION_LEN, TS_NUM_VARIATES,
             list(TS_QUANTILES),
         ))
+        for _ in range(max(0, int(skip_batches))):
+            try:
+                next(iterator)
+            except StopIteration:
+                break
     except Exception as e:  # noqa: BLE001
         logger.warning("frozen pipeline render: build_pipeline failed: %s", e)
         return []

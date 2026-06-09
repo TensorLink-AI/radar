@@ -139,7 +139,46 @@ Checkpoints persist via `local/checkpoints.py`. Agent surface:
 `/parents`, `/experiments/{id}/trajectory`, `/experiments/{id}/signature`,
 and a `continuation` block on `/frontier`. Full write-up in
 `docs/continuation_training.md`. Code: `local/continuation.py`,
-`local/shards.py`, `local/checkpoints.py`.
+`local/shards.py`, `local/checkpoints.py`. Continuation Δ is
+additionally gated by a **paired per-dataset sign test** when both
+parent and child carry `objectives.per_task` — a positive Δ the paired
+evidence can't distinguish from noise scores zero.
+
+## Experiment engine (round types, noise floor, lab reports)
+
+Beyond new/continuation the validator schedules seeded special rounds
+(`local/round_types.py`, executed/annotated by `local/special_rounds.py`):
+**replicate** (`--replicate_pct` 0.05 — validator-only re-run of a
+frontier member with a new seed; `mode="replicate"`, score 0, excluded
+from frontiers; feeds the noise floor in `local/noise.py`, served at
+`GET /experiments/noise`), **ablate** (minimal one-diff of a frontier
+member, anchor stamped to `objectives.ablation_of`), **recipe_only**
+(AST-enforced frozen arch — only optimizer/schedule may change) and
+**transfer** (scale a smaller-bucket winner into this bucket). Each
+downgrades to a normal round when no source exists.
+
+Every torch dispatcher finalizes GIFT metrics through
+`local/eval_metrics.py`: the per-dataset breakdown persists as
+`objectives.per_task`, and `RADAR_EVAL_CANARY_FRAC` (default 0) holds a
+deterministic name-hashed fraction of GIFT tasks out of the scored
+aggregate (`objectives.canary_*`, recorded but never selected on — the
+benchmark-overfitting alarm; pinned into the continuation epoch).
+
+`local/lab_reports.py` writes a structured post-mortem per experiment at
+round end (hypothesis, baseline, paired stats, dataset movers,
+noise-aware verdict; optional LLM narrative via `RADAR_LAB_REPORT_LLM`)
+— `GET /lab_reports`, `GET /experiments/{id}/report`.
+
+Training runs through `local/train_subprocess.py` (spawned subprocess +
+hard timeout; `RADAR_TRAIN_ISOLATION=auto|always|never`) so crashes and
+hangs in submitted code become failed experiments. `--screen_candidates K`
+enables the screening tier (short-budget triage of agent-submitted
+`candidates` on a truncated eval before one full run). Frozen-pipeline
+promotion is gated by a paired with/without-synthetic control run
+(`--frozen_pipeline_control_seconds`, `local/pipeline_control.py`), and
+`--frozen_pipeline_render_per_round` re-renders synthetic shards each
+round instead of reusing the promotion-time corpus. Full write-up in
+`docs/experiment_engine.md`.
 
 ## synthetic_data_generator task
 
@@ -202,7 +241,14 @@ frontier (`cumulative_compute` vs GIFT Δ). Needs the same caches as
 | `local/miner.py` | Polls for challenges, loads the agent from `--agent_dir`, calls `design_architecture(challenge, client?)`. |
 | `local/agent.py` | Default miner agent. Reads the active prompt via `miner_template.prompts`. |
 | `local/trainer.py` | Frozen Phase B+C: numpy MLP forward/backward, MSE on held-out test split. |
-| `local/scoring.py` | Size gate + sigmoid-improvement + Pareto bonus. |
+| `local/scoring.py` | Size gate + sigmoid-improvement + Pareto bonus. Replicates score 0 and never enter frontiers; continuation scores pass the paired gate. |
+| `local/eval_metrics.py` | GIFT metric finalization: per-task persistence, canary split, paired per-dataset sign test. |
+| `local/noise.py` | Eval noise floor from replicate pairs (`GET /experiments/noise`). |
+| `local/round_types.py` + `local/special_rounds.py` | Special round scheduling (replicate/ablate/recipe_only/transfer), target pickers, recipe AST freeze, replicate execution. |
+| `local/lab_reports.py` | Structured per-experiment post-mortems (`lab_reports` table, `GET /lab_reports`). |
+| `local/screening.py` | Short-budget candidate triage before the full run. |
+| `local/train_subprocess.py` | Subprocess isolation + hard timeout around `run_training`. |
+| `local/pipeline_control.py` | Paired with/without-synthetic control gate + per-round shard re-render for frozen pipelines. |
 | `local/task.py` | Synthetic 8-dim regression + FLOPs-equivalent size buckets. |
 | `local/optimize.py` | Prompt-population CLI (`gepa` / `random_mutate`). |
 | `local/run.py` | Launches validator + N miners as subprocesses. |

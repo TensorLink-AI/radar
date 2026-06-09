@@ -609,19 +609,18 @@ def run_data_pipeline_training(
             objectives, loss_curve, workdir, val_curve=val_curve,
         )
 
-    crps = eval_metrics.get("crps")
-    mase = eval_metrics.get("mase")
-    if (crps is None or mase is None
-            or not math.isfinite(crps) or not math.isfinite(mase)):
+    from local.eval_metrics import finalize_gift_eval
+    final = finalize_gift_eval(eval_metrics)
+    if final is None:
         return _fail(
-            f"GIFT-Eval non-finite (crps={crps} mase={mase})",
+            f"GIFT-Eval non-finite (crps={eval_metrics.get('crps')} "
+            f"mase={eval_metrics.get('mase')})",
             objectives, loss_curve, workdir, val_curve=val_curve,
         )
-
-    objectives["crps"] = float(crps)
-    objectives["mase"] = float(mase)
-    if "n_tasks" in eval_metrics:
-        objectives["n_tasks"] = int(eval_metrics["n_tasks"])
+    crps, mase = final["crps"], final["mase"]
+    objectives["crps"] = crps
+    objectives["mase"] = mase
+    objectives.update(final["extras"])
 
     # Capture the frozen arch's tensor signature so /signature can serve it
     # to a continuation miner picking a parent.
@@ -633,7 +632,7 @@ def run_data_pipeline_training(
     except Exception as e:  # noqa: BLE001
         logger.debug("could not capture param signature: %s", e)
 
-    gift = math.sqrt(max(crps, 0.0) * max(mase, 0.0))
+    gift = final["metric"]
     # Composite trajectory + leaderboard score: geomean(AULC_ratio, GIFT).
     # AULC_ratio = this_aulc / baseline_aulc anchors the curve half against
     # the frozen arch's own AULC on a fixed reference pipeline, so a

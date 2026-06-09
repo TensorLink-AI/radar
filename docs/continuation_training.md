@@ -116,6 +116,13 @@ Per size bucket:
     run since the parent's metric is already recorded)
   * Δ ≤ 0 scores zero; otherwise a sigmoid of normalized improvement
     with a 1.5× bonus on the compute-efficiency frontier.
+  * **Paired gate** — when both parent and child carry a per-dataset
+    breakdown (`objectives.per_task`), the improvement must also pass a
+    paired sign test over the shared GIFT datasets
+    (`eval_metrics.paired_per_task_delta`, stamped to
+    `objectives.paired`). A positive Δ that the per-dataset evidence
+    can't distinguish from noise scores zero. See
+    `docs/experiment_engine.md`.
 
 **Validation loss is never a score term** — it only drives best-checkpoint
 selection and the miner's continue/new decision.

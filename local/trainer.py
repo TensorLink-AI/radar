@@ -641,20 +641,22 @@ def _run_ts_forecasting(
             val_curve=val_curve,
         )
 
-    crps = eval_metrics.get("crps")
-    mase = eval_metrics.get("mase")
-    if (crps is None or mase is None
-            or not math.isfinite(crps) or not math.isfinite(mase)):
+    from local.eval_metrics import finalize_gift_eval
+    final = finalize_gift_eval(eval_metrics)
+    if final is None:
         return _ts_failure(
-            f"GIFT-Eval returned non-finite metrics (crps={crps} mase={mase})",
+            f"GIFT-Eval returned non-finite metrics "
+            f"(crps={eval_metrics.get('crps')} mase={eval_metrics.get('mase')})",
             objectives, loss_curve, workdir,
             val_curve=val_curve,
         )
-
-    objectives["crps"] = float(crps)
-    objectives["mase"] = float(mase)
-    if "n_tasks" in eval_metrics:
-        objectives["n_tasks"] = int(eval_metrics["n_tasks"])
+    crps, mase = final["crps"], final["mase"]
+    objectives["crps"] = crps
+    objectives["mase"] = mase
+    # Per-dataset breakdown + (optional) canary aggregates — the raw
+    # material for paired comparisons, lab reports and the held-out
+    # benchmark-overfitting canary.
+    objectives.update(final["extras"])
 
     # Capture the checkpoint's tensor signature (names + shapes, from the
     # safetensors header — no torch) so the /signature endpoint can tell a
@@ -667,8 +669,9 @@ def _run_ts_forecasting(
     except Exception as e:  # noqa: BLE001
         logger.debug("could not capture param signature: %s", e)
 
-    # Geomean of the two normalized leaderboard aggregates. Both lower=better.
-    metric = math.sqrt(max(crps, 0.0) * max(mase, 0.0))
+    # Geomean of the two normalized leaderboard aggregates (recomputed on
+    # the scored subset when a canary fraction is held out). Lower=better.
+    metric = final["metric"]
 
     train_src = (
         f"local={len(train_paths)}" if train_paths else f"streamed={len(train_urls)}"

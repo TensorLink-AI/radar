@@ -214,6 +214,7 @@ def prepare_continuation(
         "mode": "new",
         "parent_index": parent_index if isinstance(parent_index, int) else None,
         "parent_metric": None,
+        "parent_per_task": None,
         "parent_checkpoint_path": None,
         "compute_offset": 0.0,
         "step_offset": 0,
@@ -241,6 +242,9 @@ def prepare_continuation(
             mode="continue",
             parent_index=pid,
             parent_metric=parent["metric"],
+            # Parent's per-dataset eval breakdown, when recorded — feeds the
+            # paired sign test that gates the continuation score.
+            parent_per_task=(parent.get("objectives", {}) or {}).get("per_task"),
             parent_checkpoint_path=ckpt_path,
             compute_offset=float(parent.get("cumulative_compute", 0.0) or 0.0),
             n_rounds=int(parent.get("n_rounds", 1) or 1) + 1,
@@ -334,18 +338,29 @@ def score_continuation(
     parent_metric: float,
     cumulative_compute: float,
     frontier: list[dict],
+    paired: dict | None = None,
 ) -> tuple[float, float]:
     """Score one continuation. Returns ``(score, delta)``.
 
-    Δ ≤ 0 (no improvement over the parent) scores zero. Otherwise the
-    base is a sigmoid of the normalized improvement, with a 1.5× bonus
-    when the point lands on the continuation frontier.
+    Δ ≤ 0 (no improvement over the parent) scores zero. When a paired
+    per-dataset comparison vs the parent is available (``paired``, from
+    ``eval_metrics.paired_per_task_delta``) the improvement must also be
+    *significant* under the sign test — Δ is a difference of two noisy
+    geomeans, and per-dataset noise is correlated between parent and
+    child, so the paired test is the honest arbiter of "real progress".
+    Otherwise the base is a sigmoid of the normalized improvement, with
+    a 1.5× bonus when the point lands on the continuation frontier.
     """
     if parent_metric is None or metric is None:
         return 0.0, 0.0
     delta = float(parent_metric) - float(metric)
     if delta <= 0 or not math.isfinite(delta):
         return 0.0, delta
+    if paired is not None:
+        from local.eval_metrics import PAIRED_MIN_TASKS
+        if (int(paired.get("n", 0)) >= PAIRED_MIN_TASKS
+                and not paired.get("significant")):
+            return 0.0, delta
     denom = max(abs(float(parent_metric)), 1e-8)
     base = _sigmoid(_DELTA_K * delta / denom)
     bonus = 1.5 if _dominates_frontier(delta, cumulative_compute, frontier) else 1.0

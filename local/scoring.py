@@ -69,10 +69,16 @@ def pareto_bonus(
 
 
 def compute_pareto(experiments: list[dict]) -> list[dict]:
-    """Non-dominated set on (metric, flops). Both lower is better."""
+    """Non-dominated set on (metric, flops). Both lower is better.
+
+    Replicate rounds are excluded — they re-run an existing frontier
+    member's code to measure eval noise (``local/noise.py``) and must
+    never compete with it for frontier membership.
+    """
     pts = [
         e for e in experiments
         if e.get("success") and e.get("metric") is not None
+        and e.get("mode") != "replicate"
     ]
     front: list[dict] = []
     for e in pts:
@@ -161,6 +167,14 @@ def score_round(
             p["analysis"] = (p.get("analysis") or "") + " [score=0: failed]"
             out.append(p)
             continue
+        if p.get("mode") == "replicate":
+            # Noise probes are control measurements, never rewarded.
+            p["score"] = 0.0
+            p["analysis"] = (
+                (p.get("analysis") or "") + " [score=0: replicate noise probe]"
+            )
+            out.append(p)
+            continue
         if not passes_size_gate(p["objectives"], min_flops, max_flops):
             p["score"] = 0.0
             p["analysis"] = (
@@ -171,6 +185,7 @@ def score_round(
             continue
 
         if p.get("mode") == "continue" and p.get("parent_metric") is not None:
+            paired = p.get("objectives", {}).get("paired")
             score, delta = score_continuation(
                 metric=p["metric"],
                 parent_metric=p["parent_metric"],
@@ -178,11 +193,23 @@ def score_round(
                     p.get("objectives", {}).get("cumulative_compute", 0.0)
                 ),
                 frontier=cont_frontier,
+                paired=paired,
             )
             p["score"] = score
+            # Persist Δ so the continuation frontier
+            # (continuation_frontier reads objectives['delta']) actually
+            # accumulates points — previously nothing wrote it.
+            if isinstance(p.get("objectives"), dict):
+                p["objectives"]["delta"] = delta
+            paired_tag = ""
+            if paired is not None:
+                paired_tag = (
+                    f" paired={paired.get('n_improved')}/{paired.get('n')}"
+                    f" sig={int(bool(paired.get('significant')))}"
+                )
             p["analysis"] = (
                 (p.get("analysis") or "")
-                + f" [score={score:.3f} continuation Δ={delta:.4f}]"
+                + f" [score={score:.3f} continuation Δ={delta:.4f}{paired_tag}]"
             )
             out.append(p)
             continue
