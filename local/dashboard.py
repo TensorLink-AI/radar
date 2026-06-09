@@ -20,6 +20,8 @@ Endpoints:
                                    warm-started runs only
   GET /api/data_pipeline_frontier  Pareto front on (aulc, gift_metric) —
                                    ts_data_pipeline runs only
+  GET /api/synth_frontier          Pareto front on (crps, mase) —
+                                   synthetic_data_generator runs only
   GET /api/lineage                 Lineage forest (nodes/edges) + frozen-arch
                                    cross-task interaction links
   GET /api/frozen_archs            Frozen-arch version list (ts_data_pipeline)
@@ -327,6 +329,49 @@ def _continuation_frontier(conn: sqlite3.Connection) -> dict[str, Any]:
     return {"frontier": front, "all": enriched}
 
 
+def _synth_frontier(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Non-dominated set on (crps, mase) restricted to synthetic_data_generator.
+
+    The synth task shares ts_forecasting's GIFT-only scoring but trains a
+    *fixed* reference arch, so it earns its own crps×mase frontier tab rather
+    than sharing the architecture tab. Both axes lower=better. Returns
+    ``{frontier, all, versions}`` — ``versions`` lists the distinct
+    ``synth_arch_version`` values present so the UI can flag a model swap
+    (continuation lineages pin to one version).
+    """
+    rows = conn.execute(
+        "SELECT * FROM experiments WHERE success=1 AND metric IS NOT NULL "
+        "AND task='synthetic_data_generator'"
+    ).fetchall()
+    points = [_row(r) for r in rows]
+    points = [
+        p for p in points
+        if p["objectives"].get("crps") is not None
+        and p["objectives"].get("mase") is not None
+    ]
+    front: list[dict[str, Any]] = []
+    for p in points:
+        pc = p["objectives"]["crps"]
+        pm = p["objectives"]["mase"]
+        dominated = False
+        for o in points:
+            if o is p:
+                continue
+            oc = o["objectives"]["crps"]
+            om = o["objectives"]["mase"]
+            if oc <= pc and om <= pm and (oc < pc or om < pm):
+                dominated = True
+                break
+        if not dominated:
+            front.append(p)
+    front.sort(key=lambda e: e["objectives"]["crps"])
+    versions = sorted({
+        int(p["objectives"].get("synth_arch_version") or 0)
+        for p in points
+    })
+    return {"frontier": front, "all": points, "versions": versions}
+
+
 def _data_pipeline_frontier(conn: sqlite3.Connection) -> dict[str, Any]:
     """Non-dominated set on (aulc_axis, gift_metric) for ts_data_pipeline runs.
 
@@ -546,6 +591,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, _continuation_frontier(conn))
             if path == "/api/data_pipeline_frontier":
                 return self._json(200, _data_pipeline_frontier(conn))
+            if path == "/api/synth_frontier":
+                return self._json(200, _synth_frontier(conn))
             if path == "/api/lineage":
                 return self._json(200, _lineage(conn, self.frozen_arch_dir))
             if path == "/api/frozen_archs":

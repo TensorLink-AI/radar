@@ -141,6 +141,18 @@ class _ValidatingBatchIter:
             raise TypeError("pipeline batch missing 'input' or 'target'")
         inp = _as_tensor(inp, torch.float32)
         tgt = _as_tensor(tgt, torch.float32)
+        # Reject non-finite batches up front. A miner generator that draws
+        # heavy-tailed samples in float64 and casts to float32 saturates to
+        # +/-inf; the arcsinh robust scaler can't rescue inf, so the garbage
+        # would silently poison training (NaN/spiky losses). Fail the run with
+        # an attributable error instead of accepting it.
+        for name, t in (("input", inp), ("target", tgt)):
+            if not bool(torch.isfinite(t).all()):
+                raise ValueError(
+                    f"pipeline '{name}' contains non-finite values "
+                    f"(nan/inf) — check for float32 overflow in the "
+                    f"generator's casts",
+                )
         if inp.dim() != 3:
             raise ValueError(
                 f"pipeline 'input' must be (batch, context_len, num_variates), "
