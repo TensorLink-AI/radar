@@ -67,6 +67,17 @@ def test_pick_replicate_source_prefers_frontier_skips_replicates():
     assert src["id"] == 1
 
 
+def test_pick_replicate_source_skips_continuations():
+    # A warm-started lineage member's metric reflects accumulated
+    # compute; re-running its code from scratch is a different
+    # configuration, so continuations are never special-round sources.
+    cont = _exp(1, 0.3, 1000, mode="continue")
+    cont["n_rounds"] = 3
+    exps = [cont, _exp(2, 0.5, 1000)]
+    src = pick_replicate_source(exps, task="synth_regression", round_id=1)
+    assert src["id"] == 2
+
+
 def test_pick_replicate_source_respects_epoch():
     exps = [_exp(1, 0.5, 1000)]
     exps[0]["objectives"]["frozen_pipeline_version"] = 3

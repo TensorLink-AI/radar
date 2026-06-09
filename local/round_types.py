@@ -71,13 +71,20 @@ def _frontier_members(experiments: list[dict], task: str,
     ``gate_off`` covers the pipeline tasks (fixed arch ⇒ size buckets
     meaningless ⇒ every miner reports identical FLOPs, possibly outside
     every bucket): the frontier is then the plain global Pareto set.
+
+    Continuations are excluded along with replicates: a special round
+    re-trains the source's *code from scratch*, which is not the same
+    configuration as a warm-started lineage member — replicating one
+    would feed a systematic lineage-compute difference into the noise
+    floor, and ablating one confounds the code diff with the lineage.
     """
+    from local.continuation import is_continuation
     from local.scoring import compute_pareto, compute_pareto_by_bucket
 
     same_task = [
         e for e in experiments
         if e.get("task") == task and e.get("mode") != "replicate"
-        and e.get("code")
+        and e.get("code") and not is_continuation(e)
     ]
     members = (
         compute_pareto(same_task) if gate_off
