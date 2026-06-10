@@ -23,6 +23,17 @@ downgrades).
 | `recipe_only` | `--recipe_pct` (0.05) | Challenge carries `recipe_base`; the architecture surface (`build_model` + top-level classes) must be AST-identical to the base — only optimizer/scheduler/training-config hooks may change. A violating submission is treated as a normal new round (noted, not failed). |
 | `transfer` | `--transfer_pct` (0.05) | A smaller-bucket frontier winner ships as `transfer_source`; the miner scales the design into this round's bucket. `objectives.transfer_of` pins provenance. `recipe_only`/`transfer` only fire on bucketed (non-pipeline) tasks. |
 
+### Agent support
+
+`miners/claude_style_v4` and `_v5` understand all of the above
+(`core/round_context.py`): ablate/transfer rounds replace the
+analyst+researcher phases with a focused brief + target-code preamble,
+recipe_only rides the agents' existing in-round recipe machinery, the
+screening tier ships validated alternates as `candidates`, and the
+analyst reads `/lab_reports` + `/experiments/noise`. Other agents
+degrade gracefully — an unaware agent just treats special rounds as
+normal ones (recipe_only then downgrades validator-side).
+
 ## Noise floor
 
 `local/noise.py` pools every (original, replicate) metric pair:

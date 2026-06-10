@@ -57,6 +57,7 @@ from typing import Optional
 
 from core import continuation
 from core import history
+from core import round_context
 from core.fallback_templates import (
     fallback_name_for, generate_fallback,
 )
@@ -164,6 +165,7 @@ def _agent_budget(challenge: dict) -> int:
 def _package(
     code: str, name: str, motivation: str, prompt_id: str = "",
     mode: Optional[str] = None, parent_index: Optional[int] = None,
+    candidates: Optional[list] = None,
 ) -> dict:
     out = {"code": code, "name": name, "motivation": motivation}
     if prompt_id:
@@ -175,6 +177,10 @@ def _package(
         out["mode"] = mode
     if parent_index is not None:
         out["parent_index"] = parent_index
+    # Screening tier: extra validated designs the validator triages on a
+    # short budget before the full run (challenge["screening"]).
+    if candidates:
+        out["candidates"] = candidates
     return out
 
 
@@ -403,6 +409,20 @@ def _design_data_pipeline(challenge: dict, gated_client=None) -> dict:
         f"metric={fa.get('source_metric')!r})"
     )
 
+    # Ablate is the one special round type that applies to pipeline
+    # tasks: a minimal one-diff of a frontier generator. The preamble
+    # carries the target's code; the brief replaces the (absent)
+    # researcher brief.
+    pipeline_brief: Optional[dict] = None
+    special_ctx = round_context.build(challenge)
+    if special_ctx is not None and special_ctx["kind"] == "ablate":
+        challenge["_special_context"] = round_context.preamble(special_ctx)
+        pipeline_brief = round_context.brief(special_ctx)
+        _log(
+            f"[orchestrator] ABLATE round — target generator "
+            f"#{special_ctx['target'].get('id')}"
+        )
+
     scratch_dir: Optional[str] = None
     try:
         scratch_dir = load_scratchpad(challenge)  # noqa: F821 — injected
@@ -452,12 +472,14 @@ def _design_data_pipeline(challenge: dict, gated_client=None) -> dict:
                 f"{op_directive}"
             )
         # No researcher brief on this task — the design space is fully
-        # described by the system prompt. Pass an empty dict so the user
-        # prompt skips the brief section.
+        # described by the system prompt (an ablate round substitutes
+        # its focused one-diff brief).
         sub = Subagent(
             name="pipeline_designer",
             system_prompt=designer_sys,
-            user_prompt=build_pipeline_designer_user_prompt(challenge, None),
+            user_prompt=build_pipeline_designer_user_prompt(
+                challenge, pipeline_brief,
+            ),
             tools=tools,
             handlers=handlers,
             deadline=deadline,
@@ -608,6 +630,44 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
             "analyst + researcher"
         )
 
+    # ── Special-round context (ablate / recipe_only / transfer) ─
+    # Validator-owned round types beyond new/continuation. Mutually
+    # exclusive with continuation (the validator disables it on special
+    # rounds). recipe_only rides the in-round recipe machinery (frozen
+    # base arch + recipe-only preamble); ablate/transfer get a preamble
+    # carrying the target code plus a focused brief, replacing the
+    # analyst + researcher phases.
+    special_brief: Optional[dict] = None
+    special_kind = ""
+    if cont_ctx is None:
+        special_ctx = round_context.build(challenge)
+        if special_ctx is not None:
+            special_kind = special_ctx["kind"]
+            if special_kind == "recipe_only":
+                recipe_ctx = continuation.make_inround_recipe_context(
+                    special_ctx["target"].get("code") or "", {},
+                )
+                if recipe_ctx is not None:
+                    challenge["_inround_recipe_context"] = recipe_ctx
+                    special_brief = round_context.brief(special_ctx, bucket)
+                else:
+                    _log(
+                        "[orchestrator] recipe_only: base arch not "
+                        "extractable — running as a normal round"
+                    )
+                    special_kind = ""
+            else:
+                challenge["_special_context"] = round_context.preamble(
+                    special_ctx,
+                )
+                special_brief = round_context.brief(special_ctx, bucket)
+            if special_brief is not None:
+                _log(
+                    f"[orchestrator] {special_kind.upper()} round — "
+                    f"target #{special_ctx['target'].get('id')}, "
+                    "skipping analyst + researcher"
+                )
+
     # ── Scratchpad load ─────────────────────────────────────────
     scratch_dir: Optional[str] = None
     try:
@@ -678,6 +738,11 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
             # nothing to explore — hand the designer a recipe-focused
             # brief and let it use the whole budget on the recipe.
             brief = continuation.recipe_brief(cont_ctx)
+        elif special_brief is not None:
+            # Special round: the validator already chose the experiment
+            # (target + change surface) — the whole budget goes to the
+            # designer executing it.
+            brief = special_brief
         else:
             # ── Phase 1: analyst (technique #1) ─────────────────
             analyst_deadline = min(
@@ -739,6 +804,10 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
         # budgets fall back to the v3 behaviour: splitting buys nothing.
         do_recipe_pass = (
             cont_ctx is None
+            # Special rounds: ablate must stay a single diff (a recipe
+            # pass would add a second, confounding change) and
+            # recipe_only IS the recipe pass already. Transfer keeps it.
+            and special_kind not in ("ablate", "recipe_only")
             and budget >= RECIPE_TUNER_MIN_TOTAL_BUDGET
         )
         designer_deadline = min(
@@ -845,11 +914,33 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
         )
         return None, None
 
+    def _screen_cands(name: str, code: str, mode) -> Optional[list]:
+        """Screening extras — fresh rounds only (a warm-start's arch is
+        fixed by the parent, so alternates make no sense)."""
+        if mode is not None:
+            return None
+        holder = getattr(handlers.get("submit", None), "_state_holder", None)
+        st = (holder or {}).get("state") if holder else state
+        try:
+            cands = round_context.screening_candidates(
+                challenge, st or {}, primary_name=name, primary_code=code,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log(f"[orchestrator] screening packaging failed: {exc}")
+            return None
+        if cands:
+            _log(
+                f"[orchestrator] screening: shipping {len(cands)} "
+                "candidate(s) for validator triage"
+            )
+        return cands
+
     if submit_sig is not None:
         mode, parent_index = _cont_fields(submit_sig.code)
         return _package(
             submit_sig.code, submit_sig.name, submit_sig.motivation,
             prompt_id=active_prompt["id"], mode=mode, parent_index=parent_index,
+            candidates=_screen_cands(submit_sig.name, submit_sig.code, mode),
         )
 
     # Recovery: deadline hit and no SubmitSignal raised, but the LLM
@@ -863,12 +954,14 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
                 f"(name={best.get('name')!r}, no late-window submit)"
             )
             mode, parent_index = _cont_fields(best["code"])
+            best_name = best.get("name") or f"best_so_far_{bucket}"
             return _package(
                 best["code"],
-                best.get("name") or f"best_so_far_{bucket}",
+                best_name,
                 best.get("motivation") or "Auto-shipped best-so-far candidate.",
                 prompt_id=active_prompt["id"], mode=mode,
                 parent_index=parent_index,
+                candidates=_screen_cands(best_name, best["code"], mode),
             )
 
     if last_validated_code:
@@ -880,6 +973,9 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
             "submit explicitly.",
             prompt_id=active_prompt["id"], mode=mode,
             parent_index=parent_index,
+            candidates=_screen_cands(
+                f"auto_submit_{bucket}", last_validated_code, mode,
+            ),
         )
 
     # Designer failed → fallback template path.

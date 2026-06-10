@@ -203,3 +203,18 @@ budget split is unchanged.
   through to `generate_fallback`. The fallback shipped is the same
   template family as v4 (`RECIPE_DEFAULTS` unchanged); only the
   version tag bumps to `"v4"`.
+
+## Validator experiment-engine support
+
+The orchestrator handles the validator-owned special round types
+(`docs/experiment_engine.md`): **ablate** (focused one-diff brief +
+target-code preamble; recipe-tuner pass skipped so the diff stays
+single; also wired into the pipeline-task flow), **recipe_only**
+(rides the in-round recipe machinery — base arch frozen via
+`_inround_recipe_context`), **transfer** (scale-the-source brief;
+recipe pass kept). When the challenge advertises `screening`, the
+proposal ships extra validated designs from `state.candidates` as
+`candidates=[{name, code}, ...]` for short-budget validator triage.
+The analyst is pointed at `/lab_reports` and `/experiments/noise` so
+recommendations weigh paired-significant evidence over sub-noise
+metric gaps. Agent-side logic in `core/round_context.py`.
