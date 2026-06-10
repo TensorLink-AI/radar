@@ -62,15 +62,25 @@ function expTooltip(e) {
     ['score', fmt(e.score, 3)],
   ];
   if (e.is_continuation) {
-    rows.push(['kind', `<b style="color:#f0a040">continuation</b>`]);
+    rows.push(['kind', `<b style="color:#f0a040">${esc(e.round_kind || 'continuation')}</b>`]);
     if (e.parent_index !== null && e.parent_index !== undefined)
       rows.push(['parent', e.parent_index]);
     if (e.n_rounds)              rows.push(['rounds', e.n_rounds]);
     if (e.cumulative_compute)    rows.push(['Σ compute', fmt(e.cumulative_compute, 2)]);
     if (e.delta !== undefined)   rows.push(['Δ', fmt(e.delta)]);
+  } else if (e.round_kind && e.round_kind !== 'new') {
+    rows.push(['kind', `<b style="color:#b08fe0">${esc(e.round_kind)}</b>`]);
   } else {
     rows.push(['kind', `<b style="color:#7ec97e">novel</b>`]);
   }
+  // Paired per-dataset comparison vs the parent (continuations only).
+  const paired = (e.objectives || {}).paired;
+  if (paired && paired.n)
+    rows.push(['paired', `${paired.n_improved}/${paired.n}`
+      + (paired.significant ? ' <b style="color:#7ec97e">✓ sig</b>'
+                            : ' <span style="color:#888">not sig</span>')]);
+  if (obj(e, 'canary_metric') !== null)
+    rows.push(['canary', fmt(obj(e, 'canary_metric'))]);
   if (obj(e, 'aulc') !== null) rows.push(['aulc', fmt(obj(e, 'aulc'))]);
   if (obj(e, 'gift_metric') !== null)
     rows.push(['gift', fmt(obj(e, 'gift_metric'))]);
@@ -85,10 +95,24 @@ function expTooltip(e) {
   return rows.map(([k, v]) => `<span class="k">${k}</span> <b>${v}</b>`).join('<br>');
 }
 
+// Validator-owned round kinds (see docs/experiment_engine.md). Falls
+// back to the old novel/cont split for rows from pre-engine DBs.
+const KIND_LABELS = {
+  'new':                 { short: 'novel',   cls: 'badge-novel',  title: 'trained from scratch' },
+  'continuation':        { short: 'cont',    cls: 'badge-cont',   title: 'warm-started from a parent checkpoint' },
+  'continuation:extend': { short: 'extend',  cls: 'badge-cont',   title: 'warm-start, re-trained the parent\'s own generator (more compute, same data)' },
+  'continuation:modify': { short: 'modify',  cls: 'badge-cont',   title: 'warm-start, trained a new generator (same model, new data)' },
+  'replicate':           { short: 'repl',    cls: 'badge-repl',   title: 'validator noise probe — re-run of a frontier member, new seed' },
+  'ablation':            { short: 'ablate',  cls: 'badge-ablate', title: 'minimal one-diff of a frontier member' },
+  'recipe_only':         { short: 'recipe',  cls: 'badge-recipe', title: 'frozen architecture — training recipe changed only' },
+  'transfer':            { short: 'xfer',    cls: 'badge-xfer',   title: 'smaller-bucket winner scaled into this bucket' },
+};
 function kindBadge(e) {
-  return e.is_continuation
-    ? `<span class="badge badge-cont" title="warm-started from a parent checkpoint">cont</span>`
-    : `<span class="badge badge-novel" title="trained from scratch">novel</span>`;
+  const kind = e.round_kind
+    || (e.is_continuation ? 'continuation' : 'new');
+  const meta = KIND_LABELS[kind]
+    || { short: kind, cls: 'badge-novel', title: kind };
+  return `<span class="badge ${meta.cls}" title="${esc(meta.title)}">${esc(meta.short)}</span>`;
 }
 
 // Short task label so the leaderboard/recent tables show whether a row
@@ -153,6 +177,34 @@ function contRow(e) {
     + `<td class="num">${fmt(e.delta)}</td>`
     + `<td class="num">${fmt(e.metric)}</td>`
     + `<td class="score">${fmt(e.score, 3)}</td>`;
+  return tr;
+}
+
+function labReportRow(rep) {
+  const tr = document.createElement('tr');
+  tr.className = 'row';
+  tr.onclick = () => openModal(`lab report — experiment ${rep.experiment_id}`,
+    body => {
+      const pre = document.createElement('pre');
+      pre.className = 'code-block';
+      pre.textContent = JSON.stringify(rep, null, 2);
+      body.appendChild(pre);
+    });
+  const paired = rep.paired || {};
+  const pairedTxt = paired.n
+    ? `${paired.n_improved}/${paired.n}${paired.significant ? ' ✓' : ''}`
+    : '—';
+  const outcome = rep.outcome || {};
+  // Reuse the kind badge by faking the experiment-row shape.
+  const kindCell = kindBadge({ round_kind: rep.round_kind });
+  tr.innerHTML = `<td>${rep.experiment_id}</td><td>${rep.round_id ?? '—'}</td>`
+    + `<td>${taskBadge({ task: rep.task })}</td>`
+    + `<td>${kindCell}</td>`
+    + `<td>${esc(rep.name || '')}</td>`
+    + `<td class="num">${fmt(outcome.metric)}</td>`
+    + `<td class="num">${fmt(rep.delta)}</td>`
+    + `<td class="num">${pairedTxt}</td>`
+    + `<td class="verdict" title="${esc(rep.verdict || '')}">${esc(rep.verdict || '')}</td>`;
   return tr;
 }
 
@@ -1541,10 +1593,34 @@ function setupLineage() {
   buildLinChips();
 }
 
+// ── Noise floor strip (Lab reports tab) ────────────────────
+function renderNoise(noise) {
+  const host = document.getElementById('noiseStats');
+  if (!host) return;
+  const overall = (noise && noise.overall) || {};
+  const cells = [];
+  if (!overall.n_pairs) {
+    host.innerHTML = `<div class="stat"><div class="k">noise floor</div>`
+      + `<div class="v muted">no replicate pairs yet — schedule with --replicate_pct</div></div>`;
+    return;
+  }
+  cells.push(['replicate pairs', fmtInt(overall.n_pairs)]);
+  cells.push(['σ (metric)', fmt(overall.sigma_metric, 5)]);
+  cells.push(['σ (relative)', overall.sigma_rel != null
+    ? (overall.sigma_rel * 100).toFixed(2) + '%' : '—']);
+  cells.push(['95% threshold', fmt(overall.threshold, 5)]);
+  for (const [task, floor] of Object.entries((noise && noise.by_task) || {})) {
+    cells.push([`σ · ${task}`, `${fmt(floor.sigma_metric, 5)} (${floor.n_pairs}p)`]);
+  }
+  host.innerHTML = cells.map(([k, v]) =>
+    `<div class="stat"><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`
+  ).join('');
+}
+
 // ── Refresh loop ───────────────────────────────────────────
 async function refresh() {
   try {
-    const [stats, lb, fr, frCM, cont, dp, archs, recent, synth] = await Promise.all([
+    const [stats, lb, fr, frCM, cont, dp, archs, recent, synth, labReports, noise] = await Promise.all([
       get('/api/stats'), get('/api/leaderboard?n=20'),
       get('/api/frontier'), get('/api/frontier_crps_mase'),
       get('/api/continuation_frontier'),
@@ -1552,8 +1628,10 @@ async function refresh() {
       get('/api/frozen_archs'),
       get('/api/recent?n=30'),
       get('/api/synth_frontier'),
+      get('/api/lab_reports?n=100'),
+      get('/api/noise'),
     ]);
-    state.lastData = { stats, lb, fr, frCM, cont, dp, archs, recent, synth };
+    state.lastData = { stats, lb, fr, frCM, cont, dp, archs, recent, synth, labReports, noise };
     redraw(state.lastData);
     document.getElementById('refresh').textContent =
       'refreshed ' + new Date().toLocaleTimeString();
@@ -1561,7 +1639,7 @@ async function refresh() {
     document.getElementById('refresh').textContent = 'error: ' + e;
   }
 }
-function redraw({ stats, lb, fr, frCM, cont, dp, archs, recent, synth }) {
+function redraw({ stats, lb, fr, frCM, cont, dp, archs, recent, synth, labReports, noise }) {
   // novel/cont split surfaces continuation activity at a glance —
   // raw count + how many of them actually succeeded.
   const novelLine = `${fmtInt(stats.n_novel_successful)} / ${fmtInt(stats.n_novel)}`;
@@ -1583,6 +1661,19 @@ function redraw({ stats, lb, fr, frCM, cont, dp, archs, recent, synth }) {
     ['best metric', fmt(stats.best_metric)],
     ['mean metric', fmt(stats.mean_metric)],
   ];
+  // Special-round counts + the noise floor — present only on DBs
+  // written by the experiment-engine validator.
+  const nSpecial = (stats.n_replicate || 0) + (stats.n_ablation || 0)
+    + (stats.n_recipe_only || 0) + (stats.n_transfer || 0);
+  if (nSpecial) {
+    cells.push(['special rounds',
+      `${fmtInt(stats.n_replicate || 0)}r · ${fmtInt(stats.n_ablation || 0)}a`
+      + ` · ${fmtInt(stats.n_recipe_only || 0)}rec · ${fmtInt(stats.n_transfer || 0)}x`]);
+  }
+  if (stats.noise && stats.noise.n_pairs) {
+    cells.push(['noise floor (σ / 95%)',
+      `${fmt(stats.noise.sigma_metric, 4)} / ${fmt(stats.noise.threshold, 4)}`]);
+  }
   document.getElementById('stats').innerHTML = cells.map(([k, v]) =>
     `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`
   ).join('');
@@ -1605,6 +1696,7 @@ function redraw({ stats, lb, fr, frCM, cont, dp, archs, recent, synth }) {
   tableRaw.recentSDG    = (recent || []).filter(
     e => e.task === 'synthetic_data_generator',
   );
+  tableRaw.labReports = labReports || [];
   renderTable('leaderboard');
   renderTable('frontier');
   renderTable('frontierCM');
@@ -1615,6 +1707,10 @@ function redraw({ stats, lb, fr, frCM, cont, dp, archs, recent, synth }) {
   renderTable('recentDP');
   renderTable('synthFrontier');
   renderTable('recentSDG');
+  renderTable('labReports');
+  const lrCount = document.getElementById('lr-count');
+  if (lrCount) lrCount.textContent = ` (${(labReports || []).length})`;
+  renderNoise(noise);
   document.getElementById('lb-count').textContent = ` (${lb.length})`;
   document.getElementById('cm-count').textContent = ` (${frCM.length})`;
   const cAll = (cont && cont.all) || [];
@@ -1664,6 +1760,7 @@ for (const [id, m] of Object.entries({
   recentSDG:    { rowFn: recentSDGRow,    rank: false },
   events:       { rowFn: eventRow,        rank: false },
   checkpoints:  { rowFn: ckRow,           rank: false },
+  labReports:   { rowFn: labReportRow,    rank: false },
 })) {
   tableMeta[id] = m;
   tableState[id] = { sortKey: null, sortDir: 'asc', filter: '' };
@@ -1672,6 +1769,7 @@ for (const [id, m] of Object.entries({
 // Default sort: newest first for both new tables.
 tableState.events.sortKey = 'id'; tableState.events.sortDir = 'desc';
 tableState.checkpoints.sortKey = 'mtime'; tableState.checkpoints.sortDir = 'desc';
+tableState.labReports.sortKey = 'experiment_id'; tableState.labReports.sortDir = 'desc';
 setupTables();
 setupLineage();
 

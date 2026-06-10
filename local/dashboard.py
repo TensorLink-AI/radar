@@ -26,6 +26,10 @@ Endpoints:
                                    cross-task interaction links
   GET /api/frozen_archs            Frozen-arch version list (ts_data_pipeline)
   GET /api/experiment/<id>         full row (incl. code, loss_curve)
+  GET /api/lab_reports?n=&task=    structured per-experiment post-mortems
+  GET /api/lab_report/<exp_id>     one experiment's lab report
+  GET /api/noise                   replicate-derived eval noise floors
+                                   (overall + per task)
   GET /api/events                  agent_events list (round_id, miner_id,
                                    kind, endpoint, only_errors, before_id,
                                    since_id, limit filters)
@@ -51,6 +55,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from local import dashboard_logs
+from local import dashboard_reports
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +103,7 @@ def _row(r: sqlite3.Row, *, with_code: bool = False) -> dict[str, Any]:
     parent_index = r["parent_index"] if "parent_index" in r.keys() else None
     cumulative_compute = float(_opt("cumulative_compute", 0.0))
     is_cont = mode == "continue" or (n_rounds >= 2 and parent_index is not None)
+    objectives = json.loads(r["objectives_json"] or "{}")
     out = {
         "id": r["id"],
         "round_id": r["round_id"],
@@ -106,7 +112,7 @@ def _row(r: sqlite3.Row, *, with_code: bool = False) -> dict[str, Any]:
         "metric": r["metric"],
         "score": r["score"],
         "success": bool(r["success"]),
-        "objectives": json.loads(r["objectives_json"] or "{}"),
+        "objectives": objectives,
         "analysis": r["analysis"],
         "task": r["task"],
         "generation": r["generation"],
@@ -117,6 +123,10 @@ def _row(r: sqlite3.Row, *, with_code: bool = False) -> dict[str, Any]:
         "parent_index": parent_index,
         "cumulative_compute": cumulative_compute,
         "is_continuation": is_cont,
+        # Validator-owned round type (replicate / ablation / recipe_only /
+        # transfer / continuation[:kind] / new) derived from the
+        # objectives stamps — drives the kind badges in the UI.
+        "round_kind": dashboard_reports.round_kind(mode, objectives),
     }
     if with_code:
         out["code"] = r["code"]
@@ -185,7 +195,7 @@ def _stats(conn: sqlite3.Connection) -> dict[str, Any]:
         n_cont_downgraded = sched_row["n_downgraded"] or 0
     except sqlite3.OperationalError:
         pass
-    return {
+    out = {
         "total": total,
         "successful": successful,
         "failed": total - successful,
@@ -201,6 +211,14 @@ def _stats(conn: sqlite3.Connection) -> dict[str, Any]:
         "n_novel": total - n_continuation,
         "n_novel_successful": successful - n_continuation_ok,
     }
+    # Special-round counts + the replicate-derived eval noise floor —
+    # the context that makes frontier movements interpretable.
+    try:
+        out.update(dashboard_reports.special_counts(conn))
+        out["noise"] = dashboard_reports.noise_floors(conn)["overall"]
+    except Exception as e:  # noqa: BLE001
+        logger.debug("special-round stats failed: %s", e)
+    return out
 
 
 def _leaderboard(conn: sqlite3.Connection, n: int) -> list[dict[str, Any]]:
@@ -606,6 +624,23 @@ class _Handler(BaseHTTPRequestHandler):
                 if exp is None:
                     return self._json(404, {"error": "not found"})
                 return self._json(200, exp)
+            if path == "/api/lab_reports":
+                n = int(q.get("n", ["50"])[0])
+                task = _qstr(q, "task")
+                return self._json(200, dashboard_reports.list_lab_reports(
+                    conn, n=n, task=task,
+                ))
+            if path.startswith("/api/lab_report/"):
+                try:
+                    exp_id = int(path.rsplit("/", 1)[1])
+                except ValueError:
+                    return self._json(400, {"error": "bad id"})
+                report = dashboard_reports.get_lab_report(conn, exp_id)
+                if report is None:
+                    return self._json(404, {"error": "not found"})
+                return self._json(200, report)
+            if path == "/api/noise":
+                return self._json(200, dashboard_reports.noise_floors(conn))
             if path == "/api/events":
                 return self._json(200, dashboard_logs.list_events(
                     conn,

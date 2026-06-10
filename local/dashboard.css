@@ -326,6 +326,36 @@ canvas { background: var(--bg-2); border-radius: var(--radius-sm); display: bloc
   border-color: rgba(160, 124, 199, 0.36);
 }
 
+/* Special round kinds (experiment engine) */
+.badge-repl {
+  color: #9aa4b2; background: rgba(154, 164, 178, 0.14);
+  border-color: rgba(154, 164, 178, 0.32);
+}
+.badge-ablate {
+  color: #e89ab8; background: rgba(232, 154, 184, 0.14);
+  border-color: rgba(232, 154, 184, 0.34);
+}
+.badge-recipe {
+  color: #7ec5e8; background: rgba(126, 197, 232, 0.14);
+  border-color: rgba(126, 197, 232, 0.34);
+}
+.badge-xfer {
+  color: #6fd4c3; background: rgba(111, 212, 195, 0.14);
+  border-color: rgba(111, 212, 195, 0.34);
+}
+
+/* Lab-reports tab */
+td.verdict {
+  max-width: 420px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.code-block {
+  background: var(--bg-3, #1a1d24); padding: 12px;
+  border-radius: 6px; overflow: auto; max-height: 70vh;
+  font: 12px/1.5 var(--font-mono, monospace);
+  white-space: pre-wrap; word-break: break-word;
+}
+
 /* ─── Task badge (forecast / pipeline / synth) ────────── */
 .badge-task-fc {
   color: #7ec5e8; background: rgba(126, 197, 232, 0.14);
