@@ -209,3 +209,18 @@ now ships a decent recipe by construction).
   A + researcher, and the designer gets a frozen-architecture preamble.
   v4 leaves this flow intact; the in-round recipe pass is suppressed
   on continuation rounds.
+
+## Validator experiment-engine support
+
+The orchestrator handles the validator-owned special round types
+(`docs/experiment_engine.md`): **ablate** (focused one-diff brief +
+target-code preamble; recipe-tuner pass skipped so the diff stays
+single; also wired into the pipeline-task flow), **recipe_only**
+(rides the in-round recipe machinery — base arch frozen via
+`_inround_recipe_context`), **transfer** (scale-the-source brief;
+recipe pass kept). When the challenge advertises `screening`, the
+proposal ships extra validated designs from `state.candidates` as
+`candidates=[{name, code}, ...]` for short-budget validator triage.
+The analyst is pointed at `/lab_reports` and `/experiments/noise` so
+recommendations weigh paired-significant evidence over sub-noise
+metric gaps. Agent-side logic in `core/round_context.py`.

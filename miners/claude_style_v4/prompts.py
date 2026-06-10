@@ -197,6 +197,15 @@ def build_analyst_system_prompt(
         "POST `/experiments/search` body `{\"query\": \"...\"}`. "
         "**Use `families` first** — it's the cheapest signal on "
         "what's been clustered together.\n"
+        "- `query_db` evidence endpoints: `/lab_reports?task=&n=10` — "
+        "validator post-mortems with paired per-dataset verdicts; a "
+        "verdict saying 'NOT paired-significant' or 'within noise' "
+        "means that direction is NOT validated even if its metric "
+        "looks better. `/experiments/noise?task=` — the eval noise "
+        "floor; frontier gaps below its `threshold` are statistical "
+        "ties, so treat near-tied members as equally good anchors and "
+        "weight `recommend_avoid` toward directions whose only support "
+        "is a sub-noise win.\n"
         "- `time_remaining` — seconds left. You're capped at ~60s; "
         "don't browse, scan."
     )
@@ -834,14 +843,20 @@ def build_designer_user_prompt(challenge: dict, brief: dict) -> str:
     parts: list[str] = []
     inround_ctx = challenge.get("_inround_recipe_context")
     cont_ctx = challenge.get("_continuation_context")
+    special_ctx = challenge.get("_special_context")
     if inround_ctx:
         # v4 second-pass: recipe-only, architecture frozen to pass-1's
         # validated code. Takes precedence over a continuation context
         # (they're mutually exclusive in practice — continuation rounds
-        # never run a second pass).
+        # never run a second pass). Validator-declared recipe_only
+        # rounds ride this same preamble.
         parts.append(_inround_recipe_preamble(inround_ctx))
     elif cont_ctx:
         parts.append(_continuation_preamble(cont_ctx))
+    elif special_ctx:
+        # Validator-owned ablate/transfer round — pre-rendered preamble
+        # carrying the target's code (core.round_context.preamble).
+        parts.append(str(special_ctx))
     parts.append(
         f"You are designing for task `{task_name}`. The researcher "
         "produced this brief — read it, then implement one of the "
@@ -1096,6 +1111,11 @@ def build_pipeline_designer_user_prompt(
     tp = task.get("task_params", {}) or {}
     task_name = task.get("name") or "ts_data_pipeline"
     parts: list[str] = []
+    special_ctx = challenge.get("_special_context")
+    if special_ctx:
+        # Validator-owned ablate round on a pipeline task — preamble
+        # carries the target generator's code (core.round_context).
+        parts.append(str(special_ctx))
     if (task.get("name") or "") == "synthetic_data_generator":
         parts.append(
             "Round task: `synthetic_data_generator`. The arch is the FIXED "

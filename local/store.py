@@ -102,6 +102,16 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE INDEX IF NOT EXISTS idx_artifacts_round_miner ON artifacts(round_id, miner_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind);
 
+CREATE TABLE IF NOT EXISTS lab_reports (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id   INTEGER NOT NULL UNIQUE,
+    round_id        INTEGER NOT NULL,
+    task            TEXT NOT NULL DEFAULT '',
+    report_json     TEXT NOT NULL DEFAULT '{}',
+    created_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lab_reports_round ON lab_reports(round_id);
+
 CREATE TABLE IF NOT EXISTS agent_events (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     ts              REAL NOT NULL,
@@ -194,13 +204,18 @@ class LocalStore:
 
     # ── Challenges ──────────────────────────────────────────
 
-    def post_challenge(self, challenge_id: str, round_id: int, payload: dict) -> None:
+    def post_challenge(self, challenge_id: str, round_id: int, payload: dict,
+                       status: str = "open") -> None:
+        """``status`` defaults to 'open' (miners poll for those); validator-
+        only rounds (e.g. replicate noise probes) post as 'collected' so no
+        miner ever picks them up while round bookkeeping stays uniform."""
         with self._tx() as c:
             c.execute(
                 "INSERT OR REPLACE INTO challenges "
                 "(challenge_id, round_id, payload_json, status, created_at) "
-                "VALUES (?, ?, ?, 'open', ?)",
-                (challenge_id, round_id, json.dumps(payload), time.time()),
+                "VALUES (?, ?, ?, ?, ?)",
+                (challenge_id, round_id, json.dumps(payload), status,
+                 time.time()),
             )
 
     def open_challenge(self) -> Optional[dict]:
@@ -409,6 +424,43 @@ class LocalStore:
             "ORDER BY metric ASC LIMIT 1"
         ).fetchone()
         return _row_to_experiment(row) if row else None
+
+    # ── Lab reports ────────────────────────────────────────
+
+    def add_lab_report(self, *, experiment_id: int, round_id: int,
+                       task: str, report: dict) -> int:
+        with self._tx() as c:
+            cur = c.execute(
+                "INSERT OR REPLACE INTO lab_reports "
+                "(experiment_id, round_id, task, report_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (int(experiment_id), int(round_id), task,
+                 json.dumps(report), time.time()),
+            )
+            return cur.lastrowid
+
+    def get_lab_report(self, experiment_id: int) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM lab_reports WHERE experiment_id = ?",
+            (int(experiment_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["report_json"])
+
+    def recent_lab_reports(self, n: int = 20,
+                           task: Optional[str] = None) -> list[dict]:
+        if task:
+            rows = self._conn.execute(
+                "SELECT * FROM lab_reports WHERE task = ? "
+                "ORDER BY id DESC LIMIT ?", (task, max(1, int(n))),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM lab_reports ORDER BY id DESC LIMIT ?",
+                (max(1, int(n)),),
+            ).fetchall()
+        return [json.loads(r["report_json"]) for r in rows]
 
     # ── Artifacts ──────────────────────────────────────────
 

@@ -13,6 +13,9 @@ without a real network. Endpoints (handlers in ``experiments_api``):
   GET  /experiments/families?task=
   GET  /experiments/stats?task=
   GET  /experiments/tasks
+  GET  /experiments/noise?task=       replicate-derived eval noise floor
+  GET  /lab_reports?n=&task=          recent structured post-mortems
+  GET  /experiments/{idx}/report      lab report (built on demand)
   GET  /experiments/{idx}
   GET  /experiments/{idx}/artifacts
   GET  /experiments/{idx}/diff
@@ -313,6 +316,23 @@ class _Handler(BaseHTTPRequestHandler):
                 lambda: exp_api.tasks(self.store),
             )
 
+        if path == "/experiments/noise":
+            from local.noise import noise_summary
+            task = q.get("task", [None])[0]
+            return self._serve_logged(
+                "experiments_noise", path, {"task": task},
+                lambda: noise_summary(self.store, task=task),
+            )
+
+        if path == "/lab_reports":
+            from local.lab_reports import recent_reports
+            n = int(q.get("n", q.get("limit", ["20"]))[0])
+            task = q.get("task", [None])[0]
+            return self._serve_logged(
+                "lab_reports", path, {"n": n, "task": task},
+                lambda: recent_reports(self.store, n=n, task=task),
+            )
+
         if path == "/artifacts":
             def _opt_int(name: str) -> Optional[int]:
                 v = q.get(name, [None])[0]
@@ -415,6 +435,17 @@ class _Handler(BaseHTTPRequestHandler):
             return self._serve_logged(
                 "experiment_trajectory", path, {"experiment_id": idx},
                 lambda: exp_api.trajectory(self.store, idx),
+            )
+
+        if path.startswith("/experiments/") and path.endswith("/report"):
+            try:
+                idx = int(path.split("/")[2])
+            except (IndexError, ValueError):
+                return self._json(400, {"error": "bad id"})
+            from local.lab_reports import report_for
+            return self._serve_logged(
+                "experiment_report", path, {"experiment_id": idx},
+                lambda: report_for(self.store, idx),
             )
 
         if path.startswith("/experiments/") and path.endswith("/signature"):
