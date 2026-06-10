@@ -22,8 +22,10 @@ import argparse
 import importlib.util
 import inspect
 import logging
+import socket
 import sys
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Callable, Optional
@@ -115,6 +117,30 @@ def _build_client(challenge: dict, miner_id: str) -> Optional[GatedClient]:
     return GatedClient(prefixes, default_headers=headers)
 
 
+def _services_reachable(challenge: dict, timeout: float = 2.0) -> bool:
+    """True when the challenge's services URL accepts TCP connections.
+
+    A challenge published by a validator that has since died carries that
+    process's ephemeral services port; probing before invoking the agent
+    keeps the miner from burning its round budget on connection-refused
+    LLM calls and submitting a junk fallback proposal. Challenges without
+    a services URL (pre-services validators) always pass."""
+    raw = challenge.get("allowed_urls", "") or challenge.get("db_url", "")
+    url = raw.split(",")[0].strip()
+    if not url:
+        return True
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname
+    if not host:
+        return True
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Local radar miner")
     parser.add_argument("--db", default="local/radar_local.db",
@@ -151,6 +177,7 @@ def main(argv: list[str] | None = None) -> int:
 
     last_round = -1
     submitted = 0
+    unreachable_logged = ""
     try:
         while args.rounds == 0 or submitted < args.rounds:
             open_ch = store.open_challenge()
@@ -161,6 +188,21 @@ def main(argv: list[str] | None = None) -> int:
             challenge = open_ch["payload"]
             round_id = open_ch["round_id"]
             challenge_id = open_ch["challenge_id"]
+
+            # Don't burn the round on a stale challenge whose validator
+            # is gone — wait for a live one (the restarted validator
+            # expires stale rows and publishes a fresh challenge).
+            if not _services_reachable(challenge):
+                if challenge_id != unreachable_logged:
+                    logger.warning(
+                        "challenge round=%d services unreachable (%s) — "
+                        "stale challenge from a dead validator? waiting",
+                        round_id, challenge.get("allowed_urls", "?"),
+                    )
+                    unreachable_logged = challenge_id
+                time.sleep(max(args.poll_seconds, 5.0))
+                continue
+
             logger.info(
                 "got challenge round=%d bucket=[%d, %d] frontier=%d",
                 round_id, challenge.get("min_flops_equivalent", 0),
