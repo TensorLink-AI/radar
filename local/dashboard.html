@@ -21,6 +21,9 @@
     <button class="tab" role="tab" data-tab="lineage" aria-selected="false">
       Lineage
     </button>
+    <button class="tab" role="tab" data-tab="lab_reports" aria-selected="false">
+      Lab reports
+    </button>
     <button class="tab" role="tab" data-tab="service_log" aria-selected="false">
       Service log
     </button>
@@ -51,7 +54,7 @@
   <th data-key="miner_id">miner</th>
   <th data-key="name">name</th>
   <th data-key="task">task</th>
-  <th data-key="is_continuation">kind</th>
+  <th data-key="round_kind">kind</th>
   <th class="num" data-key="metric" data-type="num">metric</th>
   <th class="num" data-key="objectives.crps" data-type="num">crps</th>
   <th class="num" data-key="objectives.mase" data-type="num">mase</th>
@@ -115,7 +118,7 @@
   <th data-key="miner_id">miner</th>
   <th data-key="name">name</th>
   <th data-key="task">task</th>
-  <th data-key="is_continuation">kind</th>
+  <th data-key="round_kind">kind</th>
   <th class="num" data-key="metric" data-type="num">metric</th>
   <th class="num" data-key="score" data-type="num">score</th>
   <th data-key="success">ok</th>
@@ -193,7 +196,7 @@
   <th data-key="miner_id">miner</th>
   <th data-key="name">name</th>
   <th class="num" data-key="objectives.synth_arch_version" data-type="num">arch v</th>
-  <th data-key="is_continuation">kind</th>
+  <th data-key="round_kind">kind</th>
   <th class="num" data-key="objectives.crps" data-type="num">crps</th>
   <th class="num" data-key="objectives.mase" data-type="num">mase</th>
   <th class="num" data-key="objectives.flops_equivalent_size" data-type="num">flops</th>
@@ -210,12 +213,36 @@
   <th data-key="miner_id">miner</th>
   <th data-key="name">name</th>
   <th class="num" data-key="objectives.synth_arch_version" data-type="num">arch v</th>
-  <th data-key="is_continuation">kind</th>
+  <th data-key="round_kind">kind</th>
   <th class="num" data-key="objectives.crps" data-type="num">crps</th>
   <th class="num" data-key="objectives.mase" data-type="num">mase</th>
   <th class="num" data-key="metric" data-type="num">metric</th>
   <th data-key="success">ok</th>
 </tr></thead><tbody id="recentSDG"></tbody></table></div>
+
+</section>
+
+<!-- ─── Lab-reports tab ────────────────────────────────────────── -->
+<section data-tab="lab_reports">
+
+<h2>Eval noise floor <span class="muted">from replicate-round pairs · deltas below threshold are statistical ties</span></h2>
+<div class="stats" id="noiseStats"></div>
+
+<h2>Lab reports <span class="muted" id="lr-count"></span>
+  <span class="muted">validator post-mortems · click a row for the full report</span>
+  <input class="tbl-search" data-table="labReports" placeholder="filter…">
+</h2>
+<div class="table-wrap"><table data-table="labReports"><thead><tr>
+  <th data-key="experiment_id" data-type="num">exp</th>
+  <th data-key="round_id" data-type="num">round</th>
+  <th data-key="task">task</th>
+  <th data-key="round_kind">kind</th>
+  <th data-key="name">name</th>
+  <th class="num" data-key="outcome.metric" data-type="num">metric</th>
+  <th class="num" data-key="delta" data-type="num">Δ</th>
+  <th data-key="paired.n_improved" data-type="num">paired</th>
+  <th data-key="verdict">verdict</th>
+</tr></thead><tbody id="labReports"></tbody></table></div>
 
 </section>
 
