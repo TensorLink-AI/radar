@@ -1334,6 +1334,13 @@ def main(argv: list[str] | None = None) -> int:
         "services: db=%s llm=%s/llm desearch=%s/desearch wiki=%s/wiki",
         services_url, services_url, services_url, services_url,
     )
+    # A challenge left 'open' by a dead validator carries that process's
+    # ephemeral services port; expire it so no miner burns a round on
+    # connection-refused against the stale URL.
+    expired = store.expire_open_challenges()
+    if expired:
+        logger.info("expired %d stale open challenge(s) from a prior run",
+                    expired)
     if args.services_url_file:
         Path(args.services_url_file).write_text(services_url)
 

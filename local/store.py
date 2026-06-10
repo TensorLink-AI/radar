@@ -240,6 +240,21 @@ class LocalStore:
                 (status, challenge_id),
             )
 
+    def expire_open_challenges(self) -> int:
+        """Mark every leftover 'open' challenge as 'expired'.
+
+        The validator calls this once at startup. An 'open' row can only
+        outlive its round when the validator died mid-phase-A, and its
+        payload carries the dead process's ephemeral services port — any
+        miner that picks it up burns its round on connection errors.
+        Returns the number of rows expired."""
+        with self._tx() as c:
+            cur = c.execute(
+                "UPDATE challenges SET status = 'expired' "
+                "WHERE status = 'open'"
+            )
+            return cur.rowcount
+
     # ── Proposals ───────────────────────────────────────────
 
     def post_proposal(
