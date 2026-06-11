@@ -591,8 +591,9 @@ class _Handler(BaseHTTPRequestHandler):
         if not path.startswith("/api/"):
             return self._json(404, {"error": "not found"})
 
-        conn = _connect_ro(self.db_path)
+        conn = None
         try:
+            conn = _connect_ro(self.db_path)
             if path == "/api/stats":
                 return self._json(200, _stats(conn))
             if path == "/api/leaderboard":
@@ -680,8 +681,18 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._json(404, {"error": "no checkpoint"})
                 return self._json(200, sig)
             self._json(404, {"error": f"unknown path {path}"})
+        except Exception as e:  # noqa: BLE001
+            # Without this a raising handler closes the socket with no
+            # response and the browser reports a bare "Failed to fetch";
+            # answer with a JSON 500 so the failing endpoint is visible.
+            logger.exception("dashboard %s failed", path)
+            try:
+                self._json(500, {"error": f"{type(e).__name__}: {e}"})
+            except Exception:  # noqa: BLE001
+                pass  # headers already sent — nothing more we can do
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
 
 def serve(db_path: str, host: str, port: int,

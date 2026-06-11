@@ -1619,17 +1619,22 @@ function renderNoise(noise) {
 
 // ── Refresh loop ───────────────────────────────────────────
 async function refresh() {
+  // Prefix failures with the endpoint — a bare fetch rejection reads
+  // "Failed to fetch" with no hint of which of the 11 calls died.
+  const api = p => get(p).catch(e => {
+    throw new Error(`${p}: ${e.message || e}`);
+  });
   try {
     const [stats, lb, fr, frCM, cont, dp, archs, recent, synth, labReports, noise] = await Promise.all([
-      get('/api/stats'), get('/api/leaderboard?n=20'),
-      get('/api/frontier'), get('/api/frontier_crps_mase'),
-      get('/api/continuation_frontier'),
-      get('/api/data_pipeline_frontier'),
-      get('/api/frozen_archs'),
-      get('/api/recent?n=30'),
-      get('/api/synth_frontier'),
-      get('/api/lab_reports?n=100'),
-      get('/api/noise'),
+      api('/api/stats'), api('/api/leaderboard?n=20'),
+      api('/api/frontier'), api('/api/frontier_crps_mase'),
+      api('/api/continuation_frontier'),
+      api('/api/data_pipeline_frontier'),
+      api('/api/frozen_archs'),
+      api('/api/recent?n=30'),
+      api('/api/synth_frontier'),
+      api('/api/lab_reports?n=100'),
+      api('/api/noise'),
     ]);
     state.lastData = { stats, lb, fr, frCM, cont, dp, archs, recent, synth, labReports, noise };
     redraw(state.lastData);
