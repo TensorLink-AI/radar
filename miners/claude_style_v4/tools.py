@@ -911,7 +911,8 @@ TOOLS: list[dict] = [
         "function": {
             "name": "read_frozen_arch",
             "description": (
-                "ts_data_pipeline only: return the FROZEN architecture's "
+                "Data-pipeline tasks only (ts_data_pipeline / "
+                "synthetic_data_generator): return the FROZEN architecture's "
                 "compact card (version + I/O contract + flops + bytes). "
                 "Pass include_source=true to also get the full Python "
                 "source — do this at most once per round; the source is "
@@ -938,7 +939,8 @@ TOOLS: list[dict] = [
         "function": {
             "name": "pipeline_smoke_test",
             "description": (
-                "ts_data_pipeline only: exec the code locally, call "
+                "Data-pipeline tasks only (ts_data_pipeline / "
+                "synthetic_data_generator): exec the code locally, call "
                 "build_pipeline(**task_params), and pull up to 2 batches "
                 "to verify shape (B, ctx, V) + (B, pred, V) and batch-dim "
                 "agreement. Cheap sub-second check — run it BEFORE "
@@ -1246,8 +1248,8 @@ def build_handlers(
         frozen = challenge.get("frozen_arch") or {}
         if not frozen:
             return (
-                "error: no frozen_arch on challenge — not a ts_data_pipeline "
-                "round?"
+                "error: no frozen_arch on challenge — not a data-pipeline "
+                "(ts_data_pipeline / synthetic_data_generator) round?"
             )
         task = challenge.get("task", {}) or {}
         tp = task.get("task_params") or {}

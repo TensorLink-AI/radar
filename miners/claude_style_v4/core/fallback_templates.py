@@ -22,6 +22,7 @@ import hashlib
 import math
 import textwrap
 
+from core import is_pipeline_task
 from core.history import extract_flops_budget, identify_bucket
 from core.input_shape import (
     _CHANNEL_KEYS,
@@ -145,8 +146,7 @@ def fallback_name_for(challenge: dict) -> str:
     e.g. ``fallback_large_v2``. Makes it possible to distinguish fallback
     submissions across rounds and size buckets in the experiment DB.
     """
-    task_name = (challenge.get("task") or {}).get("name") or ""
-    if task_name == "ts_data_pipeline":
+    if is_pipeline_task(challenge):
         fa_version = (challenge.get("frozen_arch") or {}).get("version", "?")
         return f"pipeline_fallback_v{fa_version}_{FALLBACK_VERSION}"
     flops_min, flops_max = extract_flops_budget(challenge)
@@ -282,9 +282,11 @@ def generate_fallback(challenge: dict) -> str:
 
     jitter = _miner_jitter(challenge)
 
-    # 0. ts_data_pipeline — different contract (build_pipeline, not
-    # build_model). Procedural mixture generator, no data dependency.
-    if (challenge.get("task") or {}).get("name") == "ts_data_pipeline":
+    # 0. Pipeline tasks (ts_data_pipeline / synthetic_data_generator) —
+    # different contract (build_pipeline, not build_model). Procedural
+    # mixture generator, no data dependency; the build_pipeline shape
+    # contract is identical across both tasks.
+    if is_pipeline_task(challenge):
         return _generate_pipeline_fallback(challenge, jitter)
 
     # 1. Token-ID task
