@@ -1201,6 +1201,18 @@ function buildLineage(runs) {
   (runs || []).forEach((r, i) => {
     const tp = normalizeCurve(r.loss_curve);
     const vp = normalizeCurve(r.val_curve);
+    // Train losses are logged per step as a bare list (x = index), while val
+    // carries real step numbers. Spread the step-less train curve across the
+    // run's val step domain so the two share one x-axis within the run —
+    // otherwise train gets crushed into the left sliver of the run's width
+    // and the polyline draws a flat bridge to the next run. Mirrors the
+    // single-run path in renderLossCurve.
+    const trainStepless = tp.every((p, k) => p.x === k);
+    const valMax = vp.length ? Math.max(...vp.map(p => p.x)) : 0;
+    if (trainStepless && valMax > 0 && tp.length > 1) {
+      const n = tp.length;
+      for (let k = 0; k < n; k++) tp[k].x = (k / (n - 1)) * valMax;
+    }
     const maxX = Math.max(
       0,
       ...(tp.length ? tp.map(p => p.x) : [0]),
