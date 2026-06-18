@@ -9,6 +9,7 @@ import pytest
 
 from local.dashboard_reports import (
     get_lab_report,
+    lineage_curve,
     list_lab_reports,
     noise_floors,
     round_kind,
@@ -71,6 +72,36 @@ def test_lab_reports_roundtrip_and_missing_table(db, tmp_path):
     bare.execute("CREATE TABLE experiments (id INTEGER)")
     assert list_lab_reports(bare) == []
     assert get_lab_report(bare, 1) is None
+
+
+def test_lineage_curve_stitches_parent_chain(db, tmp_path):
+    s, path = db
+    root = s.add_experiment(
+        round_id=1, miner_id="m", name="v1", code="x", motivation="",
+        reasoning="", tool_calls=[], metric=0.5, success=True, objectives={},
+        score=0.0, loss_curve=[3.0, 2.0, 1.5], val_curve=[[0, 2.5]],
+        task="synthetic_data_generator", mode="new",
+    )
+    child = s.add_experiment(
+        round_id=2, miner_id="m", name="v1+", code="y", motivation="",
+        reasoning="", tool_calls=[], metric=0.45, success=True,
+        objectives={"continuation_kind": "extend"}, score=0.0,
+        loss_curve=[1.1, 0.9], val_curve=[[0, 1.0]],
+        task="synthetic_data_generator", mode="continue", n_rounds=2,
+        parent_index=root,
+    )
+    conn = _ro(path)
+    lc = lineage_curve(conn, child)
+    assert lc["n_runs"] == 2
+    assert lc["task"] == "synthetic_data_generator"
+    # Ordered root → leaf.
+    assert [r["round_id"] for r in lc["runs"]] == [1, 2]
+    assert [r["continuation_kind"] for r in lc["runs"]] == [None, "extend"]
+    assert [len(r["loss_curve"]) for r in lc["runs"]] == [3, 2]
+    assert [len(r["val_curve"]) for r in lc["runs"]] == [1, 1]
+    # A novel run is its own single-element lineage.
+    assert lineage_curve(conn, root)["n_runs"] == 1
+    conn.close()
 
 
 def test_noise_floors_and_special_counts(db):

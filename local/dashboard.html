@@ -220,6 +220,39 @@
   <th data-key="success">ok</th>
 </tr></thead><tbody id="recentSDG"></tbody></table></div>
 
+<h2>Datagen lab reports <span class="muted" id="sdg-lr-count"></span>
+  <span class="muted">validator post-mortems for this challenge · click a row for the full report</span>
+  <input class="tbl-search" data-table="synthLabReports" placeholder="filter…">
+</h2>
+<div class="table-wrap"><table data-table="synthLabReports"><thead><tr>
+  <th data-key="experiment_id" data-type="num">exp</th>
+  <th data-key="round_id" data-type="num">round</th>
+  <th data-key="task">task</th>
+  <th data-key="round_kind">kind</th>
+  <th data-key="name">name</th>
+  <th class="num" data-key="outcome.metric" data-type="num">metric</th>
+  <th class="num" data-key="delta" data-type="num">Δ</th>
+  <th data-key="paired.n_improved" data-type="num">paired</th>
+  <th data-key="verdict">verdict</th>
+</tr></thead><tbody id="synthLabReports"></tbody></table></div>
+
+<h2>Datagen service log <span class="muted" id="sdg-ev-count"></span>
+  <span class="muted">miner/validator service calls on datagen rounds · click a row for the full event</span>
+  <input class="tbl-search" data-table="synthEvents" placeholder="filter…">
+</h2>
+<div class="table-wrap log-wrap"><table data-table="synthEvents"><thead><tr>
+  <th data-key="id" data-type="num">id</th>
+  <th data-key="ts">when</th>
+  <th data-key="round_id" data-type="num">round</th>
+  <th data-key="miner_id">miner</th>
+  <th data-key="kind">kind</th>
+  <th data-key="endpoint">endpoint</th>
+  <th class="num" data-key="status" data-type="num">status</th>
+  <th class="num" data-key="latency_ms" data-type="num">ms</th>
+  <th class="num" data-key="response_bytes" data-type="num">res</th>
+  <th data-key="response_preview">preview</th>
+</tr></thead><tbody id="synthEvents"></tbody></table></div>
+
 </section>
 
 <!-- ─── Lab-reports tab ────────────────────────────────────────── -->

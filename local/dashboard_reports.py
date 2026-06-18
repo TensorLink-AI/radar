@@ -83,6 +83,66 @@ def get_lab_report(conn: sqlite3.Connection,
         return None
 
 
+def lineage_curve(conn: sqlite3.Connection, exp_id: int,
+                  max_depth: int = 64) -> dict[str, Any]:
+    """Ordered parent→child loss/val curves for a continuation lineage.
+
+    Walks the ``parent_index`` chain from ``exp_id`` up to its root and
+    returns the per-run training/val curves in chronological order so the
+    dashboard can stitch them into one continuous curve (an *extend*
+    continuation keeps training the same weights, so its curve is the tail
+    of the parent's). Tolerant of cycles, missing rows, and pre-val_curve
+    schemas — a broken link just truncates the chain.
+    """
+    chain: list[sqlite3.Row] = []
+    seen: set[int] = set()
+    cur: Optional[int] = int(exp_id)
+    while cur is not None and cur not in seen and len(chain) < max_depth:
+        seen.add(cur)
+        try:
+            r = conn.execute(
+                "SELECT * FROM experiments WHERE id = ?", (int(cur),),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            break
+        if r is None:
+            break
+        chain.append(r)
+        keys = r.keys()
+        cur = r["parent_index"] if "parent_index" in keys else None
+        cur = int(cur) if cur is not None else None
+    chain.reverse()  # root → … → leaf
+
+    def _json(row: sqlite3.Row, col: str, default: Any) -> Any:
+        if col not in row.keys() or row[col] is None:
+            return default
+        try:
+            return json.loads(row[col])
+        except (json.JSONDecodeError, TypeError):
+            return default
+
+    runs: list[dict[str, Any]] = []
+    for r in chain:
+        keys = r.keys()
+        objs = _json(r, "objectives_json", {})
+        runs.append({
+            "exp_id": r["id"],
+            "round_id": r["round_id"],
+            "mode": r["mode"] if "mode" in keys else "new",
+            "n_rounds": (r["n_rounds"] if "n_rounds" in keys else 1) or 1,
+            "continuation_kind": (objs or {}).get("continuation_kind"),
+            "success": bool(r["success"]) if "success" in keys else None,
+            "loss_curve": _json(r, "loss_curve_json", []),
+            "val_curve": _json(r, "val_curve_json", []),
+        })
+    return {
+        "experiment_id": int(exp_id),
+        "task": chain[-1]["task"] if chain else "",
+        "n_runs": len(runs),
+        "runs": runs,
+    }
+
+
 def _slim_experiments(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """Minimal experiment dicts for ``local.noise`` (id, metric, mode,
     success, task, objectives)."""
