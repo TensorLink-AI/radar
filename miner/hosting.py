@@ -79,6 +79,17 @@ async def deploy_basilica(
     if tolerance:
         pod_env["RADAR_EPISTULA_TOLERANCE"] = tolerance
 
+    # Phase-transition callback — gives operators real-time visibility
+    # into "pulling / scheduling / health_check / ..." instead of 15
+    # minutes of silence before a DeploymentTimeout.
+    def _on_progress(status):
+        logger.info(
+            "BASILICA_PROGRESS name=%s state=%s phase=%s replicas=%d/%d msg=%s",
+            deploy_name, status.state, status.phase,
+            status.replicas_ready, status.replicas_desired,
+            (status.message or "")[:200],
+        )
+
     deploy_kwargs = dict(
         name=deploy_name,
         image=image,
@@ -99,20 +110,72 @@ async def deploy_basilica(
         ]
 
     loop = asyncio.get_event_loop()
-    deployment = await loop.run_in_executor(
-        None, functools.partial(client.deploy, **deploy_kwargs),
-    )
 
-    # Enroll for public metadata so validators can verify the pod.
-    try:
-        await loop.run_in_executor(
-            None,
-            functools.partial(client.enroll_metadata, deployment.name, enabled=True),
+    # Split create + wait so a wait timeout/failure still leaves us
+    # a handle to fetch logs+events and to tear down the dead pod —
+    # client.deploy() raises before returning, losing both.
+    def _create_and_wait():
+        response = client.create_deployment(
+            instance_name=deploy_name,
+            image=image,
+            replicas=1,
+            port=8081,
+            env=pod_env,
+            memory=request.memory,
+            gpu_count=request.gpu_count,
+            min_gpu_memory_gb=request.min_gpu_memory_gb,
+            gpu_models=deploy_kwargs.get("gpu_models"),
+            ttl_seconds=ttl,
+            public=True,
+            public_metadata=True,
         )
-    except Exception as e:
-        logger.warning("Failed to enroll public metadata for %s: %s", deployment.name, e)
+        from basilica._deployment import Deployment as _BDep
+        dep = _BDep._from_response(client, response)
+        try:
+            dep.wait_until_ready(
+                timeout=deploy_timeout,
+                on_progress=_on_progress,
+                silent=True,
+            )
+            dep.refresh()
+            return dep
+        except Exception:
+            _dump_basilica_failure(client, deploy_name)
+            # Tear down the dead pod so it doesn't sit consuming quota
+            # until TTL expires.
+            try:
+                client.delete_deployment(deploy_name)
+                logger.info("BASILICA_TEARDOWN name=%s after failed deploy", deploy_name)
+            except Exception as te:
+                logger.warning("BASILICA_TEARDOWN_FAILED name=%s err=%s", deploy_name, te)
+            raise
+
+    deployment = await loop.run_in_executor(None, _create_and_wait)
 
     return Deployment(name=deployment.name, url=deployment.url, raw=deployment)
+
+
+def _dump_basilica_failure(client, name: str) -> None:
+    """Pull events + tail logs from Basilica and surface them in the miner log."""
+    try:
+        events = client.get_deployment_events(name, limit=50)
+        ev_list = events.get("events", []) if isinstance(events, dict) else []
+        for ev in ev_list[-20:]:
+            logger.error(
+                "BASILICA_EVENT name=%s type=%s reason=%s count=%s ts=%s msg=%s",
+                name, ev.get("event_type"), ev.get("reason"),
+                ev.get("count"), ev.get("last_timestamp"),
+                (ev.get("message") or "")[:300],
+            )
+    except Exception as e:
+        logger.warning("BASILICA_EVENTS_UNAVAILABLE name=%s err=%s", name, e)
+    try:
+        logs = client.get_deployment_logs(name, tail=200)
+        if logs:
+            for line in str(logs).splitlines()[-200:]:
+                logger.error("BASILICA_LOG name=%s | %s", name, line)
+    except Exception as e:
+        logger.warning("BASILICA_LOGS_UNAVAILABLE name=%s err=%s", name, e)
 
 
 def teardown_basilica_sync(deployment) -> None:
