@@ -446,6 +446,28 @@ async function loadEvents() {
     ` · showing ${events.length}`;
 }
 
+// Datagen tab: lab reports + service log scoped to synthetic_data_generator.
+// Kept separate from the global lab_reports / service_log tabs (which mix
+// all tasks and cap at the most-recent window) so the datagen challenge's
+// own post-mortems and service calls are always visible in context.
+async function loadSynthLogs() {
+  const TASK = 'synthetic_data_generator';
+  try {
+    const [reports, events] = await Promise.all([
+      get('/api/lab_reports?n=100&task=' + TASK),
+      get('/api/events?limit=200&task=' + encodeURIComponent(TASK)),
+    ]);
+    tableRaw.synthLabReports = reports || [];
+    tableRaw.synthEvents = events || [];
+    renderTable('synthLabReports');
+    renderTable('synthEvents');
+    const lr = document.getElementById('sdg-lr-count');
+    if (lr) lr.textContent = ` (${(reports || []).length})`;
+    const ev = document.getElementById('sdg-ev-count');
+    if (ev) ev.textContent = ` (${(events || []).length})`;
+  } catch (e) { /* transient fetch error — next refresh retries */ }
+}
+
 async function loadEventStats() {
   const stats = await get('/api/event_stats');
   evState.stats = stats;
@@ -1014,6 +1036,9 @@ async function showDetail(id) {
   const objJson = esc(JSON.stringify(e.objectives, null, 2));
   const ts = e.timestamp ? new Date(e.timestamp * 1000).toLocaleString() : '—';
   const hasLoss = Array.isArray(e.loss_curve) && e.loss_curve.length > 0;
+  // Continuation runs warm-start a parent's weights, so the parent's curve is
+  // the head of this one. Offer a stitched lineage view (default) for them.
+  const canLineage = !!(e.is_continuation && e.parent_index != null);
   const spikes = obj(e, 'num_spikes_skipped');
   const contLine = e.is_continuation
     ? `<p><b>kind</b> <span style="color:#a07cc7">continuation</span>`
@@ -1045,6 +1070,10 @@ async function showDetail(id) {
           + `<div class="loss-controls">`
           + `<button id="lossLin" class="active">linear</button>`
           + `<button id="lossLog">log y</button>`
+          + (canLineage
+              ? `<button id="lossThisRun">this run</button>`
+                + `<button id="lossLineage" class="active">full lineage</button>`
+              : '')
           + `</div>`
           + `<canvas id="lossCurve" width="520" height="240"></canvas>`
           + `<div class="muted" id="lossMeta"></div>`
@@ -1064,10 +1093,27 @@ async function showDetail(id) {
     );
   };
   if (hasLoss) {
-    const drawLoss = () => renderLossCurve(
-      document.getElementById('lossCurve'), e.loss_curve, e.val_curve, state.lossLogScale,
-      document.getElementById('lossMeta'),
-    );
+    // Lineage view stitches the whole continuation chain; default on for
+    // continuation runs. lineageRuns is filled lazily on first need.
+    state.lossLineage = canLineage;
+    state.lineageRuns = null;
+    const canvas = () => document.getElementById('lossCurve');
+    const meta = () => document.getElementById('lossMeta');
+    const drawLoss = () => {
+      if (state.lossLineage && state.lineageRuns && state.lineageRuns.length > 1) {
+        renderLineageCurve(canvas(), state.lineageRuns, state.lossLogScale, meta());
+      } else {
+        renderLossCurve(canvas(), e.loss_curve, e.val_curve, state.lossLogScale, meta());
+      }
+    };
+    const ensureLineage = async () => {
+      if (state.lineageRuns !== null) return;
+      try {
+        const lc = await get(`/api/experiment/${e.id}/lineage_curve`);
+        state.lineageRuns = (lc && lc.runs) || [];
+      } catch (_e) { state.lineageRuns = []; }
+    };
+    if (canLineage) ensureLineage().then(drawLoss);
     drawLoss();
     document.getElementById('lossLin').onclick = () => {
       state.lossLogScale = false;
@@ -1081,6 +1127,21 @@ async function showDetail(id) {
       document.getElementById('lossLin').classList.remove('active');
       drawLoss();
     };
+    if (canLineage) {
+      const thisBtn = document.getElementById('lossThisRun');
+      const linBtn = document.getElementById('lossLineage');
+      thisBtn.onclick = () => {
+        state.lossLineage = false;
+        thisBtn.classList.add('active'); linBtn.classList.remove('active');
+        drawLoss();
+      };
+      linBtn.onclick = async () => {
+        state.lossLineage = true;
+        linBtn.classList.add('active'); thisBtn.classList.remove('active');
+        await ensureLineage();
+        drawLoss();
+      };
+    }
     document.getElementById('lossExpand').onclick = () => openLossModal(e);
   }
   highlightSelection();
@@ -1127,6 +1188,52 @@ function renderLossCurve(canvas, curve, valCurve, logY, metaEl) {
       for (let i = 0; i < n; i++) pts[i].x = (i / (n - 1)) * valMax;
     }
   }
+  drawCurveCore(c, ctx, pts, valPts, logY, metaEl, null);
+}
+
+// Stitch a continuation lineage (root → … → leaf) into one continuous
+// curve: each run's points are offset past the previous run's width so an
+// *extend* (more compute, same data) reads as the tail of its parent's
+// curve. ``bounds`` marks where each successive run begins.
+function buildLineage(runs) {
+  let off = 0;
+  const train = [], val = [], bounds = [];
+  (runs || []).forEach((r, i) => {
+    const tp = normalizeCurve(r.loss_curve);
+    const vp = normalizeCurve(r.val_curve);
+    const maxX = Math.max(
+      0,
+      ...(tp.length ? tp.map(p => p.x) : [0]),
+      ...(vp.length ? vp.map(p => p.x) : [0]),
+    );
+    if (i > 0) bounds.push({
+      x: off, round_id: r.round_id,
+      label: r.continuation_kind || r.mode || 'cont',
+    });
+    tp.forEach(p => train.push({ x: off + p.x, y: p.y }));
+    vp.forEach(p => val.push({ x: off + p.x, y: p.y }));
+    // Small gap so adjacent runs stay visually distinct even when a run
+    // logged a single point.
+    off += maxX + Math.max(1, maxX * 0.03);
+  });
+  return { train, val, bounds };
+}
+
+function renderLineageCurve(canvas, runs, logY, metaEl) {
+  if (!canvas) return;
+  const c = canvas, ctx = c.getContext('2d');
+  ctx.fillStyle = '#161820'; ctx.fillRect(0, 0, c.width, c.height);
+  const { train, val, bounds } = buildLineage(runs);
+  if (train.length === 0) { drawEmpty(ctx, c, 'no finite points'); return; }
+  drawCurveCore(c, ctx, train, val, logY, metaEl, {
+    bounds, runCount: (runs || []).length,
+  });
+}
+
+// Shared drawing: axes, train/val polylines, optional lineage run
+// boundaries. ``pts``/``valPts`` are already in display x-coordinates.
+function drawCurveCore(c, ctx, pts, valPts, logY, metaEl, opts) {
+  const bounds = (opts && opts.bounds) || null;
   // Log y needs positive losses; drop non-positive and fall back to linear
   // if nothing survives. Keep the curves in sync (skip same indices).
   let effLog = logY;
@@ -1184,6 +1291,23 @@ function renderLossCurve(canvas, curve, valCurve, logY, metaEl) {
     ctx.fillStyle = '#777e8b';
     ctx.fillText(yv.toFixed(yv >= 100 ? 0 : yv >= 1 ? 2 : 4), 2, yy + 3);
   }
+  // Lineage run boundaries: a dashed vertical where each warm-started run
+  // picks up, labelled with its round + continuation kind.
+  if (bounds && bounds.length) {
+    ctx.save();
+    ctx.setLineDash([4, 3]);
+    ctx.strokeStyle = '#5b6b8c'; ctx.lineWidth = 1;
+    ctx.font = '9px ui-monospace, monospace';
+    for (const b of bounds) {
+      const bx = px(b.x);
+      if (!Number.isFinite(bx) || bx < pad || bx > c.width - pad) continue;
+      ctx.beginPath(); ctx.moveTo(bx, pad); ctx.lineTo(bx, c.height - pad); ctx.stroke();
+      ctx.fillStyle = '#8fa3c8';
+      const lbl = `r${b.round_id ?? '?'}·${b.label || ''}`;
+      ctx.fillText(lbl, bx + 2, pad + 10);
+    }
+    ctx.restore();
+  }
   // train line
   ctx.strokeStyle = '#7ec97e'; ctx.lineWidth = 1.5;
   ctx.beginPath();
@@ -1223,7 +1347,9 @@ function renderLossCurve(canvas, curve, valCurve, logY, metaEl) {
   ctx.fillText(effLog ? 'log loss →' : 'loss →', 0, 0); ctx.restore();
   if (metaEl) {
     const trainYs = pts.map(p => p.y);
-    let text = `train: ${pts.length} pts · first=${trainYs[0].toFixed(4)} `
+    let text = (opts && opts.runCount > 1)
+      ? `lineage: ${opts.runCount} runs · ` : '';
+    text += `train: ${pts.length} pts · first=${trainYs[0].toFixed(4)} `
       + `· last=${trainYs[trainYs.length-1].toFixed(4)} `
       + `· min=${Math.min(...trainYs).toFixed(4)}`;
     if (valPts.length > 0) {
@@ -1302,7 +1428,11 @@ function openLossModal(e) {
   openModal(`experiment ${e.id} — loss`, body => {
     body.appendChild(big);
     body.appendChild(meta);
-    renderLossCurve(big, e.loss_curve, e.val_curve, state.lossLogScale, meta);
+    if (state.lossLineage && state.lineageRuns && state.lineageRuns.length > 1) {
+      renderLineageCurve(big, state.lineageRuns, state.lossLogScale, meta);
+    } else {
+      renderLossCurve(big, e.loss_curve, e.val_curve, state.lossLogScale, meta);
+    }
   });
 }
 
@@ -1761,6 +1891,8 @@ for (const [id, m] of Object.entries({
   events:       { rowFn: eventRow,        rank: false },
   checkpoints:  { rowFn: ckRow,           rank: false },
   labReports:   { rowFn: labReportRow,    rank: false },
+  synthLabReports: { rowFn: labReportRow, rank: false },
+  synthEvents:  { rowFn: eventRow,        rank: false },
 })) {
   tableMeta[id] = m;
   tableState[id] = { sortKey: null, sortDir: 'asc', filter: '' };
@@ -1770,6 +1902,8 @@ for (const [id, m] of Object.entries({
 tableState.events.sortKey = 'id'; tableState.events.sortDir = 'desc';
 tableState.checkpoints.sortKey = 'mtime'; tableState.checkpoints.sortDir = 'desc';
 tableState.labReports.sortKey = 'experiment_id'; tableState.labReports.sortDir = 'desc';
+tableState.synthLabReports.sortKey = 'experiment_id'; tableState.synthLabReports.sortDir = 'desc';
+tableState.synthEvents.sortKey = 'id'; tableState.synthEvents.sortDir = 'desc';
 setupTables();
 setupLineage();
 
@@ -1854,6 +1988,8 @@ function setActiveTab(name) {
     loadCheckpoints();
   } else if (name === 'lineage') {
     loadLineage();
+  } else if (name === 'synth') {
+    loadSynthLogs();
   }
 }
 
@@ -1879,6 +2015,8 @@ function startTimer() {
       loadCheckpoints();
     } else if (state.activeTab === 'lineage') {
       loadLineage();
+    } else if (state.activeTab === 'synth') {
+      loadSynthLogs();
     }
   }, 5000);
 }

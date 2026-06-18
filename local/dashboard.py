@@ -26,13 +26,16 @@ Endpoints:
                                    cross-task interaction links
   GET /api/frozen_archs            Frozen-arch version list (ts_data_pipeline)
   GET /api/experiment/<id>         full row (incl. code, loss_curve)
+  GET /api/experiment/<id>/lineage_curve
+                                   parent→child loss/val curves for a
+                                   continuation lineage (stitched curve)
   GET /api/lab_reports?n=&task=    structured per-experiment post-mortems
   GET /api/lab_report/<exp_id>     one experiment's lab report
   GET /api/noise                   replicate-derived eval noise floors
                                    (overall + per task)
   GET /api/events                  agent_events list (round_id, miner_id,
-                                   kind, endpoint, only_errors, before_id,
-                                   since_id, limit filters)
+                                   kind, endpoint, task, only_errors,
+                                   before_id, since_id, limit filters)
   GET /api/event/<id>              full event (request/response bodies)
   GET /api/event_stats             aggregated counts for filter chips
   GET /api/checkpoints             local safetensors checkpoints + meta
@@ -615,6 +618,15 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, _lineage(conn, self.frozen_arch_dir))
             if path == "/api/frozen_archs":
                 return self._json(200, _frozen_archs(self.frozen_arch_dir))
+            if (path.startswith("/api/experiment/")
+                    and path.endswith("/lineage_curve")):
+                try:
+                    exp_id = int(path.split("/")[3])
+                except (ValueError, IndexError):
+                    return self._json(400, {"error": "bad id"})
+                return self._json(200, dashboard_reports.lineage_curve(
+                    conn, exp_id,
+                ))
             if path.startswith("/api/experiment/"):
                 try:
                     exp_id = int(path.rsplit("/", 1)[1])
@@ -648,6 +660,7 @@ class _Handler(BaseHTTPRequestHandler):
                     miner_id=_qstr(q, "miner_id"),
                     kind=_qstr(q, "kind"),
                     endpoint_q=_qstr(q, "endpoint"),
+                    task=_qstr(q, "task"),
                     only_errors=_qstr(q, "errors") in {"1", "true"},
                     before_id=_qint(q, "before_id"),
                     since_id=_qint(q, "since_id"),

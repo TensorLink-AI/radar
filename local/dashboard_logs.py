@@ -67,6 +67,22 @@ def event_detail(row: sqlite3.Row) -> dict[str, Any]:
     return out
 
 
+def _task_round_ids(conn: sqlite3.Connection, task: str) -> Optional[list[int]]:
+    """Round ids that produced an experiment for ``task``.
+
+    ``agent_events`` carries no task column, so a task-scoped service log is
+    built by mapping events back to the rounds that ran that task. Returns
+    ``None`` when the experiments table is unavailable (pre-engine DB)."""
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT round_id FROM experiments WHERE task = ?",
+            (task,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    return [int(r[0]) for r in rows if r[0] is not None]
+
+
 def list_events(
     conn: sqlite3.Connection,
     *,
@@ -74,6 +90,7 @@ def list_events(
     miner_id: Optional[str] = None,
     kind: Optional[str] = None,
     endpoint_q: Optional[str] = None,
+    task: Optional[str] = None,
     only_errors: bool = False,
     before_id: Optional[int] = None,
     since_id: Optional[int] = None,
@@ -81,6 +98,14 @@ def list_events(
 ) -> list[dict[str, Any]]:
     clauses: list[str] = ["1=1"]
     params: list[Any] = []
+    if task:
+        rids = _task_round_ids(conn, task)
+        if not rids:
+            # No rounds for this task (or no experiments table) → nothing to
+            # scope to. Return empty rather than the whole unscoped log.
+            return []
+        clauses.append(f"round_id IN ({','.join('?' * len(rids))})")
+        params.extend(rids)
     if round_id is not None:
         clauses.append("round_id = ?")
         params.append(int(round_id))
