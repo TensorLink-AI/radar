@@ -463,6 +463,13 @@ class LocalStore:
             return None
         return json.loads(row["report_json"])
 
+    def lab_report_experiment_ids(self) -> set[int]:
+        """Experiment ids that already have a stored report (backfill skip set)."""
+        rows = self._conn.execute(
+            "SELECT experiment_id FROM lab_reports"
+        ).fetchall()
+        return {int(r["experiment_id"]) for r in rows}
+
     def recent_lab_reports(self, n: int = 20,
                            task: Optional[str] = None) -> list[dict]:
         if task:

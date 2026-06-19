@@ -1341,6 +1341,17 @@ def main(argv: list[str] | None = None) -> int:
     if expired:
         logger.info("expired %d stale open challenge(s) from a prior run",
                     expired)
+    # Self-heal: fill lab reports for any prior experiments that don't have
+    # one (e.g. rounds that ran before report generation was wired in), so
+    # the read-only dashboard's lab-reports tab isn't permanently empty.
+    try:
+        from local.lab_reports import backfill_reports
+        n_backfilled = backfill_reports(store, narrate=False)
+        if n_backfilled:
+            logger.info("backfilled %d lab report(s) for prior experiments",
+                        n_backfilled)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("lab report backfill skipped: %s", e)
     if args.services_url_file:
         Path(args.services_url_file).write_text(services_url)
 

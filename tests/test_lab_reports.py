@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 
 from local.lab_reports import (
+    backfill_reports,
     build_report,
     generate_round_reports,
     recent_reports,
@@ -112,6 +113,25 @@ def test_generate_round_reports_and_handlers(store):
     assert len(listed["reports"]) == 1
     # report_for serves the stored copy.
     assert report_for(store, eid)["report"]["experiment_id"] == eid
+
+
+def test_backfill_fills_missing_reports_idempotently(store):
+    # Experiments that ran before report generation was wired in: rows
+    # exist but no reports. Backfill should populate them, once.
+    ids = [_add(store, metric=0.7 - i * 0.01, round_id=i) for i in range(3)]
+    _add(store, metric=0.4, task="synthetic_data_generator", round_id=9)
+    assert store.recent_lab_reports(n=100) == []
+
+    n = backfill_reports(store, narrate=False)
+    assert n == 4
+    assert {r["experiment_id"] for r in store.recent_lab_reports(n=100)} \
+        >= set(ids)
+    # Idempotent — a second pass writes nothing.
+    assert backfill_reports(store, narrate=False) == 0
+    # Task filter restricts the set.
+    store2_ids = store.lab_report_experiment_ids()
+    assert len(store2_ids) == 4
+    assert backfill_reports(store, task="ts_forecasting") == 0
 
 
 def test_report_for_builds_on_demand(store):
