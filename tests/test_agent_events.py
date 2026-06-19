@@ -191,6 +191,32 @@ def test_flush_round_to_r2_uploads_and_prunes(
     assert {p["kind"] for p in parsed} == {"llm_chat", "desearch"}
 
 
+def test_flush_retain_window_keeps_recent_rounds(
+    store: LocalStore, monkeypatch,
+):
+    """With ``retain_rounds`` set, the current round's rows survive the
+    flush (still uploaded to R2) and only rounds older than the window are
+    pruned — so the dashboard service-log tab stays populated."""
+    for rd in range(1, 6):  # rounds 1..5
+        store.record_agent_event(kind="llm_chat", miner_id="m1", round_id=rd)
+
+    class FakeStorage:
+        def __init__(self, bucket: str = "") -> None:
+            pass
+
+        def upload_text(self, key: str, text: str) -> bool:
+            return True
+
+    import shared.r2_audit as r2_audit
+    monkeypatch.setattr(r2_audit, "HippiusStorage", FakeStorage)
+
+    # Flush round 5 keeping a 3-round window → keep rounds 3,4,5; drop 1,2.
+    ok, n = flush_round_to_r2(store, 5, bucket="b", retain_rounds=3)
+    assert ok is True and n == 1
+    rounds_left = sorted(r["round_id"] for r in store.iter_agent_events())
+    assert rounds_left == [3, 4, 5]
+
+
 def test_flush_keeps_rows_on_upload_failure(
     store: LocalStore, monkeypatch,
 ):

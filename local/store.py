@@ -609,12 +609,15 @@ class LocalStore:
     def delete_agent_events(
         self, *, round_id: Optional[int] = None,
         max_id: Optional[int] = None,
+        max_round: Optional[int] = None,
     ) -> int:
         """Delete agent_events rows. Pass ``round_id`` to drop one round's
-        worth (the end-of-round flush case) or ``max_id`` to drop
-        everything up to and including that id (the snapshot-and-prune
-        case where rows may have been added during upload). Returns the
-        deleted row count."""
+        worth (the end-of-round flush case), ``max_id`` to drop everything
+        up to and including that id (the snapshot-and-prune case where rows
+        may have been added during upload), or ``max_round`` to drop every
+        round at or below that number (the retention-window case — keep the
+        most recent rounds locally for the dashboard, prune older ones that
+        are already durable in R2). Returns the deleted row count."""
         clauses: list[str] = []
         params: list = []
         if round_id is not None:
@@ -623,8 +626,12 @@ class LocalStore:
         if max_id is not None:
             clauses.append("id <= ?")
             params.append(int(max_id))
+        if max_round is not None:
+            clauses.append("round_id <= ?")
+            params.append(int(max_round))
         if not clauses:
-            raise ValueError("delete_agent_events: pass round_id or max_id")
+            raise ValueError(
+                "delete_agent_events: pass round_id, max_id or max_round")
         with self._tx() as c:
             cur = c.execute(
                 "DELETE FROM agent_events WHERE " + " AND ".join(clauses),

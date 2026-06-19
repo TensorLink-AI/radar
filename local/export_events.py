@@ -41,13 +41,21 @@ def _round_shard_key(prefix: str, round_id: int) -> str:
 def flush_round_to_r2(
     store: LocalStore, round_id: int, bucket: str,
     *, prefix: str = DEFAULT_R2_PREFIX, delete_after: bool = True,
+    retain_rounds: int = 0,
 ) -> tuple[bool, int]:
     """Upload one round's events to R2 as a single JSONL shard, then
-    drop the local rows. Returns ``(uploaded, n_events)``.
+    prune local rows. Returns ``(uploaded, n_events)``.
 
     Used by the validator's round-end hook. Failure to upload leaves the
     local rows in place so the next round (or a manual export) can retry
     — we never delete without a confirmed upload.
+
+    ``retain_rounds`` keeps the most recent N rounds (including this one)
+    in the local SQLite store so the dashboard's service-log tab still has
+    something to show; only rounds older than the window are pruned (they
+    were already uploaded in their own round, so they stay durable in R2).
+    The default of 0 preserves the original behavior — prune this round's
+    rows immediately after upload.
     """
     events = list(store.iter_agent_events(round_id=round_id))
     if not events:
@@ -67,7 +75,13 @@ def flush_round_to_r2(
         return False, len(events)
 
     if delete_after:
-        store.delete_agent_events(round_id=round_id)
+        if retain_rounds > 0:
+            # Keep the trailing window locally; prune anything older.
+            cutoff = round_id - retain_rounds
+            if cutoff >= 0:
+                store.delete_agent_events(max_round=cutoff)
+        else:
+            store.delete_agent_events(round_id=round_id)
     logger.info(
         "flushed %d agent events for round=%d → s3://%s/%s",
         len(events), round_id, bucket, key,
