@@ -1,19 +1,17 @@
 """Orchestrator for the claude_style_v6 multi-subagent miner.
 
-v6 is a data-generator-focused fork of v5. The architecture-task
-orchestration (analyst → researcher → designer → recipe-tuner) and
-v5's recipe-sanity / divergence machinery are inherited verbatim; v6's
-additions are scoped to the pipeline tasks (``ts_data_pipeline`` and
-``synthetic_data_generator``): synthetic_data_generator validation /
-fallback parity (centralised ``core.is_pipeline_task``), a
+v6 is a data-generator-focused fork of v4. The architecture-task
+orchestration (analyst → researcher → designer → recipe-tuner) is
+inherited verbatim; v6's additions are scoped to the pipeline tasks
+(``ts_data_pipeline`` and ``synthetic_data_generator``): a
 distribution-quality probe in ``core.pipeline_quality`` surfaced through
 ``pipeline_smoke_test``, and a rewritten GIFT-Eval-aware data-design
-prompt. See the package ``__init__.py`` for the v5 → v6 deltas.
+prompt (plus v4's synthetic_data_generator validation/fallback parity
+via ``core.is_pipeline_task``). See the package ``__init__.py`` for the
+v4 → v6 deltas. The v4 description below still describes the
+orchestration, which v6 does not change.
 
-The v4 docstring below describes the pipeline; v5/v6 only change
-prompts, callbacks, and the pipeline-task surface, not the orchestration.
-
-v4 extended ``claude_style_v3``'s analyst → researcher → designer
+v4 extends ``claude_style_v3``'s analyst → researcher → designer
 pipeline with a focused **in-round recipe-tuning second pass** so the
 designer doesn't have to juggle architecture and training recipe in a
 single decision. Three concrete additions over v3:
@@ -815,12 +813,11 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
         # continuation preamble already converts the designer into a
         # recipe-only pass — there's no architecture to invent. Tiny
         # budgets fall back to the v3 behaviour: splitting buys nothing.
-        # Special rounds: ablate must stay a single diff (a recipe pass
-        # would add a second, confounding change) and recipe_only IS the
-        # recipe pass already. Transfer keeps it — a scaled design wants
-        # a re-scaled recipe.
         do_recipe_pass = (
             cont_ctx is None
+            # Special rounds: ablate must stay a single diff (a recipe
+            # pass would add a second, confounding change) and
+            # recipe_only IS the recipe pass already. Transfer keeps it.
             and special_kind not in ("ablate", "recipe_only")
             and budget >= RECIPE_TUNER_MIN_TOTAL_BUDGET
         )

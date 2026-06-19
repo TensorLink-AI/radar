@@ -27,6 +27,10 @@ BRIEF_SCHEMA_EXAMPLE = {
         "<paper or method> (<author year>) — <one-line core idea, "
         "described by mechanism, not by brand name>",
     ],
+    "frontier_gaps": [
+        "<inductive bias / op family / objective / regularizer / "
+        "tokenization choice that no frontier member currently uses>",
+    ],
     "ideas_to_try": [
         "<concrete architectural idea described by its operations, "
         "shapes, and information flow — no need to attach a paper "
@@ -35,20 +39,6 @@ BRIEF_SCHEMA_EXAMPLE = {
         "<a structurally different second idea that explores a "
         "different point on the design space (different op family, "
         "different bridging strategy, different objective, etc.)>",
-    ],
-    "divergence_axes": [
-        "<an axis from the analyst's `axes_fixed_across_frontier` "
-        "that THIS brief's lead idea explicitly breaks with — name "
-        "the axis AND the specific direction of the break, e.g. "
-        "'sequence operator: replace full attention with selective "
-        "scan' or 'tokenization: drop patching, operate on raw "
-        "samples'. At least one axis is required. This field "
-        "doubles as the brief's frontier-gap commentary: an axis "
-        "everyone fixes the same way IS the gap, and naming the "
-        "break is more actionable for the designer than naming the "
-        "gap alone. A brief that doesn't break any frontier-fixed "
-        "axis will likely tie the frontier and lose the Pareto "
-        "bonus.>",
     ],
     "plan": [
         "<3-5 short steps the designer should run, written as "
@@ -421,21 +411,12 @@ def build_researcher_system_prompt(
         "- `relevant_prior_work`: list of strings — papers / methods "
         "you found that bear on this task. Brief citations + the "
         "key idea, not abstracts.\n"
+        "- `frontier_gaps`: list of strings — what the current "
+        "frontier is *missing* (architectures absent, ideas un-tried, "
+        "objectives no member optimizes for).\n"
         "- `ideas_to_try`: list of strings — concrete architectural "
         "ideas the designer could implement. Each one should fit the "
         "FLOPs bucket.\n"
-        "- `divergence_axes`: list of strings — **required, "
-        "non-empty**. Each entry names one axis from the analyst's "
-        "`axes_fixed_across_frontier` that your lead idea explicitly "
-        "breaks with, AND the direction of the break. This field "
-        "doubles as your frontier-gap commentary — an axis everyone "
-        "fixes the same way IS the gap, and naming the break is more "
-        "actionable for the designer than naming the gap alone. A "
-        "brief with no divergence axis matches the frontier on every "
-        "fixed dimension — i.e. asks the designer to ship a slight "
-        "variation that ties the Pareto frontier and loses the "
-        "bonus. If you can't name a divergence, your lead idea isn't "
-        "novel enough; go back to the analyst digest.\n"
         "- `plan`: list of 3-5 short strings — the exact sequence of "
         "tool calls / decisions you'd run if you were the designer.\n\n"
         "Example shape:\n```json\n"
@@ -487,9 +468,8 @@ def build_researcher_system_prompt(
         "`axes_fixed_across_frontier` as a generative signal: an "
         "idea is interesting if it moves on an axis nobody varies.\n"
         "- **Beat the frontier, don't match it.** A tie loses the "
-        "Pareto dominance bonus. Your `divergence_axes` is where you "
-        "make that concrete — name the axes nobody varies, then "
-        "vary them.\n"
+        "Pareto dominance bonus. Your `frontier_gaps` should make "
+        "this concrete.\n"
         "- **Concrete > abstract.** Name the operations, shapes, "
         "and information flow. \"Try a transformer\" is useless. "
         "\"Stack of <op family A> over patches of size P with a "
@@ -726,27 +706,7 @@ def build_designer_system_prompt(
         "the first one that runs.\n"
         "- **The brief is a starting point, not a contract.** If the "
         "researcher missed something, fix it. If the plan is wrong, "
-        "deviate. The shipped code is yours.\n"
-        "- **Honor the divergence axis.** The brief names one or more "
-        "axes where your design must diverge from the frontier "
-        "consensus. A candidate that validates but matches the "
-        "frontier on every fixed axis will tie, not dominate — go "
-        "back and pick a different idea.\n"
-        "- **Recipe sanity matters as much as architecture.** After "
-        "each `validate_code` you may see a `Recipe sanity inspection` "
-        "block in the next user turn. Treat `!!!` (critical) findings "
-        "as hard errors and fix before submit; `!!` (warn) as strong "
-        "suggestions; `.` (info) as telemetry. Common critical "
-        "patterns: lr outside [1e-5, 5e-2], non-positive lr, missing "
-        "build_optimizer call.\n"
-        "- **Design for continuation.** A future round may warm-start "
-        "from your checkpoint and tune only the training recipe. "
-        "Keep `build_model` + `init_weights` + `COMPILE` cleanly "
-        "separable from `build_optimizer` / `build_scheduler` / "
-        "`training_config` / `compute_loss` — no shared closures, "
-        "no hyperparams baked into the architecture. The parent-"
-        "splitter (`continuation.extract_arch_source`) splits at the "
-        "function boundary."
+        "deviate. The shipped code is yours."
     )
 
     return "\n\n".join(parts)
@@ -929,50 +889,28 @@ def build_designer_user_prompt(challenge: dict, brief: dict) -> str:
 # ── Critic prompts ────────────────────────────────────────────────────
 
 def build_critic_system_prompt() -> str:
-    """Critic system prompt — four-line KEEP/CHANGE/DROP/DIVERGE template.
+    """Critic system prompt — three-line KEEP/CHANGE/DROP template.
 
     Kept short on purpose: the critic is a single call between
     designer iterations and we don't want it generating prose.
-
-    v5: scoped to architecture + brief-adherence + the new DIVERGE
-    line. Mechanical recipe issues (bad lr, missing grad clip, AdamW
-    with weight_decay=0, etc.) are now caught by the static
-    ``core.recipe_sanity`` inspector and surfaced in the SAME user
-    message that carries the critic's reply, so the critic no longer
-    has to cover that ground — duplicating it just wastes tokens and
-    risks the two messages contradicting each other.
     """
     return (
         "You are the **critic subagent** in a multi-agent miner. "
         "You see the designer's current code and the latest "
         "validate_code result. Your job: give the designer one "
         "short, structured critique it can act on immediately.\n\n"
-        "Reply with EXACTLY four lines, no preamble, no closing:\n"
-        "KEEP: <one sentence — what's working architecturally / not to touch>\n"
-        "CHANGE: <one sentence — the single most impactful structural revision>\n"
-        "DROP: <one sentence — what to remove or stop doing>\n"
-        "DIVERGE: <one sentence — name the single axis where this "
-        "candidate already differs (or should differ) from the "
-        "frontier consensus: sequence operator, tokenization, "
-        "normalization, depth/width ratio, or objective. If the "
-        "candidate matches the frontier on every axis, say so "
-        "plainly — that's a tie, not a win.>"
-        "\n\nRules:\n"
+        "Reply with EXACTLY three lines, no preamble, no closing:\n"
+        "KEEP: <one sentence — what's working / not to touch>\n"
+        "CHANGE: <one sentence — the single most impactful revision>\n"
+        "DROP: <one sentence — what to remove or stop doing>\n\n"
+        "Rules:\n"
         "- If validation passed (`ok ...`), KEEP the architecture "
-        "and tell the designer to submit ONLY when DIVERGE names a "
-        "real break. If DIVERGE is \"matches frontier on all axes\", "
-        "CHANGE must propose a structural pivot, not a hyperparam "
-        "tweak.\n"
+        "and tell the designer to submit. CHANGE / DROP can be "
+        "\"nothing\".\n"
         "- If validation failed, focus CHANGE on the specific "
         "failing constraint (FLOPs gate, output shape, missing "
-        "build_optimizer, etc.). DIVERGE can be \"deferred — fix "
-        "validation first\".\n"
-        "- Do NOT critique optimizer / lr / scheduler / grad-clip / "
-        "weight-decay / AMP / batch_size — the recipe-sanity "
-        "inspector runs alongside you and covers those, and you'll "
-        "see its findings in the same user message the designer "
-        "sees. Stay on architecture.\n"
-        "- Never write code. Never write more than four lines. "
+        "build_optimizer, etc.).\n"
+        "- Never write code. Never write more than three lines. "
         "Never explain — the designer is already an expert."
     )
 
@@ -1009,7 +947,6 @@ def build_pipeline_designer_system_prompt(
     # synthetic_data_generator shares this designer flow but pins a FIXED
     # ~10M arch and is scored GIFT-only (no AULC composite).
     is_synth = (task.get("name") or "") == "synthetic_data_generator"
-    task_label = "synthetic_data_generator" if is_synth else "ts_data_pipeline"
 
     parts: list[str] = []
     if is_synth:

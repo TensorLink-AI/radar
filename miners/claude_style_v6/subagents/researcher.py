@@ -12,8 +12,8 @@ The v3 researcher runs in two phases:
 
       {
         "relevant_prior_work": [...],
+        "frontier_gaps": [...],
         "ideas_to_try": [...],
-        "divergence_axes": [...],
         "plan": [...],
         "primitive_rejections": [{"primitive": "...", "reason": "..."}]
       }
@@ -65,8 +65,8 @@ PHASE_A_MIN_SECONDS = 20
 
 BRIEF_KEYS = (
     "relevant_prior_work",
+    "frontier_gaps",
     "ideas_to_try",
-    "divergence_axes",
     "plan",
 )
 
@@ -149,14 +149,14 @@ def default_brief(challenge: dict, bucket: str) -> dict:
     task = challenge.get("task", {}) or {}
     return {
         "relevant_prior_work": [],
+        "frontier_gaps": [
+            "no researcher signal — designer must rely on sizing "
+            "guidance and frontier data fetched directly"
+        ],
         "ideas_to_try": [
             f"size a candidate to mid-bucket for the {bucket} bucket",
             "embed the sizing target inside build_model so the model "
             "auto-resizes to the budget",
-        ],
-        "divergence_axes": [
-            "no researcher signal — designer must pick a divergence "
-            "axis directly from the frontier listing before submit"
         ],
         "plan": [
             "sketch a small candidate that reads dimensions from "
@@ -333,8 +333,8 @@ def run_researcher(
         primitives=primitives,
         extra_user_msg=(
             "Return the JSON brief now. ONLY a single fenced "
-            "```json block with relevant_prior_work, ideas_to_try, "
-            "divergence_axes, plan. No prose."
+            "```json block with relevant_prior_work, frontier_gaps, "
+            "ideas_to_try, plan. No prose."
         ),
     )
     result2 = sub2.run()

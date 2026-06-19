@@ -17,7 +17,7 @@ runtime.
 # module — orchestrator routing, tool gating, validation, and the fallback
 # generator — agrees on the set. Keeping these out of sync is what let a
 # valid ``synthetic_data_generator`` submission get rejected by the
-# model-only validation path in v5.
+# model-only validation path.
 DATA_PIPELINE_TASK = "ts_data_pipeline"
 SYNTHETIC_DATA_GENERATOR_TASK = "synthetic_data_generator"
 PIPELINE_TASKS = frozenset({DATA_PIPELINE_TASK, SYNTHETIC_DATA_GENERATOR_TASK})

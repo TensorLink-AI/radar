@@ -1,47 +1,41 @@
 """Claude-Code-style multi-subagent miner agent — v6.
 
-Fork of ``miners/claude_style_v5``. v6 keeps the entire v5 stack
-verbatim for the architecture tasks (analyst → researcher → designer →
-recipe-tuner, the static recipe-sanity inspector, the divergence target,
-the DIVERGE critic line) and concentrates its additions on the
-**data-generator tasks** (``ts_data_pipeline`` and
-``synthetic_data_generator``), where v5 left two problems on the table:
-valid submissions could be silently rejected, and the designer got no
-signal about whether its generator was any *good* — only whether the
-shapes were right. v6's three deltas:
+Fork of ``miners/claude_style_v4``. v6 keeps v4's entire architecture-task
+pipeline (analyst → researcher → designer → recipe-tuner) verbatim and
+concentrates its additions on the **data-generator tasks**
+(``ts_data_pipeline`` and ``synthetic_data_generator``), where the
+designer previously got no signal about whether its generator was any
+*good* — only whether the shapes were right. Three deltas over v4:
 
-1. **synthetic_data_generator parity (robustness).** v5 routed both
-   pipeline tasks to the pipeline-designer flow, but ``validate_code``
-   and the fallback generator only recognised the literal
-   ``ts_data_pipeline``. On a ``synthetic_data_generator`` round a valid
-   ``build_pipeline`` submission failed the agent's own validation (it
-   demanded ``build_model``/``build_optimizer``) and the fallback shipped
-   a model with the wrong contract — a guaranteed failed round. v6
-   centralises the pipeline-task set in ``core`` (``PIPELINE_TASKS`` /
-   ``is_pipeline_task``) so routing, validation, fallback, and tool
-   gating all agree.
+1. **synthetic_data_generator parity (robustness).** Both pipeline tasks
+   route to the pipeline-designer flow, but ``validate_code`` and the
+   fallback generator must recognise both — not just ``ts_data_pipeline``
+   — or a valid ``build_pipeline`` submission is self-rejected and the
+   fallback ships a wrong-contract model. v4 centralises this in
+   ``core`` (``PIPELINE_TASKS`` / ``is_pipeline_task``); v6 inherits it
+   and keeps every pipeline-task site gated on it.
 
 2. **Quality feedback, not just shapes (better ideas).**
-   ``core.pipeline_probe`` now pulls a few extra batches and computes
-   cheap descriptive statistics — per-channel variance, constant-channel
+   ``core.pipeline_quality`` pulls a few extra batches and computes cheap
+   descriptive statistics — per-channel variance, constant-channel
    fraction, lag-1 autocorrelation, value range, cross-batch variety,
    finite fraction — and flags degenerate generators (all-constant,
-   near-zero variance, identical batches across draws, clipped range).
-   ``pipeline_smoke_test`` surfaces these so the designer can iterate
-   toward a richer distribution in-round instead of discovering a
-   collapsed generator only after it scores at the GIFT gate.
+   near-zero variance, identical batches across draws, non-finite
+   values). ``pipeline_smoke_test`` surfaces these so the designer can
+   iterate toward a richer distribution in-round instead of discovering a
+   collapsed generator only after it fails the held-out GIFT gate.
 
-3. **A sharper data-design prompt (better ideas).** The
-   pipeline-designer system prompt's design space is rewritten from a
-   four-bullet menu into concrete, GIFT-Eval-aware generation recipes
-   (trend + multi-scale seasonality, regime/change-point switching,
-   heavy-tail + heteroscedastic noise, varied scales/normalisation) with
-   an explicit *diversity-first* mandate and instructions to read the
-   new quality stats and the frontier before committing.
+3. **A sharper data-design prompt (better ideas).** The pipeline-designer
+   system prompt's design space is rewritten from a four-bullet menu into
+   concrete, GIFT-Eval-aware generation recipes (trend, multi-scale
+   seasonality, regime/change-point switching, heavy-tail +
+   heteroscedastic noise, varied scales, multivariate coupling) with an
+   explicit diversity-first mandate and instructions to read the new
+   quality stats and the frontier before committing.
 
 Everything else — the orchestration, the architecture-task subagents,
-the recipe-tuner, primitive injection, the ``_operator_prompt`` slot —
-is inherited from v5 unchanged. See ``README.md`` for the v5 → v6 deltas.
+the recipe-tuner, primitive injection, the ``_operator_prompt`` slot — is
+inherited from v4 unchanged. See ``README.md`` for the v4 → v6 deltas.
 
 A Claude-Code-inspired harness on top of the OpenAI-compatible LLM
 transport: an orchestrator coordinates four specialist subagents

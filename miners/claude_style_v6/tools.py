@@ -41,11 +41,11 @@ from core.history import (
     link_hypothesis, load_state, mark_candidate_submitted,
     mark_candidate_validated, save_state, upsert_candidate,
 )
-from core import is_pipeline_task
 from core.input_shape import infer_input
 from core.output_shape import infer_output_shape, verify_output_shape
 from core.sizing import MAX_PROBES, sweep_sizes
 from core.trace import format_trace, trace_architecture
+from core import is_pipeline_task
 from core.pipeline_probe import smoke_test_pipeline
 from core.validation import validate_code
 

@@ -5,13 +5,12 @@ The validator-side trainer in ``local/data_pipeline.py`` performs the
 shape check at round time; this module is the in-agent preview so the
 designer gets a smoke result in <1s without burning a round.
 
-v6 extends the v4/v5 shape-only probe with cheap *distribution-quality*
+v6 extends the v4 shape-only probe with cheap *distribution-quality*
 statistics over the pulled batches (per-channel variance, constant
 fraction, lag-1 autocorrelation, value range, cross-batch variety) plus
-degeneracy warnings. The validator scores generators on held-out
-GIFT-Eval; a collapsed or zero-variance generator trains fine and then
-fails the gate. Surfacing the collapse here lets the designer fix it
-in-round rather than discovering it a round too late.
+degeneracy warnings — see ``core.pipeline_quality``. A collapsed or
+zero-variance generator trains fine and then fails the GIFT gate;
+surfacing it here lets the designer fix it in-round.
 """
 
 from __future__ import annotations

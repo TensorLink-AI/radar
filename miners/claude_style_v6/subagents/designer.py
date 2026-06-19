@@ -11,15 +11,6 @@ applied as a pre-tool-call hook — the LLM must successfully run
 allowed through. The critic fires as a post-tool-call callback after
 each ``validate_code`` and its critique is injected as a user-role
 message into the next designer turn.
-
-v5: the same post-``validate_code`` callback also runs the static
-recipe-sanity inspector (``core.recipe_sanity.inspect_recipe``). Any
-warnings are appended to the critic's message so the LLM gets a single
-combined feedback turn — runtime-found bugs from validate, qualitative
-critique from the critic LLM, and recipe-anti-pattern warnings from the
-static inspector. This catches the failure mode where the LLM ships a
-recipe that runs fine but produces a weak model (lr=1e-2 on a small
-transformer, no grad clip on AdamW, etc.).
 """
 from __future__ import annotations
 
@@ -42,8 +33,6 @@ except ImportError:
     from tools import SubmitSignal, build_tools
     from subagents.base import Subagent
     from subagents.critic import run_critic
-
-from core.recipe_sanity import inspect_recipe
 
 
 # Was 12 — too tight to support multi-candidate exploration on a
@@ -81,19 +70,10 @@ def _resolve_code_from_args(
     return record.get("code") or ""
 
 
-def _make_critic_callback(
-    *, handlers: dict, deadline: float, llm_kwargs: dict, challenge: dict,
-):
+def _make_critic_callback(*, handlers: dict, deadline: float, llm_kwargs: dict):
     """Build the on_tool_result callback that fires the critic after
-    each ``validate_code``. The callback returns the combined critique
-    string so the Subagent loop appends it as a user message.
-
-    v5: the callback runs the static recipe-sanity inspector in addition
-    to the LLM critic. The inspector is cheap (AST-only, no network), so
-    we run it on every validate; its output is appended below the critic
-    block so the LLM sees both at once. Either side may be empty — we
-    only return a non-empty string when at least one produced feedback.
-    """
+    each ``validate_code``. The callback returns the critique string
+    so the Subagent loop appends it as a user message."""
 
     def _on_tool_result(
         name: str, args: dict, result: str, state: dict,
@@ -109,25 +89,9 @@ def _make_critic_callback(
             deadline=deadline,
             llm_kwargs=llm_kwargs,
         )
-        # Recipe-sanity inspection — pure static, never raises.
-        report = inspect_recipe(code, challenge)
-        sanity_block = report.format_for_prompt()
-        if sanity_block:
-            _log(
-                f"[recipe_sanity] {len(report.warnings)} finding(s): "
-                + ", ".join(
-                    f"{w.code}({w.severity})" for w in report.warnings
-                )
-            )
-
-        if not critique and not sanity_block:
+        if not critique:
             return None
-        parts: list[str] = []
-        if critique:
-            parts.append(f"Critic feedback:\n{critique}")
-        if sanity_block:
-            parts.append(sanity_block)
-        return "\n\n".join(parts)
+        return f"Critic feedback:\n{critique}"
 
     return _on_tool_result
 
@@ -153,7 +117,6 @@ def run_designer(
         handlers=handlers,
         deadline=deadline,
         llm_kwargs=llm_kwargs,
-        challenge=challenge,
     )
 
     designer_sys = build_designer_system_prompt(challenge, bucket)

@@ -45,15 +45,10 @@ FALLBACK_FLOPS_TARGET_FRACTION = 0.8
 # v4: bumped to v3 to mark the new default training recipe (AdamW + warmup-
 # cosine + grad_clip + bf16 AMP) so DB analysis can separate v4 fallbacks
 # from v3 fallbacks shipped before this template change.
-# v5: bumped to v4 — same recipe block as v4, but v5 submissions surface
-# recipe-sanity inspection results inline in the designer's loop, which
-# changes the recipe distribution on the LLM side even when the fallback
-# itself fires. Tagging the fallback lets DB analysis tell apart "fallback
-# fired under v5" from "fallback fired under v4" without re-reading code.
-# v6: bumped to v5 — the model-fallback block is unchanged, but the pipeline
-# fallback now also fires on synthetic_data_generator rounds (v5 emitted a
-# wrong-contract model there). Tagging separates v6 fallback rounds in the DB.
-FALLBACK_VERSION = "v5"
+# v6: bumped to v6 — the model-fallback block is unchanged, but the pipeline
+# fallback now also fires on synthetic_data_generator rounds (inherited from
+# v4's parity fix). Tagging separates v6 fallback rounds in the DB.
+FALLBACK_VERSION = "v6"
 
 
 # Default training-recipe block emitted by every fallback template.
