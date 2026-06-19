@@ -45,7 +45,10 @@ FALLBACK_FLOPS_TARGET_FRACTION = 0.8
 # v4: bumped to v3 to mark the new default training recipe (AdamW + warmup-
 # cosine + grad_clip + bf16 AMP) so DB analysis can separate v4 fallbacks
 # from v3 fallbacks shipped before this template change.
-FALLBACK_VERSION = "v3"
+# v6: bumped to v6 — the model-fallback block is unchanged, but the pipeline
+# fallback now also fires on synthetic_data_generator rounds (inherited from
+# v4's parity fix). Tagging separates v6 fallback rounds in the DB.
+FALLBACK_VERSION = "v6"
 
 
 # Default training-recipe block emitted by every fallback template.

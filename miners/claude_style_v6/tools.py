@@ -45,6 +45,7 @@ from core.input_shape import infer_input
 from core.output_shape import infer_output_shape, verify_output_shape
 from core.sizing import MAX_PROBES, sweep_sizes
 from core.trace import format_trace, trace_architecture
+from core import is_pipeline_task
 from core.pipeline_probe import smoke_test_pipeline
 from core.validation import validate_code
 
@@ -941,10 +942,14 @@ TOOLS: list[dict] = [
             "description": (
                 "Data-pipeline tasks only (ts_data_pipeline / "
                 "synthetic_data_generator): exec the code locally, call "
-                "build_pipeline(**task_params), and pull up to 2 batches "
-                "to verify shape (B, ctx, V) + (B, pred, V) and batch-dim "
-                "agreement. Cheap sub-second check — run it BEFORE "
-                "validate_code so syntax/contract issues surface fast."
+                "build_pipeline(**task_params), pull a few batches to verify "
+                "shape (B, ctx, V) + (B, pred, V) and batch-dim agreement, "
+                "AND report quality stats (per-channel variance, "
+                "constant-channel fraction, lag-1 autocorrelation, value "
+                "range, cross-batch variety) with warnings for degenerate "
+                "generators. Cheap sub-second check — run it BEFORE "
+                "validate_code so contract AND distribution issues surface "
+                "fast."
             ),
             "parameters": {
                 "type": "object",
@@ -1289,18 +1294,25 @@ def build_handlers(
         )
 
     def _pipeline_smoke_test(code: str = "", **_kwargs) -> str:
-        """ts_data_pipeline: exec + probe the miner's build_pipeline."""
+        """Pipeline tasks: exec + probe build_pipeline (shapes + quality)."""
         if not code or not code.strip():
             return "error: empty code"
-        if (challenge.get("task") or {}).get("name") not in (
-            "ts_data_pipeline", "synthetic_data_generator",
-        ):
+        if not is_pipeline_task(challenge):
             return (
                 "error: pipeline_smoke_test is only valid on a "
                 "ts_data_pipeline / synthetic_data_generator round"
             )
         result = smoke_test_pipeline(code, challenge)
-        return json.dumps(result, indent=2, default=str)
+        body = json.dumps(result, indent=2, default=str)
+        # Lead with the warnings so the designer can't miss a degenerate
+        # generator buried in the stats block.
+        warns = result.get("quality_warnings") or []
+        if warns:
+            banner = "QUALITY WARNINGS (shapes OK, distribution suspect):\n" + (
+                "\n".join(f"  - {w}" for w in warns)
+            )
+            return f"{banner}\n\n{body}"
+        return body
 
     # ── Analysis ─────────────────────────────────────────────────
 
