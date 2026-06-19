@@ -1002,10 +1002,13 @@ def run_round(store: LocalStore, task, round_id: int,
     )
 
     # Flush this round's agent events to R2 if configured. On success the
-    # local rows are dropped so the SQLite file stays bounded on long runs;
+    # local rows are pruned so the SQLite file stays bounded on long runs;
     # on failure they're kept and the next round (or a manual export) can
-    # retry. Wrapped in try/except because the round is already complete
-    # by this point and the flush must not break the loop.
+    # retry. ``RADAR_EVENT_LOG_LOCAL_RETAIN`` keeps the most recent N rounds
+    # in SQLite (default 20) so the dashboard's service-log tab isn't empty
+    # while events still ship to R2 for durability; 0 prunes immediately.
+    # Wrapped in try/except because the round is already complete by this
+    # point and the flush must not break the loop.
     bucket = os.getenv("RADAR_EVENT_LOG_R2_BUCKET", "").strip()
     if bucket:
         try:
@@ -1016,7 +1019,12 @@ def run_round(store: LocalStore, task, round_id: int,
             else:
                 instance = os.getenv("RADAR_INSTANCE_ID", "").strip()
                 prefix = f"agent-events/{instance}" if instance else "agent-events"
-            flush_round_to_r2(store, round_id, bucket, prefix=prefix)
+            try:
+                retain = int(os.getenv("RADAR_EVENT_LOG_LOCAL_RETAIN", "20"))
+            except ValueError:
+                retain = 20
+            flush_round_to_r2(store, round_id, bucket, prefix=prefix,
+                              retain_rounds=max(0, retain))
         except Exception as e:  # noqa: BLE001
             logger.warning("agent-events flush failed for round=%d: %s",
                            round_id, e)
@@ -1341,6 +1349,17 @@ def main(argv: list[str] | None = None) -> int:
     if expired:
         logger.info("expired %d stale open challenge(s) from a prior run",
                     expired)
+    # Self-heal: fill lab reports for any prior experiments that don't have
+    # one (e.g. rounds that ran before report generation was wired in), so
+    # the read-only dashboard's lab-reports tab isn't permanently empty.
+    try:
+        from local.lab_reports import backfill_reports
+        n_backfilled = backfill_reports(store, narrate=False)
+        if n_backfilled:
+            logger.info("backfilled %d lab report(s) for prior experiments",
+                        n_backfilled)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("lab report backfill skipped: %s", e)
     if args.services_url_file:
         Path(args.services_url_file).write_text(services_url)
 

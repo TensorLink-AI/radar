@@ -229,6 +229,48 @@ def _maybe_narrate(report: dict) -> None:
         logger.debug("lab report narrative skipped: %s", e)
 
 
+def backfill_reports(store, *, task: Optional[str] = None,
+                     limit: Optional[int] = None,
+                     narrate: bool = False) -> int:
+    """Build + persist reports for experiments that don't have one yet.
+
+    Reports are otherwise only written at round end, so any experiment that
+    ran before report generation was wired in (or a round where generation
+    was skipped) leaves a permanent hole the read-only dashboard can never
+    fill. This walks the experiments table and fills those gaps. Idempotent
+    — experiments with a stored report are skipped. The noise floor is
+    computed once per distinct task. LLM narration is off by default so a
+    bulk backfill doesn't fan out into hundreds of provider calls.
+    """
+    existing = store.lab_report_experiment_ids()
+    exps = store.recent_experiments(n=limit or 1_000_000)
+    floors: dict[str, Optional[dict]] = {}
+    n = 0
+    for exp in exps:
+        if exp.get("id") in existing:
+            continue
+        t = exp.get("task") or ""
+        if task is not None and t != task:
+            continue
+        floor = floors.get(t)
+        if floor is None:
+            floor = noise_floor(store.recent_experiments(n=10_000), task=t)
+            floors[t] = floor
+        try:
+            report = build_report(store, exp, floor=floor)
+            if narrate:
+                _maybe_narrate(report)
+            store.add_lab_report(
+                experiment_id=exp["id"],
+                round_id=exp.get("round_id", 0), task=t, report=report,
+            )
+            n += 1
+        except Exception as e:  # noqa: BLE001
+            logger.warning("backfill lab report failed for exp=%s: %s",
+                           exp.get("id"), e)
+    return n
+
+
 def generate_round_reports(store, round_id: int, task: str) -> int:
     """Build + persist a report for every experiment of this round."""
     exps = [
@@ -276,3 +318,44 @@ def report_for(store, experiment_id: int) -> dict:
         task=exp.get("task") or "", report=report,
     )
     return {"report": report}
+
+
+# ── CLI: backfill reports for an existing DB ────────────────────────
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """``python -m local.lab_reports --backfill`` — populate missing reports.
+
+    Use against a DB whose rounds predate report generation (the dashboard
+    is read-only and can't fill the table itself).
+    """
+    import argparse
+
+    from local.store import LocalStore
+
+    parser = argparse.ArgumentParser(description=main.__doc__.splitlines()[0])
+    parser.add_argument("--db", default="local/radar_local.db")
+    parser.add_argument("--backfill", action="store_true",
+                        help="Build reports for experiments lacking one.")
+    parser.add_argument("--task", default=None,
+                        help="Restrict to a single task name.")
+    parser.add_argument("--narrate", action="store_true",
+                        help="Add the optional LLM narrative (needs a key).")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    store = LocalStore(args.db)
+    try:
+        if args.backfill:
+            n = backfill_reports(store, task=args.task, narrate=args.narrate)
+            print(f"backfilled {n} lab report(s)")
+        else:
+            parser.error("nothing to do — pass --backfill")
+    finally:
+        store.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

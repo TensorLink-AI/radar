@@ -83,6 +83,12 @@ With a provider key set, a 2-3-sentence LLM narrative is appended
 Agent surface: `GET /lab_reports?n=&task=` and
 `GET /experiments/{id}/report` (builds on demand for old rows).
 
+Reports are written at round end, so experiments that ran before report
+generation was wired in leave gaps the read-only dashboard can't fill.
+The validator backfills missing reports for all prior experiments at
+startup (`backfill_reports`, idempotent), and `python -m local.lab_reports
+--db <path> --backfill` populates an existing DB without a full run.
+
 ## Screening tier
 
 `--screen_candidates K` (ts_forecasting, fresh rounds) advertises
