@@ -146,10 +146,22 @@ def lineage_curve(conn: sqlite3.Connection, exp_id: int,
 def _slim_experiments(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """Minimal experiment dicts for ``local.noise`` (id, metric, mode,
     success, task, objectives)."""
-    rows = conn.execute(
-        "SELECT id, metric, mode, success, task, objectives_json "
-        "FROM experiments"
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT id, metric, mode, success, task, objectives_json "
+            "FROM experiments"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Pre-continuation DBs lack the ``mode`` column (the validator's
+        # additive migration never ran on a read-only snapshot); retry
+        # without it so the row loop's default kicks in.
+        try:
+            rows = conn.execute(
+                "SELECT id, metric, success, task, objectives_json "
+                "FROM experiments"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []  # no experiments table at all
     out: list[dict[str, Any]] = []
     for r in rows:
         try:
