@@ -31,9 +31,13 @@ ts_forecasting = [
 # (claude_style*, openai_sdk*) talk to the validator's OpenAI-compatible
 # /llm proxy via the openai SDK.
 miners = ["torch>=2.1", "openai>=1.30", "httpx>=0.27"]
+# Meta-orchestrator: YAML spec loader, SSH wrapper, RunPod REST client.
+# Stays small on purpose — boto3 comes via the gift_eval/ts_forecasting
+# extras when needed, paramiko is the only meta-specific runtime dep.
+meta = ["pyyaml>=6.0", "paramiko>=3.0", "httpx>=0.27"]
 
 [tool.setuptools.packages.find]
-include = ["local*", "shared*", "miner_template*", "miners*", "runner*"]
+include = ["local*", "shared*", "miner_template*", "miners*", "runner*", "meta*"]
 
 # Pull torch from the CUDA 12.8 wheel index so the GPU build matches the
 # NVIDIA driver. Without this, uv pulls torch from PyPI, which ships a
