@@ -228,12 +228,16 @@ def _current_epoch(task, frozen_arch=None, frozen_pipeline=None) -> dict:
     # but pinning it future-proofs continuation against a model swap.
     if isinstance(task, SyntheticDataGeneratorSpec):
         epoch["synth_arch_version"] = int(REFERENCE_ARCH_VERSION)
-    # The scored metric changes meaning when a canary fraction is held
-    # out of the eval aggregate — pin lineages to the same split.
-    from local.eval_metrics import canary_frac
+    # The scored metric changes meaning when a canary or proxy fraction is
+    # held out of the eval aggregate — pin lineages to the same splits so Δ
+    # stays honest across rounds.
+    from local.eval_metrics import canary_frac, proxy_frac
     frac = canary_frac()
     if frac > 0:
         epoch["eval_canary_frac"] = frac
+    pfrac = proxy_frac()
+    if pfrac > 0:
+        epoch["eval_proxy_frac"] = pfrac
     return epoch
 
 
@@ -365,6 +369,36 @@ def _build_challenge(round_id: int, store: LocalStore, task,
         "cognition_wiki_url": f"{services_url}/wiki",
         "allowed_urls": services_url,
     }
+    # Score-correlated feedback: when a proxy slice is held out, tell the
+    # miner what ``proxy_metric`` is (a held-out, disjoint GIFT slice scored
+    # with the same sqrt(crps*mase) formula) so it has a gradient to climb
+    # between rounds. Each feasible-frontier member already carries its
+    # ``objectives.proxy_metric``; this block is the explanation + the best
+    # proxy seen so far.
+    from local.eval_metrics import proxy_frac as _proxy_frac
+    pfrac = _proxy_frac()
+    if pfrac > 0:
+        proxies = [
+            f["objectives"].get("proxy_metric") for f in feasible
+            if isinstance(f.get("objectives"), dict)
+            and f["objectives"].get("proxy_metric") is not None
+        ]
+        payload["proxy_feedback"] = {
+            "metric_key": "proxy_metric",
+            "eval_proxy_frac": pfrac,
+            "lower_is_better": True,
+            "best_seen": min(proxies) if proxies else None,
+            "note": (
+                "proxy_metric is sqrt(crps*mase) on a FIXED held-out GIFT "
+                "slice, disjoint from the scored set — a denoised, "
+                "score-correlated readout of generalization. Optimize it; "
+                "it tracks the true (hidden) score far better than the "
+                "in-training val loss. It is NOT the scored set, so it can't "
+                "be gamed directly, and a secret canary slice flags "
+                "overfitting to it."
+            ),
+        }
+
     # synthetic_data_generator ships the FIXED reference arch as the same
     # ``frozen_arch`` card ts_data_pipeline uses, so the miner-facing tools
     # (frozen-arch card, pipeline probe) work unchanged.

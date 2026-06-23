@@ -156,6 +156,9 @@ def build_report(store, exp: dict,
             "crps": objs.get("crps"),
             "mase": objs.get("mase"),
             "canary_metric": objs.get("canary_metric"),
+            # Exposed score-correlated proxy (held-out GIFT slice) — the
+            # feedback signal agents climb between rounds.
+            "proxy_metric": objs.get("proxy_metric"),
             "cumulative_compute": objs.get("cumulative_compute"),
         },
     }

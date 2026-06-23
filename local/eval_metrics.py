@@ -9,6 +9,17 @@ already computes (and which used to be thrown away):
   (name-hashed) fraction of GIFT tasks is held out of the scored
   aggregate. The canary aggregate is recorded but never selected on, so
   long-horizon benchmark overfitting shows up as scored/canary divergence.
+* **Proxy split** — when ``RADAR_EVAL_PROXY_FRAC`` > 0, a *second*,
+  disjoint name-hashed fraction is held out of the scored aggregate and
+  **exposed to miners** (``objectives.proxy_metric``, the lab report
+  outcome, and the challenge's ``proxy_feedback`` block). Unlike the
+  canary it is the deliberate score-correlated readout an agent climbs
+  between rounds: it is the *same* ``sqrt(crps*mase)`` metric on held-out
+  GIFT datasets, so it tracks the true score by construction — far better
+  than the in-training val *loss* (MSE-flavoured, ~uncorrelated with the
+  scored metric). Three-way disjoint partition: scored | proxy (exposed)
+  | canary (secret). Proxy ≠ scored prevents direct gaming; canary stays
+  secret so it can still flag overfitting *to the exposed proxy*.
 * **Paired per-dataset Δ** — parent-vs-child comparison per dataset.
   Per-dataset noise is heavily correlated between the two runs, so a
   sign test over ~90 paired tasks has far more power than comparing two
@@ -28,6 +39,15 @@ CANARY_ENV = "RADAR_EVAL_CANARY_FRAC"
 # Salt is versioned: changing it re-deals the canary set, which breaks
 # scored-metric comparability — bump deliberately, never casually.
 CANARY_SALT = "gift-eval-canary-v1"
+
+# Proxy split: the held-out, score-correlated slice we *show* miners as a
+# feedback signal. Default ON (0.15) — the whole point is to give agents a
+# gradient to climb; set RADAR_EVAL_PROXY_FRAC=0 to restore the old
+# "score the full leaderboard" behaviour. Distinct salt from the canary so
+# the two held-out sets are independent draws.
+PROXY_ENV = "RADAR_EVAL_PROXY_FRAC"
+PROXY_SALT = "gift-eval-proxy-v1"
+DEFAULT_PROXY_FRAC = 0.15
 # Paired sign test: minimum joined tasks before the test gates anything,
 # and the one-sided z threshold (95%).
 PAIRED_MIN_TASKS = 10
@@ -63,6 +83,32 @@ def is_canary(name: str, frac: float) -> bool:
     return u < frac
 
 
+def proxy_frac() -> float:
+    """Exposed-proxy fraction from ``RADAR_EVAL_PROXY_FRAC`` (default 0.15)."""
+    raw = os.environ.get(PROXY_ENV)
+    if raw is None or raw == "":
+        return DEFAULT_PROXY_FRAC
+    try:
+        f = float(raw)
+    except ValueError:
+        return DEFAULT_PROXY_FRAC
+    return min(max(f, 0.0), 0.5)
+
+
+def is_proxy(name: str, frac: float) -> bool:
+    """Deterministic membership in the exposed proxy slice by name hash.
+
+    Independent of ``is_canary`` (different salt). When a task hashes into
+    *both* sets the canary wins at split time (see ``finalize_gift_eval``)
+    so the canary stays a pure secret-held-out probe.
+    """
+    if frac <= 0.0:
+        return False
+    h = hashlib.sha256(f"{PROXY_SALT}:{name}".encode()).digest()
+    u = int.from_bytes(h[:8], "big") / float(1 << 64)
+    return u < frac
+
+
 def compact_per_task(per_task: list[dict]) -> list[dict]:
     """Strip a prepare.py per-task row down to what comparisons need."""
     out: list[dict] = []
@@ -84,26 +130,40 @@ def compact_per_task(per_task: list[dict]) -> list[dict]:
 
 
 def finalize_gift_eval(eval_metrics: dict,
-                       canary: Optional[float] = None) -> Optional[dict]:
+                       canary: Optional[float] = None,
+                       proxy: Optional[float] = None) -> Optional[dict]:
     """Turn a ``_gift_eval_score`` result into the scored numbers + extras.
 
     Returns ``{"crps", "mase", "metric", "extras": {...}}`` or ``None``
     when no finite aggregate can be produced (caller records a failure).
 
     With a per-task breakdown the aggregates are recomputed here from the
-    non-canary subset; without one (legacy eval path) the top-level
-    crps/mase are passed through and the canary split is skipped.
+    tasks that are neither canary nor proxy; without one (legacy eval path)
+    the top-level crps/mase are passed through and both splits are skipped.
+    The canary set (secret) and proxy set (exposed to miners) are disjoint
+    from each other and from the scored set; on a hash collision the canary
+    wins so it stays a pure held-out overfitting probe.
     """
     frac = canary_frac() if canary is None else min(max(canary, 0.0), 0.5)
+    pfrac = proxy_frac() if proxy is None else min(max(proxy, 0.0), 0.5)
     per_task = compact_per_task(eval_metrics.get("per_task") or [])
     extras: dict = {}
 
     if per_task:
         extras["per_task"] = per_task
-        scored = [t for t in per_task if not is_canary(t["name"], frac)]
         held = [t for t in per_task if is_canary(t["name"], frac)]
+        canary_names = {t["name"] for t in held}
+        proxy_held = [
+            t for t in per_task
+            if t["name"] not in canary_names and is_proxy(t["name"], pfrac)
+        ]
+        proxy_names = {t["name"] for t in proxy_held}
+        scored = [
+            t for t in per_task
+            if t["name"] not in canary_names and t["name"] not in proxy_names
+        ]
         if not scored:  # pathological frac/hash overlap — score everything
-            scored, held = per_task, []
+            scored, held, proxy_held = per_task, [], []
         crps = geomean([t["ncrps"] for t in scored])
         mase = geomean([t["nmase"] for t in scored])
         extras["n_tasks"] = len(scored)
@@ -118,6 +178,17 @@ def finalize_gift_eval(eval_metrics: dict,
                     extras["canary_mase"] = c_mase
                     extras["canary_metric"] = math.sqrt(
                         max(c_crps, 0.0) * max(c_mase, 0.0))
+        if pfrac > 0:
+            extras["eval_proxy_frac"] = pfrac
+            extras["n_tasks_proxy"] = len(proxy_held)
+            if proxy_held:
+                p_crps = geomean([t["ncrps"] for t in proxy_held])
+                p_mase = geomean([t["nmase"] for t in proxy_held])
+                if math.isfinite(p_crps) and math.isfinite(p_mase):
+                    extras["proxy_crps"] = p_crps
+                    extras["proxy_mase"] = p_mase
+                    extras["proxy_metric"] = math.sqrt(
+                        max(p_crps, 0.0) * max(p_mase, 0.0))
     else:
         crps, mase = eval_metrics.get("crps"), eval_metrics.get("mase")
         if crps is None or mase is None:

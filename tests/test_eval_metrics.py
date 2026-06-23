@@ -13,7 +13,9 @@ from local.eval_metrics import (
     finalize_gift_eval,
     geomean,
     is_canary,
+    is_proxy,
     paired_per_task_delta,
+    proxy_frac,
     task_metric,
 )
 
@@ -68,7 +70,8 @@ def test_finalize_nonfinite_returns_none():
 def test_finalize_persists_per_task_and_recomputes_aggregates():
     per_task = [_pt(f"d{i}", 0.5 * (1 + i % 3), 0.8) for i in range(20)]
     final = finalize_gift_eval(
-        {"crps": 999.0, "mase": 999.0, "per_task": per_task}, canary=0.0,
+        {"crps": 999.0, "mase": 999.0, "per_task": per_task},
+        canary=0.0, proxy=0.0,
     )
     # Aggregates recomputed from the breakdown, not the (bogus) top level.
     assert final["crps"] < 2.0
@@ -79,7 +82,8 @@ def test_finalize_persists_per_task_and_recomputes_aggregates():
 def test_finalize_canary_split_excludes_held_out_tasks():
     per_task = [_pt(f"d{i}", 1.0, 1.0) for i in range(200)]
     final = finalize_gift_eval(
-        {"per_task": per_task, "crps": 1.0, "mase": 1.0}, canary=0.2,
+        {"per_task": per_task, "crps": 1.0, "mase": 1.0},
+        canary=0.2, proxy=0.0,
     )
     extras = final["extras"]
     assert extras["eval_canary_frac"] == 0.2
@@ -88,6 +92,58 @@ def test_finalize_canary_split_excludes_held_out_tasks():
     assert extras["canary_metric"] == pytest.approx(1.0)
     # Scored aggregate only covers non-canary tasks.
     assert final["metric"] == pytest.approx(1.0)
+
+
+def test_proxy_frac_env(monkeypatch):
+    monkeypatch.delenv("RADAR_EVAL_PROXY_FRAC", raising=False)
+    assert proxy_frac() == 0.15  # default ON
+    monkeypatch.setenv("RADAR_EVAL_PROXY_FRAC", "0.25")
+    assert proxy_frac() == 0.25
+    monkeypatch.setenv("RADAR_EVAL_PROXY_FRAC", "0")
+    assert proxy_frac() == 0.0  # explicit opt-out
+    monkeypatch.setenv("RADAR_EVAL_PROXY_FRAC", "0.9")
+    assert proxy_frac() == 0.5  # clamped
+    monkeypatch.setenv("RADAR_EVAL_PROXY_FRAC", "junk")
+    assert proxy_frac() == 0.15  # bad value falls back to default
+
+
+def test_proxy_and_canary_are_disjoint_three_way_split():
+    per_task = [_pt(f"d{i}", 1.0, 1.0) for i in range(300)]
+    final = finalize_gift_eval(
+        {"per_task": per_task, "crps": 1.0, "mase": 1.0},
+        canary=0.2, proxy=0.2,
+    )
+    extras = final["extras"]
+    # scored | proxy | canary partition the whole set with no overlap.
+    assert (extras["n_tasks"] + extras["n_tasks_proxy"]
+            + extras["n_tasks_canary"] == 300)
+    assert extras["n_tasks_proxy"] > 0
+    assert extras["eval_proxy_frac"] == 0.2
+    # Proxy metric is the same sqrt(crps*mase) formula on the held-out slice.
+    assert extras["proxy_metric"] == pytest.approx(1.0)
+    # The scored metric still ignores both held-out slices.
+    assert final["metric"] == pytest.approx(1.0)
+
+
+def test_proxy_membership_independent_of_canary():
+    names = [f"ds_{i}" for i in range(400)]
+    proxy_set = {n for n in names if is_proxy(n, 0.2)}
+    canary_set = {n for n in names if is_canary(n, 0.2)}
+    # Different salts → the two name-hash draws are not identical.
+    assert proxy_set != canary_set
+    assert proxy_set  # non-empty at this fraction
+    assert not any(is_proxy(n, 0.0) for n in names)
+
+
+def test_proxy_default_on_shrinks_scored_set(monkeypatch):
+    monkeypatch.delenv("RADAR_EVAL_PROXY_FRAC", raising=False)
+    per_task = [_pt(f"d{i}", 1.0, 1.0) for i in range(200)]
+    final = finalize_gift_eval({"per_task": per_task, "crps": 1.0, "mase": 1.0})
+    extras = final["extras"]
+    # With the default proxy on, some tasks are held out of scoring and a
+    # proxy_metric is exposed.
+    assert extras["n_tasks"] < 200
+    assert extras.get("proxy_metric") is not None
 
 
 def test_canary_frac_env(monkeypatch):
