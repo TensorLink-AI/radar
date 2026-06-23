@@ -216,6 +216,7 @@ def prepare_continuation(
         "parent_metric": None,
         "parent_per_task": None,
         "parent_checkpoint_path": None,
+        "parent_optimizer_state_path": None,
         "compute_offset": 0.0,
         "step_offset": 0,
         "n_rounds": 1,
@@ -238,15 +239,26 @@ def prepare_continuation(
         ckpt_path = ckpt_store.resolve(parent.get("checkpoint_ref"))
         if ckpt_path is None:
             return False, "checkpoint unresolvable"
+        p_objs = parent.get("objectives", {}) or {}
+        # Resume the optimizer/LR-schedule position from the parent so an
+        # extend continuation accumulates net-new optimization instead of
+        # restarting a fresh warmup→cosine (the Δ≈0 failure mode). The sidecar
+        # is optional — a parent that predates it just trains the optimizer
+        # from scratch (the schedule still fast-forwards by step_offset).
+        optim_path = ckpt_store.resolve_optimizer(parent.get("checkpoint_ref"))
         prep.update(
             mode="continue",
             parent_index=pid,
             parent_metric=parent["metric"],
             # Parent's per-dataset eval breakdown, when recorded — feeds the
             # paired sign test that gates the continuation score.
-            parent_per_task=(parent.get("objectives", {}) or {}).get("per_task"),
+            parent_per_task=p_objs.get("per_task"),
             parent_checkpoint_path=ckpt_path,
+            parent_optimizer_state_path=optim_path,
             compute_offset=float(parent.get("cumulative_compute", 0.0) or 0.0),
+            # Lineage-absolute optim-step count → the LR schedule spans the
+            # whole lineage and resumes mid/late-decay.
+            step_offset=int(p_objs.get("cumulative_steps", 0) or 0),
             n_rounds=int(parent.get("n_rounds", 1) or 1) + 1,
         )
         nonlocal lineage_used, parent_code
@@ -339,22 +351,30 @@ def score_continuation(
     cumulative_compute: float,
     frontier: list[dict],
     paired: dict | None = None,
+    noise_threshold: float = 0.0,
 ) -> tuple[float, float]:
     """Score one continuation. Returns ``(score, delta)``.
 
-    Δ ≤ 0 (no improvement over the parent) scores zero. When a paired
-    per-dataset comparison vs the parent is available (``paired``, from
-    ``eval_metrics.paired_per_task_delta``) the improvement must also be
-    *significant* under the sign test — Δ is a difference of two noisy
-    geomeans, and per-dataset noise is correlated between parent and
+    Δ ≤ 0 (no improvement over the parent) scores zero. ``noise_threshold``
+    (k·σ from the replicate-derived eval-noise floor, ``local/noise.py``)
+    raises the bar: a Δ below it is within measurement noise and scores zero
+    even if positive — this is what stops the frontier rewarding sub-noise
+    "wins" (σ≈0.003 vs 0.0016 of real frontier progress over 400 rounds).
+    When a paired per-dataset comparison vs the parent is available
+    (``paired``, from ``eval_metrics.paired_per_task_delta``) the improvement
+    must *also* be significant under the sign test — Δ is a difference of two
+    noisy geomeans, and per-dataset noise is correlated between parent and
     child, so the paired test is the honest arbiter of "real progress".
-    Otherwise the base is a sigmoid of the normalized improvement, with
-    a 1.5× bonus when the point lands on the continuation frontier.
+    Otherwise the base is a sigmoid of the normalized improvement, with a
+    1.5× bonus when the point lands on the continuation frontier.
     """
     if parent_metric is None or metric is None:
         return 0.0, 0.0
     delta = float(parent_metric) - float(metric)
     if delta <= 0 or not math.isfinite(delta):
+        return 0.0, delta
+    if noise_threshold > 0.0 and delta < float(noise_threshold):
+        # Positive but within the measured noise band — not credited.
         return 0.0, delta
     if paired is not None:
         from local.eval_metrics import PAIRED_MIN_TASKS

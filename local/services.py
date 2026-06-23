@@ -102,7 +102,20 @@ class _Handler(BaseHTTPRequestHandler):
     # store write fails, the handler must still serve the response.
 
     def _miner_id(self) -> str:
-        return self.headers.get("X-Miner-Id", "") or ""
+        """Resolve the calling miner's id from its request headers.
+
+        The local miner's ``GatedClient`` sets ``X-Miner-Id``, but several
+        agents (claude_style[_v*], openai_sdk*) make LLM calls through their
+        own OpenAI/httpx client which sets ``X-Miner-UID`` instead — those
+        calls used to log as "" and get dropped, leaving agent_events empty
+        for the very agents whose reasoning traces are most worth keeping.
+        Fall back across both so any self-identifying miner is captured."""
+        for header in ("X-Miner-Id", "X-Miner-UID"):
+            val = self.headers.get(header, "") or ""
+            if val and val != "0":
+                return val
+        # Last resort: a bare "0" UID still beats dropping the row entirely.
+        return self.headers.get("X-Miner-UID", "") or ""
 
     def _active_round_id(self) -> Optional[int]:
         try:

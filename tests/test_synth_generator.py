@@ -81,10 +81,14 @@ def test_build_challenge_injects_fixed_reference_arch(tmp_path):
     assert challenge["max_flops_equivalent"] == 0
 
 
-def test_build_challenge_stamps_extend_vs_modify_kind(tmp_path):
+def test_build_challenge_stamps_extend_vs_modify_kind(tmp_path, monkeypatch):
     from local.store import LocalStore
     from local.validator import _build_challenge
 
+    # The seeded parent predates the eval-split stamps; disable them so the
+    # epoch check doesn't reject it (the split-pinning is tested separately).
+    monkeypatch.setenv("RADAR_EVAL_PROXY_FRAC", "0")
+    monkeypatch.setenv("RADAR_EVAL_CANARY_FRAC", "0")
     store = LocalStore(str(tmp_path / "t.db"))
     try:
         # An eligible parent (success + checkpoint + matching synth_arch epoch)
@@ -130,9 +134,11 @@ def test_build_challenge_kind_blank_when_no_parents(tmp_path):
     assert ch["continuation_kind"] == ""
 
 
-def test_current_epoch_pins_synth_arch_version():
+def test_current_epoch_pins_synth_arch_version(monkeypatch):
     from local.validator import _current_epoch
 
+    monkeypatch.setenv("RADAR_EVAL_PROXY_FRAC", "0")
+    monkeypatch.setenv("RADAR_EVAL_CANARY_FRAC", "0")
     sdg = make_spec("synthetic_data_generator")
     assert _current_epoch(sdg) == {"synth_arch_version": 1}
 

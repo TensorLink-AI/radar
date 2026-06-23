@@ -152,6 +152,7 @@ def run_training(
     min_flops: int = 0,
     max_flops: int = 0,
     parent_checkpoint_path: str | None = None,
+    parent_optimizer_state_path: str | None = None,
     compute_offset: float = 0.0,
     step_offset: int = 0,
     shard_paths: list[str] | None = None,
@@ -190,6 +191,7 @@ def run_training(
             min_flops=min_flops, max_flops=max_flops,
             frozen_arch=frozen_arch,
             parent_checkpoint_path=parent_checkpoint_path,
+            parent_optimizer_state_path=parent_optimizer_state_path,
             compute_offset=compute_offset,
             step_offset=step_offset,
             baseline_aulc=getattr(frozen_arch, "baseline_aulc", None),
@@ -200,6 +202,7 @@ def run_training(
             code, seed=seed, task=task,
             min_flops=min_flops, max_flops=max_flops,
             parent_checkpoint_path=parent_checkpoint_path,
+            parent_optimizer_state_path=parent_optimizer_state_path,
             compute_offset=compute_offset, step_offset=step_offset,
         )
     if isinstance(task, TSForecastingSpec):
@@ -207,6 +210,7 @@ def run_training(
             code, seed=seed, task=task,
             min_flops=min_flops, max_flops=max_flops,
             parent_checkpoint_path=parent_checkpoint_path,
+            parent_optimizer_state_path=parent_optimizer_state_path,
             compute_offset=compute_offset, step_offset=step_offset,
             shard_paths=shard_paths, shard_reuse=shard_reuse,
             frozen_pipeline=frozen_pipeline,
@@ -346,6 +350,7 @@ def _run_ts_forecasting(
     min_flops: int,
     max_flops: int,
     parent_checkpoint_path: str | None = None,
+    parent_optimizer_state_path: str | None = None,
     compute_offset: float = 0.0,
     step_offset: int = 0,
     shard_paths: list[str] | None = None,
@@ -468,6 +473,11 @@ def _run_ts_forecasting(
     }
     if parent_checkpoint_path:
         overrides["PARENT_CHECKPOINT_PATH"] = str(parent_checkpoint_path)
+    # Optimizer/scheduler resume sidecar (continuation). Set explicitly to ""
+    # when absent so a value left over from a prior in-process call can't leak.
+    overrides["PARENT_OPTIMIZER_STATE_PATH"] = (
+        str(parent_optimizer_state_path) if parent_optimizer_state_path else ""
+    )
 
     saved = {k: os.environ.get(k) for k in overrides}
     os.environ.update(overrides)
@@ -578,6 +588,9 @@ def _run_ts_forecasting(
         "train_seconds": train_seconds,
         "this_compute": this_compute,
         "cumulative_compute": cumulative_compute,
+        # Lineage-absolute optim-step count (this run's steps + offset) so a
+        # continuation child can span the LR schedule over the whole lineage.
+        "cumulative_steps": int(result.get("num_steps") or 0),
         "pretrain_shards": [Path(p).name for p in train_paths],
         "shard_reuse": bool(shard_reuse),
     }
@@ -630,9 +643,11 @@ def _run_ts_forecasting(
             objectives, loss_curve, workdir,
             val_curve=val_curve,
         )
+    from local.eval_metrics import eval_seeds
+    k_seeds = eval_seeds()
     try:
-        eval_metrics = _gift_eval_score(
-            code, checkpoint_path, cache_dir, seed,
+        eval_metrics = gift_eval_score_multiseed(
+            code, checkpoint_path, cache_dir, seed, k_seeds,
         )
     except Exception as e:  # noqa: BLE001
         return _ts_failure(
@@ -640,6 +655,7 @@ def _run_ts_forecasting(
             objectives, loss_curve, workdir,
             val_curve=val_curve,
         )
+    objectives["n_eval_seeds"] = int(eval_metrics.get("n_eval_seeds", k_seeds))
 
     from local.eval_metrics import finalize_gift_eval
     final = finalize_gift_eval(eval_metrics)
@@ -757,3 +773,37 @@ def _gift_eval_score(
         out["n_tasks"] = int(metrics["n_tasks"])
         out["per_task"] = metrics.get("per_task", [])
     return out
+
+
+def gift_eval_score_multiseed(
+    code: str, checkpoint_path: str, cache_dir: str, seed: int, k: int,
+) -> dict:
+    """Run the GIFT pass over ``k`` eval seeds and average the per-task
+    breakdown — cuts the eval-noise σ by ~√k (Task 3).
+
+    Seeds are ``seed, seed+1, …`` (deterministic, reproducible). ``k <= 1``
+    is the single-pass path (unchanged cost/behaviour). The averaged per-task
+    list feeds ``finalize_gift_eval`` exactly like a single run would; the
+    aggregates are recomputed there from the denoised breakdown.
+    """
+    from local.eval_metrics import average_per_task
+
+    if k <= 1:
+        return _gift_eval_score(code, checkpoint_path, cache_dir, seed)
+    runs: list[list[dict]] = []
+    last: dict = {}
+    for i in range(k):
+        last = _gift_eval_score(code, checkpoint_path, cache_dir, seed + i)
+        runs.append(last.get("per_task") or [])
+    averaged = average_per_task(runs)
+    if not averaged:
+        # No per-task breakdown to average (legacy eval path) — fall back to
+        # the last single run so the caller still gets crps/mase.
+        return last
+    return {
+        "crps": last.get("crps"),
+        "mase": last.get("mase"),
+        "n_tasks": len(averaged),
+        "n_eval_seeds": k,
+        "per_task": averaged,
+    }

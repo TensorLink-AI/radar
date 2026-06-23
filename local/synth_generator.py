@@ -72,6 +72,7 @@ def run_synth_generator_training(
     min_flops: int,
     max_flops: int,
     parent_checkpoint_path: str | None = None,
+    parent_optimizer_state_path: str | None = None,
     compute_offset: float = 0.0,
     step_offset: int = 0,
 ) -> dict:
@@ -149,6 +150,10 @@ def run_synth_generator_training(
         "RADAR_FLOPS_OFFSET": str(int(compute_offset)),
         "PARENT_CHECKPOINT_PATH": (
             str(parent_checkpoint_path) if parent_checkpoint_path else ""
+        ),
+        "PARENT_OPTIMIZER_STATE_PATH": (
+            str(parent_optimizer_state_path)
+            if parent_optimizer_state_path else ""
         ),
     }
     saved = {k: os.environ.get(k) for k in overrides}
@@ -245,6 +250,8 @@ def run_synth_generator_training(
         "train_seconds": train_seconds,
         "this_compute": this_compute,
         "cumulative_compute": cumulative_compute,
+        # Lineage-absolute optim-step count for the continuation LR schedule.
+        "cumulative_steps": int(result.get("num_steps") or 0),
         "synth_arch_version": int(REFERENCE_ARCH_VERSION),
     }
     if best_val_loss is not None:
@@ -275,14 +282,18 @@ def run_synth_generator_training(
             objectives, loss_curve, workdir, val_curve=val_curve,
         )
 
+    from local.eval_metrics import eval_seeds
+    k_seeds = eval_seeds()
     try:
-        from local.trainer import _gift_eval_score
-        eval_metrics = _gift_eval_score(arch.code, checkpoint_path, cache_dir, seed)
+        from local.trainer import gift_eval_score_multiseed
+        eval_metrics = gift_eval_score_multiseed(
+            arch.code, checkpoint_path, cache_dir, seed, k_seeds)
     except Exception as e:  # noqa: BLE001
         return _fail(
             f"GIFT-Eval failed: {type(e).__name__}: {e}",
             objectives, loss_curve, workdir, val_curve=val_curve,
         )
+    objectives["n_eval_seeds"] = int(eval_metrics.get("n_eval_seeds", k_seeds))
 
     from local.eval_metrics import finalize_gift_eval
     final = finalize_gift_eval(eval_metrics)

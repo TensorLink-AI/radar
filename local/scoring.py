@@ -140,6 +140,8 @@ def score_round(
     max_flops: int,
     frontier: list[dict],
     continuation_frontier: Optional[list[dict]] = None,
+    noise_threshold: float = 0.0,
+    novelty_bonus_weight: float = 0.0,
 ) -> list[dict]:
     """One scoring pass for a round. Mutates the input list with
     ``score`` and ``analysis`` fields and returns it.
@@ -152,6 +154,8 @@ def score_round(
     ``mode == "continue"`` and a ``parent_metric`` — are scored on the
     continuation frontier (GIFT-eval Δ vs cumulative compute) instead of
     the absolute initial frontier. Validation loss is never read here.
+    ``noise_threshold`` (k·σ from the replicate noise floor) gates the
+    continuation Δ: a sub-noise improvement scores zero.
     """
     out = []
     cont_frontier = continuation_frontier or []
@@ -160,6 +164,10 @@ def score_round(
         if f.get("metric") is not None
         and passes_size_gate(f.get("objectives", {}), min_flops, max_flops)
     ]
+    # Structural-diversity bonus (Task 5): reward fresh designs that use
+    # techniques the frontier under-explores. Additive and opt-in — the
+    # frontier's source code is the comparison baseline.
+    frontier_codes = [f.get("code", "") for f in frontier if f.get("code")]
 
     for p in proposals_with_metrics:
         if not p.get("success") or p.get("metric") is None:
@@ -194,6 +202,7 @@ def score_round(
                 ),
                 frontier=cont_frontier,
                 paired=paired,
+                noise_threshold=noise_threshold,
             )
             p["score"] = score
             # Persist Δ so the continuation frontier
@@ -216,10 +225,18 @@ def score_round(
 
         base = score_against_frontier(p["metric"], feasible_metrics)
         bonus = pareto_bonus(p["objectives"], p["metric"], frontier)
-        p["score"] = base * bonus
+        nov_mult, nov = 1.0, 0.0
+        if novelty_bonus_weight > 0.0:
+            from local.diversity import novelty_multiplier
+            nov_mult, nov = novelty_multiplier(
+                p.get("code", ""), frontier_codes, novelty_bonus_weight,
+            )
+        p["score"] = base * bonus * nov_mult
+        nov_tag = f" novelty={nov:.2f}×{nov_mult:.2f}" if nov_mult != 1.0 else ""
         p["analysis"] = (
             (p.get("analysis") or "")
-            + f" [score={p['score']:.3f} base={base:.3f} bonus={bonus:.2f}]"
+            + f" [score={p['score']:.3f} base={base:.3f} bonus={bonus:.2f}"
+            + f"{nov_tag}]"
         )
         out.append(p)
     return out

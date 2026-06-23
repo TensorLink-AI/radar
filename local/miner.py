@@ -22,6 +22,7 @@ import argparse
 import importlib.util
 import inspect
 import logging
+import os
 import sys
 import time
 import uuid
@@ -137,6 +138,13 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [miner:" + args.miner_id + "] %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # Several agents (claude_style[_v*], openai_sdk*) make LLM calls through
+    # their own OpenAI/httpx client, which stamps ``X-Miner-UID`` from the
+    # MINER_UID env rather than the GatedClient's ``X-Miner-Id``. Propagate
+    # our miner id into MINER_UID so those calls are attributed to (and
+    # logged under) this miner instead of the default "0".
+    os.environ.setdefault("MINER_UID", args.miner_id)
 
     design, agent_mod = _load_agent(args.agent_dir, args.agent_module)
     # Inject scratchpad helpers into the agent's module namespace before

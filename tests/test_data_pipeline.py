@@ -468,10 +468,13 @@ def test_prepare_continuation_rejects_cross_epoch_parent(tmp_path):
     store.close()
 
 
-def test_current_epoch_for_data_pipeline():
+def test_current_epoch_for_data_pipeline(monkeypatch):
     from local.frozen_arch import FrozenArch
     from local.validator import _current_epoch
 
+    # Isolate the version-pinning logic from the eval-split pins.
+    monkeypatch.setenv("RADAR_EVAL_PROXY_FRAC", "0")
+    monkeypatch.setenv("RADAR_EVAL_CANARY_FRAC", "0")
     dp = make_spec("ts_data_pipeline")
     ts = make_spec("ts_forecasting")
     arch = FrozenArch(
@@ -600,10 +603,12 @@ def test_frozen_pipeline_bootstraps_from_data_pipeline_frontier(tmp_path):
     store.close()
 
 
-def test_current_epoch_for_forecasting_includes_pipeline_version():
+def test_current_epoch_for_forecasting_includes_pipeline_version(monkeypatch):
     from local.frozen_pipeline import FrozenPipeline
     from local.validator import _current_epoch
 
+    monkeypatch.setenv("RADAR_EVAL_PROXY_FRAC", "0")
+    monkeypatch.setenv("RADAR_EVAL_CANARY_FRAC", "0")
     ts = make_spec("ts_forecasting")
     pipe = FrozenPipeline(
         version=4, code="x", source_experiment_id=1, source_metric=0.5,
