@@ -437,7 +437,11 @@ def _run_ts_forecasting(
     # (offline / prefetched runs keep working).
     train_urls: list[str] = []
     if not train_paths:
-        ttl = max(5400, int(task.time_budget_seconds) * 2)
+        # SigV4 caps presigned URL lifetime at 7 days. Pick a TTL well above
+        # any plausible training+eval wall time so URLs never expire mid-run
+        # — the previous max(5400, budget*2) yielded 7200s for the default
+        # 1h budget and tripped 403s on shard fetches near the end of the run.
+        ttl = max(86400, int(task.time_budget_seconds) * 4)
         train_urls = _pretrain_train_urls(seed, ttl)
 
     if not val_paths and (train_paths or train_urls):
