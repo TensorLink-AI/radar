@@ -49,9 +49,61 @@ PROXY_ENV = "RADAR_EVAL_PROXY_FRAC"
 PROXY_SALT = "gift-eval-proxy-v1"
 DEFAULT_PROXY_FRAC = 0.15
 # Paired sign test: minimum joined tasks before the test gates anything,
-# and the one-sided z threshold (95%).
-PAIRED_MIN_TASKS = 10
-PAIRED_Z_THRESHOLD = 1.645
+# and the one-sided z threshold (95%). Both env-overridable so the
+# significance bar can be tightened to match the measured noise floor.
+PAIRED_MIN_TASKS = int(os.environ.get("RADAR_PAIRED_MIN_TASKS", "10") or "10")
+try:
+    PAIRED_Z_THRESHOLD = float(
+        os.environ.get("RADAR_PAIRED_Z_THRESHOLD", "1.645") or "1.645")
+except ValueError:
+    PAIRED_Z_THRESHOLD = 1.645
+
+# Multi-seed eval: averaging the GIFT pass over k seeds cuts the eval-noise
+# σ by ~√k. Default 1 (single pass, old cost); raise to denoise the score at
+# k× the eval cost. Clamped to a sane ceiling.
+EVAL_SEEDS_ENV = "RADAR_EVAL_SEEDS"
+
+
+def eval_seeds() -> int:
+    try:
+        k = int(os.environ.get(EVAL_SEEDS_ENV, "1") or "1")
+    except ValueError:
+        return 1
+    return max(1, min(8, k))
+
+
+def average_per_task(runs: list[list[dict]]) -> list[dict]:
+    """Average several per-task breakdowns (one per eval seed) by dataset.
+
+    Each run is a raw ``prepare.validate`` per-task list. Returns one
+    compacted row per dataset present in *every* run, with ncrps/nmase
+    averaged across the runs (arithmetic mean — the per-dataset values are
+    already normalized, small, and same-scale). A single run passes through
+    unchanged (compacted). Datasets missing from any run are dropped so the
+    average is over a consistent set.
+    """
+    compacted = [compact_per_task(r) for r in runs if r]
+    if not compacted:
+        return []
+    if len(compacted) == 1:
+        return compacted[0]
+    # Intersection of dataset names across all runs.
+    common = set(t["name"] for t in compacted[0])
+    for run in compacted[1:]:
+        common &= {t["name"] for t in run}
+    out: list[dict] = []
+    for name in sorted(common):
+        ncs, nms = [], []
+        for run in compacted:
+            row = next(t for t in run if t["name"] == name)
+            ncs.append(row["ncrps"])
+            nms.append(row["nmase"])
+        out.append({
+            "name": name,
+            "ncrps": round(sum(ncs) / len(ncs), 6),
+            "nmase": round(sum(nms) / len(nms), 6),
+        })
+    return out
 
 
 def geomean(values: list[float]) -> float:

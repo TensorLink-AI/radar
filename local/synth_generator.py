@@ -282,14 +282,18 @@ def run_synth_generator_training(
             objectives, loss_curve, workdir, val_curve=val_curve,
         )
 
+    from local.eval_metrics import eval_seeds
+    k_seeds = eval_seeds()
     try:
-        from local.trainer import _gift_eval_score
-        eval_metrics = _gift_eval_score(arch.code, checkpoint_path, cache_dir, seed)
+        from local.trainer import gift_eval_score_multiseed
+        eval_metrics = gift_eval_score_multiseed(
+            arch.code, checkpoint_path, cache_dir, seed, k_seeds)
     except Exception as e:  # noqa: BLE001
         return _fail(
             f"GIFT-Eval failed: {type(e).__name__}: {e}",
             objectives, loss_curve, workdir, val_curve=val_curve,
         )
+    objectives["n_eval_seeds"] = int(eval_metrics.get("n_eval_seeds", k_seeds))
 
     from local.eval_metrics import finalize_gift_eval
     final = finalize_gift_eval(eval_metrics)

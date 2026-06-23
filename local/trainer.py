@@ -643,9 +643,11 @@ def _run_ts_forecasting(
             objectives, loss_curve, workdir,
             val_curve=val_curve,
         )
+    from local.eval_metrics import eval_seeds
+    k_seeds = eval_seeds()
     try:
-        eval_metrics = _gift_eval_score(
-            code, checkpoint_path, cache_dir, seed,
+        eval_metrics = gift_eval_score_multiseed(
+            code, checkpoint_path, cache_dir, seed, k_seeds,
         )
     except Exception as e:  # noqa: BLE001
         return _ts_failure(
@@ -653,6 +655,7 @@ def _run_ts_forecasting(
             objectives, loss_curve, workdir,
             val_curve=val_curve,
         )
+    objectives["n_eval_seeds"] = int(eval_metrics.get("n_eval_seeds", k_seeds))
 
     from local.eval_metrics import finalize_gift_eval
     final = finalize_gift_eval(eval_metrics)
@@ -770,3 +773,37 @@ def _gift_eval_score(
         out["n_tasks"] = int(metrics["n_tasks"])
         out["per_task"] = metrics.get("per_task", [])
     return out
+
+
+def gift_eval_score_multiseed(
+    code: str, checkpoint_path: str, cache_dir: str, seed: int, k: int,
+) -> dict:
+    """Run the GIFT pass over ``k`` eval seeds and average the per-task
+    breakdown — cuts the eval-noise σ by ~√k (Task 3).
+
+    Seeds are ``seed, seed+1, …`` (deterministic, reproducible). ``k <= 1``
+    is the single-pass path (unchanged cost/behaviour). The averaged per-task
+    list feeds ``finalize_gift_eval`` exactly like a single run would; the
+    aggregates are recomputed there from the denoised breakdown.
+    """
+    from local.eval_metrics import average_per_task
+
+    if k <= 1:
+        return _gift_eval_score(code, checkpoint_path, cache_dir, seed)
+    runs: list[list[dict]] = []
+    last: dict = {}
+    for i in range(k):
+        last = _gift_eval_score(code, checkpoint_path, cache_dir, seed + i)
+        runs.append(last.get("per_task") or [])
+    averaged = average_per_task(runs)
+    if not averaged:
+        # No per-task breakdown to average (legacy eval path) — fall back to
+        # the last single run so the caller still gets crps/mase.
+        return last
+    return {
+        "crps": last.get("crps"),
+        "mase": last.get("mase"),
+        "n_tasks": len(averaged),
+        "n_eval_seeds": k,
+        "per_task": averaged,
+    }

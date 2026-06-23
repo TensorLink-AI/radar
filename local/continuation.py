@@ -351,22 +351,30 @@ def score_continuation(
     cumulative_compute: float,
     frontier: list[dict],
     paired: dict | None = None,
+    noise_threshold: float = 0.0,
 ) -> tuple[float, float]:
     """Score one continuation. Returns ``(score, delta)``.
 
-    Δ ≤ 0 (no improvement over the parent) scores zero. When a paired
-    per-dataset comparison vs the parent is available (``paired``, from
-    ``eval_metrics.paired_per_task_delta``) the improvement must also be
-    *significant* under the sign test — Δ is a difference of two noisy
-    geomeans, and per-dataset noise is correlated between parent and
+    Δ ≤ 0 (no improvement over the parent) scores zero. ``noise_threshold``
+    (k·σ from the replicate-derived eval-noise floor, ``local/noise.py``)
+    raises the bar: a Δ below it is within measurement noise and scores zero
+    even if positive — this is what stops the frontier rewarding sub-noise
+    "wins" (σ≈0.003 vs 0.0016 of real frontier progress over 400 rounds).
+    When a paired per-dataset comparison vs the parent is available
+    (``paired``, from ``eval_metrics.paired_per_task_delta``) the improvement
+    must *also* be significant under the sign test — Δ is a difference of two
+    noisy geomeans, and per-dataset noise is correlated between parent and
     child, so the paired test is the honest arbiter of "real progress".
-    Otherwise the base is a sigmoid of the normalized improvement, with
-    a 1.5× bonus when the point lands on the continuation frontier.
+    Otherwise the base is a sigmoid of the normalized improvement, with a
+    1.5× bonus when the point lands on the continuation frontier.
     """
     if parent_metric is None or metric is None:
         return 0.0, 0.0
     delta = float(parent_metric) - float(metric)
     if delta <= 0 or not math.isfinite(delta):
+        return 0.0, delta
+    if noise_threshold > 0.0 and delta < float(noise_threshold):
+        # Positive but within the measured noise band — not credited.
         return 0.0, delta
     if paired is not None:
         from local.eval_metrics import PAIRED_MIN_TASKS

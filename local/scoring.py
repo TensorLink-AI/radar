@@ -140,6 +140,7 @@ def score_round(
     max_flops: int,
     frontier: list[dict],
     continuation_frontier: Optional[list[dict]] = None,
+    noise_threshold: float = 0.0,
 ) -> list[dict]:
     """One scoring pass for a round. Mutates the input list with
     ``score`` and ``analysis`` fields and returns it.
@@ -152,6 +153,8 @@ def score_round(
     ``mode == "continue"`` and a ``parent_metric`` — are scored on the
     continuation frontier (GIFT-eval Δ vs cumulative compute) instead of
     the absolute initial frontier. Validation loss is never read here.
+    ``noise_threshold`` (k·σ from the replicate noise floor) gates the
+    continuation Δ: a sub-noise improvement scores zero.
     """
     out = []
     cont_frontier = continuation_frontier or []
@@ -194,6 +197,7 @@ def score_round(
                 ),
                 frontier=cont_frontier,
                 paired=paired,
+                noise_threshold=noise_threshold,
             )
             p["score"] = score
             # Persist Δ so the continuation frontier

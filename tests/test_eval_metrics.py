@@ -8,8 +8,10 @@ import math
 import pytest
 
 from local.eval_metrics import (
+    average_per_task,
     canary_frac,
     compact_per_task,
+    eval_seeds,
     finalize_gift_eval,
     geomean,
     is_canary,
@@ -194,3 +196,41 @@ def test_paired_delta_small_n_never_significant():
 
 def test_task_metric_is_geomean_of_pair():
     assert task_metric(4.0, 1.0) == pytest.approx(2.0)
+
+
+# ── Task 3: multi-seed eval averaging ────────────────────────────────
+
+
+def test_eval_seeds_env(monkeypatch):
+    monkeypatch.delenv("RADAR_EVAL_SEEDS", raising=False)
+    assert eval_seeds() == 1
+    monkeypatch.setenv("RADAR_EVAL_SEEDS", "3")
+    assert eval_seeds() == 3
+    monkeypatch.setenv("RADAR_EVAL_SEEDS", "99")
+    assert eval_seeds() == 8  # clamped
+    monkeypatch.setenv("RADAR_EVAL_SEEDS", "junk")
+    assert eval_seeds() == 1
+
+
+def test_average_per_task_single_run_passthrough():
+    run = [_pt("a", 0.5, 0.8), _pt("b", 0.2, 0.4)]
+    out = average_per_task([run])
+    assert {t["name"] for t in out} == {"a", "b"}
+    assert out[0]["ncrps"] == 0.5
+
+
+def test_average_per_task_means_across_seeds():
+    r1 = [_pt("a", 0.4, 0.8), _pt("b", 0.2, 0.6)]
+    r2 = [_pt("a", 0.6, 1.2), _pt("b", 0.4, 0.4)]
+    out = average_per_task([r1, r2])
+    by = {t["name"]: t for t in out}
+    assert by["a"]["ncrps"] == pytest.approx(0.5)
+    assert by["a"]["nmase"] == pytest.approx(1.0)
+    assert by["b"]["ncrps"] == pytest.approx(0.3)
+
+
+def test_average_per_task_uses_common_datasets_only():
+    r1 = [_pt("a", 1.0, 1.0), _pt("b", 1.0, 1.0)]
+    r2 = [_pt("a", 1.0, 1.0)]  # b missing from this seed
+    out = average_per_task([r1, r2])
+    assert [t["name"] for t in out] == ["a"]

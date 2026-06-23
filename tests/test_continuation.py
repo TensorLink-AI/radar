@@ -197,6 +197,32 @@ def test_score_continuation_rewards_progress():
     assert delta == pytest.approx(0.4) and score > 0.5
 
 
+def test_score_continuation_noise_gate_zeros_sub_noise_delta():
+    # A tiny positive Δ below k·σ is within measurement noise → score 0.
+    score, delta = score_continuation(
+        metric=0.998, parent_metric=1.0, cumulative_compute=5, frontier=[],
+        noise_threshold=0.005,
+    )
+    assert delta == pytest.approx(0.002) and score == 0.0
+    # The same Δ clears a smaller threshold → credited.
+    score2, _ = score_continuation(
+        metric=0.998, parent_metric=1.0, cumulative_compute=5, frontier=[],
+        noise_threshold=0.001,
+    )
+    assert score2 > 0.0
+
+
+def test_score_round_applies_noise_threshold():
+    cont = {"success": True, "metric": 0.995, "mode": "continue",
+            "parent_metric": 1.0,
+            "objectives": {"flops_equivalent_size": 100,
+                           "cumulative_compute": 5}}
+    out = score_round([cont], min_flops=100, max_flops=100, frontier=[],
+                      continuation_frontier=[], noise_threshold=0.02)
+    # Δ=0.005 < 0.02 → uncredited.
+    assert out[0]["score"] == 0.0
+
+
 def test_score_round_dispatches_continuation():
     cont = {"success": True, "metric": 0.6, "mode": "continue",
             "parent_metric": 1.0,

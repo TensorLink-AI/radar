@@ -619,6 +619,7 @@ def run_round(store: LocalStore, task, round_id: int,
               ablate_pct: float = 0.0,
               recipe_pct: float = 0.0,
               transfer_pct: float = 0.0,
+              continuation_noise_k: float = 1.645,
               screen_candidates_n: int = 0,
               screen_seconds: int = 600,
               screen_eval_tasks: int = 15) -> None:
@@ -936,13 +937,26 @@ def run_round(store: LocalStore, task, round_id: int,
         results.append(result)
 
     # ── Scoring ─────────────────────────────────────────────
-    cont_frontier = continuation_frontier(store.recent_experiments(n=10_000))
+    all_for_score = store.recent_experiments(n=10_000)
+    cont_frontier = continuation_frontier(all_for_score)
+    # Noise-aware gate: a continuation Δ below ``continuation_noise_k`` × the
+    # replicate-derived σ is within measurement noise and scores zero, so the
+    # frontier stops rewarding sub-noise "wins".
+    from local.noise import noise_floor
+    floor = noise_floor(all_for_score, task=task.name)
+    sigma = float(floor.get("sigma_metric") or 0.0)
+    noise_threshold = continuation_noise_k * sigma if sigma > 0 else 0.0
+    if noise_threshold > 0:
+        logger.info("  noise gate: σ=%.5f threshold=%.5f (k=%.2f, %d pairs)",
+                    sigma, noise_threshold, continuation_noise_k,
+                    floor.get("n_pairs", 0))
     score_round(
         results,
         min_flops=challenge["min_flops_equivalent"],
         max_flops=challenge["max_flops_equivalent"],
         frontier=challenge["feasible_frontier"],
         continuation_frontier=cont_frontier,
+        noise_threshold=noise_threshold,
     )
 
     # Write experiments + persist checkpoints + mirror artifacts
@@ -1196,6 +1210,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="Fraction of rounds where a smaller-bucket "
                              "frontier winner is handed to the miner to scale "
                              "into this bucket. Default 0.05; 0 disables.")
+    parser.add_argument("--continuation_noise_k", type=float, default=1.645,
+                        help="Noise-gate multiplier: a continuation Δ below "
+                             "this × the replicate-derived σ is treated as "
+                             "within measurement noise and scores zero. "
+                             "Default 1.645 (one-sided 95%%); 0 disables.")
     parser.add_argument("--screen_candidates", type=int, default=0,
                         help="Screening tier: max extra candidates an agent "
                              "may submit for cheap triage before the full "
@@ -1433,6 +1452,7 @@ def main(argv: list[str] | None = None) -> int:
                       ablate_pct=args.ablate_pct,
                       recipe_pct=args.recipe_pct,
                       transfer_pct=args.transfer_pct,
+                      continuation_noise_k=args.continuation_noise_k,
                       screen_candidates_n=args.screen_candidates,
                       screen_seconds=args.screen_seconds,
                       screen_eval_tasks=args.screen_eval_tasks)
