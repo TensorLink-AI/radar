@@ -247,6 +247,34 @@ def test_flush_empty_round_is_noop(store: LocalStore):
     assert n == 0
 
 
+def test_service_logs_with_miner_uid_header(tmp_path: Path):
+    """Agents that call the LLM proxy through their own OpenAI/httpx client
+    send ``X-Miner-UID`` (not ``X-Miner-Id``); those calls must still be
+    captured — this is the gap that left agent_events empty for the
+    claude_style / openai_sdk miners."""
+    store = LocalStore(tmp_path / "events.db")
+    store.post_challenge("ch-1", round_id=4, payload={})
+    server = ServicesServer(store=store, wiki_dir=None, port=0)
+    url = server.start()
+    try:
+        body = json.dumps({"content": "hi", "model": "stub"}).encode()
+        req = urllib.request.Request(
+            url + "/llm/chat", data=body, method="POST",
+            headers={"Content-Type": "application/json",
+                     "X-Miner-UID": "miner-07"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+    finally:
+        server.stop()
+
+    rows = list(store.iter_agent_events())
+    assert len(rows) == 1
+    assert rows[0]["miner_id"] == "miner-07"
+    assert rows[0]["round_id"] == 4
+    store.close()
+
+
 def test_service_skips_logging_without_miner_header(tmp_path: Path):
     """Internal/dashboard callers (no X-Miner-Id) must not pollute the
     event log."""
