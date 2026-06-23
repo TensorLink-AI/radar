@@ -212,6 +212,30 @@ def test_score_continuation_noise_gate_zeros_sub_noise_delta():
     assert score2 > 0.0
 
 
+def test_score_round_applies_novelty_bonus():
+    # A fresh design using a non-spectral technique beats an equally-scoring
+    # spectral re-tune when the novelty bonus is on. Both score the same base
+    # (empty frontier metrics → 0.5), so the multiplier is the only difference.
+    frontier = [{"metric": 0.7, "code": "y = np.fft.rfft(x)",
+                 "objectives": {"flops_equivalent_size": 100}}]
+    novel = {"success": True, "metric": 0.8, "mode": "new",
+             "code": "gaussian_process matern kernel sampler",
+             "objectives": {"flops_equivalent_size": 100}}
+    spectral = {"success": True, "metric": 0.8, "mode": "new",
+                "code": "y = np.fft.rfft(x)",
+                "objectives": {"flops_equivalent_size": 100}}
+    out = score_round([novel, spectral], min_flops=100, max_flops=100,
+                      frontier=frontier, novelty_bonus_weight=0.5)
+    assert out[0]["score"] > out[1]["score"]
+    assert "novelty" in out[0]["analysis"]
+    # Off by default (weight 0): no novelty term, equal scores.
+    out2 = score_round(
+        [dict(novel), dict(spectral)], min_flops=100, max_flops=100,
+        frontier=frontier,
+    )
+    assert out2[0]["score"] == out2[1]["score"]
+
+
 def test_score_round_applies_noise_threshold():
     cont = {"success": True, "metric": 0.995, "mode": "continue",
             "parent_metric": 1.0,

@@ -399,6 +399,18 @@ def _build_challenge(round_id: int, store: LocalStore, task,
             ),
         }
 
+    # Break the spectral monoculture (Task 5): hand pipeline-task miners a
+    # set of non-spectral exemplar families (GP/kernel, regime/HMM, ARIMA,
+    # structural trend+seasonality, stochastic SDEs) so the design prompt is
+    # seeded with structurally distinct starting points, not just the
+    # frontier's FFT recipe. Descriptions only; opt out with
+    # RADAR_PIPELINE_EXEMPLARS=0.
+    if isinstance(task, (SyntheticDataGeneratorSpec, TSDataPipelineSpec)) and (
+        os.environ.get("RADAR_PIPELINE_EXEMPLARS", "1") != "0"
+    ):
+        from local.diversity import pipeline_exemplars
+        payload["pipeline_exemplars"] = pipeline_exemplars()
+
     # synthetic_data_generator ships the FIXED reference arch as the same
     # ``frozen_arch`` card ts_data_pipeline uses, so the miner-facing tools
     # (frozen-arch card, pipeline probe) work unchanged.
@@ -950,6 +962,7 @@ def run_round(store: LocalStore, task, round_id: int,
         logger.info("  noise gate: σ=%.5f threshold=%.5f (k=%.2f, %d pairs)",
                     sigma, noise_threshold, continuation_noise_k,
                     floor.get("n_pairs", 0))
+    from local.diversity import novelty_bonus_weight
     score_round(
         results,
         min_flops=challenge["min_flops_equivalent"],
@@ -957,6 +970,7 @@ def run_round(store: LocalStore, task, round_id: int,
         frontier=challenge["feasible_frontier"],
         continuation_frontier=cont_frontier,
         noise_threshold=noise_threshold,
+        novelty_bonus_weight=novelty_bonus_weight(),
     )
 
     # Write experiments + persist checkpoints + mirror artifacts
