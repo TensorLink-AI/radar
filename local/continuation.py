@@ -216,6 +216,7 @@ def prepare_continuation(
         "parent_metric": None,
         "parent_per_task": None,
         "parent_checkpoint_path": None,
+        "parent_optimizer_state_path": None,
         "compute_offset": 0.0,
         "step_offset": 0,
         "n_rounds": 1,
@@ -238,15 +239,26 @@ def prepare_continuation(
         ckpt_path = ckpt_store.resolve(parent.get("checkpoint_ref"))
         if ckpt_path is None:
             return False, "checkpoint unresolvable"
+        p_objs = parent.get("objectives", {}) or {}
+        # Resume the optimizer/LR-schedule position from the parent so an
+        # extend continuation accumulates net-new optimization instead of
+        # restarting a fresh warmup→cosine (the Δ≈0 failure mode). The sidecar
+        # is optional — a parent that predates it just trains the optimizer
+        # from scratch (the schedule still fast-forwards by step_offset).
+        optim_path = ckpt_store.resolve_optimizer(parent.get("checkpoint_ref"))
         prep.update(
             mode="continue",
             parent_index=pid,
             parent_metric=parent["metric"],
             # Parent's per-dataset eval breakdown, when recorded — feeds the
             # paired sign test that gates the continuation score.
-            parent_per_task=(parent.get("objectives", {}) or {}).get("per_task"),
+            parent_per_task=p_objs.get("per_task"),
             parent_checkpoint_path=ckpt_path,
+            parent_optimizer_state_path=optim_path,
             compute_offset=float(parent.get("cumulative_compute", 0.0) or 0.0),
+            # Lineage-absolute optim-step count → the LR schedule spans the
+            # whole lineage and resumes mid/late-decay.
+            step_offset=int(p_objs.get("cumulative_steps", 0) or 0),
             n_rounds=int(parent.get("n_rounds", 1) or 1) + 1,
         )
         nonlocal lineage_used, parent_code

@@ -70,6 +70,40 @@ def test_checkpoint_save_resolve_gc(tmp_path):
     assert cs.resolve("ckpt:8") is None
 
 
+def test_checkpoint_optimizer_sidecar_roundtrip(tmp_path):
+    # The harness writes optim_state.pt next to model.safetensors; the store
+    # must copy it, resolve it back, and gc it alongside the weights.
+    cs = CheckpointStore(base_dir=tmp_path / "ck")
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    src = workdir / "model.safetensors"
+    src.write_bytes(b"weights")
+    (workdir / "optim_state.pt").write_bytes(b"optim-moments")
+
+    ref = cs.save(11, src)
+    assert ref == "ckpt:11"
+    optim_path = cs.resolve_optimizer(ref)
+    assert optim_path is not None
+    assert Path(optim_path).read_bytes() == b"optim-moments"
+
+    # gc removes both the weights and the sidecar when the id isn't kept.
+    removed = cs.gc(keep_ids=set())
+    assert removed == 2
+    assert cs.resolve("ckpt:11") is None
+    assert cs.resolve_optimizer("ckpt:11") is None
+
+
+def test_checkpoint_optimizer_sidecar_absent_is_none(tmp_path):
+    # A parent that predates the sidecar (weights only) resolves to None —
+    # the continuation then trains the optimizer from scratch.
+    cs = CheckpointStore(base_dir=tmp_path / "ck")
+    src = tmp_path / "model.safetensors"
+    src.write_bytes(b"w")
+    cs.save(3, src)
+    assert cs.resolve("ckpt:3") is not None
+    assert cs.resolve_optimizer("ckpt:3") is None
+
+
 def test_checkpoint_save_missing_source(tmp_path):
     cs = CheckpointStore(base_dir=tmp_path / "ck")
     assert cs.save(1, tmp_path / "nope.safetensors") is None
@@ -271,6 +305,58 @@ def test_prepare_continuation_valid(store, tmp_path):
     assert prep["compute_offset"] == 5.0
     assert prep["n_rounds"] == 2
     assert prep["parent_checkpoint_path"] is not None
+
+
+def test_prepare_continuation_resumes_steps_and_optimizer(store, tmp_path):
+    # An extend/continuation must carry the parent's cumulative step count
+    # (so the LR schedule spans the lineage) and the optimizer sidecar path
+    # (so AdamW moments resume) — the fix for Δ≈0 extend rounds.
+    cs = CheckpointStore(base_dir=tmp_path / "ck")
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    src = workdir / "model.safetensors"
+    src.write_bytes(b"w")
+    (workdir / "optim_state.pt").write_bytes(b"moments")
+
+    e1 = store.add_experiment(
+        round_id=1, miner_id="m", name="x", code="c", motivation="",
+        reasoning="", tool_calls=[], metric=1.0, success=True,
+        objectives={"flops_equivalent_size": 100, "cumulative_compute": 5.0,
+                    "cumulative_steps": 4200},
+        score=0.0, loss_curve=[], task="ts_forecasting",
+        cumulative_compute=5.0,
+    )
+    cs.save(e1, src)
+    store.set_checkpoint_ref(e1, f"ckpt:{e1}")
+
+    prep = prepare_continuation(
+        store, cs, payload={"mode": "continue", "parent_index": e1},
+        task_name="ts_forecasting", min_flops=100, max_flops=100,
+        pool=[], shards_per_round=0, seed=1,
+    )
+    assert prep["mode"] == "continue"
+    assert prep["step_offset"] == 4200
+    assert prep["parent_optimizer_state_path"] is not None
+    assert Path(prep["parent_optimizer_state_path"]).read_bytes() == b"moments"
+
+
+def test_prepare_continuation_optimizer_path_none_when_absent(store, tmp_path):
+    # Parent has weights but no optimizer sidecar → path is None, step_offset
+    # falls back to 0 (no cumulative_steps recorded).
+    cs = CheckpointStore(base_dir=tmp_path / "ck")
+    src = tmp_path / "m.safetensors"
+    src.write_bytes(b"w")
+    e1 = _add(store, metric=1.0, cumc=5.0)
+    cs.save(e1, src)
+    store.set_checkpoint_ref(e1, f"ckpt:{e1}")
+    prep = prepare_continuation(
+        store, cs, payload={"mode": "continue", "parent_index": e1},
+        task_name="ts_forecasting", min_flops=100, max_flops=100,
+        pool=[], shards_per_round=0, seed=1,
+    )
+    assert prep["mode"] == "continue"
+    assert prep["parent_optimizer_state_path"] is None
+    assert prep["step_offset"] == 0
 
 
 def test_prepare_continuation_rejects_bad_parent(store, tmp_path):

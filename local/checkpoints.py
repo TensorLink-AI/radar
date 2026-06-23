@@ -71,14 +71,23 @@ class CheckpointStore:
     def _local_path(self, exp_id: int) -> Path:
         return self.base_dir / f"{int(exp_id)}.safetensors"
 
+    def _local_optim_path(self, exp_id: int) -> Path:
+        return self.base_dir / f"{int(exp_id)}.optim.pt"
+
     def _r2_key(self, exp_id: int) -> str:
         return f"{self.r2_prefix}/{int(exp_id)}.safetensors"
+
+    def _r2_optim_key(self, exp_id: int) -> str:
+        return f"{self.r2_prefix}/{int(exp_id)}.optim.pt"
 
     def save(self, exp_id: int, src_path: str | Path) -> Optional[str]:
         """Copy ``src_path`` into the store keyed by ``exp_id``.
 
-        Returns the ``checkpoint_ref`` to persist, or ``None`` if the
-        source is missing.
+        If a sibling ``optim_state.pt`` (the harness's optimizer/scheduler
+        sidecar) lives next to the weights it is copied too, so a
+        continuation child can resume the optimizer + LR schedule rather than
+        restarting them. Returns the ``checkpoint_ref`` to persist, or
+        ``None`` if the weights source is missing.
         """
         src = Path(src_path)
         if not src.is_file():
@@ -97,6 +106,22 @@ class CheckpointStore:
                 self.sink._client.upload_file_from_disk(str(dst), key)  # type: ignore[attr-defined]
             except Exception as e:  # noqa: BLE001
                 logger.debug("checkpoint R2 mirror failed: %s", e)
+        # Optional optimizer/scheduler sidecar.
+        optim_src = src.parent / "optim_state.pt"
+        if optim_src.is_file():
+            optim_dst = self._local_optim_path(exp_id)
+            try:
+                shutil.copy2(optim_src, optim_dst)
+            except OSError as e:  # noqa: BLE001
+                logger.warning("optimizer sidecar save failed (%s)", e)
+                optim_dst = None
+            if (optim_dst is not None and self.sink is not None
+                    and getattr(self.sink, "r2_enabled", False)):
+                try:
+                    self.sink._client.upload_file_from_disk(  # type: ignore[attr-defined]
+                        str(optim_dst), self._r2_optim_key(exp_id))
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("optimizer sidecar R2 mirror failed: %s", e)
         return ref
 
     def resolve(self, ref: Optional[str]) -> Optional[str]:
@@ -122,25 +147,54 @@ class CheckpointStore:
                 logger.debug("checkpoint R2 fetch failed: %s", e)
         return None
 
+    def resolve_optimizer(self, ref: Optional[str]) -> Optional[str]:
+        """Local path to the optimizer/scheduler sidecar for ``ref``, or None.
+
+        Mirrors ``resolve`` for the ``{exp_id}.optim.pt`` file. A parent that
+        predates the sidecar (or never produced one) returns None and the
+        continuation simply trains the optimizer from scratch (the LR-schedule
+        fast-forward still applies)."""
+        if not ref or not ref.startswith("ckpt:"):
+            return None
+        try:
+            exp_id = int(ref.split(":", 1)[1])
+        except ValueError:
+            return None
+        local = self._local_optim_path(exp_id)
+        if local.is_file():
+            return str(local)
+        if self.sink is not None and getattr(self.sink, "r2_enabled", False):
+            try:
+                body = self.sink.fetch_bytes(self._r2_optim_key(exp_id))  # type: ignore[attr-defined]
+                if body:
+                    local.write_bytes(body)
+                    return str(local)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("optimizer sidecar R2 fetch failed: %s", e)
+        return None
+
     def gc(self, keep_ids: set[int]) -> int:
         """Delete local checkpoints whose experiment id is not in ``keep_ids``.
 
-        Returns the number of files removed. R2 copies (if any) are left
-        intact — they're cheap and re-downloadable.
+        Returns the number of files removed (weights + optimizer sidecars).
+        R2 copies (if any) are left intact — they're cheap and
+        re-downloadable.
         """
         removed = 0
         keep = {int(i) for i in keep_ids}
-        for f in self.base_dir.glob("*.safetensors"):
-            try:
-                exp_id = int(f.stem)
-            except ValueError:
-                continue
-            if exp_id not in keep:
+        for pattern in ("*.safetensors", "*.optim.pt"):
+            for f in self.base_dir.glob(pattern):
+                # ``{id}.optim.pt`` → stem is ``{id}.optim``; take the leading int.
                 try:
-                    f.unlink()
-                    removed += 1
-                except OSError:
-                    pass
+                    exp_id = int(f.name.split(".", 1)[0])
+                except ValueError:
+                    continue
+                if exp_id not in keep:
+                    try:
+                        f.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
         return removed
 
 

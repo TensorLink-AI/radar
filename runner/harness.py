@@ -239,6 +239,24 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
     from safetensors.torch import save_file
     save_file(state_to_save, checkpoint_path)
 
+    # 7b. Optimizer/scheduler sidecar — lets a continuation child resume the
+    # optimizer moments and the LR schedule position (the difference between
+    # "more compute that does net-new optimization" and "re-perturb + re-decay
+    # to the same minimum"). safetensors can't hold the non-tensor structure,
+    # so this is a separate torch.save next to the weights.
+    optimizer_state_path = ""
+    optim_snapshot = loop_result.get("best_optim_state")
+    if optim_snapshot:
+        try:
+            optimizer_state_path = os.path.join(checkpoint_dir, "optim_state.pt")
+            torch.save(
+                {**optim_snapshot, "step": loop_result["step"]},
+                optimizer_state_path,
+            )
+        except Exception as e:
+            logger.warning("could not save optimizer sidecar: %s", e)
+            optimizer_state_path = ""
+
     # Continuation bookkeeping: shift step/flops coordinates by the
     # lineage offset so a stitched trajectory across rounds is monotonic,
     # and report cumulative_flops (this run) for the continuation frontier.
@@ -262,6 +280,7 @@ def run_training(runner: TaskRunner, architecture_code: str, config: TrainingCon
         "num_params_M": num_params / 1e6,
         "peak_vram_mb": torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else 0.0,
         "checkpoint_path": checkpoint_path,
+        "optimizer_state_path": optimizer_state_path,
         "train_loss_history": train_hist,
         "val_loss_history": val_hist,
         "best_val_loss": loop_result["best_val_loss"],
@@ -415,13 +434,51 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
     amp_enabled = amp_cfg["enabled"] and (device == "cuda")
     amp_dtype = amp_dtypes[amp_cfg["dtype"]]
 
+    # Continuation resume: a warm-start parent contributed ``step_offset``
+    # optimizer steps already (lineage-absolute). Restoring its optimizer +
+    # scheduler state — and spanning the LR schedule over the CUMULATIVE
+    # lineage horizon rather than restarting a fresh warmup→cosine each round
+    # — is what turns an "extend" continuation into net-new optimization
+    # instead of re-perturbing converged weights and re-decaying to the same
+    # minimum (the Δ≈0 failure mode).
+    step_offset = int(os.environ.get("RADAR_STEP_OFFSET", "0") or 0)
+    parent_optim_state = _load_parent_optim_state(device)
+
     total_steps_est = (time_budget * cfg["batch_size"]) // 2
+    # The schedule horizon spans the whole lineage so the cosine tail keeps
+    # decaying past the parent's stopping point instead of restarting.
+    sched_horizon = total_steps_est + max(0, step_offset)
     scheduler = None
     if _has_callable(sub, "build_scheduler"):
         try:
-            scheduler = sub.build_scheduler(optimizer, total_steps_est)
+            scheduler = sub.build_scheduler(optimizer, sched_horizon)
         except Exception:
             pass
+
+    if parent_optim_state is not None:
+        try:
+            optimizer.load_state_dict(parent_optim_state["optimizer"])
+            logger.info("resumed optimizer state from parent checkpoint")
+        except Exception as e:
+            logger.warning("could not resume optimizer state: %s", e)
+        if scheduler is not None and parent_optim_state.get("scheduler"):
+            try:
+                scheduler.load_state_dict(parent_optim_state["scheduler"])
+                logger.info("resumed scheduler state (last_epoch=%s)",
+                            getattr(scheduler, "last_epoch", "?"))
+            except Exception as e:
+                logger.warning("could not resume scheduler state: %s", e)
+    elif scheduler is not None and step_offset > 0:
+        # No restorable scheduler state (parent predates the sidecar) but we
+        # know how many steps the lineage already took — fast-forward so LR
+        # resumes mid/late-decay rather than re-warming up from zero.
+        try:
+            for _ in range(step_offset):
+                scheduler.step()
+            logger.info("fast-forwarded scheduler by %d lineage steps",
+                        step_offset)
+        except Exception as e:
+            logger.warning("could not fast-forward scheduler: %s", e)
 
     # Loss: miner's compute_loss() (wrapped for task compat) or task's default
     loss_fn = runner.default_loss
@@ -447,6 +504,10 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
     best_val_loss = float("inf")
     best_val_step = -1
     best_state = None
+    # Optimizer + scheduler state snapshotted at the SAME step as best_state so
+    # a continuation child resumes a coherent (weights, optimizer) pair rather
+    # than mixing best-val weights with a final-step optimizer.
+    best_optim_state: dict | None = None
     val_history: list[dict] = []
     train_history: list[dict] = []
 
@@ -657,6 +718,7 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
                         best_val_step = optim_step
                         # Clone state_dict to CPU to avoid holding GPU memory.
                         best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                        best_optim_state = _snapshot_optim(optimizer, scheduler)
                 if val_eval_tokens == 0 and tokens_seen > 0:
                     val_eval_tokens = tokens_seen
 
@@ -708,8 +770,15 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
                     best_val_loss = val_loss
                     best_val_step = optim_step
                     best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                    best_optim_state = _snapshot_optim(optimizer, scheduler)
             if val_eval_tokens == 0 and tokens_seen > 0:
                 val_eval_tokens = tokens_seen
+
+    # If val never produced a best (sparse/no val), the saved weights are the
+    # final model.state_dict() — pair them with the final optimizer state so a
+    # continuation child can still resume coherently.
+    if best_optim_state is None and optim_step > 0:
+        best_optim_state = _snapshot_optim(optimizer, scheduler)
 
     return {
         "step": step,
@@ -718,6 +787,7 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
         "best_val_loss": (best_val_loss if best_val_step >= 0 else None),
         "best_val_step": best_val_step,
         "best_state": best_state,
+        "best_optim_state": best_optim_state,
         "val_cadence_unit": cfg["val_cadence_unit"],
         "val_base": (
             float(cfg["val_base_flops"])
@@ -730,6 +800,66 @@ def _training_loop(runner: TaskRunner, sub, model, device: str, time_budget: int
         "cumulative_flops": int(cumulative_flops),
         "num_spikes_skipped": int(num_spikes_skipped),
     }
+
+
+def _snapshot_optim(optimizer, scheduler) -> dict:
+    """CPU-clone the optimizer (and scheduler) state for a durable sidecar.
+
+    Optimizer state (AdamW moments etc.) is moved to CPU so the snapshot
+    doesn't pin GPU memory. Scheduler state is small and picklable
+    (``LambdaLR`` excludes the lambda itself). Best-effort: any failure
+    returns an empty-ish dict rather than killing training.
+    """
+    import torch
+
+    out: dict = {}
+    try:
+        sd = optimizer.state_dict()
+
+        def _to_cpu(o):
+            if torch.is_tensor(o):
+                return o.detach().cpu().clone()
+            if isinstance(o, dict):
+                return {k: _to_cpu(v) for k, v in o.items()}
+            if isinstance(o, list):
+                return [_to_cpu(v) for v in o]
+            return o
+
+        out["optimizer"] = _to_cpu(sd)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("optimizer snapshot failed: %s", e)
+        return {}
+    if scheduler is not None:
+        try:
+            out["scheduler"] = scheduler.state_dict()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("scheduler snapshot skipped: %s", e)
+    return out
+
+
+def _load_parent_optim_state(device: str):
+    """Load a parent optimizer/scheduler sidecar named by
+    ``PARENT_OPTIMIZER_STATE_PATH``. Returns the dict or ``None``.
+
+    Tensors are mapped to ``device`` so ``optimizer.load_state_dict`` lands
+    the moments where the params live. Missing/unreadable sidecar ⇒ None
+    (the run trains optimizer-from-scratch, falling back to the schedule
+    fast-forward)."""
+    import os as _os
+
+    path = _os.environ.get("PARENT_OPTIMIZER_STATE_PATH", "")
+    if not path or not _os.path.isfile(path):
+        return None
+    try:
+        import torch
+
+        state = torch.load(path, map_location=device)
+        if isinstance(state, dict) and "optimizer" in state:
+            return state
+        logger.warning("parent optimizer sidecar malformed at %s", path)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("could not load parent optimizer sidecar: %s", e)
+    return None
 
 
 def _run_val(runner, model, val_loader_factory, device, amp_dtype, amp_enabled):

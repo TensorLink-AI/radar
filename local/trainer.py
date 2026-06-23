@@ -152,6 +152,7 @@ def run_training(
     min_flops: int = 0,
     max_flops: int = 0,
     parent_checkpoint_path: str | None = None,
+    parent_optimizer_state_path: str | None = None,
     compute_offset: float = 0.0,
     step_offset: int = 0,
     shard_paths: list[str] | None = None,
@@ -190,6 +191,7 @@ def run_training(
             min_flops=min_flops, max_flops=max_flops,
             frozen_arch=frozen_arch,
             parent_checkpoint_path=parent_checkpoint_path,
+            parent_optimizer_state_path=parent_optimizer_state_path,
             compute_offset=compute_offset,
             step_offset=step_offset,
             baseline_aulc=getattr(frozen_arch, "baseline_aulc", None),
@@ -200,6 +202,7 @@ def run_training(
             code, seed=seed, task=task,
             min_flops=min_flops, max_flops=max_flops,
             parent_checkpoint_path=parent_checkpoint_path,
+            parent_optimizer_state_path=parent_optimizer_state_path,
             compute_offset=compute_offset, step_offset=step_offset,
         )
     if isinstance(task, TSForecastingSpec):
@@ -207,6 +210,7 @@ def run_training(
             code, seed=seed, task=task,
             min_flops=min_flops, max_flops=max_flops,
             parent_checkpoint_path=parent_checkpoint_path,
+            parent_optimizer_state_path=parent_optimizer_state_path,
             compute_offset=compute_offset, step_offset=step_offset,
             shard_paths=shard_paths, shard_reuse=shard_reuse,
             frozen_pipeline=frozen_pipeline,
@@ -346,6 +350,7 @@ def _run_ts_forecasting(
     min_flops: int,
     max_flops: int,
     parent_checkpoint_path: str | None = None,
+    parent_optimizer_state_path: str | None = None,
     compute_offset: float = 0.0,
     step_offset: int = 0,
     shard_paths: list[str] | None = None,
@@ -468,6 +473,11 @@ def _run_ts_forecasting(
     }
     if parent_checkpoint_path:
         overrides["PARENT_CHECKPOINT_PATH"] = str(parent_checkpoint_path)
+    # Optimizer/scheduler resume sidecar (continuation). Set explicitly to ""
+    # when absent so a value left over from a prior in-process call can't leak.
+    overrides["PARENT_OPTIMIZER_STATE_PATH"] = (
+        str(parent_optimizer_state_path) if parent_optimizer_state_path else ""
+    )
 
     saved = {k: os.environ.get(k) for k in overrides}
     os.environ.update(overrides)
@@ -578,6 +588,9 @@ def _run_ts_forecasting(
         "train_seconds": train_seconds,
         "this_compute": this_compute,
         "cumulative_compute": cumulative_compute,
+        # Lineage-absolute optim-step count (this run's steps + offset) so a
+        # continuation child can span the LR schedule over the whole lineage.
+        "cumulative_steps": int(result.get("num_steps") or 0),
         "pretrain_shards": [Path(p).name for p in train_paths],
         "shard_reuse": bool(shard_reuse),
     }

@@ -346,6 +346,7 @@ def run_data_pipeline_training(
     max_flops: int,
     frozen_arch: FrozenArch,
     parent_checkpoint_path: str | None = None,
+    parent_optimizer_state_path: str | None = None,
     compute_offset: float = 0.0,
     step_offset: int = 0,
     baseline_aulc: Optional[float] = None,
@@ -436,6 +437,10 @@ def run_data_pipeline_training(
         # Empty string disables warm-start (harness checks ``if env:``).
         "PARENT_CHECKPOINT_PATH": (
             str(parent_checkpoint_path) if parent_checkpoint_path else ""
+        ),
+        "PARENT_OPTIMIZER_STATE_PATH": (
+            str(parent_optimizer_state_path)
+            if parent_optimizer_state_path else ""
         ),
     }
     saved = {k: os.environ.get(k) for k in overrides}
@@ -536,6 +541,8 @@ def run_data_pipeline_training(
         "train_seconds": train_seconds,
         "this_compute": this_compute,
         "cumulative_compute": cumulative_compute,
+        # Lineage-absolute optim-step count for the continuation LR schedule.
+        "cumulative_steps": int(result.get("num_steps") or 0),
         "frozen_arch_version": int(frozen_arch.version),
         "frozen_arch_source_id": int(frozen_arch.source_experiment_id),
     }
